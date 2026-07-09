@@ -1,0 +1,11 @@
+name: virusflow
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - numpy>=1.24
+  - astropy>=6
+  - pyyaml>=6
+  - pip
+  - pip:
+      - -e .

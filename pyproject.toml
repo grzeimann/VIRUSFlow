@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling>=1.24.2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "virusflow"
+version = "0.1.0"
+description = "Orchestration, provenance, calibration, and reduction framework for the VIRUS spectrograph."
+readme = "README.md"
+authors = [
+  { name = "Greg Zeimann", email = "" },
+]
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["astronomy", "spectrograph", "pipeline", "provenance", "orchestration"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: BSD License",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Astronomy",
+]
+dependencies = [
+  "PyYAML>=6.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/VIRUSFlow"
+Issues = "https://github.com/your-org/VIRUSFlow/issues"
+
+[project.scripts]
+virusflow = "virusflow.cli.virusflow:main"
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=7",
+  "ruff>=0.5",
+  "black>=24",
+  "mypy>=1.8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["virusflow"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "virusflow",
+  "README.md",
+  "LICENSE",
+  "VIRUSFlow_Architecture_Vision_with_ObservationSet.md",
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q"
