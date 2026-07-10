@@ -213,6 +213,7 @@ def cmd_run(args: argparse.Namespace) -> None:
     if not os.path.exists(args.db):
         raise SystemExit(f"Registry DB not found at {args.db}. Initialize and scan first: 'virusflow init --db {args.db}' then 'virusflow scan --db {args.db} <root>'.")
 
+    from ..core.pathutils import ensure_dir
     plan_path = Path(args.plan)
     text = plan_path.read_text()
     try:
@@ -252,7 +253,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         deps = t.get("deps", [])
         exec.add_task(node_id, instances[node_id], depends_on=deps)
 
-    os.makedirs(args.workdir, exist_ok=True)
+    ensure_dir(args.workdir)
     exec.run()
     print("Run complete")
 

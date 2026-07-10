@@ -41,8 +41,9 @@ class DarkTask(Task):
         return ["master_dark"]
 
     def run(self, inputs: Dict[str, Artifact]):
+        from ..core.pathutils import ensure_dir
         out_path = os.path.join(self.ctx.workdir, "master_dark.fits")
-        os.makedirs(self.ctx.workdir, exist_ok=True)
+        ensure_dir(self.ctx.workdir)
         with open(out_path, "w") as f:
             f.write("SIMULATED MASTER DARK")
         art = CalibrationProduct(

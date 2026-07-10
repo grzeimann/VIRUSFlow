@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import os
 from typing import Iterable, Optional, Dict, Any, List, Union
 
 import numpy as np
-from astropy.io import fits
 from astropy.stats import biweight_location
 from .ccd import base_reduction
+from ..core.artifacts import save_master_bias
 
 # Input item type accepted by step_bias
 BiasInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
@@ -82,16 +81,9 @@ def step_bias(
     # Scalar readnoise estimate
     readnoise = float(np.nanmedian(mad))
 
-    # Write FITS
+    # Write artifact via centralized helper
     if output_path is not None:
-        os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-        hdu = fits.PrimaryHDU(master.astype(np.float32))
-        hdr = hdu.header
-        hdr["NINPUTS"] = (len(frames), "number of input bias frames")
-        hdr["BIASRN"] = (readnoise, "median per-pixel MAD (scaled)")
-        hdr["ALGOVER"] = ("bias-1.0", "algorithms.bias.step_bias version")
-        hdul = fits.HDUList([hdu])
-        hdul.writeto(output_path, overwrite=True)
+        save_master_bias(output_path, master, n_inputs=len(frames), readnoise=readnoise, algo_version="bias-1.0")
 
     return {
         "readnoise": readnoise,

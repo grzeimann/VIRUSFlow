@@ -103,10 +103,11 @@ class CalibrationTask(Task):
 
     def output_path(self) -> str:
         import os
+        from ..core.pathutils import ensure_dir
         self._require_target()
         if not self.artifact_name:
             raise ValueError(f"{self.__class__.__name__}.artifact_name is not set")
-        os.makedirs(self.ctx.workdir, exist_ok=True)
+        ensure_dir(self.ctx.workdir)
         zkey = self.target.zipcode.key() if getattr(self.target, "zipcode", None) else "UNKNOWN"
         start_s, end_s = self.target.start_date, self.target.end_date
         fname = f"{self.artifact_name}_{zkey}_{start_s}_{end_s}.fits"
