@@ -18,7 +18,6 @@ def step_bias(
     params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[BiasInput]] = None,
 ) -> Dict[str, Any]:
-    from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
     """
     Construct a master bias frame from input zero (bias) frames using numpy/astropy.
 
@@ -44,10 +43,7 @@ def step_bias(
         # Fail fast per architecture guidance: empty inputs indicate a planning/scoping error
         raise ValueError("step_bias requires at least one raw bias input in raw_bias_inputs")
 
-    # Read all frames (optionally in parallel)
-    workers = int(params.get("workers", 0) or 0)
-    parallel_mode = str(params.get("parallel_mode", "thread")).lower()
-
+    # Read all frames serially. Parallelism is handled by the task/executor layer.
     def _reduce_one(idx_item):
         i, it = idx_item
         p = it.get("path")
@@ -63,27 +59,12 @@ def step_bias(
     frames: List[np.ndarray] = []
     errors: List[str] = []
 
-    if workers and workers > 0 and n_inputs > 1:
-        if parallel_mode == "process":
-            # ProcessPool can be heavy due to large array returns; default to thread unless explicitly requested
-            Executor = ProcessPoolExecutor
-        else:
-            Executor = ThreadPoolExecutor
-        with Executor(max_workers=workers) as ex:
-            futs = [ex.submit(_reduce_one, (i, it)) for i, it in enumerate(inputs)]
-            for fut in as_completed(futs):
-                img, idx, err = fut.result()
-                if img is not None:
-                    frames.append(img)
-                elif err:
-                    errors.append(f"[{idx}] {err}")
-    else:
-        for i, it in enumerate(inputs):
-            img, idx, err = _reduce_one((i, it))
-            if img is not None:
-                frames.append(img)
-            elif err:
-                errors.append(f"[{idx}] {err}")
+    for i, it in enumerate(inputs):
+        img, idx, err = _reduce_one((i, it))
+        if img is not None:
+            frames.append(img)
+        elif err:
+            errors.append(f"[{idx}] {err}")
 
     if not frames:
         raise RuntimeError("No readable bias frames provided to step_bias")
