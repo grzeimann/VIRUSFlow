@@ -6,6 +6,8 @@ from .database import (
     list_raw_files,
     list_raw_files_scoped,
     list_zipcodes,
+    list_exposure_table,
     save_artifact,
     get_artifact,
+    ensure_tar_index,
 )

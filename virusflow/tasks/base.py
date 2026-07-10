@@ -128,12 +128,28 @@ class CalibrationTask(Task):
         )
 
     def run(self, inputs: Dict[str, Artifact]):
+        import time
         if not callable(self.algorithm):
             raise ValueError(f"{self.__class__.__name__}.algorithm is not set to a callable")
+        dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
+        t0 = time.perf_counter()
         raw_inputs, parent_ids = self.query_inputs()
+        t1 = time.perf_counter()
         out = self.output_path()
+        # Merge context config into params so algorithms can see workers/debug flags
+        algo_params = dict(self.params)
+        if isinstance(self.ctx.config, dict):
+            for k, v in self.ctx.config.items():
+                algo_params.setdefault(k, v)
+        if dbg:
+            print(f"[Timing] {self.__class__.__name__}: query_inputs={t1 - t0:.3f}s, n_inputs={len(raw_inputs)}")
         # Call the algorithm; support both raw_inputs and legacy raw_bias_inputs kw
-        meta = self.algorithm(raw_inputs=raw_inputs, output_path=out, params=self.params)
+        t2 = time.perf_counter()
+        meta = self.algorithm(raw_inputs=raw_inputs, output_path=out, params=algo_params)
+        t3 = time.perf_counter()
         artifact = self.make_artifact(out)
-        self.save_artifact(artifact, parent_ids=parent_ids)
+        art_id = self.save_artifact(artifact, parent_ids=parent_ids)
+        t4 = time.perf_counter()
+        if dbg:
+            print(f"[Timing] {self.__class__.__name__}: algorithm={t3 - t2:.3f}s, save_artifact={t4 - t3:.3f}s, total={t4 - t0:.3f}s")
         return {self.artifact_name or "calibration": artifact}

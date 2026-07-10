@@ -26,22 +26,123 @@ def cmd_scan(args: argparse.Namespace) -> None:
     storage = FileSystemStorage(args.root)
     db.init_db(args.db)
     count = 0
-    # Regular FITS on filesystem
-    for p in storage.list_fits():
-        rid = db.register_raw_file(str(p), db_path=args.db)
-        if rid is not None:
-            count += 1
-    # FITS inside tar archives
-    for tar_path, member in storage.list_tar_fits():
-        rid = db.register_raw_file(str(tar_path), db_path=args.db, tar_member=member)
-        if rid is not None:
-            count += 1
+    zipcode_keys = set()
+    indexed_tars = set()
+    # Unified iteration over both filesystem FITS and FITS inside tar archives
+    with db.connect(args.db) as conn:
+        for src in storage.iter_raw_sources():
+            # For tar-backed members, ensure we have a DB tar index built once per tar
+            if src.backend == "tar":
+                p = os.path.abspath(str(src.path))
+                if p not in indexed_tars:
+                    try:
+                        db.ensure_tar_index(p, conn=conn)
+                    except Exception:
+                        pass
+                    indexed_tars.add(p)
+            rid = db.register_raw_file(str(src.path), db_path=args.db, tar_member=src.tar_member, conn=conn)
+            if rid is not None:
+                count += 1
+                if rid.zipcode is not None:
+                    zipcode_keys.add(rid.zipcode.key())
     print(f"Registered {count} raw FITS files from {args.root}")
+    # Report unique ZipCodes discovered during this scan
+    zc_count = len(zipcode_keys)
+    print(f"Discovered {zc_count} unique zipcodes")
+    if zc_count:
+        examples = sorted(zipcode_keys)[: min(5, zc_count)]
+        print("Example zipcodes:")
+        for z in examples:
+            print(f"  - {z}")
+    # Report how many tar files were indexed during this scan (DB mode only)
+    if indexed_tars:
+        print(f"Indexed {len(indexed_tars)} tar files into registry (DB mode)")
 
 
 def cmd_tasks(args: argparse.Namespace) -> None:
     av = available_tasks()
     print(yaml.safe_dump(av, sort_keys=False))
+
+
+def _format_table(rows: List[dict], csv: bool = False) -> str:
+    if csv:
+        import csv as _csv
+        import io as _io
+        if not rows:
+            return ""
+        cols = [
+            "exposure_id",
+            "when_utc",
+            "frame_type",
+            "expnum",
+            "qobject",
+            "qprog",
+            "pexptime",
+            "date",
+            "qra",
+            "qdec",
+            "tar_path",
+        ]
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([r.get(c, "") if r.get(c) is not None else "" for c in cols])
+        return buf.getvalue()
+    # text table
+    cols = [
+        ("exposure_id", "EXPOSURE"),
+        ("when_utc", "DATE"),
+        ("frame_type", "TYPE"),
+        ("expnum", "EXP#"),
+        ("qobject", "QOBJECT"),
+        ("qprog", "QPROG"),
+        ("pexptime", "PEXPTIME"),
+        ("date", "DATEHDR"),
+        ("qra", "QRA"),
+        ("qdec", "QDEC"),
+        ("tar_path", "TAR")
+    ]
+    # Compute widths
+    widths = []
+    for key, title in cols:
+        w = len(title)
+        for r in rows:
+            v = r.get(key)
+            s = "" if v is None else str(v)
+            if len(s) > w:
+                w = len(s)
+        widths.append(w)
+    # Build header
+    parts = []
+    for (key, title), w in zip(cols, widths):
+        parts.append(title.ljust(w))
+    out = [" ".join(parts)]
+    out.append(" ".join(["-" * w for w in widths]))
+    # Rows
+    for r in rows:
+        fields = []
+        for (key, _title), w in zip(cols, widths):
+            v = r.get(key)
+            s = "" if v is None else str(v)
+            if len(s) > w:
+                s = s[: w - 1] + "…" if w > 1 else s[:w]
+            fields.append(s.ljust(w))
+        out.append(" ".join(fields))
+    return "\n".join(out)
+
+
+def cmd_exposures(args: argparse.Namespace) -> None:
+    rows = db.list_exposure_table(db_path=args.db, start_date=args.start_date, end_date=args.end_date, limit=args.limit)
+    if not rows:
+        msg = "No exposures found"
+        if args.start_date and args.end_date:
+            msg += f" in date window {args.start_date}..{args.end_date}"
+        print(msg)
+        return
+    table = _format_table(rows, csv=bool(args.csv))
+    if table:
+        print(table)
 
 
 # ------------------ Planner subcommands ------------------
@@ -72,7 +173,8 @@ def cmd_plan_calibrations(args: argparse.Namespace) -> None:
             end_date=args.end_date,
             limit=args.limit,
         )
-
+        if not zipcodes:
+            raise SystemExit(f"No zipcodes found for date window {args.start_date}..{args.end_date}")
     tasks = []
     for zc in zipcodes:
         tgt = BiasTarget(zc, args.start_date, args.end_date)
@@ -107,6 +209,10 @@ def cmd_plan_observation_set(args: argparse.Namespace) -> None:
 # ------------------ Runner ------------------
 
 def cmd_run(args: argparse.Namespace) -> None:
+    # Enforce DB mode: require an existing registry DB path
+    if not os.path.exists(args.db):
+        raise SystemExit(f"Registry DB not found at {args.db}. Initialize and scan first: 'virusflow init --db {args.db}' then 'virusflow scan --db {args.db} <root>'.")
+
     plan_path = Path(args.plan)
     text = plan_path.read_text()
     try:
@@ -114,7 +220,12 @@ def cmd_run(args: argparse.Namespace) -> None:
     except Exception:
         # Fallback to JSON for backward compatibility
         plan = json.loads(text)
-    ctx = TaskContext(db_path=args.db, workdir=args.workdir, config={})
+
+    # Configure I/O layer with registry DB for DB-backed tar indexing (mandatory for tar-backed FITS)
+    from ..algorithms import io as aio
+    aio.set_registry_db_path(args.db)
+
+    ctx = TaskContext(db_path=args.db, workdir=args.workdir, config={"workers": args.workers, "debug_timing": bool(args.debug_timing)})
 
     # Instantiate tasks (target-scoped when provided)
     instances = {}
@@ -135,7 +246,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         instances[t["id"]] = cls(ctx, target=target_obj)
 
     # Build simple graph and execute in-order
-    exec = LocalExecutor()
+    exec = LocalExecutor(max_workers=(args.workers if args.workers and args.workers > 0 else 1), debug=bool(args.debug_timing))
     for t in plan.get("tasks", []):
         node_id = t["id"]
         deps = t.get("deps", [])
@@ -164,6 +275,14 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     sp = sub.add_parser("tasks", help="List available tasks and versions")
     sp.set_defaults(func=cmd_tasks)
+
+    # exposures table
+    sp = sub.add_parser("exposures", help="Show a quick readable table from exposures in the registry", parents=[global_opts])
+    sp.add_argument("--start-date", help="Filter start date YYYYMMDD")
+    sp.add_argument("--end-date", help="Filter end date YYYYMMDD")
+    sp.add_argument("--limit", type=int, help="Limit number of rows")
+    sp.add_argument("--csv", action="store_true", help="Output as CSV instead of a fixed-width table")
+    sp.set_defaults(func=cmd_exposures)
 
     # plan group with subcommands
     plan_p = sub.add_parser("plan", help="Create a YAML plan from scientific intent")
@@ -198,6 +317,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp = sub.add_parser("run", help="Run a previously created YAML plan file", parents=[global_opts])
     sp.add_argument("plan", help="Path to plan YAML file (JSON still accepted)")
     sp.add_argument("--workdir", default=str(Path.cwd() / "work"), help="Working directory")
+    sp.add_argument("--workers", type=int, default=4, help="Worker threads for algorithms and task batches (set 0 for serial)")
+    sp.add_argument("--debug-timing", action="store_true", help="Print timing diagnostics during run")
     sp.set_defaults(func=cmd_run)
 
     args = p.parse_args(argv)

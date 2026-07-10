@@ -2,8 +2,16 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Tuple
+from typing import Iterable, Iterator, List, Optional, Tuple, Literal
 import tarfile
+from dataclasses import dataclass
+
+
+@dataclass
+class RawSource:
+    path: Path
+    tar_member: Optional[str] = None
+    backend: Literal["filesystem", "tar"] = "filesystem"
 
 
 class FileSystemStorage:
@@ -42,3 +50,11 @@ class FileSystemStorage:
             except (tarfile.TarError, OSError):
                 # Skip unreadable/corrupt tar files silently for now
                 continue
+
+    def iter_raw_sources(self, subdir: Optional[str] = None) -> Iterator[RawSource]:
+        # filesystem files
+        for p in self.list_fits(subdir=subdir):
+            yield RawSource(path=p, tar_member=None, backend="filesystem")
+        # tar members
+        for tar_path, member in self.list_tar_fits(subdir=subdir):
+            yield RawSource(path=tar_path, tar_member=member, backend="tar")

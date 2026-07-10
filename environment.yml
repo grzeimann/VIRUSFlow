@@ -5,6 +5,8 @@ dependencies:
   - python>=3.10
   - numpy>=1.24
   - astropy>=6
+  - scipy>=1.11
+  - matplotlib>=3.7
   - pyyaml>=6
   - pip
   - pip:
