@@ -153,6 +153,11 @@ class CalibrationTask(Task):
         t3 = time.perf_counter()
         artifact = self.make_artifact(out)
         art_id = self.save_artifact(artifact, parent_ids=parent_ids)
+        # Attach the generated artifact id to the Artifact instance for downstream inspection
+        try:
+            setattr(artifact, "id", int(art_id))
+        except Exception:
+            pass
         t4 = time.perf_counter()
         # Automatic QA: evaluate and persist based on algorithm metadata and artifact kind
         try:
