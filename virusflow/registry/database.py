@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, date
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Set
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Set, Any
 
 from astropy.io import fits
 
@@ -570,6 +570,134 @@ def get_artifact(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[D
             (artifact_id,),
         ).fetchone()
         return dict(row) if row else None
+
+
+def find_artifacts(
+    *,
+    kind: str,
+    zipcode: Optional[ZipCode] = None,
+    at_time: Optional[datetime] = None,
+    db_path: str = DEFAULT_DB_PATH,
+    limit: Optional[int] = None,
+) -> List[Dict]:
+    """Find artifacts by kind, optional zipcode scope, and optional validity at_time.
+
+    Orders by provenance.created_at DESC (newest first).
+    """
+    # Normalize time to ISO for lexical compare
+    at_iso: Optional[str] = at_time.isoformat() if isinstance(at_time, datetime) else None
+    with connect(db_path) as conn:
+        sql = (
+            "SELECT a.*, p.software_version, p.git_commit, p.algorithm, p.parameters_hash, p.created_at, p.parents "
+            "FROM artifacts a LEFT JOIN provenance p ON a.id = p.artifact_id WHERE a.kind = ?"
+        )
+        params: List[Any] = [kind]
+        if zipcode is not None:
+            sql += " AND a.amp_key = ?"
+            params.append(zipcode.key())
+        if at_iso is not None:
+            # validity_start <= at_iso <= validity_end; allow NULLs to mean open intervals
+            sql += (
+                " AND (a.validity_start IS NULL OR a.validity_start <= ?)"
+                " AND (a.validity_end IS NULL OR a.validity_end >= ?)"
+            )
+            params.extend([at_iso, at_iso])
+        sql += " ORDER BY p.created_at DESC NULLS LAST, a.id DESC"
+        if limit and int(limit) > 0:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_artifacts(
+    *,
+    kind: Optional[str] = None,
+    zipcode: Optional[ZipCode] = None,
+    at_time: Optional[datetime] = None,
+    db_path: str = DEFAULT_DB_PATH,
+    limit: Optional[int] = None,
+) -> List[Dict]:
+    """List artifacts with optional filters.
+
+    If kind is None, return all kinds. Optionally filter by zipcode and validity window.
+    Orders by provenance.created_at DESC (newest first).
+    """
+    at_iso: Optional[str] = at_time.isoformat() if isinstance(at_time, datetime) else None
+    with connect(db_path) as conn:
+        sql = (
+            "SELECT a.*, p.software_version, p.git_commit, p.algorithm, p.parameters_hash, p.created_at, p.parents, "
+            "q.status AS qa_status, q.metrics_json AS qa_metrics_json "
+            "FROM artifacts a "
+            "LEFT JOIN provenance p ON a.id = p.artifact_id "
+            "LEFT JOIN qa_results q ON a.id = q.artifact_id "
+            "WHERE 1=1"
+        )
+        params: List[Any] = []
+        if kind:
+            sql += " AND a.kind = ?"
+            params.append(kind)
+        if zipcode is not None:
+            sql += " AND a.amp_key = ?"
+            params.append(zipcode.key())
+        if at_iso is not None:
+            sql += (
+                " AND (a.validity_start IS NULL OR a.validity_start <= ?)"
+                " AND (a.validity_end IS NULL OR a.validity_end >= ?)"
+            )
+            params.extend([at_iso, at_iso])
+        sql += " ORDER BY p.created_at DESC NULLS LAST, a.id DESC"
+        if limit and int(limit) > 0:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_qa_results(
+    artifact_id: int,
+    *,
+    status: str,
+    metrics: Optional[Dict[str, Any]] = None,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """Upsert QA results for an artifact.
+
+    metrics is serialized to JSON for storage.
+    """
+    import json as _json
+    with connect(db_path) as conn:
+        payload = _json.dumps(metrics or {}, sort_keys=True, separators=(",", ":"))
+        conn.execute(
+            """
+            INSERT INTO qa_results(artifact_id, status, metrics_json)
+            VALUES(?, ?, ?)
+            ON CONFLICT(artifact_id) DO UPDATE SET
+                status=excluded.status,
+                metrics_json=excluded.metrics_json
+            """,
+            (int(artifact_id), str(status), payload),
+        )
+
+
+def get_qa_results(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    """Fetch QA status and metrics for an artifact id.
+
+    Returns a dict with keys: artifact_id, status, metrics (dict) or None if missing.
+    """
+    import json as _json
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT artifact_id, status, metrics_json FROM qa_results WHERE artifact_id=?",
+            (int(artifact_id),),
+        ).fetchone()
+        if not row:
+            return None
+        try:
+            metrics = _json.loads(row[2]) if row[2] else {}
+        except Exception:
+            metrics = {}
+        return {"artifact_id": int(row[0]), "status": row[1], "metrics": metrics}
 
 
 def list_zipcodes(

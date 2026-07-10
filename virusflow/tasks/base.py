@@ -103,12 +103,13 @@ class CalibrationTask(Task):
 
     def output_path(self) -> str:
         import os
-        from ..core.pathutils import ensure_dir
+        from ..core.pathutils import ensure_dir, sanitize_for_filename
         self._require_target()
         if not self.artifact_name:
             raise ValueError(f"{self.__class__.__name__}.artifact_name is not set")
         ensure_dir(self.ctx.workdir)
-        zkey = self.target.zipcode.key() if getattr(self.target, "zipcode", None) else "UNKNOWN"
+        zkey_raw = self.target.zipcode.key() if getattr(self.target, "zipcode", None) else "UNKNOWN"
+        zkey = sanitize_for_filename(zkey_raw)
         start_s, end_s = self.target.start_date, self.target.end_date
         fname = f"{self.artifact_name}_{zkey}_{start_s}_{end_s}.fits"
         return os.path.join(self.ctx.workdir, fname)
@@ -118,9 +119,11 @@ class CalibrationTask(Task):
         zipcode = getattr(self.target, "zipcode", None)
         vstart = self._parse_date(getattr(self.target, "start_date", None))
         vend = self._parse_date(getattr(self.target, "end_date", None))
+        # Use the specific artifact name as the artifact kind for discoverability (e.g., 'master_bias')
+        art_kind = self.artifact_name or "calibration"
         return CalibrationProduct(
             id=None,
-            kind="calibration",
+            kind=art_kind,
             name=self.artifact_name or "calibration",
             path=out_path,
             zipcode=zipcode,

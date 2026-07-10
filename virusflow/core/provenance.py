@@ -24,14 +24,15 @@ def current_git_commit() -> Optional[str]:
 
 
 def param_hash(params: Dict[str, Any]) -> str:
-    m = hashlib.sha256()
-    for k in sorted(params.keys()):
-        v = params[k]
-        m.update(str(k).encode())
-        m.update(b"=")
-        m.update(str(v).encode())
-        m.update(b";")
-    return m.hexdigest()[:16]
+    """Canonical JSON parameter hashing (stable across Python versions).
+
+    - Serialize with json.dumps(sort_keys=True, separators=(",", ":"))
+    - Hash with SHA-256 and return a short prefix for readability.
+    """
+    import json
+    payload = json.dumps(params or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    h = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return h[:16]
 
 
 def build_provenance(algorithm: str, params: Dict[str, Any], parents: Iterable[str] | None = None) -> ProvenanceInfo:

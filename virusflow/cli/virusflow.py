@@ -64,6 +64,75 @@ def cmd_tasks(args: argparse.Namespace) -> None:
     print(yaml.safe_dump(av, sort_keys=False))
 
 
+def _parse_zipcode_key(key: str) -> ZipCode:
+    parts = key.split("+")
+    if len(parts) != 5:
+        raise SystemExit(f"Invalid zipcode key '{key}'. Expected 5 parts joined by '+'.")
+    return ZipCode(ifuslot=parts[0], ifuid=parts[1], specid=parts[2], amp=parts[3], controller=parts[4])
+
+
+def _format_artifacts(rows: List[dict], csv: bool = False, include_summary: bool = False) -> str:
+    if csv:
+        import csv as _csv
+        import io as _io
+        if not rows:
+            return ""
+        cols = [
+            "id",
+            "kind",
+            "name",
+            "path",
+            "amp_key",
+            "validity_start",
+            "validity_end",
+            "created_at",
+            "qa_status",
+        ]
+        if include_summary:
+            cols.append("summary")
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([r.get(c, "") if r.get(c) is not None else "" for c in cols])
+        return buf.getvalue()
+    # text table formatting
+    cols = [
+        ("id", "ID"),
+        ("kind", "KIND"),
+        ("name", "NAME"),
+        ("path", "PATH"),
+        ("amp_key", "ZIPCODE"),
+        ("validity_start", "VSTART"),
+        ("validity_end", "VEND"),
+        ("created_at", "CREATED"),
+        ("qa_status", "QA"),
+    ]
+    if include_summary:
+        cols.append(("summary", "SUMMARY"))
+    widths: List[int] = []
+    for key, title in cols:
+        w = len(title)
+        for r in rows:
+            v = r.get(key)
+            s = "" if v is None else str(v)
+            if len(s) > w:
+                w = len(s)
+        widths.append(w)
+    header = " ".join([title.ljust(w) for (_k, title), w in zip(cols, widths)])
+    sep = " ".join(["-" * w for w in widths])
+    lines = [header, sep]
+    for r in rows:
+        fields: List[str] = []
+        for (key, _title), w in zip(cols, widths):
+            s = "" if r.get(key) is None else str(r.get(key))
+            if len(s) > w:
+                s = s[: w - 1] + "…" if w > 1 else s[:w]
+            fields.append(s.ljust(w))
+        lines.append(" ".join(fields))
+    return "\n".join(lines)
+
+
 def _format_table(rows: List[dict], csv: bool = False) -> str:
     if csv:
         import csv as _csv
@@ -145,13 +214,95 @@ def cmd_exposures(args: argparse.Namespace) -> None:
         print(table)
 
 
-# ------------------ Planner subcommands ------------------
+def cmd_artifacts(args: argparse.Namespace) -> None:
+    # Optional zipcode filter
+    zc = None
+    if args.zipcode:
+        zc = _parse_zipcode_key(args.zipcode)
+    at_time = None
+    if args.at:
+        # Accept YYYYMMDD or full ISO datetime
+        s = str(args.at)
+        from datetime import datetime
+        try:
+            if len(s) == 8 and s.isdigit():
+                at_time = datetime.strptime(s, "%Y%m%d")
+            else:
+                at_time = datetime.fromisoformat(s)
+        except Exception:
+            raise SystemExit(f"Invalid --at value '{args.at}'. Use YYYYMMDD or ISO datetime.")
+    # Best-selection mode using policy
+    if args.best:
+        if not args.kind or not args.zipcode:
+            raise SystemExit("--best requires --kind and --zipcode")
+        from ..core.artifact_service import ArtifactService, Scope
+        svc = ArtifactService(args.db)
+        row = svc.find_best(kind=args.kind, scope=Scope(zc), at_time=at_time, policy=(args.policy or "latest_valid"))
+        if not row:
+            print("No artifacts found")
+            return
+        rows = [row]
+    else:
+        rows = db.list_artifacts(kind=args.kind, zipcode=zc, at_time=at_time, db_path=args.db, limit=args.limit)
+    if not rows:
+        print("No artifacts found")
+        return
+    # Optionally enrich with sidecar summaries without opening FITS
+    if args.summary:
+        from ..core.artifact_service import ArtifactService
+        svc = ArtifactService(args.db)
+        import json as _json
+        for r in rows:
+            s = svc.load_summary(r)
+            r["summary"] = _json.dumps(s, sort_keys=True) if s is not None else None
+    # Optional status filter (client-side) for convenience
+    if args.status:
+        rows = [r for r in rows if (str(r.get("qa_status") or "").lower() == str(args.status).lower())]
+        if not rows:
+            print("No artifacts found")
+            return
+    print(_format_artifacts(rows, csv=bool(args.csv), include_summary=bool(args.summary)))
 
-def _parse_zipcode_key(key: str) -> ZipCode:
-    parts = key.split("+")
-    if len(parts) != 5:
-        raise SystemExit(f"Invalid zipcode key '{key}'. Expected 5 parts joined by '+'.")
-    return ZipCode(ifuslot=parts[0], ifuid=parts[1], specid=parts[2], amp=parts[3], controller=parts[4])
+
+# ------------------ QA subcommands ------------------
+
+def cmd_qa_set(args: argparse.Namespace) -> None:
+    from ..registry import database as _db
+    import json as _json
+    metrics = None
+    if args.metrics:
+        try:
+            metrics = _json.loads(args.metrics)
+        except Exception as e:
+            raise SystemExit(f"Invalid JSON for --metrics: {e}")
+    _db.save_qa_results(int(args.artifact_id), status=args.status, metrics=metrics, db_path=args.db)
+    print(f"Saved QA for artifact {args.artifact_id}: status={args.status}")
+
+
+def cmd_qa_show(args: argparse.Namespace) -> None:
+    from ..registry import database as _db
+    qa = _db.get_qa_results(int(args.artifact_id), db_path=args.db)
+    if not qa:
+        print("No QA found")
+        return
+    import yaml as _yaml
+    print(_yaml.safe_dump(qa, sort_keys=False))
+
+
+def cmd_qa_list(args: argparse.Namespace) -> None:
+    # Reuse artifacts listing with status filter
+    zc = None
+    if args.zipcode:
+        zc = _parse_zipcode_key(args.zipcode)
+    rows = db.list_artifacts(kind=args.kind, zipcode=zc, db_path=args.db, limit=args.limit)
+    if args.status:
+        rows = [r for r in rows if (str(r.get("qa_status") or "").lower() == str(args.status).lower())]
+    if not rows:
+        print("No artifacts found")
+        return
+    print(_format_artifacts(rows, csv=bool(args.csv)))
+
+# ------------------ Planner subcommands ------------------
 
 
 def cmd_plan_calibrations(args: argparse.Namespace) -> None:
@@ -277,6 +428,19 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp = sub.add_parser("tasks", help="List available tasks and versions")
     sp.set_defaults(func=cmd_tasks)
 
+    # artifacts listing
+    sp = sub.add_parser("artifacts", help="List or select artifacts in the registry", parents=[global_opts])
+    sp.add_argument("--kind", help="Artifact kind to filter (e.g., master_bias, master_dark)")
+    sp.add_argument("--zipcode", help="ZipCode key to filter (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
+    sp.add_argument("--at", help="Only artifacts valid at this time (YYYYMMDD or ISO datetime)")
+    sp.add_argument("--limit", type=int, help="Limit number of rows")
+    sp.add_argument("--csv", action="store_true", help="Output as CSV instead of a fixed-width table")
+    sp.add_argument("--summary", action="store_true", help="Include sidecar JSON summary if available (no FITS I/O)")
+    sp.add_argument("--best", action="store_true", help="Select best artifact per policy instead of listing (requires --kind and --zipcode)")
+    sp.add_argument("--policy", choices=["latest_valid", "latest"], help="Selection policy for --best (default: latest_valid)")
+    sp.add_argument("--status", help="Filter by QA status (e.g., pass, fail)")
+    sp.set_defaults(func=cmd_artifacts)
+
     # exposures table
     sp = sub.add_parser("exposures", help="Show a quick readable table from exposures in the registry", parents=[global_opts])
     sp.add_argument("--start-date", help="Filter start date YYYYMMDD")
@@ -284,6 +448,25 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("--limit", type=int, help="Limit number of rows")
     sp.add_argument("--csv", action="store_true", help="Output as CSV instead of a fixed-width table")
     sp.set_defaults(func=cmd_exposures)
+
+    # QA group with subcommands
+    qa_p = sub.add_parser("qa", help="Manage/view artifact QA", parents=[global_opts])
+    qa_sub = qa_p.add_subparsers(dest="qa_cmd", required=True)
+    qas = qa_sub.add_parser("set", help="Set QA status/metrics", parents=[global_opts])
+    qas.add_argument("--artifact-id", required=True, help="Artifact id")
+    qas.add_argument("--status", required=True, help="QA status (e.g., pass, fail)")
+    qas.add_argument("--metrics", help="JSON dict of QA metrics")
+    qas.set_defaults(func=cmd_qa_set)
+    qash = qa_sub.add_parser("show", help="Show QA for an artifact", parents=[global_opts])
+    qash.add_argument("--artifact-id", required=True, help="Artifact id")
+    qash.set_defaults(func=cmd_qa_show)
+    qal = qa_sub.add_parser("list", help="List artifacts with optional QA filter", parents=[global_opts])
+    qal.add_argument("--kind", help="Filter by artifact kind")
+    qal.add_argument("--zipcode", help="Filter by zipcode key")
+    qal.add_argument("--status", help="Filter by QA status (e.g., pass, fail)")
+    qal.add_argument("--limit", type=int, help="Limit number of rows")
+    qal.add_argument("--csv", action="store_true", help="Output as CSV")
+    qal.set_defaults(func=cmd_qa_list)
 
     # plan group with subcommands
     plan_p = sub.add_parser("plan", help="Create a YAML plan from scientific intent")
