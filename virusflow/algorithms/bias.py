@@ -7,6 +7,9 @@ from astropy.stats import biweight_location
 from .ccd import base_reduction
 from ..core.artifacts import save_master_bias
 
+# Algorithm version string for this module
+ALGO_VERSION = "bias-1.0"
+
 # Input item type accepted by step_bias
 BiasInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
 
@@ -83,7 +86,7 @@ def step_bias(
 
     # Write artifact via centralized helper
     if output_path is not None:
-        save_master_bias(output_path, master, n_inputs=len(frames), readnoise=readnoise, algo_version="bias-1.0")
+        save_master_bias(output_path, master, n_inputs=len(frames), readnoise=readnoise, algo_version=ALGO_VERSION)
 
     return {
         "readnoise": readnoise,
@@ -91,5 +94,5 @@ def step_bias(
         "shape": list(master.shape),
         "output_path": output_path,
         "algo": "algorithms.bias.step_bias",
-        "version": "1.0",
+        "version": ALGO_VERSION,
     }

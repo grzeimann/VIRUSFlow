@@ -154,6 +154,16 @@ class CalibrationTask(Task):
         artifact = self.make_artifact(out)
         art_id = self.save_artifact(artifact, parent_ids=parent_ids)
         t4 = time.perf_counter()
+        # Automatic QA: evaluate and persist based on algorithm metadata and artifact kind
+        try:
+            from ..qa import diagnostics as qa_diag
+            qa_kind = (self.artifact_name or "").strip().lower()
+            status = qa_diag.evaluate_and_save(artifact_id=art_id, kind=qa_kind, meta=dict(meta or {}), db_path=self.ctx.db_path)
+            if dbg and status:
+                print(f"[QA] {self.__class__.__name__}: auto-qa status={status} kind={qa_kind} artifact_id={art_id}")
+        except Exception:
+            # Never fail the task on QA evaluation errors
+            pass
         if dbg:
             print(f"[Timing] {self.__class__.__name__}: algorithm={t3 - t2:.3f}s, save_artifact={t4 - t3:.3f}s, total={t4 - t0:.3f}s")
         return {self.artifact_name or "calibration": artifact}

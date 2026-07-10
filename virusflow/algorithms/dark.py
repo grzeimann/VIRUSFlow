@@ -8,6 +8,9 @@ from astropy.stats import biweight_location, sigma_clipped_stats
 from .ccd import base_reduction
 from ..core.artifacts import save_master_dark
 
+# Algorithm version string for this module
+ALGO_VERSION = "dark-1.0"
+
 # Input item type accepted by step_dark (same structure as bias)
 DarkInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
 
@@ -110,7 +113,7 @@ def step_dark(
 
     # Write artifact via centralized helper
     if output_path is not None:
-        save_master_dark(output_path, master, dark_mask, n_inputs=len(frames), bad_fraction=frac_bad, algo_version="dark-1.0")
+        save_master_dark(output_path, master, dark_mask, n_inputs=len(frames), bad_fraction=frac_bad, algo_version=ALGO_VERSION)
 
     return {
         "n_inputs": len(frames),
@@ -119,5 +122,5 @@ def step_dark(
         "bad_fraction": frac_bad,
         "output_path": output_path,
         "algo": "algorithms.dark.step_dark",
-        "version": "1.0",
+        "version": ALGO_VERSION,
     }

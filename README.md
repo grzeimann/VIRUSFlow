@@ -142,6 +142,12 @@ virusflow artifacts --db ./virusflow.sqlite3 --best --kind master_bias --zipcode
 
 7) Record and view QA for an artifact
 
+Note: master_bias artifacts now receive automatic QA based on readnoise after they are created:
+- pass: 1e-4 < readnoise < 4.5
+- marginal: 4.5 <= readnoise < 6.0
+- fail: readnoise >= 6.0 or <= 1e-4 (or missing)
+You can still override or add metrics manually via the QA commands below.
+
 ```bash
 # Replace ARTID with an id from the artifacts listing
 virusflow qa set --db ./virusflow.sqlite3 --artifact-id ARTID --status pass --metrics '{"rn":3.1, "n_inputs":12}'

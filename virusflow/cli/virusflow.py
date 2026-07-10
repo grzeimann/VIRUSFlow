@@ -13,8 +13,9 @@ from ..storage.filesystem import FileSystemStorage
 from ..tasks import available_tasks, get_task_class
 from ..tasks.base import TaskContext
 from ..executors.local import LocalExecutor
-from ..core.identity import ZipCode
-from ..core.targets import BiasTarget
+from ..core.identity import ZipCode, parse_zipcode_key
+from ..core.targets import BiasTarget, DarkTarget, build_calibration_tasks, default_calibration_needs
+from .formatting import format_artifacts_table, format_exposures_table
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -64,143 +65,6 @@ def cmd_tasks(args: argparse.Namespace) -> None:
     print(yaml.safe_dump(av, sort_keys=False))
 
 
-def _parse_zipcode_key(key: str) -> ZipCode:
-    parts = key.split("+")
-    if len(parts) != 5:
-        raise SystemExit(f"Invalid zipcode key '{key}'. Expected 5 parts joined by '+'.")
-    return ZipCode(ifuslot=parts[0], ifuid=parts[1], specid=parts[2], amp=parts[3], controller=parts[4])
-
-
-def _format_artifacts(rows: List[dict], csv: bool = False, include_summary: bool = False) -> str:
-    if csv:
-        import csv as _csv
-        import io as _io
-        if not rows:
-            return ""
-        cols = [
-            "id",
-            "kind",
-            "name",
-            "path",
-            "amp_key",
-            "validity_start",
-            "validity_end",
-            "created_at",
-            "qa_status",
-        ]
-        if include_summary:
-            cols.append("summary")
-        buf = _io.StringIO()
-        w = _csv.writer(buf)
-        w.writerow(cols)
-        for r in rows:
-            w.writerow([r.get(c, "") if r.get(c) is not None else "" for c in cols])
-        return buf.getvalue()
-    # text table formatting
-    cols = [
-        ("id", "ID"),
-        ("kind", "KIND"),
-        ("name", "NAME"),
-        ("path", "PATH"),
-        ("amp_key", "ZIPCODE"),
-        ("validity_start", "VSTART"),
-        ("validity_end", "VEND"),
-        ("created_at", "CREATED"),
-        ("qa_status", "QA"),
-    ]
-    if include_summary:
-        cols.append(("summary", "SUMMARY"))
-    widths: List[int] = []
-    for key, title in cols:
-        w = len(title)
-        for r in rows:
-            v = r.get(key)
-            s = "" if v is None else str(v)
-            if len(s) > w:
-                w = len(s)
-        widths.append(w)
-    header = " ".join([title.ljust(w) for (_k, title), w in zip(cols, widths)])
-    sep = " ".join(["-" * w for w in widths])
-    lines = [header, sep]
-    for r in rows:
-        fields: List[str] = []
-        for (key, _title), w in zip(cols, widths):
-            s = "" if r.get(key) is None else str(r.get(key))
-            if len(s) > w:
-                s = s[: w - 1] + "…" if w > 1 else s[:w]
-            fields.append(s.ljust(w))
-        lines.append(" ".join(fields))
-    return "\n".join(lines)
-
-
-def _format_table(rows: List[dict], csv: bool = False) -> str:
-    if csv:
-        import csv as _csv
-        import io as _io
-        if not rows:
-            return ""
-        cols = [
-            "exposure_id",
-            "when_utc",
-            "frame_type",
-            "expnum",
-            "qobject",
-            "qprog",
-            "pexptime",
-            "date",
-            "qra",
-            "qdec",
-            "tar_path",
-        ]
-        buf = _io.StringIO()
-        w = _csv.writer(buf)
-        w.writerow(cols)
-        for r in rows:
-            w.writerow([r.get(c, "") if r.get(c) is not None else "" for c in cols])
-        return buf.getvalue()
-    # text table
-    cols = [
-        ("exposure_id", "EXPOSURE"),
-        ("when_utc", "DATE"),
-        ("frame_type", "TYPE"),
-        ("expnum", "EXP#"),
-        ("qobject", "QOBJECT"),
-        ("qprog", "QPROG"),
-        ("pexptime", "PEXPTIME"),
-        ("date", "DATEHDR"),
-        ("qra", "QRA"),
-        ("qdec", "QDEC"),
-        ("tar_path", "TAR")
-    ]
-    # Compute widths
-    widths = []
-    for key, title in cols:
-        w = len(title)
-        for r in rows:
-            v = r.get(key)
-            s = "" if v is None else str(v)
-            if len(s) > w:
-                w = len(s)
-        widths.append(w)
-    # Build header
-    parts = []
-    for (key, title), w in zip(cols, widths):
-        parts.append(title.ljust(w))
-    out = [" ".join(parts)]
-    out.append(" ".join(["-" * w for w in widths]))
-    # Rows
-    for r in rows:
-        fields = []
-        for (key, _title), w in zip(cols, widths):
-            v = r.get(key)
-            s = "" if v is None else str(v)
-            if len(s) > w:
-                s = s[: w - 1] + "…" if w > 1 else s[:w]
-            fields.append(s.ljust(w))
-        out.append(" ".join(fields))
-    return "\n".join(out)
-
-
 def cmd_exposures(args: argparse.Namespace) -> None:
     rows = db.list_exposure_table(db_path=args.db, start_date=args.start_date, end_date=args.end_date, limit=args.limit)
     if not rows:
@@ -209,7 +73,7 @@ def cmd_exposures(args: argparse.Namespace) -> None:
             msg += f" in date window {args.start_date}..{args.end_date}"
         print(msg)
         return
-    table = _format_table(rows, csv=bool(args.csv))
+    table = format_exposures_table(rows, csv=bool(args.csv))
     if table:
         print(table)
 
@@ -218,7 +82,7 @@ def cmd_artifacts(args: argparse.Namespace) -> None:
     # Optional zipcode filter
     zc = None
     if args.zipcode:
-        zc = _parse_zipcode_key(args.zipcode)
+        zc = parse_zipcode_key(args.zipcode)
     at_time = None
     if args.at:
         # Accept YYYYMMDD or full ISO datetime
@@ -261,7 +125,7 @@ def cmd_artifacts(args: argparse.Namespace) -> None:
         if not rows:
             print("No artifacts found")
             return
-    print(_format_artifacts(rows, csv=bool(args.csv), include_summary=bool(args.summary)))
+    print(format_artifacts_table(rows, csv=bool(args.csv), include_summary=bool(args.summary)))
 
 
 # ------------------ QA subcommands ------------------
@@ -293,14 +157,14 @@ def cmd_qa_list(args: argparse.Namespace) -> None:
     # Reuse artifacts listing with status filter
     zc = None
     if args.zipcode:
-        zc = _parse_zipcode_key(args.zipcode)
+        zc = parse_zipcode_key(args.zipcode)
     rows = db.list_artifacts(kind=args.kind, zipcode=zc, db_path=args.db, limit=args.limit)
     if args.status:
         rows = [r for r in rows if (str(r.get("qa_status") or "").lower() == str(args.status).lower())]
     if not rows:
         print("No artifacts found")
         return
-    print(_format_artifacts(rows, csv=bool(args.csv)))
+    print(format_artifacts_table(rows, csv=bool(args.csv)))
 
 # ------------------ Planner subcommands ------------------
 
@@ -314,28 +178,40 @@ def cmd_plan_calibrations(args: argparse.Namespace) -> None:
     zipcodes: List[ZipCode] = []
     if args.only_zipcode:
         zkeys = [z.strip() for z in args.only_zipcode.split(",") if z.strip()]
-        zipcodes = [_parse_zipcode_key(z) for z in zkeys]
+        zipcodes = [parse_zipcode_key(z) for z in zkeys]
     else:
-        # Discover from registry
-        zipcodes = db.list_zipcodes(
-            db_path=args.db,
-            frame_type="zro",
-            start_date=args.start_date,
-            end_date=args.end_date,
-            limit=args.limit,
-        )
+        # Defer discovery until needs are established (we will compute union across needs)
+        zipcodes = []
+    # Define what calibrations we plan for and their input frame types
+    needs = default_calibration_needs(include_bias=True, include_dark=True)
+
+    # If user provided explicit zipcodes, use them as-is.
+    # Otherwise, discover union of zipcodes across all needs (frame types) for the window.
+    if not args.only_zipcode:
+        zc_set = []
+        seen = set()
+        for need in needs:
+            zlist = db.list_zipcodes(
+                db_path=args.db,
+                frame_type=need.frame_type,
+                start_date=args.start_date,
+                end_date=args.end_date,
+                limit=args.limit,
+            )
+            for z in zlist:
+                k = z.key()
+                if k not in seen:
+                    seen.add(k)
+                    zc_set.append(z)
+        zipcodes = zc_set
         if not zipcodes:
             raise SystemExit(f"No zipcodes found for date window {args.start_date}..{args.end_date}")
-    tasks = []
-    for zc in zipcodes:
-        tgt = BiasTarget(zc, args.start_date, args.end_date)
-        node_id = tgt.node_id()
-        tasks.append({
-            "id": node_id,
-            "name": "bias",
-            "version": args.bias_version,
-            "target": tgt.to_dict(),
-        })
+
+    # Map from calibration name to requested version (None means latest/default)
+    versions = {"bias": args.bias_version, "dark": args.dark_version}
+
+    # Build tasks keeping the clean outer loop over zipcodes (zipcode-major order)
+    tasks = build_calibration_tasks(zipcodes, args.start_date, args.end_date, needs, versions=versions)
 
     plan = {"tasks": tasks}
     print(yaml.safe_dump(plan, sort_keys=False))
@@ -385,7 +261,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         cls = get_task_class(t["name"], t.get("version"))
         target_obj = None
         tgt = t.get("target")
-        if tgt and t["name"] == "bias":
+        if tgt and t["name"] in ("bias", "dark"):
             z = tgt.get("zipcode", {})
             zc = ZipCode(
                 ifuslot=z.get("ifuslot", "000"),
@@ -394,7 +270,10 @@ def cmd_run(args: argparse.Namespace) -> None:
                 amp=z.get("amp", "XX"),
                 controller=z.get("controller", "X"),
             )
-            target_obj = BiasTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
+            if t["name"] == "bias":
+                target_obj = BiasTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
+            else:
+                target_obj = DarkTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
         instances[t["id"]] = cls(ctx, target=target_obj)
 
     # Build simple graph and execute in-order
