@@ -3,6 +3,7 @@ from __future__ import annotations
 from .base import CalibrationTask
 from ..algorithms.bias import step_bias
 from ..algorithms.dark import step_dark
+from ..algorithms.flat import step_flt
 
 
 class BiasTask(CalibrationTask):
@@ -30,3 +31,18 @@ class DarkTask(CalibrationTask):
     frame_type = "drk"
     artifact_name = "master_dark"
     algorithm = step_dark
+
+
+class FlatTask(CalibrationTask):
+    """Flat master-frame task using generic CalibrationTask.
+
+    - Uses flat frames (frame_type='flt')
+    - Produces 'master_flat' artifact via algorithms.flat.step_flt
+    """
+    name = "flat"
+    version = "v1"
+
+    # CalibrationTask configuration
+    frame_type = "flt"
+    artifact_name = "master_flat"
+    algorithm = step_flt

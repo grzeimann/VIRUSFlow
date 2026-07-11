@@ -81,18 +81,48 @@ class DarkTarget:
 
 
 @dataclass(frozen=True)
+class FlatTarget:
+    zipcode: ZipCode
+    start_date: str  # YYYYMMDD (UTC day)
+    end_date: str    # YYYYMMDD (UTC day)
+
+    def __post_init__(self):  # type: ignore[override]
+        object.__setattr__(self, "start_date", _norm_date(self.start_date))
+        object.__setattr__(self, "end_date", _norm_date(self.end_date))
+
+    def node_id(self) -> str:
+        return f"flat:{self.zipcode.key()}:{self.start_date}:{self.end_date}"
+
+    def to_dict(self) -> Dict:
+        return {
+            "type": "flat",
+            "zipcode": {
+                "ifuslot": self.zipcode.ifuslot,
+                "ifuid": self.zipcode.ifuid,
+                "specid": self.zipcode.specid,
+                "amp": self.zipcode.amp,
+                "controller": self.zipcode.controller,
+            },
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+        }
+
+
+@dataclass(frozen=True)
 class CalibrationNeed:
     name: str            # task name, e.g., 'bias', 'dark'
     frame_type: str      # raw frame_type required, e.g., 'zro', 'drk'
     target_cls: Type[BiasTarget]  # constructor for target
 
 
-def default_calibration_needs(include_bias: bool = True, include_dark: bool = True) -> List[CalibrationNeed]:
+def default_calibration_needs(include_bias: bool = True, include_dark: bool = True, include_flat: bool = False) -> List[CalibrationNeed]:
     needs: List[CalibrationNeed] = []
     if include_bias:
         needs.append(CalibrationNeed(name="bias", frame_type="zro", target_cls=BiasTarget))
     if include_dark:
         needs.append(CalibrationNeed(name="dark", frame_type="drk", target_cls=DarkTarget))
+    if include_flat:
+        needs.append(CalibrationNeed(name="flat", frame_type="flt", target_cls=FlatTarget))
     return needs
 
 

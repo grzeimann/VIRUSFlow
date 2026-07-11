@@ -10,6 +10,7 @@ from .artifacts import (
     CalibrationProduct,
     load_master_bias,
     load_master_dark,
+    load_master_flat,
 )
 from .provenance import build_provenance
 from ..registry import database as db

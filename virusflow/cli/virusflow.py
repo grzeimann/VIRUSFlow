@@ -14,7 +14,7 @@ from ..tasks import available_tasks, get_task_class
 from ..tasks.base import TaskContext
 from ..executors.local import LocalExecutor
 from ..core.identity import ZipCode, parse_zipcode_key
-from ..core.targets import BiasTarget, DarkTarget, build_calibration_tasks, default_calibration_needs
+from ..core.targets import BiasTarget, DarkTarget, FlatTarget, build_calibration_tasks, default_calibration_needs
 from .formatting import format_artifacts_table, format_exposures_table
 
 
@@ -261,7 +261,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         cls = get_task_class(t["name"], t.get("version"))
         target_obj = None
         tgt = t.get("target")
-        if tgt and t["name"] in ("bias", "dark"):
+        if tgt and t["name"] in ("bias", "dark", "flat"):
             z = tgt.get("zipcode", {})
             zc = ZipCode(
                 ifuslot=z.get("ifuslot", "000"),
@@ -272,8 +272,10 @@ def cmd_run(args: argparse.Namespace) -> None:
             )
             if t["name"] == "bias":
                 target_obj = BiasTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
-            else:
+            elif t["name"] == "dark":
                 target_obj = DarkTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
+            else:
+                target_obj = FlatTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
         instances[t["id"]] = cls(ctx, target=target_obj)
 
     # Build simple graph and execute in-order

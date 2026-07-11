@@ -3,12 +3,13 @@ from __future__ import annotations
 from typing import Dict, Type
 
 from .base import Task, TaskContext
-from .calibs import BiasTask, DarkTask
+from .calibs import BiasTask, DarkTask, FlatTask
 
 # Simple plugin/task registry keyed by (name, version)
 _TASK_REGISTRY: Dict[tuple[str, str], Type[Task]] = {
     (BiasTask.name, BiasTask.version): BiasTask,
     (DarkTask.name, DarkTask.version): DarkTask,
+    (FlatTask.name, FlatTask.version): FlatTask,
 }
 
 

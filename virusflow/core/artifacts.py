@@ -149,6 +149,43 @@ def save_master_dark(output_path: str, master: np.ndarray, dark_mask: np.ndarray
     })
 
 
+def save_master_flat(output_path: str, master: np.ndarray, flat_mask: np.ndarray, *, n_inputs: int, bad_fraction: float, algo_version: str = "flat-1.0", extra_header: Optional[Dict[str, str]] = None) -> None:
+    """Write a master flat and its pixel mask to a FITS file.
+
+    - Primary HDU: master as float32 with NINPUTS, BADFRAC, ALGOVER
+    - ImageHDU 'FLATMASK': uint8 mask
+    - extra_header (optional) allows callers to add more cards to primary
+    """
+    from pathlib import Path
+    from .pathutils import ensure_dir
+    ensure_dir(Path(output_path).parent)
+    phdu = fits.PrimaryHDU(master.astype(np.float32))
+    phdr = phdu.header
+    phdr["NINPUTS"] = (int(n_inputs), "number of input flat frames")
+    phdr["BADFRAC"] = (float(bad_fraction), "fraction of pixels flagged in flat mask")
+    phdr["ALGOVER"] = (str(algo_version), "algorithm version")
+    if extra_header:
+        for k, v in extra_header.items():
+            try:
+                phdr[str(k)] = v
+            except Exception:
+                pass
+    mhdu = fits.ImageHDU(flat_mask.astype(np.uint8), name="FLATMASK")
+    # Atomic write
+    ensure_dir(Path(output_path).parent)
+    _tmp = str(Path(output_path).with_suffix(Path(output_path).suffix + ".tmp"))
+    fits.HDUList([phdu, mhdu]).writeto(_tmp, overwrite=True)
+    Path(_tmp).replace(output_path)
+    # Sidecar summary
+    _write_sidecar_json(output_path, {
+        "kind": "master_flat",
+        "n_inputs": int(n_inputs),
+        "bad_fraction": float(bad_fraction),
+        "shape": list(master.shape),
+        "algo_version": str(algo_version),
+    })
+
+
 def load_master_bias(path: str):
     """Load master bias array and header from a FITS artifact file.
 
@@ -172,6 +209,24 @@ def load_master_dark(path: str):
         # Find DARKMASK extension by name or index 1
         for h in hdul[1:]:
             if getattr(h, "name", "").upper() == "DARKMASK":
+                mask = np.asarray(h.data, dtype=np.uint8)
+                break
+        if mask is None and len(hdul) > 1:
+            mask = np.asarray(hdul[1].data, dtype=np.uint8)
+    return data, mask, hdr
+
+
+def load_master_flat(path: str):
+    """Load master flat array, flat mask, and header from a FITS artifact file.
+
+    Returns (array, mask_uint8, header_dict).
+    """
+    with fits.open(Path(path)) as hdul:
+        data = np.asarray(hdul[0].data, dtype=float)
+        hdr = dict(hdul[0].header)
+        mask = None
+        for h in hdul[1:]:
+            if getattr(h, "name", "").upper() == "FLATMASK":
                 mask = np.asarray(h.data, dtype=np.uint8)
                 break
         if mask is None and len(hdul) > 1:
