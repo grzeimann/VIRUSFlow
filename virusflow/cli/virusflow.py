@@ -8,6 +8,10 @@ from typing import Optional, List
 
 import yaml
 
+# Prefer a non-interactive Matplotlib backend by default to avoid GUI warnings in workers
+import os as _os_mplcfg
+_os_mplcfg.environ.setdefault("MPLBACKEND", "Agg")
+
 from ..registry import database as db
 from ..storage.filesystem import FileSystemStorage
 from ..tasks import available_tasks, get_task_class
@@ -109,9 +113,9 @@ def cmd_artifacts(args: argparse.Namespace) -> None:
     if args.best:
         if not args.kind or not args.zipcode:
             raise SystemExit("--best requires --kind and --zipcode")
-        from ..core.artifact_service import ArtifactService, Scope
+        from ..artifacts import ArtifactService, Scope
         svc = ArtifactService(args.db)
-        row = svc.find_best(kind=args.kind, scope=Scope(zc), at_time=at_time, policy=(args.policy or "latest_valid"))
+        row = svc.select_best(kind=args.kind, scope=Scope(zc), at_time=at_time, policy=(args.policy or "latest_valid"))
         if not row:
             print("No artifacts found")
             return
@@ -123,11 +127,12 @@ def cmd_artifacts(args: argparse.Namespace) -> None:
         return
     # Optionally enrich with sidecar summaries without opening FITS
     if args.summary:
-        from ..core.artifact_service import ArtifactService
+        from ..artifacts import ArtifactService
         svc = ArtifactService(args.db)
         import json as _json
         for r in rows:
-            s = svc.load_summary(r)
+            d = svc.describe(r)
+            s = d.get("summary") if isinstance(d, dict) else None
             r["summary"] = _json.dumps(s, sort_keys=True) if s is not None else None
     # Optional status filter (client-side) for convenience
     if args.status:
@@ -149,7 +154,9 @@ def cmd_qa_set(args: argparse.Namespace) -> None:
             metrics = _json.loads(args.metrics)
         except Exception as e:
             raise SystemExit(f"Invalid JSON for --metrics: {e}")
-    _db.save_qa_results(int(args.artifact_id), status=args.status, metrics=metrics, db_path=args.db)
+    from ..artifacts import ArtifactService
+    svc = ArtifactService(args.db)
+    svc.set_diagnostics(int(args.artifact_id), status=args.status, metrics=metrics)
     print(f"Saved QA for artifact {args.artifact_id}: status={args.status}")
 
 
@@ -281,7 +288,11 @@ def cmd_run(args: argparse.Namespace) -> None:
     from ..algorithms import io as aio
     aio.set_registry_db_path(args.db)
 
-    ctx = TaskContext(db_path=args.db, workdir=args.workdir, config={"workers": args.workers, "debug_timing": bool(args.debug_timing)})
+    # Build TaskContext config and propagate optional QA output directory so tasks/algorithms can write QA
+    cfg = {"workers": args.workers, "debug_timing": bool(args.debug_timing)}
+    if getattr(args, "qa_out_dir", None):
+        cfg["qa_out_dir"] = args.qa_out_dir
+    ctx = TaskContext(db_path=args.db, workdir=args.workdir, config=cfg)
 
     # Instantiate tasks (target-scoped when provided)
     instances = {}
@@ -450,6 +461,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("plan", help="Path to plan YAML file (JSON still accepted)")
     sp.add_argument("--workdir", default=str(Path.cwd() / "work"), help="Working directory")
     sp.add_argument("--workers", type=int, default=4, help="Worker threads for algorithms and task batches (set 0 for serial)")
+    sp.add_argument("--qa-out-dir", help="Directory to write QA outputs (plots and JSON packets)")
     sp.add_argument("--debug-timing", action="store_true", help="Print timing diagnostics during run")
     sp.set_defaults(func=cmd_run)
 

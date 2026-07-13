@@ -9,7 +9,8 @@ from ..algorithms.twi import step_twi
 import numpy as np
 from ..algorithms.wave import step_wave
 from ..algorithms.cmp import step_cmp
-from ..core.artifacts import load_master_cmp, load_trace_solution, save_wave_solution
+from ..artifacts import ArtifactService, Scope
+from ..artifacts.materialize import ArtifactMaterializer
 
 
 class BiasTask(CalibrationTask):
@@ -142,7 +143,14 @@ class TraceTask(CalibrationTask):
         if isinstance(self.ctx.config, dict):
             for k, v in self.ctx.config.items():
                 algo_params.setdefault(k, v)
-        # Inject required fields for step_trace
+        # Inject registry context for artifact-centric loading
+        try:
+            algo_params.setdefault("db_path", self.ctx.db_path)
+        except Exception:
+            pass
+        if getattr(self.target, "zipcode", None) is not None:
+            algo_params.setdefault("zipcode", getattr(self.target, "zipcode"))
+        # Inject required fields for step_trace (direct path fallback)
         algo_params.setdefault("master_flat_path", mf.get("path"))
         zc = getattr(self.target, "zipcode", None)
         if zc is not None:
@@ -241,32 +249,49 @@ class WaveTask(CalibrationTask):
 
         out_path = self.output_path()
 
-        # Load required arrays
-        master_cmp, hdr_cmp = load_master_cmp(str(mc.get("path")))
-        trace_2d, hdr_tr = load_trace_solution(str(tr.get("path")))
+        # Load required arrays using artifact-centric materializer
+        svc = ArtifactService(self.ctx.db_path)
+        mat = ArtifactMaterializer(svc)
+        lr_cmp = mat.load_by_id(int(mc.get("id")))
+        lr_tr = mat.load_by_id(int(tr.get("id")))
+        master_cmp, hdr_cmp = lr_cmp.data, lr_cmp.header
+        trace_2d, hdr_tr = lr_tr.data, lr_tr.header
 
         t1 = time.perf_counter()
+        # Build algorithm params: merge task params with context config so CLI-provided qa_out_dir flows through
+        algo_params = dict(self.params or {})
+        if isinstance(self.ctx.config, dict):
+            for k, v in self.ctx.config.items():
+                algo_params.setdefault(k, v)
         # Run wavelength algorithm
-        meta = step_wave(master_cmp=master_cmp, trace=trace_2d, output_path=None, params=self.params)
+        meta = step_wave(master_cmp=master_cmp, trace=trace_2d, output_path=None, params=algo_params)
         t2 = time.perf_counter()
 
         wave = meta.get("wave") if isinstance(meta, dict) else None
         if wave is None:
             raise RuntimeError("WaveTask: step_wave returned no wavelength solution")
 
-        # Persist wavelength solution
+        # Persist wavelength solution via materializer
         rms_rows = meta.get("rms_rows") if isinstance(meta, dict) else None
-        rms_med = float(np.nanmedian(np.asarray(rms_rows))) if rms_rows is not None else None
-        save_wave_solution(
+        rms_med = float(np.nanmedian(np.asarray(rms_rows))) if (rms_rows is not None and np.asarray(rms_rows).size) else None
+        sidecar = {
+            "kind": "wave",
+            "role": "calibration",
+            "payload_type": "array",
+            "storage_format": "fits",
+        }
+        if rms_med is not None:
+            sidecar["rms_median"] = float(rms_med)
+        mat.persist_array(
             out_path,
-            wave_2d=wave,
+            data=wave,
             n_inputs=int(hdr_cmp.get("NINPUTS", 0)),
             algo_version=meta.get("version", "wave-1.0"),
-            rms_median=rms_med,
             extra_header={
                 "SRCCMP": str(mc.get("path")),
                 "SRCTRACE": str(tr.get("path")),
             },
+            sidecar=sidecar,
         )
 
         artifact = self.make_artifact(out_path)

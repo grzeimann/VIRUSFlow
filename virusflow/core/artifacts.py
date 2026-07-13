@@ -132,6 +132,8 @@ def _save_fits_artifact(
     # Sidecar
     side = {
         "kind": str(kind),
+        "role": "calibration",  # default role; producers may override in metadata
+        "payload_type": "array",
         "n_inputs": int(n_inputs),
         "algo_version": str(algo_version),
         "shape": list(arr.shape),

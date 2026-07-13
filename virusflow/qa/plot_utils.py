@@ -3,7 +3,35 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Dict, List
 import numpy as np
-import matplotlib.pyplot as plt
+
+# Matplotlib backend safety for worker threads and headless environments
+import matplotlib as _mpl
+
+# If a GUI backend is active, prefer a non-interactive one.
+# Use environment MPLBACKEND if the user set it; otherwise fall back to Agg.
+try:
+    # If pyplot already imported elsewhere, we may need to switch at runtime.
+    _current_backend = str(getattr(_mpl, 'get_backend', lambda: ''))().lower() if hasattr(_mpl, 'get_backend') else ''
+    if 'agg' not in _current_backend:
+        # Try switching after import if pyplot is already loaded
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+            try:
+                plt.switch_backend('Agg')
+            except Exception:
+                pass
+        except Exception:
+            # Pyplot not yet imported: set backend pre-import
+            try:
+                _mpl.use('Agg', force=True)
+            except Exception:
+                pass
+            import matplotlib.pyplot as plt  # type: ignore
+    else:
+        import matplotlib.pyplot as plt  # type: ignore
+except Exception:
+    # Last resort: import pyplot (whatever backend) and hope for the best
+    import matplotlib.pyplot as plt  # type: ignore
 
 
 def plot_identify_arc_summary(

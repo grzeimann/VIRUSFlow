@@ -3,9 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
-from ..core.artifacts import Artifact
-from ..core.provenance import build_provenance
+# Legacy core.artifacts types are no longer used in new artifact subsystem
 from ..registry import database as db
+from ..artifacts import Artifact as NewArtifact, ArtifactService, Scope, StorageRef, Provenance
 
 
 @dataclass
@@ -39,15 +39,18 @@ class Task:
     def outputs(cls) -> List[str]:
         return []
 
-    def run(self, inputs: Dict[str, Artifact]) -> Dict[str, Artifact]:
+    def run(self, inputs: Dict[str, NewArtifact]) -> Dict[str, NewArtifact]:
         raise NotImplementedError
 
-    def save_artifact(self, art: Artifact, parent_ids: List[int] | None = None) -> int:
-        # Merge target into provenance parameters for traceability
+    def save_artifact(self, art: NewArtifact, parent_ids: List[int] | None = None) -> int:
+        """Register an artifact via ArtifactService.register (full delegation).
+
+        This centralizes provenance and registry behavior in the service.
+        """
+        # Build provenance params (include serialized target for traceability)
         params = dict(self.params)
         if getattr(self, "target", None) is not None:
             try:
-                # Try to serialize target to a dict
                 t = self.target
                 if hasattr(t, "to_dict"):
                     params["target"] = t.to_dict()
@@ -55,12 +58,30 @@ class Task:
                     params["target"] = str(t)
             except Exception:
                 params["target"] = str(self.target)
-        prov = build_provenance(
-            algorithm=f"{self.name}:{self.version}",
-            params=params,
-            parents=[str(x) for x in (parent_ids or [])],
+
+        # Construct service scope
+        from ..artifacts import ArtifactService, Scope, Artifact as NewArtifact, StorageRef, Provenance
+        zc = getattr(art, "zipcode", None) or getattr(getattr(self, "target", None), "zipcode", None)
+        scope = Scope(zipcode=zc)
+
+        # Build new-model Artifact and register
+        svc = ArtifactService(self.ctx.db_path)
+        new_art = NewArtifact(
+            id=None,
+            kind=str(getattr(art, "kind", self.name)),
+            role=getattr(art, "role", "calibration"),
+            payload_type=getattr(art, "payload_type", "array"),
+            storage_format="fits",  # current savers use FITS primary HDU
+            storage=StorageRef(uri=str(getattr(art, "path", None) or ""), storage_format="fits", backend="fs"),
+            scope=scope,
+            metadata=dict(getattr(art, "metadata", {}) or {}),
+            provenance=Provenance(
+                algorithm=f"{self.name}:{self.version}",
+                params=params,
+                parents=[int(x) for x in (parent_ids or [])],
+            ),
         )
-        return db.save_artifact(art, prov, db_path=self.ctx.db_path)
+        return svc.register(new_art)
 
 
 # Generic calibration task template used by BiasTask and future calibs
@@ -152,24 +173,24 @@ class CalibrationTask(Task):
         fname = f"{self.artifact_name}_{zkey}_{start_s}_{end_s}.fits"
         return os.path.join(self.ctx.workdir, fname)
 
-    def make_artifact(self, out_path: str) -> Artifact:
-        from ..core.artifacts import CalibrationProduct
+    def make_artifact(self, out_path: str) -> NewArtifact:
+        # Build a new-model Artifact with explicit representation fields
         zipcode = getattr(self.target, "zipcode", None)
-        vstart = self._parse_date(getattr(self.target, "start_date", None))
-        vend = self._parse_date(getattr(self.target, "end_date", None))
-        # Use the specific artifact name as the artifact kind for discoverability (e.g., 'master_bias')
+        scope = Scope(zipcode=zipcode)
         art_kind = self.artifact_name or "calibration"
-        return CalibrationProduct(
+        return NewArtifact(
             id=None,
             kind=art_kind,
-            name=self.artifact_name or "calibration",
-            path=out_path,
-            zipcode=zipcode,
-            validity_start=vstart,
-            validity_end=vend,
+            role="calibration",
+            payload_type="array",
+            storage_format="fits",
+            storage=StorageRef(uri=str(out_path), storage_format="fits", backend="fs"),
+            scope=scope,
+            metadata={},
+            provenance=None,
         )
 
-    def run(self, inputs: Dict[str, Artifact]):
+    def run(self, inputs: Dict[str, NewArtifact]):
         import time
         if not callable(self.algorithm):
             raise ValueError(f"{self.__class__.__name__}.algorithm is not set to a callable")
@@ -185,6 +206,13 @@ class CalibrationTask(Task):
                 algo_params.setdefault(k, v)
         if dbg:
             print(f"[Timing] {self.__class__.__name__}: query_inputs={t1 - t0:.3f}s, n_inputs={len(raw_inputs)}")
+        # Ensure algorithms receive db_path and zipcode for artifact-centric loading
+        algo_params.setdefault("db_path", self.ctx.db_path)
+        try:
+            if getattr(self.target, "zipcode", None) is not None:
+                algo_params.setdefault("zipcode", getattr(self.target, "zipcode"))
+        except Exception:
+            pass
         # Call the algorithm; support both raw_inputs and legacy raw_bias_inputs kw
         t2 = time.perf_counter()
         meta = self.algorithm(raw_inputs=raw_inputs, output_path=out, params=algo_params)
