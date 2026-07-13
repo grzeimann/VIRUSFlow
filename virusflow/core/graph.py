@@ -29,11 +29,42 @@ class TaskGraph:
                 dependents[d].add(nid)
         return indeg, dependents
 
-    def execute(self, max_workers: int = 1, debug: bool = False) -> None:
+    def execute(self, max_workers: int = 1, debug: bool = False, show_progress: bool = True) -> None:
         from concurrent.futures import ThreadPoolExecutor, as_completed
         # QA-aware execution: if a node's produced artifacts have QA status 'fail',
         # mark the node as failed and skip all of its transitive dependents.
         from ..registry import database as _db
+        import sys
+
+        # Precompute totals per task type (by task.name if available)
+        def _task_type(nid: str) -> str:
+            try:
+                return str(getattr(self.nodes[nid].task, 'name', 'task'))
+            except Exception:
+                return 'task'
+
+        type_totals: Dict[str, int] = {}
+        for nid in self.nodes:
+            t = _task_type(nid)
+            type_totals[t] = type_totals.get(t, 0) + 1
+        type_succeeded: Dict[str, int] = {k: 0 for k in type_totals}
+        type_failed: Dict[str, int] = {k: 0 for k in type_totals}
+
+        def _render_progress_line(final: bool = False) -> None:
+            if not show_progress:
+                return
+            parts = []
+            for t in sorted(type_totals.keys()):
+                ok = type_succeeded.get(t, 0)
+                fl = type_failed.get(t, 0)
+                tot = type_totals.get(t, 0)
+                parts.append(f"{t}: {ok}/{tot} ok, {fl} fail")
+            line = " | ".join(parts)
+            # Carriage return update; ensure newline at the end
+            if final:
+                print(f"[Progress] {line}")
+            else:
+                print(f"\r[Progress] {line}", end="", file=sys.stdout, flush=True)
 
         indeg, dependents = self._indeg_and_dependents()
         ready = [k for k, v in indeg.items() if v == 0]
@@ -42,6 +73,14 @@ class TaskGraph:
 
         def _has_failed_dep(nid: str) -> bool:
             return any(d in failed for d in self.nodes[nid].deps)
+
+        def _mark_completion(nid: str) -> None:
+            t = _task_type(nid)
+            if nid in failed:
+                type_failed[t] = type_failed.get(t, 0) + 1
+            else:
+                type_succeeded[t] = type_succeeded.get(t, 0) + 1
+            _render_progress_line(final=False)
 
         def _eval_node_qa(nid: str, result: object) -> bool:
             """Inspect returned artifacts (dict) and check QA; return True if node failed."""
@@ -67,6 +106,9 @@ class TaskGraph:
                 # On any error evaluating QA, do not mark as failed
                 return False
 
+        # Initial render (all zeros)
+        _render_progress_line(final=False)
+
         while ready:
             batch = ready[:]
             ready.clear()
@@ -80,6 +122,7 @@ class TaskGraph:
             for nid in skipped:
                 failed.add(nid)
                 done.add(nid)
+                _mark_completion(nid)
                 for dep in dependents.get(nid, ()):  # decrease indegree for dependents
                     indeg[dep] -= 1
                     if indeg[dep] == 0:
@@ -97,6 +140,7 @@ class TaskGraph:
                         if debug:
                             print(f"[Executor] Node {nid} marked FAILED due to QA status of its outputs")
                     done.add(nid)
+                    _mark_completion(nid)
                     for dep in dependents.get(nid, ()):  # decrease indegree for dependents
                         indeg[dep] -= 1
                         if indeg[dep] == 0:
@@ -113,9 +157,12 @@ class TaskGraph:
                             if debug:
                                 print(f"[Executor] Node {nid} marked FAILED due to QA status of its outputs")
                         done.add(nid)
+                        _mark_completion(nid)
                         for dep in dependents.get(nid, ()):  # decrease indegree for dependents
                             indeg[dep] -= 1
                             if indeg[dep] == 0:
                                 ready.append(dep)
         if len(done) != len(self.nodes):
+            _render_progress_line(final=True)
             raise ValueError("Not all tasks executed; possible cycle in graph")
+        _render_progress_line(final=True)

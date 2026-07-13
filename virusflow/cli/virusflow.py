@@ -303,8 +303,10 @@ def cmd_run(args: argparse.Namespace) -> None:
                 target_obj = FlatTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
             elif t["name"] == "twi":
                 target_obj = TwiTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
-            else:  # trace
+            elif t["name"] == "trace":
                 target_obj = TraceTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
+            elif t["name"] == "wave":
+                target_obj = WaveTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
         instances[t["id"]] = cls(ctx, target=target_obj)
 
     # Build simple graph and execute in-order
