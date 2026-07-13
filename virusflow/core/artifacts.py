@@ -237,6 +237,22 @@ def save_master_twi(output_path: str, master: np.ndarray, *, n_inputs: int, algo
     )
 
 
+def save_master_cmp(output_path: str, master: np.ndarray, *, n_inputs: int, algo_version: str = "cmp-1.0", extra_header: Optional[Dict[str, str]] = None) -> None:
+    """Write a master comparison (cmp) frame using the generic saver (no mask)."""
+    _save_fits_artifact(
+        kind="master_cmp",
+        output_path=output_path,
+        primary=master,
+        n_inputs=n_inputs,
+        algo_version=algo_version,
+        extra_primary_cards=None,
+        extra_header=extra_header,
+        mask=None,
+        mask_name=None,
+        sidecar_extra={},
+    )
+
+
 def load_master_bias(path: str):
     """Load master bias array and header from a FITS artifact file.
 
@@ -259,6 +275,77 @@ def load_master_flat(path: str):
     Returns (array, mask_uint8, header_dict).
     """
     return _load_fits_artifact(path, mask_name="FLATMASK")
+
+
+def build_union_pixelmask(
+    *,
+    flat_path: Optional[str] = None,
+    dark_path: Optional[str] = None,
+    flat_artifact: Optional[Dict[str, object]] = None,
+    dark_artifact: Optional[Dict[str, object]] = None,
+) -> tuple[Optional[np.ndarray], float]:
+    """Load flat and dark pixel masks (when available) and return their union.
+
+    Parameters
+    ----------
+    flat_path, dark_path : Optional[str]
+        Direct filesystem paths to master_flat/master_dark artifacts.
+    flat_artifact, dark_artifact : Optional[Dict]
+        Registry rows or dict-like objects with a 'path' key.
+
+    Returns
+    -------
+    (mask_uint8_or_None, frac_bad)
+        The union mask (uint8) if both are loadable and shape-compatible; otherwise
+        the available mask (if one), else None. frac_bad is the mean of the returned
+        mask (0.0 if None).
+    """
+    # Resolve paths from artifacts if not given
+    try:
+        if flat_path is None and flat_artifact is not None and isinstance(flat_artifact, dict):
+            flat_path = flat_artifact.get("path")  # type: ignore[assignment]
+    except Exception:
+        pass
+    try:
+        if dark_path is None and dark_artifact is not None and isinstance(dark_artifact, dict):
+            dark_path = dark_artifact.get("path")  # type: ignore[assignment]
+    except Exception:
+        pass
+
+    flat_mask = None
+    dark_mask = None
+    try:
+        if flat_path:
+            _flat, fm, _hdr = load_master_flat(str(flat_path))
+            flat_mask = np.asarray(fm, dtype=np.uint8) if fm is not None else None
+    except Exception:
+        flat_mask = None
+    try:
+        if dark_path:
+            _dark, dm, _hdr = load_master_dark(str(dark_path))
+            dark_mask = np.asarray(dm, dtype=np.uint8) if dm is not None else None
+    except Exception:
+        dark_mask = None
+
+    def _frac(m: Optional[np.ndarray]) -> float:
+        try:
+            return float(np.mean(np.asarray(m, dtype=bool))) if m is not None else 0.0
+        except Exception:
+            return 0.0
+
+    # Combine with shape checks
+    out_mask: Optional[np.ndarray] = None
+    if flat_mask is not None and dark_mask is not None:
+        if flat_mask.shape == dark_mask.shape:
+            out_mask = ((flat_mask.astype(bool)) | (dark_mask.astype(bool))).astype(np.uint8)
+        else:
+            # Prefer the denser mask if shapes mismatch
+            out_mask = flat_mask if _frac(flat_mask) >= _frac(dark_mask) else dark_mask
+    else:
+        out_mask = flat_mask if flat_mask is not None else dark_mask
+
+    frac_bad = _frac(out_mask)
+    return out_mask, frac_bad
 
 
 def load_master_twi(path: str):
