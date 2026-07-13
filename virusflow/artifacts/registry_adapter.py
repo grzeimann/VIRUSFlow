@@ -22,19 +22,16 @@ class RegistryAdapter:
         """Transactionally register artifact and provenance.
         Uses the existing db.save_artifact which handles both.
         """
-        # Map to legacy Artifact-like structure expected by db.save_artifact
-        from ..core.artifacts import CalibrationProduct
+        # Map to a simple dict structure expected by db.save_artifact (decoupled from legacy dataclasses)
         zipcode = art.scope.zipcode if art.scope else None
-        # Validity timing will remain stored via task-level policy (dates in names)
-        legacy = CalibrationProduct(
-            id=None,
-            kind=art.kind,
-            name=art.kind,
-            path=art.storage.uri,
-            zipcode=zipcode,
-            validity_start=None,
-            validity_end=None,
-        )
+        legacy_like = {
+            "kind": art.kind,
+            "name": art.kind,
+            "path": art.storage.uri if art.storage else None,
+            "zipcode": zipcode,
+            "validity_start": None,
+            "validity_end": None,
+        }
         prov = {
             "algorithm": art.provenance.algorithm if art.provenance else "unknown",
             "params": (art.provenance.params if art.provenance else {}),
@@ -42,7 +39,7 @@ class RegistryAdapter:
         }
         from ..core.provenance import build_provenance
         prov_row = build_provenance(algorithm=prov["algorithm"], params=prov["params"], parents=[str(p) for p in prov["parents"]])
-        return db.save_artifact(legacy, prov_row, db_path=self.db_path)
+        return db.save_artifact(legacy_like, prov_row, db_path=self.db_path)
 
     # --- Retrieval ---
     def get_row(self, artifact_id: int) -> Optional[dict]:

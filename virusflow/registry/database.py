@@ -12,10 +12,29 @@ from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Set, Any
 from astropy.io import fits
 
 from ..core.identity import RawFileId, ZipCode
-from ..core.artifacts import Artifact, ProvenanceInfo
 
 
 DEFAULT_DB_PATH = os.environ.get("VIRUSFLOW_DB", str(Path.cwd() / "virusflow.sqlite3"))
+
+# ---- Small internal helpers to keep SQL paths concise and consistent ----
+def _as_iso(dt: Optional[datetime]) -> Optional[str]:
+    return dt.isoformat() if isinstance(dt, datetime) else None
+
+
+def _zc_key(zipcode: Optional[ZipCode]) -> Optional[str]:
+    try:
+        return zipcode.key() if zipcode is not None else None
+    except Exception:
+        return None
+
+
+def _rows_to_dicts(rows: Iterable[sqlite3.Row]) -> List[Dict]:
+    return [dict(r) for r in rows]
+
+
+def _date8(s: str) -> str:
+    # Normalize various YYYYMMDD[THH...] forms to YYYYMMDD
+    return str(s).split("T", 1)[0].replace("-", "")[:8]
 
 
 def _connect(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -129,6 +148,10 @@ CREATE TABLE IF NOT EXISTS qa_results (
     metrics_json TEXT,
     FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
 );
+
+-- Helpful indexes (safe no-ops if already present)
+CREATE INDEX IF NOT EXISTS artifacts_kind_amp ON artifacts(kind, amp_key);
+CREATE INDEX IF NOT EXISTS provenance_created_at ON provenance(created_at);
 """
 
 
@@ -494,11 +517,8 @@ def list_raw_files_scoped(
 
     Returns list of (raw_db_id, RawFileId) tuples. Dates compare against exposures.when_utc (YYYYMMDD prefix).
     """
-    # Normalize dates to YYYYMMDD
-    def _d(s: str) -> str:
-        return s.split("T", 1)[0]
-
-    sd, ed = _d(start_date), _d(end_date)
+    # Normalize dates to YYYYMMDD using shared helper
+    sd, ed = _date8(start_date), _date8(end_date)
     with connect(db_path) as conn:
         base = (
             "SELECT rf.id, rf.exposure_id, rf.frame_type, rf.path, rf.tar_member, rf.storage_backend, "
@@ -524,24 +544,47 @@ def list_raw_files_scoped(
         return out
 
 
-def save_artifact(artifact: Artifact, prov: ProvenanceInfo, db_path: str = DEFAULT_DB_PATH) -> int:
+def save_artifact(artifact, prov, db_path: str = DEFAULT_DB_PATH) -> int:
     with connect(db_path) as conn:
+        # Normalize artifact fields from either a dict-like or object with attributes
+        akind = artifact.get("kind") if isinstance(artifact, dict) else getattr(artifact, "kind", None)
+        aname = artifact.get("name") if isinstance(artifact, dict) else getattr(artifact, "name", None)
+        apath = artifact.get("path") if isinstance(artifact, dict) else getattr(artifact, "path", None)
+        azip = artifact.get("zipcode") if isinstance(artifact, dict) else getattr(artifact, "zipcode", None)
+        vstart = artifact.get("validity_start") if isinstance(artifact, dict) else getattr(artifact, "validity_start", None)
+        vend = artifact.get("validity_end") if isinstance(artifact, dict) else getattr(artifact, "validity_end", None)
+        amp_key = azip.key() if azip is not None else None
+        vstart_iso = vstart.isoformat() if hasattr(vstart, "isoformat") and vstart is not None else None
+        vend_iso = vend.isoformat() if hasattr(vend, "isoformat") and vend is not None else None
         cur = conn.execute(
             """
             INSERT INTO artifacts(kind, name, path, amp_key, validity_start, validity_end)
             VALUES(?, ?, ?, ?, ?, ?)
             """,
             (
-                artifact.kind,
-                artifact.name,
-                artifact.path,
-                artifact.zipcode.key() if artifact.zipcode else None,
-                artifact.validity_start.isoformat() if artifact.validity_start else None,
-                artifact.validity_end.isoformat() if artifact.validity_end else None,
+                akind,
+                aname or akind,
+                apath,
+                amp_key,
+                vstart_iso,
+                vend_iso,
             ),
         )
         artifact_id = cur.lastrowid
-        parents = ",".join(prov.parents)
+        # Normalize provenance fields from either dict-like or object
+        def _get(obj, name):
+            return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+        sw = _get(prov, "software_version")
+        git = _get(prov, "git_commit")
+        algo = _get(prov, "algorithm")
+        phash = _get(prov, "parameters_hash")
+        created = _get(prov, "created_at")
+        parents_list = _get(prov, "parents") or []
+        if isinstance(parents_list, str):
+            parents_list = [parents_list]
+        parents_list = [str(p) for p in parents_list]
+        created_iso = created.isoformat() if hasattr(created, "isoformat") and created is not None else datetime.utcnow().isoformat()
+        parents = ",".join(parents_list)
         conn.execute(
             """
             INSERT INTO provenance(artifact_id, software_version, git_commit, algorithm, parameters_hash, created_at, parents)
@@ -549,11 +592,11 @@ def save_artifact(artifact: Artifact, prov: ProvenanceInfo, db_path: str = DEFAU
             """,
             (
                 artifact_id,
-                prov.software_version,
-                prov.git_commit,
-                prov.algorithm,
-                prov.parameters_hash,
-                prov.created_at.isoformat(),
+                sw,
+                git,
+                algo,
+                phash,
+                created_iso,
                 parents,
             ),
         )
@@ -585,16 +628,17 @@ def find_artifacts(
     Orders by provenance.created_at DESC (newest first).
     """
     # Normalize time to ISO for lexical compare
-    at_iso: Optional[str] = at_time.isoformat() if isinstance(at_time, datetime) else None
+    at_iso: Optional[str] = _as_iso(at_time)
     with connect(db_path) as conn:
         sql = (
             "SELECT a.*, p.software_version, p.git_commit, p.algorithm, p.parameters_hash, p.created_at, p.parents "
             "FROM artifacts a LEFT JOIN provenance p ON a.id = p.artifact_id WHERE a.kind = ?"
         )
         params: List[Any] = [kind]
-        if zipcode is not None:
+        zkey = _zc_key(zipcode)
+        if zkey is not None:
             sql += " AND a.amp_key = ?"
-            params.append(zipcode.key())
+            params.append(zkey)
         if at_iso is not None:
             # validity_start <= at_iso <= validity_end; allow NULLs to mean open intervals
             sql += (
@@ -607,7 +651,7 @@ def find_artifacts(
             sql += " LIMIT ?"
             params.append(int(limit))
         rows = conn.execute(sql, tuple(params)).fetchall()
-        return [dict(r) for r in rows]
+        return _rows_to_dicts(rows)
 
 
 def list_artifacts(
@@ -623,7 +667,7 @@ def list_artifacts(
     If kind is None, return all kinds. Optionally filter by zipcode and validity window.
     Orders by provenance.created_at DESC (newest first).
     """
-    at_iso: Optional[str] = at_time.isoformat() if isinstance(at_time, datetime) else None
+    at_iso: Optional[str] = _as_iso(at_time)
     with connect(db_path) as conn:
         sql = (
             "SELECT a.*, p.software_version, p.git_commit, p.algorithm, p.parameters_hash, p.created_at, p.parents, "
@@ -637,9 +681,10 @@ def list_artifacts(
         if kind:
             sql += " AND a.kind = ?"
             params.append(kind)
-        if zipcode is not None:
+        zkey = _zc_key(zipcode)
+        if zkey is not None:
             sql += " AND a.amp_key = ?"
-            params.append(zipcode.key())
+            params.append(zkey)
         if at_iso is not None:
             sql += (
                 " AND (a.validity_start IS NULL OR a.validity_start <= ?)"
@@ -651,7 +696,7 @@ def list_artifacts(
             sql += " LIMIT ?"
             params.append(int(limit))
         rows = conn.execute(sql, tuple(params)).fetchall()
-        return [dict(r) for r in rows]
+        return _rows_to_dicts(rows)
 
 
 def save_qa_results(
