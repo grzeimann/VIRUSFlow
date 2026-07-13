@@ -20,6 +20,7 @@ import numpy as np
 from datetime import datetime
 import glob
 from astropy.convolution import convolve, Gaussian1DKernel
+from astropy.stats import mad_std
 from scipy.ndimage import percentile_filter
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.linear_model import HuberRegressor
@@ -397,6 +398,30 @@ def step_trace(
     except Exception as e:
         raise RuntimeError(f"step_trace failed to compute trace via _get_trace: {e}") from e
 
+    # Compute per-fiber robust dispersion between sampled chunk traces and the modeled trace2d at xchunks
+    # Use MAD-based standard deviation (astropy.stats.mad_std) for robustness to outliers.
+    try:
+        nfib, nch = Trace_samples.shape
+        xidx = np.clip(np.round(np.asarray(xchunks, dtype=float)).astype(int), 0, nx - 1)
+        rms_fibers = np.full((nfib,), np.nan, dtype=float)
+        for i in range(nfib):
+            ts = np.asarray(Trace_samples[i, :], dtype=float)
+            sel = np.isfinite(ts) & (ts > 0)
+            if np.count_nonzero(sel) >= 2:
+                model = trace_2d[i, xidx[sel]]
+                diff = ts[sel] - model
+                # Robust sigma via MAD; ignore NaNs in diff just in case
+                val = mad_std(diff, ignore_nan=True)
+                try:
+                    val = float(val)
+                except Exception:
+                    val = np.nan
+                if np.isfinite(val):
+                    rms_fibers[i] = val
+    except Exception:
+        # If anything goes wrong, leave rms_fibers as None
+        rms_fibers = None
+
     if output_path is None:
         raise ValueError("step_trace requires an explicit output_path")
 
@@ -412,10 +437,61 @@ def step_trace(
         },
     )
 
-    return {
+    result: Dict[str, Any] = {
         "algo": "algorithms.trace.step_trace",
         "version": ALGO_VERSION,
         "trace_len": int(nx),
         "output_path": output_path,
         "source_master_flat": str(mf_path),
+        # Expose per-fiber RMS metrics for QA diagnostics (aliases for compatibility)
+        "rms_fibers": rms_fibers,
+        "trace_rms_per_fiber": rms_fibers,
     }
+
+    # Build algo_meta for QA and emit a QA packet if qa_out_dir is provided
+    qa_dir = None
+    identifiers: Dict[str, Optional[str]] = {}
+    db_path = None
+    artifact_id = None
+    if isinstance(params, dict):
+        qa_dir = params.get("qa_out_dir")
+        identifiers = {
+            "amp_id": params.get("amp_id"),
+            "run_id": params.get("run_id"),
+            "obs_time": params.get("obs_time"),
+            "zip_code": params.get("zip_code"),
+        }
+        db_path = params.get("qa_db_path")
+        artifact_id = params.get("artifact_id")
+
+    algo_meta = {
+        "rms_fibers": rms_fibers,
+        "trace_len": int(nx),
+    }
+
+    if qa_dir is not None:
+        try:
+            from pathlib import Path as _Path
+            from ..qa.build_qa import build_qa
+            qa_dir_path = _Path(str(qa_dir))
+            qa_bundle = {
+                "xchunks": xchunks,
+                "trace_chunks": Trace_samples,
+                "trace": trace_2d,
+            }
+            pkt = build_qa(
+                kind="trace",
+                qa_dir=qa_dir_path,
+                algo_meta=algo_meta,
+                qa_bundle=qa_bundle,
+                identifiers=identifiers,
+                artifact_id=artifact_id,
+                db_path=db_path,
+                always_plot=True,
+            )
+            result["qa_packet_path"] = str(qa_dir_path / "trace_qa.json")
+            result["qa_plots"] = pkt.plots
+        except Exception:
+            pass
+
+    return result

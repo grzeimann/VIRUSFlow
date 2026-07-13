@@ -17,6 +17,7 @@ import numpy as np
 import logging
 from typing import Optional, Tuple
 from itertools import combinations
+import matplotlib.pyplot as plt
 from .fiber import find_peaks, get_spectra
 from pathlib import Path
 
@@ -33,6 +34,111 @@ PIXELS = 1032
 # Reference arc line list (Hg, Cd, etc.) used for matching
 LINE_LIST = [3610.508, 3650.153, 4046.565, 4358.335, 4678.149, 4799.912, 4916.068, 5085.822, 5460.750]
 
+
+
+def _plot_identify_arc_summary(
+    out_folder: Path,
+    ref_profile: Optional[np.ndarray],
+    best: Optional[dict],
+    filename: str = "identify_arc_summary.png",
+) -> Optional[Path]:
+    """Diagnostic for arc identification using _identify_arc outputs.
+
+    Panels:
+    - Top: spectrum with candidate peaks (blue dashed), matched peaks (green), and unmatched candidates (red x).
+    - Bottom: residuals (wave_fit - wave_ref) vs wave_ref for matched peaks, annotated with RMS and nmatch.
+
+    Args:
+        out_folder: directory to write the image.
+        ref_profile: reference 1D spectrum used to detect peaks (S).
+        best: dict returned by _identify_arc containing keys like
+              'peak_x_all', 'detected_x', 'matches', 'rms', 'nmatch'.
+        filename: output filename.
+    """
+    if ref_profile is None or best is None:
+        return None
+
+    prof = np.asarray(ref_profile, dtype=float).ravel()
+    n = int(prof.size)
+    if n == 0:
+        return None
+    x = np.arange(n)
+
+    guesses = np.asarray(best.get("peak_x_all", []), dtype=float).ravel()
+    det = np.asarray(best.get("detected_x", []), dtype=float).ravel()
+
+    # Determine unmatched candidate peaks
+    tol_pix = 2.5
+    if guesses.size == 0:
+        guesses = np.full(0, np.nan)
+    if det.size == 0:
+        det = np.full(0, np.nan)
+    if guesses.size > 0 and det.size > 0 and np.isfinite(det).any():
+        gfin = np.isfinite(guesses)
+        dfin = np.isfinite(det)
+        if np.any(gfin) and np.any(dfin):
+            dmin = np.full(guesses.shape, np.inf, dtype=float)
+            dmin[gfin] = np.min(np.abs(guesses[gfin, None] - det[dfin][None, :]), axis=1)
+            matched_mask = dmin <= tol_pix
+        else:
+            matched_mask = np.zeros(guesses.shape, dtype=bool)
+    else:
+        matched_mask = np.zeros(guesses.shape, dtype=bool)
+    missing = (~matched_mask) & np.isfinite(guesses)
+
+    # Build figure
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(11, 6.5), gridspec_kw=dict(height_ratios=[2, 1]))
+
+    # Top panel: spectrum and lines
+    finite_prof = prof[np.isfinite(prof)]
+    if finite_prof.size:
+        lo, hi = np.percentile(finite_prof, [1, 99])
+        if hi <= lo:
+            hi = lo + 1e-6
+    else:
+        lo, hi = 0.0, 1.0
+    ax_top.plot(x, prof, color='0.2', lw=0.8)
+    if np.isfinite(guesses).any():
+        ax_top.vlines(guesses[np.isfinite(guesses)], lo, hi, colors='tab:blue', linestyles='--', alpha=0.5, lw=1.0, label='candidates')
+    if np.isfinite(det).any():
+        ax_top.vlines(det[np.isfinite(det)], lo, hi, colors='tab:green', linestyles='-', alpha=0.7, lw=1.2, label='matched')
+    if np.any(missing):
+        gx = guesses[missing]
+        ax_top.plot(gx, np.full_like(gx, hi), 'x', color='tab:red', ms=6, mew=1.2, label='missing')
+    ax_top.set_xlim(0, n - 1)
+    ax_top.set_ylim(lo, hi)
+    ax_top.set_ylabel('Ref profile (arb)')
+    ax_top.legend(ncol=3, frameon=False, loc='upper right')
+    info = f"nmatch={int(best.get('nmatch', 0))}, rms={float(best.get('rms', np.nan)):.3f}"
+    ax_top.text(0.01, 0.95, info, transform=ax_top.transAxes, ha='left', va='top', fontsize=10, bbox=dict(facecolor='white', alpha=0.6, edgecolor='none'))
+
+    # Bottom panel: residuals vs. reference wavelength
+    matches = best.get('matches', []) or []
+    try:
+        wave_ref = np.array([m.get('wave_ref', np.nan) for m in matches], dtype=float)
+        wave_resid = np.array([m.get('wave_resid', np.nan) for m in matches], dtype=float)
+    except Exception:
+        wave_ref = np.array([], dtype=float)
+        wave_resid = np.array([], dtype=float)
+    mfin = np.isfinite(wave_ref) & np.isfinite(wave_resid)
+    if np.any(mfin):
+        ax_bot.axhline(0.0, color='0.5', lw=1.0)
+        ax_bot.scatter(wave_ref[mfin], wave_resid[mfin], s=18, c='tab:purple', alpha=0.8)
+        rms = float(best.get('rms', np.nan))
+        ax_bot.text(0.02, 0.90, f"RMS={rms:.3f}", transform=ax_bot.transAxes, ha='left', va='top', fontsize=10)
+    else:
+        ax_bot.text(0.5, 0.5, 'No matched lines', ha='center', va='center', color='0.5')
+    ax_bot.set_xlabel('Reference wavelength')
+    ax_bot.set_ylabel('Residual (fit - ref)')
+    ax_bot.grid(alpha=0.2)
+
+    fig.tight_layout(rect=(0.02, 0.02, 1, 1))
+    out_folder = Path(out_folder)
+    out_folder.mkdir(parents=True, exist_ok=True)
+    out = out_folder / filename
+    fig.savefig(out, dpi=160)
+    plt.close(fig)
+    return out
 
 def _suppress_close_peaks(peak_x, peak_h, min_sep=10, max_keep=25):
     peak_x = np.asarray(peak_x, dtype=float)
@@ -170,11 +276,13 @@ def _get_wave_single(fiber_arc_spectrum, final_order=4, qa: Optional[dict] = Non
             wavelength model. Defaults to 4.
 
     Returns:
-        tuple[np.ndarray, float]:
+        tuple[np.ndarray, float, dict]:
             - ``wave``: 1D array giving the wavelength (same units as
               ``LINE_LIST``) for each pixel index.
             - ``rms``: RMS of residuals (in wavelength units) across matched
               lines.
+            - ``best``: dictionary with arc-identification details for QA plotting
+              (keys include 'coeff', 'matches', 'nmatch', 'rms', 'peak_x_all', 'detected_x').
     """
     x_indices = np.arange(len(fiber_arc_spectrum))
     fiber_arc_spectrum_clean = np.array(fiber_arc_spectrum, dtype=float).copy()
@@ -190,14 +298,14 @@ def _get_wave_single(fiber_arc_spectrum, final_order=4, qa: Optional[dict] = Non
         final_order=final_order,
     )
     wave = np.polyval(best["coeff"], x_indices)
-    return wave, best["rms"]
+    return wave, best["rms"], best
 
 def _get_wave(spec: np.ndarray,
               trace: np.ndarray,
               T_array: Optional[np.ndarray] = None,
               res_lim: float = 1.0,
               order: int = 4,
-              qa: Optional[dict] = None) -> Tuple[Optional[np.ndarray], Optional[Path], Optional[np.ndarray]]:
+              qa: Optional[dict] = None) -> Tuple[Optional[np.ndarray], Optional[Path], Optional[np.ndarray], Optional[dict]]:
     """
     Build a 2D wavelength solution using robust per-row arc fitting.
 
@@ -210,13 +318,14 @@ def _get_wave(spec: np.ndarray,
         order: Polynomial order used for cross-row and along-dispersion fits.
 
     Returns:
-        Tuple (wave, ref_img, rms_rows):
+        Tuple (wave, ref_img, rms_rows, qa_bundle):
         - wave: 2D array (Nrows x Npix) with wavelength at each pixel, or None if insufficient good rows are found.
         - ref_img: Path to the QA ref_profile_quarters image produced (if any), otherwise None.
         - rms_rows: 1D array (Nrows,) with per-row RMS residuals from seed fits (0 for rows not attempted), or None if unavailable.
+        - qa_bundle: Optional dict with keys 'ref_profile' (1D array) and 'best' (dict from _identify_arc) from the best attempted row, for plotting on failures.
     """
     if spec is None or trace is None:
-        return None, None, None
+        return None, None, None, None
 
     nrows, npix = spec.shape
     w_seed = np.zeros_like(spec, dtype=float)
@@ -229,22 +338,30 @@ def _get_wave(spec: np.ndarray,
     # Solve per selected row using robust single-fiber routine
     qa_plotted = False
     ref_img: Optional[Path] = None
+    qa_best: Optional[dict] = None
     for j in try_rows:
         try:
             # Robustify by median-combining a small window of rows, as before
             j0 = max(0, j - 2)
             j1 = min(nrows, j + 3)
             S = np.nanmedian(spec[j0:j1], axis=0)
-            wave_j, res = _get_wave_single(S, final_order=order)
+            wave_j, res, best = _get_wave_single(S, final_order=order)
             w_seed[j] = wave_j
             rms[j] = res
+            # Track best identification for QA plotting on failure
+            try:
+                nmatch = int(best.get("nmatch", 0)) if isinstance(best, dict) else -1
+            except Exception:
+                nmatch = -1
+            if qa_best is None or (nmatch > int(((qa_best or {}).get('best') or {}).get('nmatch', -1))):
+                qa_best = {"ref_profile": np.asarray(S, dtype=float), "best": best}
         except Exception:
             # Leave defaults (zeros), continue
             pass
 
     good = (rms > 0) & (rms < res_lim)
     if np.count_nonzero(good) < 7:
-        return None, ref_img, rms
+        return None, ref_img, rms, qa_best
 
     # Initialize final wavelength array
     wave = np.zeros_like(spec, dtype=float)
@@ -275,9 +392,9 @@ def _get_wave(spec: np.ndarray,
                 jj = int(np.argmin(np.abs(np.where(good)[0] - j)))
                 wave[j] = wave[np.where(good)[0][jj]]
             else:
-                return None, ref_img, rms
+                return None, ref_img, rms, qa_best
 
-    return wave, ref_img, rms
+    return wave, ref_img, rms, qa_best
 
 
 
@@ -347,7 +464,8 @@ def step_wave(*,
             raise RuntimeError(f"Failed to extract spectra from master_cmp/trace: {e}")
 
     # Delegate to internal _get_wave to compute the wavelength map
-    wave, ref_img, rms_rows = _get_wave(cmp_spec, trace, T_array=None, res_lim=res_lim, order=order, qa=None)
+    # Compute wavelength solution (collect QA bundle for failure diagnostics)
+    wave, ref_img, rms_rows, qa_bundle = _get_wave(cmp_spec, trace, T_array=None, res_lim=res_lim, order=order, qa=None)
 
     result = {
         "wave": wave,
@@ -356,4 +474,60 @@ def step_wave(*,
         "version": ALGO_VERSION,
         "output_path": output_path,
     }
+
+    # Build algo_meta for QA and always emit a QA packet if qa_out_dir is provided
+    qa_dir = None
+    identifiers = {}
+    db_path = None
+    artifact_id = None
+    if isinstance(params, dict):
+        qa_dir = params.get("qa_out_dir")
+        identifiers = {
+            "amp_id": params.get("amp_id"),
+            "run_id": params.get("run_id"),
+            "obs_time": params.get("obs_time"),
+            "zip_code": params.get("zip_code"),
+        }
+        db_path = params.get("qa_db_path")
+        artifact_id = params.get("artifact_id")
+
+    algo_meta = {
+        "rms_rows": rms_rows,
+    }
+
+    if wave is None:
+        failure_reason = "wavelength modeling failed"
+        try:
+            if rms_rows is not None:
+                arr = np.asarray(rms_rows, dtype=float).ravel()
+                fin = arr[np.isfinite(arr) & (arr > 0)]
+                tried = int(np.count_nonzero(np.isfinite(arr)))
+                good = int(np.count_nonzero((arr > 0) & (arr < float(res_lim))))
+                med = float(np.nanmedian(fin)) if fin.size else np.nan
+                failure_reason = (f"insufficient good seed rows: {good} < 7 (res_lim={float(res_lim)}) ; "
+                                   f"tried_rows={tried}/{arr.size}; median_rms={med if (med==med) else 'nan'}")
+        except Exception:
+            pass
+        result["failure_reason"] = failure_reason
+        algo_meta["failure_reason"] = failure_reason
+
+    if qa_dir is not None:
+        try:
+            from pathlib import Path as _Path
+            from ..qa.wave_qa import build_wave_qa
+            qa_dir_path = _Path(str(qa_dir))
+            pkt = build_wave_qa(
+                qa_dir=qa_dir_path,
+                algo_meta=algo_meta,
+                qa_bundle=qa_bundle,
+                identifiers=identifiers,
+                artifact_id=artifact_id,
+                db_path=db_path,
+                always_plot=True,
+            )
+            result["qa_packet_path"] = str(qa_dir_path / "wave_qa.json")
+            result["qa_plots"] = pkt.plots
+        except Exception:
+            pass
+
     return result
