@@ -5,6 +5,7 @@ from ..algorithms.bias import step_bias
 from ..algorithms.dark import step_dark
 from ..algorithms.flat import step_flt
 from ..algorithms.trace import step_trace
+from ..algorithms.twi import step_twi
 
 
 class BiasTask(CalibrationTask):
@@ -47,6 +48,21 @@ class FlatTask(CalibrationTask):
     frame_type = "flt"
     artifact_name = "master_flat"
     algorithm = step_flt
+
+
+class TwiTask(CalibrationTask):
+    """Twilight master-frame task using generic CalibrationTask.
+
+    - Uses twilight frames (frame_type='twi')
+    - Produces 'master_twi' artifact via algorithms.twi.step_twi
+    """
+    name = "twi"
+    version = "v1"
+
+    # CalibrationTask configuration
+    frame_type = "twi"
+    artifact_name = "master_twi"
+    algorithm = step_twi
 
 
 class TraceTask(CalibrationTask):

@@ -221,6 +221,22 @@ def save_master_flat(output_path: str, master: np.ndarray, flat_mask: np.ndarray
     )
 
 
+def save_master_twi(output_path: str, master: np.ndarray, *, n_inputs: int, algo_version: str = "twi-1.0", extra_header: Optional[Dict[str, str]] = None) -> None:
+    """Write a master twilight to a FITS file using the generic saver (no mask)."""
+    _save_fits_artifact(
+        kind="master_twi",
+        output_path=output_path,
+        primary=master,
+        n_inputs=n_inputs,
+        algo_version=algo_version,
+        extra_primary_cards=None,
+        extra_header=extra_header,
+        mask=None,
+        mask_name=None,
+        sidecar_extra={},
+    )
+
+
 def load_master_bias(path: str):
     """Load master bias array and header from a FITS artifact file.
 
@@ -243,6 +259,14 @@ def load_master_flat(path: str):
     Returns (array, mask_uint8, header_dict).
     """
     return _load_fits_artifact(path, mask_name="FLATMASK")
+
+
+def load_master_twi(path: str):
+    """Load master twilight array and header from a FITS artifact file.
+
+    Returns (array, header_dict).
+    """
+    return _load_fits_artifact(path)
 
 
 def save_trace_solution(output_path: str, *, trace_2d: np.ndarray, n_inputs: int = 0, algo_version: str = "trace-1.0", extra_header: Optional[Dict[str, str]] = None) -> None:

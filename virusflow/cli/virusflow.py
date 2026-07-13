@@ -14,7 +14,15 @@ from ..tasks import available_tasks, get_task_class
 from ..tasks.base import TaskContext
 from ..executors.local import LocalExecutor
 from ..core.identity import ZipCode, parse_zipcode_key
-from ..core.targets import BiasTarget, DarkTarget, FlatTarget, build_calibration_tasks, default_calibration_needs
+from ..core.targets import (
+    BiasTarget,
+    DarkTarget,
+    FlatTarget,
+    TwiTarget,
+    TraceTarget,
+    CalibrationNeed,
+    build_calibration_tasks,
+)
 from .formatting import format_artifacts_table, format_exposures_table
 
 
@@ -182,8 +190,15 @@ def cmd_plan_calibrations(args: argparse.Namespace) -> None:
     else:
         # Defer discovery until needs are established (we will compute union across needs)
         zipcodes = []
-    # Define what calibrations we plan for and their input frame types
-    needs = default_calibration_needs(include_bias=True, include_dark=True)
+    # Define calibrations to plan by default: bias, dark, flat, twi, trace
+    needs = [
+        CalibrationNeed(name="bias", frame_type="zro", target_cls=BiasTarget),
+        CalibrationNeed(name="dark", frame_type="drk", target_cls=DarkTarget),
+        CalibrationNeed(name="flat", frame_type="flt", target_cls=FlatTarget),
+        CalibrationNeed(name="twi", frame_type="twi", target_cls=TwiTarget),
+        # Trace depends on an existing master_flat; use 'flt' for zipcode discovery
+        CalibrationNeed(name="trace", frame_type="flt", target_cls=TraceTarget),
+    ]
 
     # If user provided explicit zipcodes, use them as-is.
     # Otherwise, discover union of zipcodes across all needs (frame types) for the window.
@@ -208,7 +223,13 @@ def cmd_plan_calibrations(args: argparse.Namespace) -> None:
             raise SystemExit(f"No zipcodes found for date window {args.start_date}..{args.end_date}")
 
     # Map from calibration name to requested version (None means latest/default)
-    versions = {"bias": args.bias_version, "dark": args.dark_version}
+    versions = {
+        "bias": args.bias_version,
+        "dark": args.dark_version,
+        "flat": args.flat_version,
+        "twi": args.twi_version,
+        "trace": args.trace_version,
+    }
 
     # Build tasks keeping the clean outer loop over zipcodes (zipcode-major order)
     tasks = build_calibration_tasks(zipcodes, args.start_date, args.end_date, needs, versions=versions)
@@ -261,7 +282,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         cls = get_task_class(t["name"], t.get("version"))
         target_obj = None
         tgt = t.get("target")
-        if tgt and t["name"] in ("bias", "dark", "flat"):
+        if tgt and t["name"] in ("bias", "dark", "flat", "twi", "trace"):
             z = tgt.get("zipcode", {})
             zc = ZipCode(
                 ifuslot=z.get("ifuslot", "000"),
@@ -274,8 +295,12 @@ def cmd_run(args: argparse.Namespace) -> None:
                 target_obj = BiasTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
             elif t["name"] == "dark":
                 target_obj = DarkTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
-            else:
+            elif t["name"] == "flat":
                 target_obj = FlatTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
+            elif t["name"] == "twi":
+                target_obj = TwiTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
+            else:  # trace
+                target_obj = TraceTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
         instances[t["id"]] = cls(ctx, target=target_obj)
 
     # Build simple graph and execute in-order
@@ -359,6 +384,9 @@ def main(argv: Optional[list[str]] = None) -> None:
     spc.add_argument("--end-date", required=True, help="End date YYYYMMDD")
     spc.add_argument("--bias-version", default=None, help="Bias task version, default=latest")
     spc.add_argument("--dark-version", default=None, help="Dark task version, default=latest")
+    spc.add_argument("--flat-version", default=None, help="Flat task version, default=latest")
+    spc.add_argument("--twi-version", default=None, help="Twi task version, default=latest")
+    spc.add_argument("--trace-version", default=None, help="Trace task version, default=latest")
     spc.add_argument("--only-zipcode", help="Developer filter: comma-separated ZipCode keys (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
     spc.add_argument("--limit", type=int, help="Developer filter: limit number of zipcodes")
     spc.set_defaults(func=cmd_plan_calibrations)
