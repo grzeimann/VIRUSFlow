@@ -1,13 +1,28 @@
 from __future__ import annotations
 
+"""Flat-field master-frame construction.
+
+This module focuses on building a master flat used for tracing and pixelmasking:
+- step_flt: reduce raw flat exposures with CCD base_reduction and combine them
+  robustly (biweight) into a master flat; compute a flat-specific pixel mask
+  using a median-filter deviation rule and simple column heuristics; persist
+  via core.artifacts.save_master_flat.
+
+Exports: step_flt
+"""
+
 from typing import Iterable, Optional, Dict, Any, List
 
+import logging
 import numpy as np
 from astropy.stats import biweight_location
 from scipy.signal import medfilt
 
 from .ccd import base_reduction
 from ..core.artifacts import save_master_flat
+
+__all__ = ["step_flt"]
+logger = logging.getLogger(__name__)
 
 # Algorithm version string for this module
 ALGO_VERSION = "flat-1.0"

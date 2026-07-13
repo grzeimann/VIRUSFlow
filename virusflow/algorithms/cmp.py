@@ -1,14 +1,27 @@
 from __future__ import annotations
 
+"""Comparison (arc-lamp) master-frame construction.
+
+This module exposes a single public routine:
+- step_cmp: reduce a set of raw comparison-lamp exposures using CCD base_reduction
+  and robustly combine them (biweight) into a master comparison frame. When
+  available, it also builds the union of existing flat/dark pixel masks and
+  attempts a light-weight column repair on the master using that mask before
+  persisting via core.artifacts.save_master_cmp.
+
+Exports: step_cmp
+"""
+
 from typing import Iterable, Optional, Dict, Any, List
 
+import logging
 import numpy as np
 from astropy.stats import biweight_location
 
-import logging
 from .ccd import base_reduction, repair_masked_columns
 from ..core.artifacts import save_master_cmp, build_union_pixelmask
 
+__all__ = ["step_cmp"]
 logger = logging.getLogger(__name__)
 
 # Algorithm version string for this module

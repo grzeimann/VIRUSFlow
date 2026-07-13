@@ -1,11 +1,26 @@
 from __future__ import annotations
 
-from typing import Iterable, Optional, Dict, Any, List, Union
+"""Bias (zero) master-frame construction.
 
+This module provides a single public routine:
+- step_bias: reduce a set of raw bias frames with CCD base_reduction and
+  robustly combine them into a master bias. It also computes a robust
+  per-pixel scatter (MAD) and reports a scalar readnoise estimate. The
+  resulting master is persisted via core.artifacts.save_master_bias.
+
+Exports: step_bias
+"""
+
+from typing import Iterable, Optional, Dict, Any, List
+
+import logging
 import numpy as np
 from astropy.stats import biweight_location
 from .ccd import base_reduction
 from ..core.artifacts import save_master_bias
+
+__all__ = ["step_bias"]
+logger = logging.getLogger(__name__)
 
 # Algorithm version string for this module
 ALGO_VERSION = "bias-1.0"

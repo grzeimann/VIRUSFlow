@@ -1,12 +1,27 @@
 from __future__ import annotations
 
+"""Dark-current master-frame construction.
+
+This module provides:
+- step_dark: reduce raw dark frames with CCD base_reduction and robustly combine
+  them (biweight) into a master dark; derive a dark pixel mask using
+  sigma-clipped residual logic and simple full-column heuristics; persist via
+  core.artifacts.save_master_dark.
+
+Exports: step_dark
+"""
+
 from typing import Iterable, Optional, Dict, Any, List
 
+import logging
 import numpy as np
 from astropy.stats import biweight_location, sigma_clipped_stats
 
 from .ccd import base_reduction
 from ..core.artifacts import save_master_dark
+
+__all__ = ["step_dark"]
+logger = logging.getLogger(__name__)
 
 # Algorithm version string for this module
 ALGO_VERSION = "dark-1.0"

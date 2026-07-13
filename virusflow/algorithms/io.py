@@ -1,5 +1,20 @@
 from __future__ import annotations
 
+"""I/O helpers for reading FITS data from files and tar archives.
+
+This module centralizes FITS reading for algorithms, with optional DB-backed
+random access into tar archives that contain many FITS members:
+- set_registry_db_path: configure the path to the registry SQLite DB used to
+  locate tar members by byte offset and size.
+- read_fits_data: return only the primary image data as a NumPy array.
+- read_fits: return both the primary image data and header.
+
+Notes:
+- When tar_member is provided, a registry entry is REQUIRED (built via
+  'virusflow scan'); direct tar iteration is intentionally not supported here
+  for performance and reproducibility.
+"""
+
 import io as _io
 import os
 from typing import Optional, Tuple

@@ -1,12 +1,29 @@
 from __future__ import annotations
 
+"""CCD-level utilities for VIRUS/LRS2 reductions.
+
+This module contains low-level image operations shared across algorithms:
+- orient_image: normalize amplifier images to a common orientation (blue→red left-to-right)
+  and consistent fiber order based on header metadata.
+- base_reduction: perform overscan subtraction, trimming, orientation, gain application,
+  and error propagation, returning (image, error[, header]).
+- repair_masked_columns: fill masked/bad pixels in arc/continuum images via row-wise
+  interpolation and gentle Gaussian smoothing to avoid artifacts.
+
+Exports: orient_image, base_reduction, repair_masked_columns
+"""
+
 from typing import Optional, Tuple
 
+import logging
 import numpy as np
 from astropy.stats import biweight_location
 from scipy.ndimage import gaussian_filter1d
 
 from .io import read_fits
+
+__all__ = ["orient_image", "base_reduction", "repair_masked_columns"]
+logger = logging.getLogger(__name__)
 
 
 def orient_image(image: np.ndarray, amp: str, ampname: Optional[str]) -> np.ndarray:

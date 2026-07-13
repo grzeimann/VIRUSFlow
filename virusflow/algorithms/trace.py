@@ -1,5 +1,19 @@
 from __future__ import annotations
 
+"""Fiber trace detection and polynomial modeling.
+
+This module assembles utilities to estimate fiber traces from flat fields and
+fit smooth polynomials suitable for building a 2D trace map:
+- _simple_trace_from_flat: quick proxy trace using per-column maxima.
+- preprocess_flat_for_detection: background-remove and smooth 1D profiles to
+  aid robust peak finding.
+- robust_polyfit_predict: stable polynomial fit/predict with robust fallback.
+- step_trace: end-to-end routine to produce and persist a trace solution
+  artifact for downstream extraction/wavelength steps.
+
+Exports: step_trace
+"""
+
 from typing import Iterable, Optional, Dict, Any, List
 
 import numpy as np

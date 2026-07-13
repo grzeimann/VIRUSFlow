@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from typing import Any
+"""Fiber-related extraction and 1D profile utilities.
+
+This module provides:
+- get_spectra: extract per-fiber spectra from a 2D image given a 2D trace.
+- find_peaks: robust 1D peak finder with sub-pixel parabolic refinement.
+"""
 
 import numpy as np
 
-__all__ = ["get_spectra"]
+__all__ = ["get_spectra", "find_peaks"]
 
 
 def get_spectra(array_flt: np.ndarray, array_trace: np.ndarray, npix: int = 5) -> np.ndarray:
@@ -85,3 +90,71 @@ def get_spectra(array_flt: np.ndarray, array_trace: np.ndarray, npix: int = 5) -
     except Exception as e:
         # Convert unexpected issues into a clear runtime error for callers
         raise RuntimeError(f"get_spectra failed: {e}") from e
+    
+def find_peaks(y: np.ndarray | list[float], thresh: float = 10.0) -> tuple[np.ndarray, np.ndarray]:
+    """Find 1D local maxima with sub-pixel refinement using parabolic interpolation.
+
+    Parameters
+    ----------
+    y : 1D array-like
+        Input profile. It will be converted to a float NumPy array; NaNs are treated as -inf.
+    thresh : float, optional
+        Minimum peak height threshold applied on the original profile to select
+        candidate maxima (default: 10.0, same units as y).
+
+    Returns
+    -------
+    (peak_x, peak_h) : tuple of np.ndarray
+        - peak_x: sub-pixel x-positions of detected peaks (float)
+        - peak_h: peak heights sampled from y at nearest integer to peak_x
+
+    Notes
+    -----
+    - Candidate peaks are first located where the discrete derivative changes sign
+      from positive to negative.
+    - Sub-pixel refinement uses a 3-point parabola around each candidate index i
+      using y[i-1], y[i], y[i+1]. Division-by-zero is guarded; invalid fits are dropped.
+    - Only candidates with y[i] > thresh are returned.
+    """
+    y_arr = np.asarray(y, dtype=float).ravel()
+    n = y_arr.size
+    if n < 3:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    # Replace NaNs to avoid propagating them in differences
+    y_safe = np.where(np.isfinite(y_arr), y_arr, -np.inf)
+    diff_array = y_safe[1:] - y_safe[:-1]
+    # Candidates where slope goes + to -
+    cand = np.where((diff_array[:-1] > 0.0) & (diff_array[1:] < 0.0))[0] + 1
+    if cand.size == 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    # Apply height threshold on original y (before NaN replacement)
+    sel = y_arr[cand] > float(thresh)
+    cand = cand[sel]
+    if cand.size == 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    # Keep only those with valid neighbors (1..n-2)
+    cand = cand[(cand >= 1) & (cand <= n - 2)]
+    if cand.size == 0:
+        return np.array([], dtype=float), np.array([], dtype=float)
+
+    # Parabolic interpolation for sub-pixel maxima around integer candidates
+    x = np.arange(n, dtype=float)
+    y0 = y_safe[cand - 1]
+    y1 = y_safe[cand]
+    y2 = y_safe[cand + 1]
+    denom = 2.0 * (y2 - 2.0 * y1 + y0)
+    # Avoid divide-by-zero; mark invalids
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dx = (y2 - y0) / denom
+    x_peak = x[cand] - dx
+
+    # Filter invalid/NaN results
+    good = np.isfinite(x_peak)
+    x_peak = x_peak[good]
+    # Heights from nearest integer sample for stability
+    peaks_h = y_arr[np.clip(np.round(x_peak).astype(int), 0, n - 1)]
+
+    return x_peak.astype(float), np.asarray(peaks_h, dtype=float)

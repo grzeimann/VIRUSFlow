@@ -1,5 +1,15 @@
 from __future__ import annotations
 
+"""Twilight (continuum) master-frame construction.
+
+This module exposes a single public routine:
+- step_twi: reduce raw twilight exposures with CCD base_reduction and combine
+  them robustly (biweight) into a master twilight frame for tracing/extraction
+  support. The result is persisted via core.artifacts.save_master_twi.
+
+Exports: step_twi
+"""
+
 from typing import Iterable, Optional, Dict, Any, List
 
 import numpy as np
