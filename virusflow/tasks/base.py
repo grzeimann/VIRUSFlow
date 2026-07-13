@@ -19,6 +19,11 @@ class Task:
     kind: str = "task"
     name: str = "base"
     version: str = "v1"
+    # Declarative dependencies: names of task types that must run for the same target
+    # before this task can execute (e.g., TraceTask.requires = ["flat"]).
+    # Semantics: dependencies are resolved at runtime for tasks sharing the same
+    # zipcode and date window; plans need not (and should not) carry explicit deps.
+    requires: list[str] = []
 
     def __init__(self, ctx: TaskContext, target: Any | None = None, params: Optional[Dict[str, Any]] = None) -> None:
         self.ctx = ctx
@@ -78,6 +83,39 @@ class CalibrationTask(Task):
         if s in (None, "", "00000000"):
             return None
         return datetime.strptime(str(s), "%Y%m%d")
+
+    # ---- Common artifact resolution helpers for calibration tasks ----
+    def _target_mid_time(self):
+        """Return the midpoint datetime of the target validity window when available.
+
+        If only one bound is present, return that bound. If neither is present, return None.
+        """
+        vstart = self._parse_date(getattr(self.target, "start_date", None))
+        vend = self._parse_date(getattr(self.target, "end_date", None))
+        if vstart and vend:
+            return vstart + (vend - vstart) / 2
+        return vstart or vend
+
+    def _resolve_artifact(self, kind: str, required: bool = True) -> dict | None:
+        """Find the best existing artifact of a given kind for this task's target.
+
+        Searches by zipcode and, when possible, selects the artifact valid at the
+        midpoint of the target window. Falls back to the latest by zipcode if a
+        time-qualified match is not found.
+        """
+        from ..registry import database as _db
+        self._require_target()
+        zipcode = getattr(self.target, "zipcode", None)
+        at_time = self._target_mid_time()
+        rows = _db.find_artifacts(kind=kind, zipcode=zipcode, at_time=at_time, db_path=self.ctx.db_path, limit=1)
+        if not rows:
+            rows = _db.find_artifacts(kind=kind, zipcode=zipcode, db_path=self.ctx.db_path, limit=1)
+        if not rows:
+            if required:
+                zkey = zipcode.key() if zipcode else "UNKNOWN"
+                raise RuntimeError(f"{self.__class__.__name__} requires an existing {kind} for zipcode={zkey} in the given date window")
+            return None
+        return rows[0]
 
     def query_inputs(self):
         from ..registry import database as _db

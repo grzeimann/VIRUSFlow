@@ -21,6 +21,7 @@ from ..core.targets import (
     TwiTarget,
     TraceTarget,
     WaveTarget,
+    CmpTarget,
     CalibrationNeed,
     build_calibration_tasks,
 )
@@ -191,12 +192,12 @@ def cmd_plan_calibrations(args: argparse.Namespace) -> None:
     else:
         # Defer discovery until needs are established (we will compute union across needs)
         zipcodes = []
-    # Define calibrations to plan by default: bias, dark, flat, twi, trace
+    # Define calibrations to plan by default: bias, dark, flat, cmp, trace, wave
     needs = [
         CalibrationNeed(name="bias", frame_type="zro", target_cls=BiasTarget),
         CalibrationNeed(name="dark", frame_type="drk", target_cls=DarkTarget),
         CalibrationNeed(name="flat", frame_type="flt", target_cls=FlatTarget),
-        CalibrationNeed(name="twi", frame_type="twi", target_cls=TwiTarget),
+        CalibrationNeed(name="cmp", frame_type="cmp", target_cls=CmpTarget),
         # Trace depends on an existing master_flat; use 'flt' for zipcode discovery
         CalibrationNeed(name="trace", frame_type="flt", target_cls=TraceTarget),
         # Wave depends on existing master_cmp and trace; use 'cmp' for zipcode discovery
@@ -230,6 +231,7 @@ def cmd_plan_calibrations(args: argparse.Namespace) -> None:
         "bias": args.bias_version,
         "dark": args.dark_version,
         "flat": args.flat_version,
+        "cmp": args.cmp_version,
         "twi": args.twi_version,
         "trace": args.trace_version,
         "wave": args.wave_version,
@@ -237,6 +239,7 @@ def cmd_plan_calibrations(args: argparse.Namespace) -> None:
 
     # Build tasks keeping the clean outer loop over zipcodes (zipcode-major order)
     tasks = build_calibration_tasks(zipcodes, args.start_date, args.end_date, needs, versions=versions)
+
 
     plan = {"tasks": tasks}
     print(yaml.safe_dump(plan, sort_keys=False))
@@ -282,11 +285,13 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     # Instantiate tasks (target-scoped when provided)
     instances = {}
+    target_key_by_id = {}
     for t in plan.get("tasks", []):
         cls = get_task_class(t["name"], t.get("version"))
         target_obj = None
         tgt = t.get("target")
-        if tgt and t["name"] in ("bias", "dark", "flat", "twi", "trace", "wave"):
+        zc = None
+        if tgt and t["name"] in ("bias", "dark", "flat", "cmp", "twi", "trace", "wave"):
             z = tgt.get("zipcode", {})
             zc = ZipCode(
                 ifuslot=z.get("ifuslot", "000"),
@@ -301,20 +306,46 @@ def cmd_run(args: argparse.Namespace) -> None:
                 target_obj = DarkTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
             elif t["name"] == "flat":
                 target_obj = FlatTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
-            elif t["name"] == "twi":
-                target_obj = TwiTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
+            elif t["name"] == "cmp":
+                target_obj = CmpTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
             elif t["name"] == "trace":
                 target_obj = TraceTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
             elif t["name"] == "wave":
                 target_obj = WaveTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
         instances[t["id"]] = cls(ctx, target=target_obj)
+        # Build a scope key for auto-dependency resolution (zipcode + date window)
+        if tgt and zc is not None:
+            target_key_by_id[t["id"]] = (
+                zc.ifuslot, zc.ifuid, zc.specid, zc.amp, zc.controller,
+                tgt.get("start_date"), tgt.get("end_date"),
+            )
+        else:
+            target_key_by_id[t["id"]] = None
 
-    # Build simple graph and execute in-order
+    # Build simple graph and execute in-order, deriving dependencies from Task.requires
     exec = LocalExecutor(max_workers=(args.workers if args.workers and args.workers > 0 else 1), debug=bool(args.debug_timing))
+
+    # Pre-index tasks by (name, target_key)
+    name_target_to_id = {}
+    for t in plan.get("tasks", []):
+        name_target_to_id[(t.get("name"), target_key_by_id.get(t["id"]))] = t["id"]
+
     for t in plan.get("tasks", []):
         node_id = t["id"]
-        deps = t.get("deps", [])
-        exec.add_task(node_id, instances[node_id], depends_on=deps)
+        task_obj = instances[node_id]
+        # Start with any explicit deps present in plan for backward compatibility
+        deps = list(t.get("deps", []) or [])
+        # Add declarative requires mapped within the same target scope
+        try:
+            req_names = list(getattr(task_obj, "requires", []) or [])
+        except Exception:
+            req_names = []
+        tgt_key = target_key_by_id.get(node_id)
+        for req in req_names:
+            dep_id = name_target_to_id.get((req, tgt_key))
+            if dep_id and dep_id not in deps:
+                deps.append(dep_id)
+        exec.add_task(node_id, task_obj, depends_on=deps)
 
     ensure_dir(args.workdir)
     exec.run()
@@ -391,6 +422,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     spc.add_argument("--bias-version", default=None, help="Bias task version, default=latest")
     spc.add_argument("--dark-version", default=None, help="Dark task version, default=latest")
     spc.add_argument("--flat-version", default=None, help="Flat task version, default=latest")
+    spc.add_argument("--cmp-version", default=None, help="Cmp task version, default=latest")
     spc.add_argument("--twi-version", default=None, help="Twi task version, default=latest")
     spc.add_argument("--trace-version", default=None, help="Trace task version, default=latest")
     spc.add_argument("--wave-version", default=None, help="Wave task version, default=latest")

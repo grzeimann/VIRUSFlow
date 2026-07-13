@@ -3,13 +3,14 @@ from __future__ import annotations
 from typing import Dict, Type
 
 from .base import Task, TaskContext
-from .calibs import BiasTask, DarkTask, FlatTask, TwiTask, TraceTask, WaveTask
+from .calibs import BiasTask, DarkTask, FlatTask, CmpTask, TwiTask, TraceTask, WaveTask
 
 # Simple plugin/task registry keyed by (name, version)
 _TASK_REGISTRY: Dict[tuple[str, str], Type[Task]] = {
     (BiasTask.name, BiasTask.version): BiasTask,
     (DarkTask.name, DarkTask.version): DarkTask,
     (FlatTask.name, FlatTask.version): FlatTask,
+    (CmpTask.name, CmpTask.version): CmpTask,
     (TwiTask.name, TwiTask.version): TwiTask,
     (TraceTask.name, TraceTask.version): TraceTask,
     (WaveTask.name, WaveTask.version): WaveTask,

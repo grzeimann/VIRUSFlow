@@ -49,6 +49,49 @@ class TaskGraph:
             type_totals[t] = type_totals.get(t, 0) + 1
         type_succeeded: Dict[str, int] = {k: 0 for k in type_totals}
         type_failed: Dict[str, int] = {k: 0 for k in type_totals}
+        # Failure diagnostics: count reasons per task type and print concise error lines
+        fail_reason_counts: Dict[str, Dict[str, int]] = {k: {} for k in type_totals}
+
+        def _bump_reason(task_type: str, category: str) -> None:
+            d = fail_reason_counts.setdefault(task_type, {})
+            d[category] = int(d.get(category, 0)) + 1
+
+        def _print_error_line(task_type: str, node_id: str, category: str, detail: Optional[str] = None) -> None:
+            try:
+                msg = f"[Error] {task_type} {node_id}: {category}"
+                if detail:
+                    s = str(detail)
+                    if len(s) > 200:
+                        s = s[:197] + "..."
+                    msg += f" - {s}"
+                print(msg, file=sys.stderr, flush=True)
+            except Exception:
+                # Never fail rendering errors
+                pass
+
+        def _record_failure(nid: str, category: str, detail: Optional[str] = None) -> None:
+            t = _task_type(nid)
+            _bump_reason(t, category)
+            _print_error_line(t, nid, category, detail)
+
+        def _print_failure_summary() -> None:
+            # At end of run, summarize failures by task type and category
+            try:
+                any_fail = any(type_failed.get(t, 0) > 0 for t in type_totals)
+                if not any_fail:
+                    return
+                for t in sorted(type_totals.keys()):
+                    nfail = int(type_failed.get(t, 0))
+                    if nfail <= 0:
+                        continue
+                    cats = fail_reason_counts.get(t, {})
+                    # sort categories by count desc
+                    items = sorted(cats.items(), key=lambda kv: kv[1], reverse=True)
+                    parts = ", ".join([f"{k}={v}" for k, v in items[:3]]) if items else ""
+                    line = f"[Failures] {t}: {nfail} failed" + (f" ({parts})" if parts else "")
+                    print(line, file=sys.stderr, flush=True)
+            except Exception:
+                pass
 
         def _render_progress_line(final: bool = False) -> None:
             if not show_progress:
@@ -60,11 +103,11 @@ class TaskGraph:
                 tot = type_totals.get(t, 0)
                 parts.append(f"{t}: {ok}/{tot} ok, {fl} fail")
             line = " | ".join(parts)
-            # Carriage return update; ensure newline at the end
+            # Carriage return update; write to stderr to reduce buffering issues in some shells
             if final:
-                print(f"[Progress] {line}")
+                print(f"[Progress] {line}", file=sys.stderr, flush=True)
             else:
-                print(f"\r[Progress] {line}", end="", file=sys.stdout, flush=True)
+                print(f"\r[Progress] {line}", end="", file=sys.stderr, flush=True)
 
         indeg, dependents = self._indeg_and_dependents()
         ready = [k for k, v in indeg.items() if v == 0]
@@ -122,23 +165,37 @@ class TaskGraph:
             for nid in skipped:
                 failed.add(nid)
                 done.add(nid)
+                # Record that this node could not run due to a failed dependency
+                _record_failure(nid, "blocked-dependency")
                 _mark_completion(nid)
                 for dep in dependents.get(nid, ()):  # decrease indegree for dependents
                     indeg[dep] -= 1
                     if indeg[dep] == 0:
-                        ready.append(dep)
+                        # Prioritize newly-unlocked dependents so pipelines advance promptly
+                        ready.insert(0, dep)
             if not runnable:
                 continue
             if debug:
                 print(f"[Executor] Running batch of {len(runnable)} tasks (max_workers={max_workers})")
             if max_workers <= 1 or len(runnable) == 1:
                 for nid in runnable:
-                    res = self.nodes[nid].task.run({})
-                    # Evaluate QA; if failed, mark node
-                    if _eval_node_qa(nid, res):
+                    res = None
+                    try:
+                        res = self.nodes[nid].task.run({})
+                    except Exception as e:
+                        # Mark node as failed on exception but allow the graph to continue
                         failed.add(nid)
+                        # Record diagnostic and optionally print debug
+                        _record_failure(nid, "exception", str(e))
                         if debug:
-                            print(f"[Executor] Node {nid} marked FAILED due to QA status of its outputs")
+                            print(f"[Executor] Node {nid} raised exception: {e}")
+                    else:
+                        # Evaluate QA; if failed, mark node
+                        if _eval_node_qa(nid, res):
+                            failed.add(nid)
+                            _record_failure(nid, "qa-fail")
+                            if debug:
+                                print(f"[Executor] Node {nid} marked FAILED due to QA status of its outputs")
                     done.add(nid)
                     _mark_completion(nid)
                     for dep in dependents.get(nid, ()):  # decrease indegree for dependents
@@ -146,23 +203,57 @@ class TaskGraph:
                         if indeg[dep] == 0:
                             ready.append(dep)
             else:
+                # Threaded execution with bounded submission: keep at most max_workers running
+                from concurrent.futures import wait, FIRST_COMPLETED
+                from collections import deque
                 with ThreadPoolExecutor(max_workers=max_workers) as ex:
-                    futs = {ex.submit(self.nodes[nid].task.run, {}): nid for nid in runnable}
-                    for fut in as_completed(futs):
-                        nid = futs[fut]
-                        # propagate exceptions and capture result
-                        res = fut.result()
-                        if _eval_node_qa(nid, res):
-                            failed.add(nid)
-                            if debug:
-                                print(f"[Executor] Node {nid} marked FAILED due to QA status of its outputs")
-                        done.add(nid)
-                        _mark_completion(nid)
-                        for dep in dependents.get(nid, ()):  # decrease indegree for dependents
-                            indeg[dep] -= 1
-                            if indeg[dep] == 0:
-                                ready.append(dep)
+                    q = deque(runnable)
+                    in_flight = {}
+
+                    # Prime the pool
+                    while q and len(in_flight) < max_workers:
+                        nid = q.popleft()
+                        fut = ex.submit(self.nodes[nid].task.run, {})
+                        in_flight[fut] = nid
+
+                    while in_flight:
+                        done_futs, _ = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
+                        for fut in done_futs:
+                            nid = in_flight.pop(fut)
+                            # propagate exceptions and capture result
+                            res = None
+                            try:
+                                res = fut.result()
+                            except Exception as e:
+                                failed.add(nid)
+                                _record_failure(nid, "exception", str(e))
+                                if debug:
+                                    print(f"[Executor] Node {nid} raised exception: {e}")
+                            else:
+                                if _eval_node_qa(nid, res):
+                                    failed.add(nid)
+                                    _record_failure(nid, "qa-fail")
+                                    if debug:
+                                        print(f"[Executor] Node {nid} marked FAILED due to QA status of its outputs")
+                            done.add(nid)
+                            _mark_completion(nid)
+                            for dep in dependents.get(nid, ()):  # decrease indegree for dependents
+                                indeg[dep] -= 1
+                                if indeg[dep] == 0:
+                                    # Prioritize newly-unlocked dependents ahead of the backlog
+                                    from collections import deque as _deque
+                                    if isinstance(q, _deque):
+                                        q.appendleft(dep)
+                                    else:
+                                        q.append(dep)
+                        # Top up the pool to keep max_workers busy
+                        while q and len(in_flight) < max_workers:
+                            nid = q.popleft()
+                            fut = ex.submit(self.nodes[nid].task.run, {})
+                            in_flight[fut] = nid
         if len(done) != len(self.nodes):
             _render_progress_line(final=True)
+            _print_failure_summary()
             raise ValueError("Not all tasks executed; possible cycle in graph")
         _render_progress_line(final=True)
+        _print_failure_summary()

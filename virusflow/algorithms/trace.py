@@ -168,22 +168,69 @@ def preprocess_flat_for_detection(flat: np.ndarray | List[float], perc_window: i
     except Exception:
         return np.asarray(flat, dtype=float).ravel()
 
+def default_virusconfig_root() -> str:
+    """Resolve the default virusconfig root.
+
+    Preference order:
+    1) Environment variable VIRUSCONFIG_ROOT if it points to a directory.
+    2) Walk up from this file to find a directory containing 'Fiber_Locations'.
+       If found, return that directory path.
+    3) Fallback to the historical path '/work/03946/hetdex/maverick/virus_config'.
+    """
+    from pathlib import Path as _Path
+    import os as _os
+    # 1) ENV override
+    env = _os.environ.get("VIRUSCONFIG_ROOT")
+    if env and _Path(env).is_dir():
+        return str(_Path(env).resolve())
+    # 2) Walk parents looking for Fiber_Locations at repo root
+    here = _Path(__file__).resolve()
+    for p in [here.parent, *here.parents]:
+        try:
+            # Stop at filesystem root
+            if p == p.parent:
+                break
+            if (p / "Fiber_Locations").is_dir():
+                return str(p)
+        except Exception:
+            pass
+    # 3) Historical fallback
+    return "/work/03946/hetdex/maverick/virus_config"
+
+
 def get_trace_reference(specid: str, ifuslot: str, ifuid: str, amp: str, obsdate: str,
-                        virusconfig: str = '/work/03946/hetdex/maverick/virus_config') -> np.ndarray:
+                        virusconfig: str | None = None) -> np.ndarray:
     """Locate and load the closest-in-time fiber location reference file.
 
     The directory layout is expected to be:
       <virusconfig>/Fiber_Locations/<YYYYMMDD>/fiber_loc_<specid>_<ifuslot>_<ifuid>_<amp>.txt
 
+    Notes
+    -----
+    Historically, specid/ifuslot/ifuid may appear without leading zeros
+    (e.g., "27"). Reference filenames are zero-padded to width 3
+    (e.g., "027"). This function normalizes IDs by zero-padding to 3
+    characters before globbing so callers can pass either form.
+
     Returns a NumPy array loaded from the selected reference file.
     """
     try:
         from pathlib import Path
+        # Normalize IDs to width-3 strings ("27" -> "027"). Non-numeric strings are left as-is.
+        def _pad3(v: object) -> str:
+            s = str(v).strip()
+            return s.zfill(3) if s.isdigit() and len(s) < 3 else s
+        specid_n = _pad3(specid)
+        ifuslot_n = _pad3(ifuslot)
+        ifuid_n = _pad3(ifuid)
+
+        if virusconfig is None:
+            virusconfig = default_virusconfig_root()
         base = Path(virusconfig)
-        patt = base / 'Fiber_Locations' / '*' / f'fiber_loc_{specid}_{ifuslot}_{ifuid}_{amp}.txt'
+        patt = base / 'Fiber_Locations' / '*' / f'fiber_loc_{specid_n}_{ifuslot_n}_{ifuid_n}_{amp}.txt'
         files = sorted(glob.glob(str(patt)))
         if not files:
-            raise FileNotFoundError(f"No fiber_loc reference found at {patt}")
+            raise FileNotFoundError(f"No fiber_loc reference found. Tried pattern: {patt}")
         # Extract date directory names
         dates = [Path(fn).parent.name for fn in files]
         # Normalize observation date

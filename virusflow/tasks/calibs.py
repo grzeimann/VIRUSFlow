@@ -8,6 +8,7 @@ from ..algorithms.trace import step_trace
 from ..algorithms.twi import step_twi
 import numpy as np
 from ..algorithms.wave import step_wave
+from ..algorithms.cmp import step_cmp
 from ..core.artifacts import load_master_cmp, load_trace_solution, save_wave_solution
 
 
@@ -53,6 +54,20 @@ class FlatTask(CalibrationTask):
     algorithm = step_flt
 
 
+class CmpTask(CalibrationTask):
+    """Comparison-lamp master-frame task using generic CalibrationTask.
+
+    - Uses comparison frames (frame_type='cmp')
+    - Produces 'master_cmp' artifact via algorithms.cmp.step_cmp
+    """
+    name = "cmp"
+    version = "v1"
+
+    frame_type = "cmp"
+    artifact_name = "master_cmp"
+    algorithm = step_cmp
+
+
 class TwiTask(CalibrationTask):
     """Twilight master-frame task using generic CalibrationTask.
 
@@ -78,6 +93,9 @@ class TraceTask(CalibrationTask):
     name = "trace"
     version = "v1"
 
+    # Declarative dependency: requires a 'flat' task for the same target
+    requires = ["flat"]
+
     # CalibrationTask configuration (no raw inputs gathered via frame_type)
     frame_type = None  # override query_inputs to supply parent master_flat only
     artifact_name = "trace"
@@ -89,28 +107,11 @@ class TraceTask(CalibrationTask):
     def _parse_date(self, s: str):
         return super()._parse_date(s)
 
-    def _resolve_master_flat(self) -> dict:
-        from ..registry import database as _db
-        zipcode = getattr(self.target, "zipcode", None)
-        vstart = self._parse_date(getattr(self.target, "start_date", None))
-        vend = self._parse_date(getattr(self.target, "end_date", None))
-        at_time = None
-        if vstart and vend:
-            at_time = vstart + (vend - vstart) / 2
-        else:
-            at_time = vstart or vend
-        flats = _db.find_artifacts(kind="master_flat", zipcode=zipcode, at_time=at_time, db_path=self.ctx.db_path, limit=1)
-        if not flats:
-            flats = _db.find_artifacts(kind="master_flat", zipcode=zipcode, db_path=self.ctx.db_path, limit=1)
-        if not flats:
-            zkey = zipcode.key() if zipcode else "UNKNOWN"
-            raise RuntimeError(f"TraceTask requires an existing master_flat for zipcode={zkey} in the given date window")
-        return flats[0]
 
     def query_inputs(self):
         # Provide no raw inputs to the algorithm, but return parent_ids for provenance
         self._require_target()
-        mf = self._resolve_master_flat()
+        mf = self._resolve_artifact("master_flat", required=True)
         parent_ids = [pid for pid in [mf.get("id")] if pid is not None]
         return [], parent_ids
 
@@ -131,7 +132,7 @@ class TraceTask(CalibrationTask):
         t0 = time.perf_counter()
 
         # Resolve dependency master_flat and parent provenance
-        mf = self._resolve_master_flat()
+        mf = self._resolve_artifact("master_flat", required=True)
         parent_ids = [str(mf.get("id"))] if mf.get("id") is not None else []
 
         out_path = self.output_path()
@@ -146,9 +147,13 @@ class TraceTask(CalibrationTask):
         zc = getattr(self.target, "zipcode", None)
         if zc is not None:
             try:
-                algo_params.setdefault("specid", str(getattr(zc, "specid", None)))
-                algo_params.setdefault("ifuslot", str(getattr(zc, "ifuslot", None)))
-                algo_params.setdefault("ifuid", str(getattr(zc, "ifuid", None)))
+                # Normalize numeric IDs to 3-digit zero-padded strings for reference lookup consistency
+                def _pad3(v: object) -> str:
+                    s = str(v).strip()
+                    return s.zfill(3) if s.isdigit() and len(s) < 3 else s
+                algo_params.setdefault("specid", _pad3(getattr(zc, "specid", None)))
+                algo_params.setdefault("ifuslot", _pad3(getattr(zc, "ifuslot", None)))
+                algo_params.setdefault("ifuid", _pad3(getattr(zc, "ifuid", None)))
                 algo_params.setdefault("amp", str(getattr(zc, "amp", None)))
             except Exception:
                 pass
@@ -163,9 +168,17 @@ class TraceTask(CalibrationTask):
             vc = None
         if vc:
             algo_params.setdefault("virusconfig", str(vc))
+        else:
+            # Default to repository root (containing Fiber_Locations) when available
+            try:
+                from ..algorithms.trace import default_virusconfig_root as _vf_default_root
+                algo_params.setdefault("virusconfig", _vf_default_root())
+            except Exception:
+                # Last-resort historical path
+                algo_params.setdefault("virusconfig", "/work/03946/hetdex/maverick/virus_config")
 
         t1 = time.perf_counter()
-        meta = self.algorithm(raw_inputs=None, output_path=out_path, params=algo_params)
+        meta = self.algorithm(output_path=out_path, params=algo_params)
         t2 = time.perf_counter()
 
         artifact = self.make_artifact(out_path)
@@ -198,44 +211,20 @@ class WaveTask(CalibrationTask):
     name = "wave"
     version = "v1"
 
+    # Declarative dependency: requires 'trace' and 'cmp' tasks for the same target
+    requires = ["trace", "cmp"]
+
     # No raw inputs; depends on prior artifacts
     frame_type = None
     artifact_name = "wave"
     algorithm = None  # not used; run() is overridden
 
-    def _resolve_master_cmp(self) -> dict:
-        from ..registry import database as _db
-        zipcode = getattr(self.target, "zipcode", None)
-        vstart = self._parse_date(getattr(self.target, "start_date", None))
-        vend = self._parse_date(getattr(self.target, "end_date", None))
-        at_time = vstart + (vend - vstart) / 2 if (vstart and vend) else (vstart or vend)
-        rows = _db.find_artifacts(kind="master_cmp", zipcode=zipcode, at_time=at_time, db_path=self.ctx.db_path, limit=1)
-        if not rows:
-            rows = _db.find_artifacts(kind="master_cmp", zipcode=zipcode, db_path=self.ctx.db_path, limit=1)
-        if not rows:
-            zkey = zipcode.key() if zipcode else "UNKNOWN"
-            raise RuntimeError(f"WaveTask requires an existing master_cmp for zipcode={zkey} in the given date window")
-        return rows[0]
-
-    def _resolve_trace(self) -> dict:
-        from ..registry import database as _db
-        zipcode = getattr(self.target, "zipcode", None)
-        vstart = self._parse_date(getattr(self.target, "start_date", None))
-        vend = self._parse_date(getattr(self.target, "end_date", None))
-        at_time = vstart + (vend - vstart) / 2 if (vstart and vend) else (vstart or vend)
-        rows = _db.find_artifacts(kind="trace", zipcode=zipcode, at_time=at_time, db_path=self.ctx.db_path, limit=1)
-        if not rows:
-            rows = _db.find_artifacts(kind="trace", zipcode=zipcode, db_path=self.ctx.db_path, limit=1)
-        if not rows:
-            zkey = zipcode.key() if zipcode else "UNKNOWN"
-            raise RuntimeError(f"WaveTask requires an existing trace for zipcode={zkey} in the given date window")
-        return rows[0]
 
     def query_inputs(self):
         # No raw inputs; establish parents from existing artifacts
         self._require_target()
-        mc = self._resolve_master_cmp()
-        tr = self._resolve_trace()
+        mc = self._resolve_artifact("master_cmp", required=True)
+        tr = self._resolve_artifact("trace", required=True)
         parent_ids = [pid for pid in [mc.get("id"), tr.get("id")] if pid is not None]
         return [], parent_ids
 
@@ -246,8 +235,8 @@ class WaveTask(CalibrationTask):
         dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
         t0 = time.perf_counter()
 
-        mc = self._resolve_master_cmp()
-        tr = self._resolve_trace()
+        mc = self._resolve_artifact("master_cmp", required=True)
+        tr = self._resolve_artifact("trace", required=True)
         parent_ids = [str(x) for x in (mc.get("id"), tr.get("id")) if x is not None]
 
         out_path = self.output_path()
