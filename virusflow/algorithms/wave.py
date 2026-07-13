@@ -514,10 +514,11 @@ def step_wave(*,
     if qa_dir is not None:
         try:
             from pathlib import Path as _Path
-            from ..qa.wave_qa import build_wave_qa
+            from ..qa.build_qa import build_qa
             qa_dir_path = _Path(str(qa_dir))
-            pkt = build_wave_qa(
-                qa_dir=qa_dir_path,
+            pkt = build_qa(
+                kind="wave",
+                qa_dir=qa_dir,
                 algo_meta=algo_meta,
                 qa_bundle=qa_bundle,
                 identifiers=identifiers,
