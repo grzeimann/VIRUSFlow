@@ -73,117 +73,152 @@ def _write_sidecar_json(base_path: str, payload: Dict[str, object]) -> None:
         pass
 
 
-def save_master_bias(output_path: str, master: np.ndarray, *, n_inputs: int, readnoise: float, algo_version: str = "bias-1.0", extra_header: Optional[Dict[str, str]] = None) -> None:
-    """Write a master bias to a FITS file.
+def _save_fits_artifact(
+    *,
+    kind: str,
+    output_path: str,
+    primary: np.ndarray,
+    n_inputs: int,
+    algo_version: str,
+    extra_primary_cards: Optional[Dict[str, object]] = None,
+    extra_header: Optional[Dict[str, object]] = None,
+    mask: Optional[np.ndarray] = None,
+    mask_name: Optional[str] = None,
+    sidecar_extra: Optional[Dict[str, object]] = None,
+) -> None:
+    """Generic FITS artifact writer with atomic write and JSON sidecar.
 
-    - Primary HDU contains the master array as float32.
-    - Header keywords: NINPUTS, BIASRN, ALGOVER.
-    - extra_header (optional) allows callers to add more cards.
+    - primary is written as float32 in the primary HDU.
+    - If mask is provided, it is written as uint8 ImageHDU named mask_name.
+    - Standard header cards NINPUTS and ALGOVER are added to primary.
+    - extra_primary_cards and extra_header are merged into the primary header.
+    - Writes a compact sidecar JSON including kind, n_inputs, algo_version, shape, and sidecar_extra.
     """
-    from pathlib import Path
     from .pathutils import ensure_dir
-    ensure_dir(Path(output_path).parent)
-    hdu = fits.PrimaryHDU(master.astype(np.float32))
-    hdr = hdu.header
-    hdr["NINPUTS"] = (int(n_inputs), "number of input bias frames")
-    hdr["BIASRN"] = (float(readnoise), "median per-pixel MAD (scaled)")
+
+    arr = np.asarray(primary)
+    phdu = fits.PrimaryHDU(arr.astype(np.float32))
+    hdr = phdu.header
+    hdr["NINPUTS"] = (int(n_inputs), "number of inputs contributing to artifact")
     hdr["ALGOVER"] = (str(algo_version), "algorithm version")
+    # Specific cards first (e.g., BADFRAC/BIASRN)
+    if extra_primary_cards:
+        for k, v in extra_primary_cards.items():
+            try:
+                hdr[str(k)] = v
+            except Exception:
+                pass
+    # Arbitrary additional cards
     if extra_header:
         for k, v in extra_header.items():
             try:
                 hdr[str(k)] = v
             except Exception:
-                # ignore invalid cards for now
                 pass
-    # Atomic write to avoid torn files
-    from .pathutils import ensure_dir
-    ensure_dir(Path(output_path).parent)
-    _tmp = str(Path(output_path).with_suffix(Path(output_path).suffix + ".tmp"))
-    fits.HDUList([hdu]).writeto(_tmp, overwrite=True)
-    Path(_tmp).replace(output_path)
-    # Write interpolation-ready sidecar summary
-    _write_sidecar_json(output_path, {
-        "kind": "master_bias",
+
+    hdus: List[fits.hdu.base.ExtensionHDU] = [phdu]
+    if mask is not None:
+        name = str(mask_name) if mask_name else "MASK"
+        mhdu = fits.ImageHDU(np.asarray(mask, dtype=np.uint8), name=name)
+        hdus.append(mhdu)
+
+    # Atomic write
+    outp = Path(output_path)
+    ensure_dir(outp.parent)
+    tmp = str(outp.with_suffix(outp.suffix + ".tmp"))
+    fits.HDUList(hdus).writeto(tmp, overwrite=True)
+    Path(tmp).replace(outp)
+
+    # Sidecar
+    side = {
+        "kind": str(kind),
         "n_inputs": int(n_inputs),
-        "readnoise": float(readnoise),
-        "shape": list(master.shape),
         "algo_version": str(algo_version),
-    })
+        "shape": list(arr.shape),
+    }
+    if sidecar_extra:
+        try:
+            side.update({k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in sidecar_extra.items()})
+        except Exception:
+            side.update(sidecar_extra)
+    _write_sidecar_json(str(outp), side)
+
+
+essential_mask_names = {
+    "master_dark": "DARKMASK",
+    "master_flat": "FLATMASK",
+}
+
+
+def _load_fits_artifact(path: str, *, mask_name: Optional[str] = None):
+    """Generic FITS artifact loader.
+
+    Returns (data, header) if mask_name is None, else (data, mask, header).
+    """
+    with fits.open(Path(path)) as hdul:
+        data = np.asarray(hdul[0].data, dtype=float)
+        hdr = dict(hdul[0].header)
+        if mask_name is None:
+            return data, hdr
+        # Try to locate mask extension by name, else fall back to first extension
+        m = None
+        # Look by exact name first
+        for h in hdul[1:]:
+            if getattr(h, "name", "").upper() == str(mask_name).upper():
+                m = np.asarray(h.data, dtype=np.uint8)
+                break
+        if m is None and len(hdul) > 1:
+            m = np.asarray(hdul[1].data, dtype=np.uint8)
+        return data, m, hdr
+
+
+def save_master_bias(output_path: str, master: np.ndarray, *, n_inputs: int, readnoise: float, algo_version: str = "bias-1.0", extra_header: Optional[Dict[str, str]] = None) -> None:
+    """Write a master bias to a FITS file using the generic saver.
+
+    Preserves public contract and header semantics.
+    """
+    _save_fits_artifact(
+        kind="master_bias",
+        output_path=output_path,
+        primary=master,
+        n_inputs=n_inputs,
+        algo_version=algo_version,
+        extra_primary_cards={"BIASRN": float(readnoise)},
+        extra_header=extra_header,
+        sidecar_extra={"readnoise": float(readnoise)},
+    )
 
 
 def save_master_dark(output_path: str, master: np.ndarray, dark_mask: np.ndarray, *, n_inputs: int, bad_fraction: float, algo_version: str = "dark-1.0", extra_header: Optional[Dict[str, str]] = None) -> None:
-    """Write a master dark and its pixel mask to a FITS file.
-
-    - Primary HDU: master as float32 with NINPUTS, BADFRAC, ALGOVER
-    - ImageHDU 'DARKMASK': uint8 mask
-    - extra_header (optional) allows callers to add more cards to primary
-    """
-    from pathlib import Path
-    from .pathutils import ensure_dir
-    ensure_dir(Path(output_path).parent)
-    phdu = fits.PrimaryHDU(master.astype(np.float32))
-    phdr = phdu.header
-    phdr["NINPUTS"] = (int(n_inputs), "number of input dark frames")
-    phdr["BADFRAC"] = (float(bad_fraction), "fraction of pixels flagged in dark mask")
-    phdr["ALGOVER"] = (str(algo_version), "algorithm version")
-    if extra_header:
-        for k, v in extra_header.items():
-            try:
-                phdr[str(k)] = v
-            except Exception:
-                pass
-    mhdu = fits.ImageHDU(dark_mask.astype(np.uint8), name="DARKMASK")
-    # Atomic write to avoid torn files
-    from .pathutils import ensure_dir
-    ensure_dir(Path(output_path).parent)
-    _tmp = str(Path(output_path).with_suffix(Path(output_path).suffix + ".tmp"))
-    fits.HDUList([phdu, mhdu]).writeto(_tmp, overwrite=True)
-    Path(_tmp).replace(output_path)
-    # Write interpolation-ready sidecar summary
-    _write_sidecar_json(output_path, {
-        "kind": "master_dark",
-        "n_inputs": int(n_inputs),
-        "bad_fraction": float(bad_fraction),
-        "shape": list(master.shape),
-        "algo_version": str(algo_version),
-    })
+    """Write a master dark and its pixel mask to a FITS file using the generic saver."""
+    _save_fits_artifact(
+        kind="master_dark",
+        output_path=output_path,
+        primary=master,
+        n_inputs=n_inputs,
+        algo_version=algo_version,
+        extra_primary_cards={"BADFRAC": float(bad_fraction)},
+        extra_header=extra_header,
+        mask=dark_mask,
+        mask_name="DARKMASK",
+        sidecar_extra={"bad_fraction": float(bad_fraction)},
+    )
 
 
 def save_master_flat(output_path: str, master: np.ndarray, flat_mask: np.ndarray, *, n_inputs: int, bad_fraction: float, algo_version: str = "flat-1.0", extra_header: Optional[Dict[str, str]] = None) -> None:
-    """Write a master flat and its pixel mask to a FITS file.
-
-    - Primary HDU: master as float32 with NINPUTS, BADFRAC, ALGOVER
-    - ImageHDU 'FLATMASK': uint8 mask
-    - extra_header (optional) allows callers to add more cards to primary
-    """
-    from pathlib import Path
-    from .pathutils import ensure_dir
-    ensure_dir(Path(output_path).parent)
-    phdu = fits.PrimaryHDU(master.astype(np.float32))
-    phdr = phdu.header
-    phdr["NINPUTS"] = (int(n_inputs), "number of input flat frames")
-    phdr["BADFRAC"] = (float(bad_fraction), "fraction of pixels flagged in flat mask")
-    phdr["ALGOVER"] = (str(algo_version), "algorithm version")
-    if extra_header:
-        for k, v in extra_header.items():
-            try:
-                phdr[str(k)] = v
-            except Exception:
-                pass
-    mhdu = fits.ImageHDU(flat_mask.astype(np.uint8), name="FLATMASK")
-    # Atomic write
-    ensure_dir(Path(output_path).parent)
-    _tmp = str(Path(output_path).with_suffix(Path(output_path).suffix + ".tmp"))
-    fits.HDUList([phdu, mhdu]).writeto(_tmp, overwrite=True)
-    Path(_tmp).replace(output_path)
-    # Sidecar summary
-    _write_sidecar_json(output_path, {
-        "kind": "master_flat",
-        "n_inputs": int(n_inputs),
-        "bad_fraction": float(bad_fraction),
-        "shape": list(master.shape),
-        "algo_version": str(algo_version),
-    })
+    """Write a master flat and its pixel mask to a FITS file using the generic saver."""
+    _save_fits_artifact(
+        kind="master_flat",
+        output_path=output_path,
+        primary=master,
+        n_inputs=n_inputs,
+        algo_version=algo_version,
+        extra_primary_cards={"BADFRAC": float(bad_fraction)},
+        extra_header=extra_header,
+        mask=flat_mask,
+        mask_name="FLATMASK",
+        sidecar_extra={"bad_fraction": float(bad_fraction)},
+    )
 
 
 def load_master_bias(path: str):
@@ -191,10 +226,7 @@ def load_master_bias(path: str):
 
     Returns (array, header_dict).
     """
-    with fits.open(Path(path)) as hdul:
-        data = np.asarray(hdul[0].data, dtype=float)
-        hdr = dict(hdul[0].header)
-    return data, hdr
+    return _load_fits_artifact(path)
 
 
 def load_master_dark(path: str):
@@ -202,18 +234,7 @@ def load_master_dark(path: str):
 
     Returns (array, mask_uint8, header_dict).
     """
-    with fits.open(Path(path)) as hdul:
-        data = np.asarray(hdul[0].data, dtype=float)
-        hdr = dict(hdul[0].header)
-        mask = None
-        # Find DARKMASK extension by name or index 1
-        for h in hdul[1:]:
-            if getattr(h, "name", "").upper() == "DARKMASK":
-                mask = np.asarray(h.data, dtype=np.uint8)
-                break
-        if mask is None and len(hdul) > 1:
-            mask = np.asarray(hdul[1].data, dtype=np.uint8)
-    return data, mask, hdr
+    return _load_fits_artifact(path, mask_name="DARKMASK")
 
 
 def load_master_flat(path: str):
@@ -221,14 +242,33 @@ def load_master_flat(path: str):
 
     Returns (array, mask_uint8, header_dict).
     """
-    with fits.open(Path(path)) as hdul:
-        data = np.asarray(hdul[0].data, dtype=float)
-        hdr = dict(hdul[0].header)
-        mask = None
-        for h in hdul[1:]:
-            if getattr(h, "name", "").upper() == "FLATMASK":
-                mask = np.asarray(h.data, dtype=np.uint8)
-                break
-        if mask is None and len(hdul) > 1:
-            mask = np.asarray(hdul[1].data, dtype=np.uint8)
-    return data, mask, hdr
+    return _load_fits_artifact(path, mask_name="FLATMASK")
+
+
+def save_trace_solution(output_path: str, *, trace_2d: np.ndarray, n_inputs: int = 0, algo_version: str = "trace-1.0", extra_header: Optional[Dict[str, str]] = None) -> None:
+    """Persist a trace solution to FITS using the generic saver.
+
+    - Primary HDU: 2D trace array (float32) with NINPUTS and ALGOVER.
+    - Sidecar JSON includes kind="trace", n_inputs, algo_version, shape, and trace_len (total elements).
+    """
+    tr = np.asarray(trace_2d)
+    _save_fits_artifact(
+        kind="trace",
+        output_path=output_path,
+        primary=tr,
+        n_inputs=int(n_inputs),
+        algo_version=str(algo_version),
+        extra_primary_cards=None,
+        extra_header=extra_header,
+        mask=None,
+        mask_name=None,
+        sidecar_extra={"trace_len": int(tr.size)},
+    )
+
+
+def load_trace_solution(path: str):
+    """Load the trace array and header from a trace artifact file using the generic loader.
+
+    Returns (trace_array, header_dict).
+    """
+    return _load_fits_artifact(path)

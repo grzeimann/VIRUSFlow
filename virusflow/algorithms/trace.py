@@ -1,0 +1,360 @@
+from __future__ import annotations
+
+from typing import Iterable, Optional, Dict, Any, List
+
+import numpy as np
+from datetime import datetime
+import glob
+from astropy.convolution import convolve, Gaussian1DKernel
+from scipy.ndimage import percentile_filter
+from sklearn.preprocessing import PolynomialFeatures
+from sklearn.linear_model import HuberRegressor
+
+from ..core.artifacts import save_trace_solution, load_master_flat
+
+# Algorithm version string for this module
+ALGO_VERSION = "trace-1.0"
+
+# Input item type accepted by step_trace (kept for interface symmetry)
+TraceInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
+
+
+def _simple_trace_from_flat(master_flat: np.ndarray) -> np.ndarray:
+    """Compute a simple 1D trace proxy from a master flat image.
+
+    For each detector column, return the row index of maximum illumination.
+    Safe for NaNs. Returns float32 vector with length = nx (number of columns).
+    """
+    try:
+        img = np.asarray(master_flat, dtype=float)
+        if img.ndim != 2 or min(img.shape) == 0:
+            raise ValueError("master_flat must be a 2D array with positive shape")
+        col_max_idx = np.nanargmax(img, axis=0)
+        return col_max_idx.astype(np.float32)
+    except Exception:
+        # Fallback: all zeros vector
+        nx = int(np.asarray(master_flat).shape[1]) if np.asarray(master_flat).ndim == 2 else 0
+        return np.zeros((nx,), dtype=np.float32)
+
+
+def robust_polyfit_predict(x_obs: np.ndarray | List[float], y_obs: np.ndarray | List[float], x_pred: np.ndarray | List[float], degree: int = 4) -> np.ndarray:
+    """
+    Robust polynomial fit y(x) using a low-order polynomial and predict on x_pred.
+
+    To avoid numerical blow-up when x spans large pixel ranges (e.g., 0..1031),
+    we normalize x to [-1, 1] for both sklearn and numpy backends.
+
+    Preference order:
+    1) sklearn.linear_model.HuberRegressor with PolynomialFeatures (degree<=4)
+    2) Fallback to numpy.polyfit/polyval with the same degree (reduced if needed)
+
+    Returns a float array of shape x_pred with NaNs if insufficient data.
+    """
+    # Coerce inputs
+    x_obs = np.asarray(x_obs, dtype=float).ravel()
+    y_obs = np.asarray(y_obs, dtype=float).ravel()
+    x_pred = np.asarray(x_pred, dtype=float).ravel()
+
+    m = np.isfinite(x_obs) & np.isfinite(y_obs)
+    if m.sum() < 2:
+        return np.full(x_pred.shape, np.nan, dtype=float)
+
+    x = x_obs[m]
+    y = y_obs[m]
+    # Choose feasible degree
+    deg = int(max(1, min(int(degree), len(x) - 1)))
+
+    # Normalize x to [-1, 1] for stability
+    xmin = np.nanmin(x)
+    xmax = np.nanmax(x)
+    span = float(xmax - xmin)
+    if not np.isfinite(span) or span <= 0:
+        # Degenerate x: predict constant = median(y)
+        return np.full(x_pred.shape, float(np.nanmedian(y)), dtype=float)
+
+    def _scale(u):
+        return 2.0 * (u - xmin) / span - 1.0
+
+    xs = _scale(x)
+    xps = _scale(x_pred)
+
+    # Try robust sklearn fit
+    try:
+        PF = PolynomialFeatures(degree=deg, include_bias=False)
+        X = PF.fit_transform(xs.reshape(-1, 1))
+        Xp = PF.transform(xps.reshape(-1, 1))
+        model = HuberRegressor(epsilon=1.35, alpha=0.0, fit_intercept=True)
+        model.fit(X, y)
+        yhat = model.predict(Xp)
+        return yhat.astype(float)
+    except Exception:
+        # Numpy fallback on scaled coordinates
+        try:
+            coeff = np.polyfit(xs, y, deg=deg)
+            yhat = np.polyval(coeff, xps)
+            return yhat.astype(float)
+        except Exception:
+            return np.full(x_pred.shape, np.nan, dtype=float)
+
+def preprocess_flat_for_detection(flat: np.ndarray | List[float], perc_window: int = 201, perc: float = 5.0, poly_order: int = 2, gauss_sigma: float = 1.5) -> np.ndarray:
+    """
+    Preprocess a 1D flat (median-collapsed along columns) to aid fiber peak detection.
+
+    Steps:
+    - Estimate a smooth background using a low percentile filter (e.g., 5th) with
+      a wide window (default 201 pixels).
+    - Fit a low-order polynomial (order=2) to the percentile background to model
+      large-scale structure, and subtract it from the original profile.
+    - Smooth the background-subtracted profile with a 1D Gaussian kernel
+      (sigma≈fiber dispersion resolution; default 1.5 pixels) to boost S/N.
+
+    Parameters
+    ----------
+    flat : 1D numpy array
+        Cross-dispersion profile (e.g., median of an image chunk along x).
+    perc_window : int, optional
+        Window size for percentile filter (odd recommended).
+    perc : float, optional
+        Percentile to compute in the filter (e.g., 5.0 for 5th percentile).
+    poly_order : int, optional
+        Polynomial order for background model fit (default: 2).
+    gauss_sigma : float, optional
+        Sigma of the Gaussian kernel used for smoothing (in pixels).
+
+    Returns
+    -------
+    prof_smooth : 1D numpy array
+        Background-subtracted and smoothed profile for robust peak finding.
+        Returns a safe fallback (copy of input or median-filtered) on failure.
+    """
+    try:
+        f = np.asarray(flat, dtype=float).ravel()
+        n = f.size
+        if n == 0:
+            return f
+        # Percentile background with wide window
+        w = int(max(3, perc_window))
+        if w % 2 == 0:
+            w += 1  # prefer odd window
+        bgp = percentile_filter(f, percentile=perc, size=w, mode='nearest')
+        # Poly-2 fit to percentile curve
+        x = np.arange(n, dtype=float)
+        # Guard against singular fit: need >= (poly_order+1) points
+        if n >= (poly_order + 1):
+            coeff = np.polyfit(x, bgp, deg=int(poly_order))
+            bgfit = np.polyval(coeff, x)
+        else:
+            bgfit = bgp
+        resid = f - bgfit
+        # Smooth residuals with Gaussian 1D kernel
+        sig = float(max(0.5, gauss_sigma))
+        kernel = Gaussian1DKernel(stddev=sig)
+        prof_smooth = convolve(resid, kernel, boundary='extend', nan_treatment='interpolate', preserve_nan=False)
+        return prof_smooth
+    except Exception:
+        return np.asarray(flat, dtype=float).ravel()
+
+def get_trace_reference(specid: str, ifuslot: str, ifuid: str, amp: str, obsdate: str,
+                        virusconfig: str = '/work/03946/hetdex/maverick/virus_config') -> np.ndarray:
+    """Locate and load the closest-in-time fiber location reference file.
+
+    The directory layout is expected to be:
+      <virusconfig>/Fiber_Locations/<YYYYMMDD>/fiber_loc_<specid>_<ifuslot>_<ifuid>_<amp>.txt
+
+    Returns a NumPy array loaded from the selected reference file.
+    """
+    try:
+        from pathlib import Path
+        base = Path(virusconfig)
+        patt = base / 'Fiber_Locations' / '*' / f'fiber_loc_{specid}_{ifuslot}_{ifuid}_{amp}.txt'
+        files = sorted(glob.glob(str(patt)))
+        if not files:
+            raise FileNotFoundError(f"No fiber_loc reference found at {patt}")
+        # Extract date directory names
+        dates = [Path(fn).parent.name for fn in files]
+        # Normalize observation date
+        od = datetime(int(str(obsdate)[:4]), int(str(obsdate)[4:6]), int(str(obsdate)[6:]))
+        # Choose file with minimum |obs - ref| days
+        diffs = []
+        for ds in dates:
+            try:
+                d = datetime(int(ds[:4]), int(ds[4:6]), int(ds[6:]))
+                diffs.append(abs((od - d).days))
+            except Exception:
+                diffs.append(float('inf'))
+        best_idx = int(np.nanargmin(np.asarray(diffs, dtype=float)))
+        ref_file = np.loadtxt(files[best_idx])
+        return np.asarray(ref_file)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load trace reference for {specid}/{ifuslot}/{ifuid}/{amp} at {virusconfig}: {e}"
+        ) from e
+
+
+def _get_trace(twilight: np.ndarray, specid: str, ifuslot: str, ifuid: str, amp: str, obsdate: str, tr_folder: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute 2D fiber traces from a flat (twilight) image using reference locations.
+
+    Returns (trace_2d, ref_table, xchunks, Trace_samples), where trace_2d has
+    shape (nfiber, nx) and Trace_samples are the per-chunk sampled positions.
+    """
+    try:
+        ref = get_trace_reference(specid, ifuslot, ifuid, amp, obsdate, virusconfig=tr_folder)
+        # Number of not dead fibers (aka, good fibers)
+        N1 = int((ref[:, 1] == 0.0).sum())
+        good = np.where(ref[:, 1] == 0.0)[0]
+
+        def get_trace_chunk(flat: np.ndarray, XN: np.ndarray) -> np.ndarray:
+            YM = np.arange(flat.shape[0])
+            inds = np.zeros((3, len(XN)))
+            inds[0] = XN - 1.0
+            inds[1] = XN + 0.0
+            inds[2] = XN + 1.0
+            inds = np.array(inds, dtype=int)
+            # Parabolic interpolation for sub-pixel maxima
+            denom = (2.0 * (flat[inds[2]] - 2.0 * flat[inds[1]] + flat[inds[0]]))
+            # Avoid divide-by-zero
+            denom = np.where(denom == 0, np.nan, denom)
+            Trace = (YM[inds[1]] - (flat[inds[2]] - flat[inds[0]]) / denom)
+            return Trace
+
+        image = np.asarray(twilight, dtype=float)
+        N = 40
+        xchunks = np.array([np.mean(x) for x in np.array_split(np.arange(image.shape[1]), N)])
+        chunks = np.array_split(image, N, axis=1)
+        flats = [np.nanmedian(chunk, axis=1) for chunk in chunks]
+        Trace = np.zeros((len(ref), len(chunks)))
+        for k, (flat, _x) in enumerate(zip(flats, xchunks)):
+            # Preprocess the flat profile to improve S/N for peak detection
+            flat_proc = preprocess_flat_for_detection(flat, perc_window=201, perc=5.0, poly_order=2, gauss_sigma=1.5)
+            diff_array = flat_proc[1:] - flat_proc[:-1]
+            loc = np.where((diff_array[:-1] > 0.0) & (diff_array[1:] < 0.0))[0]
+            peaks = flat_proc[loc + 1] if loc.size else np.array([])
+
+            # Dynamically choose a cut that yields N1 peaks (number of good fibers)
+            if len(peaks) >= N1 and N1 > 0:
+                top_idx = np.argsort(peaks)[::-1][:N1]
+                loc = np.sort(loc[top_idx]) + 1
+            else:
+                loc = np.sort(loc) + 1 if loc.size else np.array([], dtype=int)
+            # Use original (unprocessed) flat for sub-pixel peak localization
+            trace = get_trace_chunk(np.asarray(flat, dtype=float), loc)
+            T = np.zeros((len(ref)))
+            if len(trace) == N1:
+                T[good] = trace
+                for missing in np.where(ref[:, 1] == 1)[0]:
+                    gind = int(np.argmin(np.abs(missing - good))) if good.size else 0
+                    T[missing] = (T[good[gind]] + ref[missing, 0] - ref[good[gind], 0])
+            # Dead Fibers found case
+            if len(trace) == len(ref):
+                T = trace
+            Trace[:, k] = T
+
+        x = np.arange(image.shape[1])
+        trace2d = np.zeros((Trace.shape[0], image.shape[1]))
+        for i in np.arange(Trace.shape[0]):
+            sel = Trace[i, :] > 0.0
+            if not np.any(sel):
+                continue
+            trace2d[i] = robust_polyfit_predict(np.asarray(xchunks)[sel], Trace[i, sel], x, degree=4)
+        if (specid == '504') and (ifuid == '018') and (amp == 'RU'):
+            return trace2d[:-1, :], ref[:-1], xchunks, Trace[:-1, :]
+        return trace2d, ref, xchunks, Trace
+    except Exception as e:
+        raise RuntimeError(f"_get_trace failed: {e}") from e
+
+def step_trace(
+    raw_inputs: Optional[Iterable[TraceInput]] = None,
+    output_path: Optional[str] = None,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build a trace solution using the existing master flat artifact.
+
+    Contract:
+    - Inputs: none strictly required, but accepted for future use.
+    - params must include one of:
+        - 'master_flat_path': direct filesystem path to a master_flat FITS
+        - 'master_flat_artifact': dict-like with key 'path' to the artifact
+    - Output: write a trace solution FITS to output_path and return metadata.
+
+    Note: This is a minimal scaffolding that migrates the get_trace concept into
+    the standard step_* algorithm form used by VIRUSFlow. A full trace solution
+    requires instrument-identifying parameters; if any are missing, this
+    function will fail fast with a clear error rather than falling back.
+    """
+    params = dict(params or {})
+
+    # Resolve master-flat path
+    mf_path: Optional[str] = params.get("master_flat_path")
+    if not mf_path:
+        mf_art = params.get("master_flat_artifact") or {}
+        try:
+            mf_path = mf_art.get("path") if isinstance(mf_art, dict) else None
+        except Exception:
+            mf_path = None
+    if not mf_path:
+        raise ValueError("step_trace requires 'master_flat_path' or 'master_flat_artifact' with a 'path'")
+
+    # Load master flat data
+    master, flat_mask, hdr = load_master_flat(str(mf_path))
+    nx = master.shape[1]
+
+    # Gather and validate required parameters
+    specid = str(params.get("specid")) if params.get("specid") is not None else None
+    ifuslot = str(params.get("ifuslot")) if params.get("ifuslot") is not None else None
+    ifuid = str(params.get("ifuid")) if params.get("ifuid") is not None else None
+    amp = str(params.get("amp")) if params.get("amp") is not None else None
+    obsdate = str(params.get("obsdate")) if params.get("obsdate") is not None else None
+    tr_folder = (
+        str(params.get("virusconfig") or params.get("trace_config") or params.get("tr_folder"))
+        if (params.get("virusconfig") or params.get("trace_config") or params.get("tr_folder")) is not None
+        else None
+    )
+
+    missing: List[str] = []
+    if specid is None or specid == "None":
+        missing.append("specid")
+    if ifuslot is None or ifuslot == "None":
+        missing.append("ifuslot")
+    if ifuid is None or ifuid == "None":
+        missing.append("ifuid")
+    if amp is None or amp == "None":
+        missing.append("amp")
+    if obsdate is None or obsdate == "None":
+        missing.append("obsdate")
+    if tr_folder is None or tr_folder == "None":
+        missing.append("virusconfig/tr_folder")
+
+    if missing:
+        raise ValueError(
+            "step_trace missing required parameters: " + ", ".join(missing) +
+            ". Provide specid, ifuslot, ifuid, amp, obsdate (YYYYMMDD), and virusconfig/tr_folder."
+        )
+
+    # Compute full trace using updated algorithm; no fallback
+    try:
+        trace_2d, ref, xchunks, Trace_samples = _get_trace(master, specid, ifuslot, ifuid, amp, obsdate, tr_folder)
+    except Exception as e:
+        raise RuntimeError(f"step_trace failed to compute trace via _get_trace: {e}") from e
+
+    if output_path is None:
+        raise ValueError("step_trace requires an explicit output_path")
+
+    # Persist the trace solution
+    save_trace_solution(
+        output_path,
+        trace_2d=trace_2d,
+        n_inputs=int(hdr.get("NINPUTS", 0)),
+        algo_version=ALGO_VERSION,
+        extra_header={
+            "SRCMFLAT": str(mf_path),
+            "MFBADFR": float(hdr.get("BADFRAC", np.nan)) if "BADFRAC" in hdr else np.nan,
+        },
+    )
+
+    return {
+        "algo": "algorithms.trace.step_trace",
+        "version": ALGO_VERSION,
+        "trace_len": int(nx),
+        "output_path": output_path,
+        "source_master_flat": str(mf_path),
+    }
