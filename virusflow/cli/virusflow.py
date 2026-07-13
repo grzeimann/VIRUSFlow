@@ -20,6 +20,7 @@ from ..core.targets import (
     FlatTarget,
     TwiTarget,
     TraceTarget,
+    WaveTarget,
     CalibrationNeed,
     build_calibration_tasks,
 )
@@ -198,6 +199,8 @@ def cmd_plan_calibrations(args: argparse.Namespace) -> None:
         CalibrationNeed(name="twi", frame_type="twi", target_cls=TwiTarget),
         # Trace depends on an existing master_flat; use 'flt' for zipcode discovery
         CalibrationNeed(name="trace", frame_type="flt", target_cls=TraceTarget),
+        # Wave depends on existing master_cmp and trace; use 'cmp' for zipcode discovery
+        CalibrationNeed(name="wave", frame_type="cmp", target_cls=WaveTarget),
     ]
 
     # If user provided explicit zipcodes, use them as-is.
@@ -229,6 +232,7 @@ def cmd_plan_calibrations(args: argparse.Namespace) -> None:
         "flat": args.flat_version,
         "twi": args.twi_version,
         "trace": args.trace_version,
+        "wave": args.wave_version,
     }
 
     # Build tasks keeping the clean outer loop over zipcodes (zipcode-major order)
@@ -282,7 +286,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         cls = get_task_class(t["name"], t.get("version"))
         target_obj = None
         tgt = t.get("target")
-        if tgt and t["name"] in ("bias", "dark", "flat", "twi", "trace"):
+        if tgt and t["name"] in ("bias", "dark", "flat", "twi", "trace", "wave"):
             z = tgt.get("zipcode", {})
             zc = ZipCode(
                 ifuslot=z.get("ifuslot", "000"),
@@ -387,6 +391,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     spc.add_argument("--flat-version", default=None, help="Flat task version, default=latest")
     spc.add_argument("--twi-version", default=None, help="Twi task version, default=latest")
     spc.add_argument("--trace-version", default=None, help="Trace task version, default=latest")
+    spc.add_argument("--wave-version", default=None, help="Wave task version, default=latest")
     spc.add_argument("--only-zipcode", help="Developer filter: comma-separated ZipCode keys (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
     spc.add_argument("--limit", type=int, help="Developer filter: limit number of zipcodes")
     spc.set_defaults(func=cmd_plan_calibrations)

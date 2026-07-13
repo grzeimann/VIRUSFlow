@@ -1,28 +1,31 @@
-# -*- coding: utf-8 -*-
+from __future__ import annotations
+
 """Wavelength solution derivation from arc spectra and traces.
 
 This module implements a robust per-fiber arc identification and expands it to
 build a full 2D wavelength map:
-- get_wave_single: detect arc peaks, match to a reference line list with
+- _get_wave_single: detect arc peaks, match to a reference line list with
   polynomial modeling and sigma-clipping, and return a per-fiber wavelength fit
   with RMS residuals.
-- get_wave: apply per-row seeds, fit across fibers/rows and along dispersion to
+- _get_wave: apply per-row seeds, fit across fibers/rows and along dispersion to
   produce a smooth wavelength solution for all pixels.
 
-Exports: get_wave, get_wave_single
+Exports: step_wave
 """
-from __future__ import annotations
 
 import numpy as np
 import logging
 from typing import Optional, Tuple
 from itertools import combinations
-from .fiber import find_peaks
+from .fiber import find_peaks, get_spectra
 from pathlib import Path
 
-__all__ = ["get_wave", "get_wave_single"]
+__all__ = ["step_wave"]
 
 logger = logging.getLogger(__name__)
+
+# Algorithm version string for this module
+ALGO_VERSION = "wave-1.0"
 
 # Default pixel length assumption for VIRUS spectra, used in some helpers
 PIXELS = 1032
@@ -31,7 +34,7 @@ PIXELS = 1032
 LINE_LIST = [3610.508, 3650.153, 4046.565, 4358.335, 4678.149, 4799.912, 4916.068, 5085.822, 5460.750]
 
 
-def suppress_close_peaks(peak_x, peak_h, min_sep=10, max_keep=25):
+def _suppress_close_peaks(peak_x, peak_h, min_sep=10, max_keep=25):
     peak_x = np.asarray(peak_x, dtype=float)
     peak_h = np.asarray(peak_h, dtype=float)
     order = np.argsort(peak_h)[::-1]
@@ -51,7 +54,7 @@ def suppress_close_peaks(peak_x, peak_h, min_sep=10, max_keep=25):
     return keep_x[s], keep_h[s]
 
 
-def match_with_model(peak_x, line_list, coeff, x_tol=8.0):
+def _match_with_model(peak_x, line_list, coeff, x_tol=8.0):
     peak_x = np.asarray(peak_x, dtype=float)
     line_list = np.asarray(line_list, dtype=float)
     wave_at_peaks = np.polyval(coeff, peak_x)
@@ -82,7 +85,7 @@ def match_with_model(peak_x, line_list, coeff, x_tol=8.0):
     return matches
 
 
-def sigma_clip_matches(matches, nsig=3.0):
+def _sigma_clip_matches(matches, nsig=3.0):
     if not matches:
         return matches
     import numpy as _np
@@ -96,7 +99,7 @@ def sigma_clip_matches(matches, nsig=3.0):
     return [m for m, g in zip(matches, good) if g]
 
 
-def refit_from_matches(matches, degree=4):
+def _refit_from_matches(matches, degree=4):
     if not matches:
         # fallback linear
         return np.array([2.0, 0.0]), 0
@@ -106,7 +109,7 @@ def refit_from_matches(matches, degree=4):
     return coeff, len(matches)
 
 
-def identify_arc(
+def _identify_arc(
     peak_x,
     peak_h,
     line_list,
@@ -116,7 +119,7 @@ def identify_arc(
     Nbrightest=6,
     final_order=4,
 ):
-    peak_x, peak_h = suppress_close_peaks(peak_x, peak_h, min_sep=min_sep, max_keep=max_keep)
+    peak_x, peak_h = _suppress_close_peaks(peak_x, peak_h, min_sep=min_sep, max_keep=max_keep)
     line_list = np.sort(np.asarray(line_list, dtype=float))
     top_peaks = np.argsort(peak_h)[::-1][:Nbrightest]
     top_peaks_x = np.sort(peak_x[top_peaks])
@@ -135,9 +138,9 @@ def identify_arc(
             best_coeff = coeff
             best_rms = rms
     coeff = best_coeff
-    matches = match_with_model(peak_x, line_list, coeff, x_tol=anchor_tol_pix)
-    coeff_fit, _ = refit_from_matches(matches, degree=final_order)
-    matches_final = match_with_model(peak_x, line_list, coeff_fit, x_tol=anchor_tol_pix)
+    matches = _match_with_model(peak_x, line_list, coeff, x_tol=anchor_tol_pix)
+    coeff_fit, _ = _refit_from_matches(matches, degree=final_order)
+    matches_final = _match_with_model(peak_x, line_list, coeff_fit, x_tol=anchor_tol_pix)
     resid = np.array([m["wave_resid"] for m in matches_final], dtype=float)
     rms = np.sqrt(np.mean(resid ** 2))
     detected_x = np.array([m["x_obs"] for m in matches_final], dtype=float)
@@ -153,7 +156,7 @@ def identify_arc(
     return best, len(matches)
 
 
-def get_wave_single(fiber_arc_spectrum, final_order=4, qa: Optional[dict] = None):
+def _get_wave_single(fiber_arc_spectrum, final_order=4, qa: Optional[dict] = None):
     """
     Derive a per-fiber wavelength solution from an arc spectrum.
 
@@ -177,7 +180,7 @@ def get_wave_single(fiber_arc_spectrum, final_order=4, qa: Optional[dict] = None
     fiber_arc_spectrum_clean = np.array(fiber_arc_spectrum, dtype=float).copy()
     fiber_arc_spectrum_clean[~np.isfinite(fiber_arc_spectrum_clean)] = 0.0
     peak_loc, peaks = find_peaks(fiber_arc_spectrum_clean, thresh=1)
-    best, _ = identify_arc(
+    best, _ = _identify_arc(
         peak_loc,
         peaks,
         LINE_LIST,
@@ -189,13 +192,12 @@ def get_wave_single(fiber_arc_spectrum, final_order=4, qa: Optional[dict] = None
     wave = np.polyval(best["coeff"], x_indices)
     return wave, best["rms"]
 
-
-def get_wave(spec: np.ndarray,
-             trace: np.ndarray,
-             T_array: Optional[np.ndarray] = None,
-             res_lim: float = 1.0,
-             order: int = 4,
-             qa: Optional[dict] = None) -> Tuple[Optional[np.ndarray], Optional[Path], Optional[np.ndarray]]:
+def _get_wave(spec: np.ndarray,
+              trace: np.ndarray,
+              T_array: Optional[np.ndarray] = None,
+              res_lim: float = 1.0,
+              order: int = 4,
+              qa: Optional[dict] = None) -> Tuple[Optional[np.ndarray], Optional[Path], Optional[np.ndarray]]:
     """
     Build a 2D wavelength solution using robust per-row arc fitting.
 
@@ -233,7 +235,7 @@ def get_wave(spec: np.ndarray,
             j0 = max(0, j - 2)
             j1 = min(nrows, j + 3)
             S = np.nanmedian(spec[j0:j1], axis=0)
-            wave_j, res = get_wave_single(S, final_order=order)
+            wave_j, res = _get_wave_single(S, final_order=order)
             w_seed[j] = wave_j
             rms[j] = res
         except Exception:
@@ -248,7 +250,7 @@ def get_wave(spec: np.ndarray,
     wave = np.zeros_like(spec, dtype=float)
 
     # Fit across rows at a sparse set of columns, then evaluate on all rows
-    # This mirrors the strategy used in fiber_utils.get_wave
+    # This mirrors the strategy used in fiber_utils._get_wave
     xi = np.hstack([np.arange(0, npix, 24), npix - 1])
     xi = np.unique(np.clip(xi, 0, npix - 1))
 
@@ -276,3 +278,82 @@ def get_wave(spec: np.ndarray,
                 return None, ref_img, rms
 
     return wave, ref_img, rms
+
+
+
+def step_wave(*,
+              cmp_spec: Optional[np.ndarray] = None,
+              master_cmp: Optional[np.ndarray] = None,
+              trace: Optional[np.ndarray] = None,
+              npix_extract: int = 5,
+              res_lim: float = 1.0,
+              order: int = 4,
+              output_path: Optional[str] = None,
+              params: Optional[dict] = None) -> dict:
+    """
+    Build the wavelength solution from spectra of the master comparison (arc) frame.
+
+    This is the public entry point for wavelength calibration. It expects either:
+    - cmp_spec: 2D array of extracted arc spectra with shape (Nrows, Npix), or
+    - master_cmp: 2D master comparison image and a corresponding 2D trace array
+      (same shape as master_cmp) to extract spectra via fiber.get_spectra.
+
+    The routine delegates the core modeling to the internal _get_wave function
+    and returns a dictionary with results and metadata. No artifact persistence is
+    currently performed because core.artifacts has no wave saver yet.
+
+    Parameters
+    ----------
+    cmp_spec : Optional[np.ndarray]
+        Pre-extracted arc spectra (Nrows x Npix). If provided, master_cmp is ignored.
+    master_cmp : Optional[np.ndarray]
+        Master comparison image used to extract spectra when cmp_spec is None.
+    trace : Optional[np.ndarray]
+        2D trace map (Nrows x Npix). Required to build the 2D wavelength model.
+    npix_extract : int
+        Extraction aperture (rows integrated around the trace) passed to get_spectra.
+    res_lim : float
+        Maximum acceptable RMS for a row to be used as a seed in _get_wave.
+    order : int
+        Polynomial order for cross-row and along-dispersion fits in _get_wave.
+    output_path : Optional[str]
+        Reserved for future use (no-op for now).
+    params : Optional[dict]
+        Reserved for future use.
+
+    Returns
+    -------
+    dict
+        {
+          "wave": 2D wavelength array or None on failure,
+          "rms_rows": 1D RMS residuals per seed row (or None),
+          "algo": "algorithms.wave.step_wave",
+          "version": ALGO_VERSION,
+          "output_path": output_path,
+        }
+    """
+    params = params or {}
+
+    if trace is None:
+        raise ValueError("step_wave requires a trace array (Nrows x Npix)")
+
+    if cmp_spec is None:
+        if master_cmp is None:
+            raise ValueError("step_wave requires either cmp_spec, or (master_cmp and trace)")
+        # Extract per-row spectra from the master CMP image using the provided trace
+        try:
+            cmp_spec = get_spectra(master_cmp, trace, npix=npix_extract)
+        except Exception as e:
+            raise RuntimeError(f"Failed to extract spectra from master_cmp/trace: {e}")
+
+    # Delegate to internal _get_wave to compute the wavelength map
+    wave, ref_img, rms_rows = _get_wave(cmp_spec, trace, T_array=None, res_lim=res_lim, order=order, qa=None)
+
+    result = {
+        "wave": wave,
+        "rms_rows": rms_rows,
+        "algo": "algorithms.wave.step_wave",
+        "version": ALGO_VERSION,
+        "output_path": output_path,
+    }
+    return result

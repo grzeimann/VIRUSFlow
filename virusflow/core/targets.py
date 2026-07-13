@@ -165,6 +165,34 @@ class TraceTarget:
 
 
 @dataclass(frozen=True)
+class WaveTarget:
+    zipcode: ZipCode
+    start_date: str
+    end_date: str
+
+    def __post_init__(self):  # type: ignore[override]
+        object.__setattr__(self, "start_date", _norm_date(self.start_date))
+        object.__setattr__(self, "end_date", _norm_date(self.end_date))
+
+    def node_id(self) -> str:
+        return f"wave:{self.zipcode.key()}:{self.start_date}:{self.end_date}"
+
+    def to_dict(self) -> Dict:
+        return {
+            "type": "wave",
+            "zipcode": {
+                "ifuslot": self.zipcode.ifuslot,
+                "ifuid": self.zipcode.ifuid,
+                "specid": self.zipcode.specid,
+                "amp": self.zipcode.amp,
+                "controller": self.zipcode.controller,
+            },
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+        }
+
+
+@dataclass(frozen=True)
 class CalibrationNeed:
     name: str            # task name, e.g., 'bias', 'dark'
     frame_type: str      # raw frame_type required, e.g., 'zro', 'drk'

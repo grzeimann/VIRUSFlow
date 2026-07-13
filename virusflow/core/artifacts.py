@@ -356,6 +356,14 @@ def load_master_twi(path: str):
     return _load_fits_artifact(path)
 
 
+def load_master_cmp(path: str):
+    """Load master comparison (cmp) array and header from a FITS artifact file.
+
+    Returns (array, header_dict).
+    """
+    return _load_fits_artifact(path)
+
+
 def save_trace_solution(output_path: str, *, trace_2d: np.ndarray, n_inputs: int = 0, algo_version: str = "trace-1.0", extra_header: Optional[Dict[str, str]] = None) -> None:
     """Persist a trace solution to FITS using the generic saver.
 
@@ -381,5 +389,37 @@ def load_trace_solution(path: str):
     """Load the trace array and header from a trace artifact file using the generic loader.
 
     Returns (trace_array, header_dict).
+    """
+    return _load_fits_artifact(path)
+
+
+def save_wave_solution(output_path: str, *, wave_2d: np.ndarray, n_inputs: int = 0, algo_version: str = "wave-1.0", rms_median: float | None = None, extra_header: Optional[Dict[str, str]] = None) -> None:
+    """Persist a wavelength solution to FITS using the generic saver.
+
+    - Primary HDU: 2D wavelength array (float32) with NINPUTS and ALGOVER.
+    - Sidecar JSON includes kind="wave", n_inputs, algo_version, shape, and rms_median if provided.
+    """
+    wv = np.asarray(wave_2d)
+    side = {}
+    if rms_median is not None:
+        side["rms_median"] = float(rms_median)
+    _save_fits_artifact(
+        kind="wave",
+        output_path=output_path,
+        primary=wv,
+        n_inputs=int(n_inputs),
+        algo_version=str(algo_version),
+        extra_primary_cards=None,
+        extra_header=extra_header,
+        mask=None,
+        mask_name=None,
+        sidecar_extra=side,
+    )
+
+
+def load_wave_solution(path: str):
+    """Load the wavelength solution array and header from a wave artifact file using the generic loader.
+
+    Returns (wave_array, header_dict).
     """
     return _load_fits_artifact(path)
