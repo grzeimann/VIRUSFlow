@@ -34,6 +34,20 @@ conda env create -f environment.yml
 conda activate virusflow
 ```
 
+Run tests
+
+To run the test suite with pytest:
+
+```bash
+# If you used pip with dev extras
+pip install -e .[dev]
+pytest -q
+
+# Or if you created the conda env from environment.yml
+conda activate virusflow
+pytest -q
+```
+
 Quickstart
 
 - Ensure Python 3.10+ (the environment.yml sets this automatically).
