@@ -16,7 +16,7 @@ import numpy as np
 from astropy.stats import biweight_location
 
 from .ccd import base_reduction
-from ..core.artifacts import save_master_twi
+from ..artifacts.io_fits import write_array_fits
 
 # Algorithm version string for this module
 ALGO_VERSION = "twi-1.0"
@@ -84,7 +84,18 @@ def step_twi(
     master = biweight_location(stack, axis=0, ignore_nan=True)
 
     if output_path is not None:
-        save_master_twi(output_path, master, n_inputs=len(frames), algo_version=ALGO_VERSION)
+        write_array_fits(
+            output_path,
+            data=master,
+            n_inputs=len(frames),
+            algo_version=ALGO_VERSION,
+            sidecar={
+                "kind": "master_twi",
+                "role": "calibration",
+                "payload_type": "array",
+                "storage_format": "fits",
+            },
+        )
 
     return {
         "n_inputs": len(frames),

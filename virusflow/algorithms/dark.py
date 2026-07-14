@@ -18,7 +18,7 @@ import numpy as np
 from astropy.stats import biweight_location, sigma_clipped_stats
 
 from .ccd import base_reduction
-from ..core.artifacts import save_master_dark
+from ..artifacts.io_fits import write_array_fits
 
 __all__ = ["step_dark"]
 logger = logging.getLogger(__name__)
@@ -126,9 +126,24 @@ def step_dark(
     n_bad = int(dark_mask.sum())
     frac_bad = float(n_bad) / float(dark_mask.size)
 
-    # Write artifact via centralized helper
+    # Write artifact via generic FITS I/O with explicit sidecar and DARKMASK extension
     if output_path is not None:
-        save_master_dark(output_path, master, dark_mask, n_inputs=len(frames), bad_fraction=frac_bad, algo_version=ALGO_VERSION)
+        write_array_fits(
+            output_path,
+            data=master,
+            n_inputs=len(frames),
+            algo_version=ALGO_VERSION,
+            extra_primary_cards={"BADFRAC": float(frac_bad)},
+            mask=dark_mask,
+            mask_name="DARKMASK",
+            sidecar={
+                "kind": "master_dark",
+                "role": "calibration",
+                "payload_type": "array",
+                "storage_format": "fits",
+                "bad_fraction": float(frac_bad),
+            },
+        )
 
     return {
         "n_inputs": len(frames),

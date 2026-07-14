@@ -40,6 +40,8 @@ class ArtifactMaterializer:
         header_cards: Optional[Dict] = None,
         extra_header: Optional[Dict] = None,
         sidecar: Optional[Dict] = None,
+        mask=None,
+        mask_name: Optional[str] = None,
     ) -> None:
         """Persist a 1D/2D array as FITS with a compact sidecar.
 
@@ -57,6 +59,8 @@ class ArtifactMaterializer:
             algo_version=algo_version,
             extra_primary_cards=header_cards,
             extra_header=extra_header,
+            mask=mask,
+            mask_name=mask_name,
             sidecar=sc,
         )
 

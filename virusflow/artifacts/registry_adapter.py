@@ -37,7 +37,7 @@ class RegistryAdapter:
             "params": (art.provenance.params if art.provenance else {}),
             "parents": [int(p) for p in (art.provenance.parents if art.provenance else [])],
         }
-        from ..core.provenance import build_provenance
+        from ..artifacts.provenance import build_provenance
         prov_row = build_provenance(algorithm=prov["algorithm"], params=prov["params"], parents=[str(p) for p in prov["parents"]])
         return db.save_artifact(legacy_like, prov_row, db_path=self.db_path)
 

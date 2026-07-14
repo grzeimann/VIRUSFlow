@@ -1,13 +1,10 @@
 from __future__ import annotations
 
 import hashlib
-import os
 import subprocess
-from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, Iterable, Optional
 
-from .artifacts import ProvenanceInfo
 from .. import get_version
 
 
@@ -30,17 +27,24 @@ def param_hash(params: Dict[str, Any]) -> str:
     - Hash with SHA-256 and return a short prefix for readability.
     """
     import json
+
     payload = json.dumps(params or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     h = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return h[:16]
 
 
-def build_provenance(algorithm: str, params: Dict[str, Any], parents: Iterable[str] | None = None) -> ProvenanceInfo:
-    return ProvenanceInfo(
-        software_version=get_version(),
-        git_commit=current_git_commit(),
-        algorithm=algorithm,
-        parameters_hash=param_hash(params),
-        parents=list(parents) if parents else [],
-        created_at=datetime.utcnow(),
-    )
+def build_provenance(
+    algorithm: str, params: Dict[str, Any], parents: Iterable[str] | None = None
+) -> Dict[str, Any]:
+    """Build a plain dict provenance record for registry/database.save_artifact.
+
+    Located under virusflow.artifacts to fully decouple from legacy core.* modules.
+    """
+    return {
+        "software_version": get_version(),
+        "git_commit": current_git_commit(),
+        "algorithm": algorithm,
+        "parameters_hash": param_hash(params),
+        "parents": list(parents) if parents else [],
+        "created_at": datetime.utcnow(),
+    }

@@ -17,7 +17,7 @@ import logging
 import numpy as np
 from astropy.stats import biweight_location
 from .ccd import base_reduction
-from ..core.artifacts import save_master_bias
+from ..artifacts.io_fits import write_array_fits
 
 __all__ = ["step_bias"]
 logger = logging.getLogger(__name__)
@@ -99,9 +99,22 @@ def step_bias(
     # Scalar readnoise estimate
     readnoise = float(np.nanmedian(mad))
 
-    # Write artifact via centralized helper
+    # Write artifact via generic FITS I/O with explicit sidecar
     if output_path is not None:
-        save_master_bias(output_path, master, n_inputs=len(frames), readnoise=readnoise, algo_version=ALGO_VERSION)
+        write_array_fits(
+            output_path,
+            data=master,
+            n_inputs=len(frames),
+            algo_version=ALGO_VERSION,
+            extra_primary_cards={"BIASRN": float(readnoise)},
+            sidecar={
+                "kind": "master_bias",
+                "role": "calibration",
+                "payload_type": "array",
+                "storage_format": "fits",
+                "readnoise": float(readnoise),
+            },
+        )
 
     return {
         "readnoise": readnoise,

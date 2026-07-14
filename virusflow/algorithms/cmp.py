@@ -19,7 +19,8 @@ import numpy as np
 from astropy.stats import biweight_location
 
 from .ccd import base_reduction, repair_masked_columns
-from ..core.artifacts import save_master_cmp, build_union_pixelmask
+from ..artifacts.io_fits import write_array_fits
+from .utils.masks import build_union_pixelmask
 
 __all__ = ["step_cmp"]
 logger = logging.getLogger(__name__)
@@ -119,7 +120,18 @@ def step_cmp(
 
     if output_path is not None:
         # Persist the repaired image (if repairs were applied) as the master CMP
-        save_master_cmp(output_path, repaired, n_inputs=len(frames), algo_version=ALGO_VERSION)
+        write_array_fits(
+            output_path,
+            data=repaired,
+            n_inputs=len(frames),
+            algo_version=ALGO_VERSION,
+            sidecar={
+                "kind": "master_cmp",
+                "role": "calibration",
+                "payload_type": "array",
+                "storage_format": "fits",
+            },
+        )
 
     if errors:
         logger.warning("step_cmp encountered %d reduction errors; proceeding with %d good frames", len(errors), len(frames))
