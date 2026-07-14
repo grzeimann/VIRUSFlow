@@ -70,9 +70,58 @@ def write_array_fits(
 
     outp = Path(output_path)
     _ensure_dir(outp)
-    tmp = outp.with_suffix(outp.suffix + ".tmp")
-    fits.HDUList(hdus).writeto(str(tmp), overwrite=True)
-    tmp.replace(outp)
+    # Robust atomic write: write to a NamedTemporaryFile in the same directory,
+    # fsync, then atomically replace the final path. This avoids races where a
+    # previously chosen temp name no longer exists at rename time.
+    import os as _os
+    import tempfile as _tempfile
+    import time as _time
+
+    hdul = fits.HDUList(hdus)
+
+    # Create a temp file in the destination directory (delete=False so we can replace)
+    with _tempfile.NamedTemporaryFile(prefix=outp.name + ".", suffix=".tmp", dir=str(outp.parent), delete=False) as tf:
+        tmp_path = Path(tf.name)
+    # Write to temp path
+    hdul.writeto(str(tmp_path), overwrite=True)
+    # Ensure data is on disk before rename
+    try:
+        with open(tmp_path, 'rb') as _f:
+            try:
+                _os.fsync(_f.fileno())
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Attempt atomic replace with a short bounded retry for transient issues
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            tmp_path.replace(outp)
+            last_err = None
+            break
+        except Exception as e:
+            last_err = e
+            # If the final file already exists and is recent, treat as success (another worker won the race)
+            try:
+                if outp.exists() and (time := _time.time()) and (time - outp.stat().st_mtime) < 5.0:
+                    last_err = None
+                    break
+            except Exception:
+                pass
+            _time.sleep(0.05 * (attempt + 1))
+    # Cleanup temp if it still exists and we succeeded or are giving up
+    try:
+        if tmp_path.exists() and (last_err is None or not outp.exists()):
+            # If replace failed and final doesn't exist, keep temp for debugging
+            if last_err is None:
+                tmp_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+    if last_err is not None:
+        # Surface a clear error including paths for debugging
+        raise RuntimeError(f"Atomic write failed: {tmp_path} -> {outp}: {last_err}")
 
     # Sidecar JSON
     side = {

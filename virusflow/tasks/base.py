@@ -207,7 +207,7 @@ class CalibrationTask(Task):
             zipcode=getattr(self.target, "zipcode", None),
             db_path=self.ctx.db_path,
         )
-        raw_inputs = [{"path": r.path, "tar_member": r.tar_member} for (_id, r) in scoped]
+        raw_inputs = [{"path": r.path, "tar_member": r.tar_member, "storage_backend": r.storage_backend} for (_id, r) in scoped]
         parent_ids = [pid for (pid, _r) in scoped if pid is not None]
         if not raw_inputs:
             zkey = getattr(self.target, "zipcode", None)
@@ -215,6 +215,20 @@ class CalibrationTask(Task):
             raise RuntimeError(
                 f"No raw '{self.frame_type}' frames found for zipcode={zkey} in date window {self.target.start_date}..{self.target.end_date}"
             )
+        # Optional debug print of a few resolved inputs for visibility during failures
+        try:
+            dbg_inputs = bool(self.ctx.config.get("debug_inputs", False)) if isinstance(self.ctx.config, dict) else False
+        except Exception:
+            dbg_inputs = False
+        if dbg_inputs:
+            try:
+                n = len(raw_inputs)
+                sample = raw_inputs[:3]
+                print(f"[Debug] {self.__class__.__name__}: resolved {n} '{self.frame_type}' inputs. Sample:")
+                for s in sample:
+                    print(f"  - path={s.get('path')} tar_member={s.get('tar_member')} backend={s.get('storage_backend')}")
+            except Exception:
+                pass
         return raw_inputs, parent_ids
 
     def output_path(self) -> str:
@@ -289,6 +303,13 @@ class CalibrationTask(Task):
             status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind=qa_kind, meta=dict(meta or {}))
             if dbg and status:
                 print(f"[QA] {self.__class__.__name__}: auto-qa status={status} kind={qa_kind} artifact_id={art_id}")
+            # Enforce policy: hard-fail kinds with status=fail
+            try:
+                if svc.diagnostics.should_block(kind=qa_kind, status=status):
+                    raise RuntimeError(f"QA hard-fail for {qa_kind} (artifact_id={art_id})")
+            except Exception:
+                # Do not block on errors computing policy
+                pass
         except Exception:
             # Never fail the task on QA evaluation errors
             pass

@@ -44,11 +44,14 @@ class PlanningTargetAdapter:
     - zipcode: ZipCode from the planning target's scope
     - start_date: YYYYMMDD derived from window.start (or None if absent)
     - end_date: YYYYMMDD derived from window.end (or None if absent)
+    - start_dt/end_dt: precise datetimes preserved from planning window for filename disambiguation
     """
 
     zipcode: object
     start_date: Optional[str]
     end_date: Optional[str]
+    start_dt: Optional[datetime] = None
+    end_dt: Optional[datetime] = None
 
     @classmethod
     def from_planning(cls, t: Target) -> "PlanningTargetAdapter":
@@ -61,6 +64,8 @@ class PlanningTargetAdapter:
             zipcode=z,
             start_date=_dt_to_date_str(ws),
             end_date=_dt_to_date_str(we),
+            start_dt=ws,
+            end_dt=we,
         )
 
 

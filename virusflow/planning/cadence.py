@@ -19,7 +19,7 @@ from ..registry import database as db
 from .targets import TemporalWindow
 
 
-def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_days: int, min_n_inputs: int = 1) -> List[TemporalWindow]:
+def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_days: int, min_n_inputs: int = 1, start_date: str | None = None, end_date: str | None = None) -> List[TemporalWindow]:
     """Enumerate periodic windows for a zipcode.
 
     Refined minimal behavior:
@@ -31,11 +31,11 @@ def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_d
     z = scope.zipcode
     if z is None:
         return []
-    # Probe raw files presence for the zipcode and frame_type across a wide date range.
-    ALL_START = "19000101"
-    ALL_END = "21000101"
+    # Probe raw files presence for the zipcode and frame_type across a requested or wide date range.
+    SD = start_date or "19000101"
+    ED = end_date or "21000101"
     try:
-        rows = db.list_raw_files_scoped(frame_type=frame_type, start_date=ALL_START, end_date=ALL_END, zipcode=z, db_path=db_path)
+        rows = db.list_raw_files_scoped(frame_type=frame_type, start_date=SD, end_date=ED, zipcode=z, db_path=db_path)
     except Exception:
         # Fallback: attempt unscoped listing and filter client-side when older APIs are present
         raw = db.list_raw_files(exposure_id=None, db_path=db_path)
@@ -46,7 +46,28 @@ def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_d
                     rows.append((0, r))
             except Exception:
                 pass
+    # If a planning window was provided and there are any rows in that window, emit a concrete window even if below min_n_inputs.
     if len(rows) < int(min_n_inputs):
+        if start_date or end_date:
+            # derive bounds and emit a single window if any timestamps are parsable
+            def _parse_exposure_id(eid: str):
+                from datetime import datetime as _dt
+                s = str(eid)
+                base = s.split(".")[0]
+                try:
+                    return _dt.strptime(base, "%Y%m%dT%H%M%S")
+                except Exception:
+                    try:
+                        return _dt.strptime(base[:8], "%Y%m%d")
+                    except Exception:
+                        return None
+            times: List[datetime] = []
+            for (_rid, rf) in rows:
+                t = _parse_exposure_id(getattr(rf, "exposure_id", None))
+                if t is not None:
+                    times.append(t)
+            if times:
+                return [TemporalWindow(start=min(times), end=max(times))]
         return []
     # Derive concrete window bounds from exposure_id timestamps
     def _parse_exposure_id(eid: str):
@@ -73,7 +94,7 @@ def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_d
     return [TemporalWindow(start=start_t, end=end_t)]
 
 
-def exposure_count_windows(*, db_path: str, scope: Scope, frame_type: str, min_n: int, max_span_days: int) -> List[TemporalWindow]:
+def exposure_count_windows(*, db_path: str, scope: Scope, frame_type: str, min_n: int, max_span_days: int, start_date: str | None = None, end_date: str | None = None) -> List[TemporalWindow]:
     """Enumerate windows by rolling exposure counts.
 
     Implementation notes:
@@ -90,11 +111,11 @@ def exposure_count_windows(*, db_path: str, scope: Scope, frame_type: str, min_n
     z = scope.zipcode
     if z is None:
         return []
-    # Fetch all rows for this zipcode+frame_type across a generous date range
-    ALL_START = "19000101"
-    ALL_END = "21000101"
+    # Fetch rows for this zipcode+frame_type across requested or generous date range
+    SD = start_date or "19000101"
+    ED = end_date or "21000101"
     try:
-        rows = db.list_raw_files_scoped(frame_type=frame_type, start_date=ALL_START, end_date=ALL_END, zipcode=z, db_path=db_path)
+        rows = db.list_raw_files_scoped(frame_type=frame_type, start_date=SD, end_date=ED, zipcode=z, db_path=db_path)
     except TypeError:
         # Fallback path: list_raw_files (no zipcode scoping available); filter client-side
         raw = db.list_raw_files(exposure_id=None, db_path=db_path)

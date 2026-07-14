@@ -6,7 +6,6 @@ import json
 import numpy as np
 
 from .models import QAPacket
-from .diagnostics import evaluate_and_save
 from .plot_utils import plot_identify_arc_summary, plot_trace_overlay
 
 
@@ -90,11 +89,12 @@ def build_qa(
     status: Optional[str] = None
     if db_path is not None:
         try:
-            status = evaluate_and_save(
-                artifact_id or -1,
+            from ..artifacts.service import ArtifactService as _ArtSvc
+            svc = _ArtSvc(str(db_path))
+            status = svc.diagnostics.evaluate_and_save(
+                artifact_id=artifact_id or -1,
                 kind=k,
                 meta={**(algo_meta or {}), **metrics},
-                db_path=str(db_path),
             )
         except Exception:
             status = None

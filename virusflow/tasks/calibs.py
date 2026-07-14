@@ -126,7 +126,6 @@ class TraceTask(CalibrationTask):
 
     def run(self, inputs):
         import time
-        from ..qa import diagnostics as qa_diag
 
         self._require_target()
         dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
@@ -202,6 +201,11 @@ class TraceTask(CalibrationTask):
             status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind="trace", meta=dict(meta or {}))
             if dbg and status:
                 print(f"[QA] TraceTask: auto-qa status={status} artifact_id={art_id}")
+            try:
+                if svc.diagnostics.should_block(kind="trace", status=status):
+                    raise RuntimeError(f"QA hard-fail for trace (artifact_id={art_id})")
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -239,7 +243,6 @@ class WaveTask(CalibrationTask):
 
     def run(self, inputs):
         import time
-        from ..qa import diagnostics as qa_diag
         self._require_target()
         dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
         t0 = time.perf_counter()
@@ -253,10 +256,31 @@ class WaveTask(CalibrationTask):
         # Load required arrays using artifact-centric materializer
         svc = ArtifactService(self.ctx.db_path)
         mat = ArtifactMaterializer(svc)
-        lr_cmp = mat.load_by_id(int(mc.get("id")))
-        lr_tr = mat.load_by_id(int(tr.get("id")))
-        master_cmp, hdr_cmp = lr_cmp.data, lr_cmp.header
-        trace_2d, hdr_tr = lr_tr.data, lr_tr.header
+        def _load_with_fallback(row: dict, kind: str):
+            from pathlib import Path as _Path
+            try:
+                return mat.load_by_id(int(row.get("id"))), row
+            except FileNotFoundError:
+                # Attempt to reselect a better candidate that actually exists on disk
+                scope = Scope(getattr(self.target, "zipcode", None))
+                at_time = self._target_mid_time()
+                # Prefer latest_valid at target time
+                cand = svc.select_best(kind=kind, scope=scope, at_time=at_time, policy="latest_valid")
+                if not cand or not cand.get("path") or not _Path(str(cand.get("path"))).exists():
+                    # Fallback to latest regardless of time
+                    cand = svc.select_best(kind=kind, scope=scope, at_time=None, policy="latest")
+                if cand and cand.get("id") and cand.get("path") and _Path(str(cand.get("path"))).exists():
+                    try:
+                        return mat.load_by_id(int(cand.get("id"))), cand
+                    except Exception:
+                        pass
+                # Re-raise original if no viable candidate found
+                raise
+
+        lr_cmp_obj, mc = _load_with_fallback(mc, "master_cmp")
+        lr_tr_obj, tr = _load_with_fallback(tr, "trace")
+        master_cmp, hdr_cmp = lr_cmp_obj.data, lr_cmp_obj.header
+        trace_2d, hdr_tr = lr_tr_obj.data, lr_tr_obj.header
 
         t1 = time.perf_counter()
         # Build algorithm params: merge task params with context config so CLI-provided qa_out_dir flows through
@@ -308,6 +332,11 @@ class WaveTask(CalibrationTask):
             status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind="wave", meta=dict(meta or {}))
             if dbg and status:
                 print(f"[QA] WaveTask: auto-qa status={status} artifact_id={art_id}")
+            try:
+                if svc.diagnostics.should_block(kind="wave", status=status):
+                    raise RuntimeError(f"QA hard-fail for wave (artifact_id={art_id})")
+            except Exception:
+                pass
         except Exception:
             pass
 

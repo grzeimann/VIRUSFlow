@@ -91,6 +91,7 @@ class ReductionGraph:
         scopes: Sequence[Scope],
         when: Optional[TemporalWindow] = None,
         service_factory: Optional[callable] = None,
+        force_replan: bool = False,
     ) -> Tuple[List[Target], PlanningReport]:
         """Emit a set of Targets to execute in topological order.
 
@@ -111,70 +112,116 @@ class ReductionGraph:
                 return None
             return min(int(getattr(e, "tolerance_days", 0) or 0) for e in es) or None
 
+        # Track which windows were planned per kind and scope to enable
+        # planning of artifact-driven nodes without raw inputs (e.g., trace, wave).
+        planned_windows: Dict[Tuple[str, str], List[TemporalWindow]] = {}
+
+        def _scope_key(scope: Scope) -> str:
+            try:
+                z = getattr(scope, "zipcode", None)
+                if z is None:
+                    return "__global__"
+                k = getattr(z, "key", None)
+                return str(k() if callable(k) else k or str(z))
+            except Exception:
+                return "__global__"
+
+        def _emit(kind: str, scope: Scope, win: Optional[TemporalWindow], reason_forced: bool = False):
+            # Shared emission with idempotency and tolerance handling
+            tol_days = _edge_tolerance_for(kind)
+            tgt = Target(kind=kind, scope=scope, window=win)
+            if reason_forced or force_replan:
+                planned.append(tgt)
+                try:
+                    report.reasons[_tkey(tgt)] = "forced_replan"
+                except Exception:
+                    pass
+            else:
+                # Idempotency: consult registry for an existing artifact
+                at_time = getattr(win, "start", None) if win is not None else None
+                existing = svc.select_best(kind=kind, scope=scope, at_time=at_time, policy="latest_valid")
+                if existing is not None:
+                    reason = "already_registered"
+                    if tol_days is not None and at_time is not None:
+                        try:
+                            created = existing.get("created_at")
+                            if isinstance(created, str):
+                                from datetime import datetime as _dt
+                                try:
+                                    created_dt = _dt.fromisoformat(created)
+                                except Exception:
+                                    created_dt = _dt.strptime(created.split(".")[0], "%Y-%m-%d %H:%M:%S")
+                            else:
+                                created_dt = created  # assume datetime
+                            delta_days = abs((created_dt - at_time).days) if (created_dt and at_time) else 0
+                            if delta_days <= int(tol_days):
+                                report.existing.append(tgt)
+                                report.reasons[_tkey(tgt)] = "already_registered_within_tolerance"
+                                return
+                            else:
+                                reason = "existing_outside_tolerance"
+                        except Exception:
+                            pass
+                    report.existing.append(tgt)
+                    report.reasons[_tkey(tgt)] = reason
+                    return
+                planned.append(tgt)
+            # Record planned window for downstream propagation
+            if win is not None:
+                key = (kind, _scope_key(scope))
+                planned_windows.setdefault(key, []).append(win)
+
         for node in self.nodes:
+            has_raw = bool(node.inputs_raw)
+            has_up = bool(node.inputs_artifacts)
             if node.cadence is None:
-                # Non-cadence nodes (e.g., science or derived steps) are not enumerated
-                # by default here.
+                # Non-cadence nodes that depend on artifacts: schedule per upstream windows
+                if not has_up:
+                    continue
+                for scope in scopes:
+                    key_src = (node.inputs_artifacts[0], _scope_key(scope)) if node.inputs_artifacts else None
+                    src_wins = planned_windows.get(key_src, []) if key_src else []
+                    for win in src_wins:
+                        _emit(node.kind, scope, win)
                 continue
 
-            # Cadence-driven calibration nodes
-            frame_type = (node.inputs_raw or [None])[0] or ""
+            # Cadence-driven nodes
             for scope in scopes:
-                # Enumerate windows based on the cadence policy type
-                windows: Sequence[TemporalWindow]
-                try:
-                    # Prefer explicit windows() if implementation provided
-                    windows = node.cadence.windows(frame_type=frame_type, scope=scope, db_path=db_path)
-                except NotImplementedError:
-                    # Fallback to built-in helpers based on cadence type
-                    from .targets import TimeCadence, ExposureCountCadence  # local import to avoid cycles
-                    from .cadence import time_cadence_windows, exposure_count_windows
-                    c = node.cadence
-                    if isinstance(c, TimeCadence):
-                        windows = time_cadence_windows(db_path=db_path, scope=scope, frame_type=frame_type, every_days=c.every_days, min_n_inputs=c.min_n_inputs)
-                    elif isinstance(c, ExposureCountCadence):
-                        windows = exposure_count_windows(db_path=db_path, scope=scope, frame_type=frame_type, min_n=c.min_n, max_span_days=c.max_span_days)
-                    else:
-                        windows = [TemporalWindow(start=None, end=None)]
-
-                tol_days = _edge_tolerance_for(node.kind)
-                for win in windows:
-                    tgt = Target(kind=node.kind, scope=scope, window=win)
-                    # Idempotency: consult registry for an existing artifact
-                    existing = svc.select_best(kind=node.kind, scope=scope, at_time=win.start, policy="latest_valid")
-                    if existing is not None:
-                        # If a tolerance applies and we have a concrete window start,
-                        # check whether the existing artifact is within tolerance.
-                        reason = "already_registered"
-                        if tol_days is not None and getattr(win, "start", None) is not None:
+                windows: Sequence[TemporalWindow] = []
+                if has_raw:
+                    frame_type = (node.inputs_raw or [None])[0] or ""
+                    try:
+                        windows = node.cadence.windows(frame_type=frame_type, scope=scope, db_path=db_path)
+                    except NotImplementedError:
+                        from .targets import TimeCadence, ExposureCountCadence  # local import to avoid cycles
+                        from .cadence import time_cadence_windows, exposure_count_windows
+                        c = node.cadence
+                        sd = ed = None
+                        if when is not None:
                             try:
-                                created = existing.get("created_at")
-                                if isinstance(created, str):
-                                    from datetime import datetime as _dt
-                                    try:
-                                        created_dt = _dt.fromisoformat(created)
-                                    except Exception:
-                                        # Some rows may store dates without tz; attempt loose parsing
-                                        created_dt = _dt.strptime(created.split(".")[0], "%Y-%m-%d %H:%M:%S")
-                                else:
-                                    created_dt = created  # assume datetime
-                                ws = win.start  # type: ignore[assignment]
-                                delta_days = abs((created_dt - ws).days) if (created_dt and ws) else 0
-                                if delta_days <= int(tol_days):
-                                    report.existing.append(tgt)
-                                    report.reasons[_tkey(tgt)] = "already_registered_within_tolerance"
-                                    continue
-                                else:
-                                    # Outside tolerance: plan a new one
-                                    reason = "existing_outside_tolerance"
+                                ws = getattr(when, "start", None)
+                                we = getattr(when, "end", None)
+                                if ws is not None:
+                                    sd = ws.strftime("%Y%m%d")
+                                if we is not None:
+                                    ed = we.strftime("%Y%m%d")
                             except Exception:
-                                # On any parsing error, fall back to skipping as already registered
-                                pass
-                        # Default: treat as existing and skip
-                        report.existing.append(tgt)
-                        report.reasons[_tkey(tgt)] = reason
-                        continue
-                    planned.append(tgt)
+                                sd = ed = None
+                        if isinstance(c, TimeCadence):
+                            windows = time_cadence_windows(db_path=db_path, scope=scope, frame_type=frame_type, every_days=c.every_days, min_n_inputs=c.min_n_inputs, start_date=sd, end_date=ed)
+                        elif isinstance(c, ExposureCountCadence):
+                            windows = exposure_count_windows(db_path=db_path, scope=scope, frame_type=frame_type, min_n=c.min_n, max_span_days=c.max_span_days, start_date=sd, end_date=ed)
+                        else:
+                            windows = [TemporalWindow(start=None, end=None)]
+                elif has_up:
+                    # Derive windows by propagating from first upstream kind planned for this scope
+                    key_src = (node.inputs_artifacts[0], _scope_key(scope)) if node.inputs_artifacts else None
+                    windows = list(planned_windows.get(key_src, [])) if key_src else []
+                else:
+                    windows = []
+
+                for win in windows:
+                    _emit(node.kind, scope, win)
 
         report.planned = planned
         return planned, report

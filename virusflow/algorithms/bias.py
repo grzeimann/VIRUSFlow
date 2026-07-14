@@ -86,7 +86,9 @@ def step_bias(
             errors.append(f"[{idx}] {err}")
 
     if not frames:
-        raise RuntimeError("No readable bias frames provided to step_bias")
+        # Aggregate a few input errors to aid debugging without changing behavior
+        detail = ("; ".join(errors[:5])) if errors else "no per-input errors captured"
+        raise RuntimeError(f"No readable bias frames provided to step_bias (n_inputs={n_inputs}). Sample errors: {detail}")
 
     # Align shapes (ensure all equal); if not, raise
     shapes = {f.shape for f in frames}

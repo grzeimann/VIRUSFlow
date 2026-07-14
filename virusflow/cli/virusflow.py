@@ -171,6 +171,148 @@ def cmd_qa_list(args: argparse.Namespace) -> None:
         return
     print(format_artifacts_table(rows, csv=bool(args.csv)))
 
+
+def cmd_qa_eval(args: argparse.Namespace) -> None:
+    """Re-evaluate QA for a single artifact.
+
+    Uses --meta JSON when provided; if --from-summary is set, uses ArtifactService.describe(...)["summary"].
+    """
+    import json as _json
+    from ..artifacts import ArtifactService
+    svc = ArtifactService(args.db)
+    art_id = int(args.artifact_id)
+    kind = args.kind
+    meta = None
+    if args.meta:
+        try:
+            meta = _json.loads(args.meta)
+        except Exception as e:
+            raise SystemExit(f"Invalid --meta JSON: {e}")
+    elif args.from_summary:
+        try:
+            desc = svc.describe(art_id)
+            meta = desc.get("summary") if isinstance(desc, dict) else None
+        except Exception:
+            meta = None
+    status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind=kind, meta=meta or {})
+    print(f"QA evaluate: artifact_id={art_id} kind={kind} status={status}")
+
+
+essential_kinds = {"master_bias", "master_dark", "master_flat", "master_cmp", "trace", "wave"}
+
+
+def cmd_qa_backfill(args: argparse.Namespace) -> None:
+    """Re-evaluate QA for many artifacts, optionally filtered by kind and date.
+
+    By default uses summary-derived meta when --from-summary is set; otherwise passes an empty meta.
+    """
+    import datetime as _dt
+    from ..artifacts import ArtifactService
+    svc = ArtifactService(args.db)
+    rows = db.list_artifacts(kind=args.kind, zipcode=None, db_path=args.db, limit=args.limit)
+    # Optional since filter based on created_at when present
+    if args.since:
+        try:
+            since_dt = _dt.datetime.strptime(str(args.since), "%Y%m%d")
+        except Exception:
+            raise SystemExit("--since must be YYYYMMDD")
+        def _ok(r):
+            ca = r.get("created_at")
+            if not ca:
+                return True
+            try:
+                return _dt.datetime.fromisoformat(str(ca)) >= since_dt
+            except Exception:
+                return True
+        rows = [r for r in rows if _ok(r)]
+    n = 0
+    n_fail = 0
+    for r in rows:
+        try:
+            art_id = int(r.get("id"))
+            kind = args.kind or str(r.get("kind"))
+            meta = None
+            if args.from_summary:
+                try:
+                    desc = svc.describe(r)
+                    meta = desc.get("summary") if isinstance(desc, dict) else None
+                except Exception:
+                    meta = None
+            if args.dry_run:
+                print(f"[dry-run] would evaluate artifact_id={art_id} kind={kind}")
+                continue
+            status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind=kind, meta=meta or {})
+            print(f"artifact_id={art_id} kind={kind} status={status}")
+            n += 1
+            if str(status).lower() == "fail":
+                n_fail += 1
+        except Exception as e:
+            print(f"error evaluating artifact id={r.get('id')}: {e}")
+    if not args.dry_run:
+        print(f"Backfill complete: evaluated={n}, failures={n_fail}")
+
+# ------------------ Debugging helpers ------------------
+
+def cmd_debug_raw(args: argparse.Namespace) -> None:
+    """Probe raw inputs for a zipcode and frame type without running algorithms.
+
+    Prints a concise table and optionally attempts a single CCD base reduction on the first item.
+    """
+    from ..registry import database as _db
+    import os as _os
+    import tarfile as _tarfile
+    from astropy.io import fits as _fits
+    # Ensure algorithms I/O knows which registry DB to use for tar member reads
+    try:
+        from ..algorithms.io import set_registry_db_path as _set_registry_db_path
+        _set_registry_db_path(args.db)
+    except Exception:
+        pass
+
+    zc = parse_zipcode_key(args.zipcode) if getattr(args, "zipcode", None) else None
+    if zc is None:
+        print("--zipcode is required (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
+        return
+    sd = args.start_date or "19000101"
+    ed = args.end_date or "21000101"
+    rows = _db.list_raw_files_scoped(frame_type=args.frame_type, start_date=sd, end_date=ed, zipcode=zc, db_path=args.db)
+    if not rows:
+        print("No raw files found for the given filters.")
+        return
+    print(f"Found {len(rows)} raw files for frame_type={args.frame_type} zipcode={zc.key()} {sd}..{ed}")
+    # Show up to N samples
+    N = int(args.limit or 10)
+    for (rid, rf) in rows[:N]:
+        exists = _os.path.exists(rf.path)
+        info = f"id={rid} path={rf.path} member={rf.tar_member} backend={rf.storage_backend} exists={exists}"
+        print(" - " + info)
+        # For tar members, optionally verify readability
+        if args.verify and rf.storage_backend == "tar" and rf.tar_member and exists:
+            try:
+                with _tarfile.open(rf.path, mode="r:") as tf:
+                    m = tf.getmember(rf.tar_member)
+                    ef = tf.extractfile(m) if m is not None else None
+                    if ef is None:
+                        print("   [verify] cannot extract member (None)")
+                    else:
+                        with _fits.open(ef, memmap=False):
+                            print("   [verify] FITS header read OK")
+            except Exception as e:
+                print(f"   [verify] error: {e}")
+    # Optional single base_reduction probe
+    if args.probe:
+        try:
+            import virusflow.algorithms.ccd as _ccd
+        except Exception as e:  # pragma: no cover
+            print(f"Probe unavailable (import error): {e}")
+            return
+        (rid0, rf0) = rows[0]
+        try:
+            img, _hdr = _ccd.base_reduction(rf0.path, rf0.tar_member, return_header=False)
+            print(f"Probe success: shape={getattr(img, 'shape', None)} from path={rf0.path} member={rf0.tar_member}")
+        except Exception as e:
+            print(f"Probe failed: {e}")
+
 # ------------------ Planner subcommands ------------------
 
 
@@ -208,6 +350,13 @@ def _run_planned(args: argparse.Namespace) -> None:
     from ..artifacts.models import Scope
     from ..registry import database as _db
 
+    # Respect --qa-yaml by setting VF_QA_YAML for the QA engine
+    try:
+        if getattr(args, "qa_yaml", None):
+            os.environ["VF_QA_YAML"] = str(args.qa_yaml)
+    except Exception:
+        pass
+
     # Load external planning YAML if provided
     cfg_obj: PlanningConfig | None = None
     if getattr(args, "planning_yaml", None):
@@ -220,8 +369,32 @@ def _run_planned(args: argparse.Namespace) -> None:
     G = ReductionGraph(nodes, edges)
     # Determine scopes: list zipcodes that have any raw files in optional date window
     zcs = _db.list_zipcodes(db_path=args.db, frame_type=None, start_date=getattr(args, "plan_start_date", None), end_date=getattr(args, "plan_end_date", None))
+    # Optional developer filter: only specified zipcode keys
+    only_keys = getattr(args, "only_zipcodes", None)
+    if only_keys:
+        try:
+            want = {s.strip() for s in str(only_keys).split(",") if s.strip()}
+            zcs = [zc for zc in zcs if zc.key() in want]
+            if not zcs:
+                print("Note: --only-zipcodes filter resulted in 0 scopes; nothing to plan.")
+        except Exception:
+            pass
     scopes = [Scope(zc) for zc in zcs]
-    planned, report = G.plan(db_path=args.db, scopes=scopes)
+    # Build an optional planning window from CLI args
+    from ..planning.targets import TemporalWindow as _TemporalWindow
+    def _parse_ymd(s: Optional[str]):
+        if not s:
+            return None
+        try:
+            from datetime import datetime as _dt
+            return _dt.strptime(str(s), "%Y%m%d")
+        except Exception:
+            return None
+    w_start = _parse_ymd(getattr(args, "plan_start_date", None))
+    w_end = _parse_ymd(getattr(args, "plan_end_date", None))
+    when_win = _TemporalWindow(start=w_start, end=w_end) if (w_start or w_end) else None
+
+    planned, report = G.plan(db_path=args.db, scopes=scopes, when=when_win, force_replan=bool(getattr(args, "force_replan", False)))
     # Persist a simple planning report YAML alongside workdir
     ensure_dir(args.workdir)
     rep_path = Path(args.workdir) / "planning_report.yml"
@@ -282,6 +455,12 @@ def _run_planned(args: argparse.Namespace) -> None:
     # Automatic execution of planned calibrations unless --plan-only is passed
     if getattr(args, "plan_only", False):
         return
+    # Ensure algorithms I/O knows which registry DB to use for tar member reads during execution
+    try:
+        from ..algorithms.io import set_registry_db_path as _set_registry_db_path  # type: ignore
+        _set_registry_db_path(args.db)
+    except Exception:
+        pass
     # Execute scheduled tasks
     from ..planning import schedule as _schedule, adapt_target as _adapt_target
     from ..tasks.mapping import default_kind_to_task as _default_kind_to_task
@@ -289,7 +468,7 @@ def _run_planned(args: argparse.Namespace) -> None:
     if _schedule is None:
         raise RuntimeError("planning.schedule is unavailable")
     # Build context and mapping
-    cfg = {"workers": args.workers, "debug_timing": bool(args.debug_timing)}
+    cfg = {"workers": args.workers, "debug_timing": bool(args.debug_timing), "debug_inputs": bool(getattr(args, "debug_inputs", False))}
     if getattr(args, "qa_out_dir", None):
         cfg["qa_out_dir"] = args.qa_out_dir
     # Experimental mapping helper controls
@@ -319,7 +498,24 @@ def _run_planned(args: argparse.Namespace) -> None:
         execp.add_task(st.id, st.task, kind=st.kind, depends_on=st.depends_on)
     ensure_dir(args.workdir)
     execp.run()
-    print("Run complete (planning-first default path)")
+    # Print executor summary if available
+    try:
+        stats = getattr(execp, "execution_stats", {}) or {}
+        total = int(stats.get("total", 0))
+        ok_n = int(stats.get("succeeded", 0))
+        fail_n = int(stats.get("failed", 0))
+        print(f"Run complete (planning-first default path): executed={total}, ok={ok_n}, failed={fail_n}")
+        if fail_n > 0:
+            # Show a few sample failures to aid debugging
+            fails = list(stats.get("failures", []))[:5]
+            for f in fails:
+                try:
+                    print(f" - Failed {f.get('kind','?')} node {f.get('id','?')}: {f.get('reason','')}")
+                except Exception:
+                    pass
+            print("Hint: re-run with --debug-timing for detailed progress and errors.")
+    except Exception:
+        print("Run complete (planning-first default path)")
 
 
 
@@ -390,6 +586,30 @@ def main(argv: Optional[list[str]] = None) -> None:
     qal.add_argument("--limit", type=int, help="Limit number of rows")
     qal.add_argument("--csv", action="store_true", help="Output as CSV")
     qal.set_defaults(func=cmd_qa_list)
+    qae = qa_sub.add_parser("eval", help="Evaluate QA for a specific artifact", parents=[global_opts])
+    qae.add_argument("--artifact-id", required=True, help="Artifact id")
+    qae.add_argument("--kind", required=True, help="Artifact kind (e.g., trace, wave)")
+    qae.add_argument("--meta", help="JSON dict of algo meta or summary to feed QA engine")
+    qae.add_argument("--from-summary", action="store_true", help="Use ArtifactService.describe(summary) as meta if --meta not provided")
+    qae.set_defaults(func=cmd_qa_eval)
+    qab = qa_sub.add_parser("backfill", help="Re-evaluate QA for many artifacts", parents=[global_opts])
+    qab.add_argument("--kind", help="Only re-evaluate this kind (optional)")
+    qab.add_argument("--since", help="Only artifacts created since YYYYMMDD (optional)")
+    qab.add_argument("--limit", type=int, help="Limit number of artifacts (optional)")
+    qab.add_argument("--from-summary", action="store_true", help="Use ArtifactService.describe(summary) as meta for each artifact")
+    qab.add_argument("--dry-run", action="store_true", help="Do not write results, just show planned actions")
+    qab.set_defaults(func=cmd_qa_backfill)
+
+    # debug-raw helper
+    sp_dbg = sub.add_parser("debug-raw", help="Probe raw inputs for a zipcode and frame type", parents=[global_opts])
+    sp_dbg.add_argument("--zipcode", required=True, help="ZipCode key (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
+    sp_dbg.add_argument("--frame-type", required=True, help="Frame type (e.g., zro, drk, flt)")
+    sp_dbg.add_argument("--start-date", help="Filter start date YYYYMMDD")
+    sp_dbg.add_argument("--end-date", help="Filter end date YYYYMMDD")
+    sp_dbg.add_argument("--limit", type=int, help="Show up to N sample rows (default 10)")
+    sp_dbg.add_argument("--verify", action="store_true", help="For tar members, verify FITS header readability via tarfile+astropy")
+    sp_dbg.add_argument("--probe", action="store_true", help="Attempt a single algorithms.ccd.base_reduction on the first candidate and report")
+    sp_dbg.set_defaults(func=cmd_debug_raw)
 
     # plan group with subcommands
     plan_p = sub.add_parser("plan", help="Create a YAML plan from scientific intent")
@@ -430,15 +650,20 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("--workdir", default=str(Path.cwd() / "work"), help="Working directory")
     sp.add_argument("--workers", type=int, default=4, help="Worker threads for algorithms and task batches (set 0 for serial)")
     sp.add_argument("--qa-out-dir", help="Directory to write QA outputs (plots and JSON packets)")
+    sp.add_argument("--qa-yaml", help="Path to QA rules YAML (overrides VF_QA_YAML and default docs/qa_default.yml)")
     sp.add_argument("--debug-timing", action="store_true", help="Print timing diagnostics during run")
+    sp.add_argument("--debug-inputs", action="store_true", help="Print a few resolved raw inputs per task (paths/tar_members)")
     # Planning options
     sp.add_argument("--planning-yaml", help="Path to planning rules YAML to override defaults (see docs/planning_config.md)")
     sp.add_argument("--plan-only", action="store_true", help="Only perform planning and write planning_report.yml to --workdir, do not execute tasks")
     sp.add_argument("--plan-start-date", help="Planning date window start (YYYYMMDD)")
     sp.add_argument("--plan-end-date", help="Planning date window end (YYYYMMDD)")
+    sp.add_argument("--only-zipcodes", help="Comma-separated ZipCode keys to limit planning (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
     # Mapping helper controls (science→calib selection centralization)
     sp.add_argument("--use-mapping-helper", action="store_true", help="Use planning.mapping.select_for_edge for artifact selection inside tasks (experimental)")
     sp.add_argument("--mapping-tolerance-days", type=int, help="Optional tolerance window (days) for mapping helper when selecting parent calibrations")
+    # Force planning controls
+    sp.add_argument("--force-replan", action="store_true", help="Force planning even if an existing artifact is registered (rebuild calibrations)")
     sp.set_defaults(func=cmd_run)
 
     args = p.parse_args(argv)
