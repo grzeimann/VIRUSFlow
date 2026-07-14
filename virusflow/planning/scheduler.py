@@ -64,6 +64,7 @@ def schedule(
     edges: Sequence[Edge],
     kind_to_task: Dict[str, type],
     task_context_factory: Optional[callable] = None,
+    target_adapter: Optional[callable] = None,
 ) -> List[ScheduledTask]:
     """Build a simple schedule in topological order of kinds.
 
@@ -107,7 +108,8 @@ def schedule(
                 task_obj = object()
             else:
                 ctx = task_context_factory() if task_context_factory else None
-                task_obj = task_cls(ctx, target=t)
+                tgt_for_task = target_adapter(t) if target_adapter else t
+                task_obj = task_cls(ctx, target=tgt_for_task)
             # Determine deps: for each incoming edge (src→dst with dst==kind), depend on src task of same scope
             deps_ids: List[str] = []
             scope_k = _scope_key(t)

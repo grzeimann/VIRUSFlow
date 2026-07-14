@@ -22,21 +22,29 @@ from .targets import TemporalWindow
 def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_days: int, min_n_inputs: int = 1) -> List[TemporalWindow]:
     """Enumerate periodic windows for a zipcode.
 
-    Minimal stub behavior (DB-lite):
-    - If there are at least `min_n_inputs` raw files of the given frame_type for the scope.zipcode,
-      return a single open window (start=None, end=None) to indicate "build a target".
+    Minimal behavior:
+    - If there are at least `min_n_inputs` raw files of the given frame_type for the scope.zipcode
+      across all time, return a single open window (start=None, end=None) to indicate "build a target".
     - Otherwise, return an empty list.
     """
     z = scope.zipcode
     if z is None:
         return []
-    # Probe raw files presence for the zipcode and frame_type across the DB.
+    # Probe raw files presence for the zipcode and frame_type across a wide date range.
+    ALL_START = "19000101"
+    ALL_END = "21000101"
     try:
-        rows = db.list_raw_files_scoped(frame_type=frame_type, start_date=None, end_date=None, zipcode=z, db_path=db_path)
-    except TypeError:
-        # Older signature might not accept None dates; fall back to list_raw_files and filter exposure table
-        rows = db.list_raw_files(exposure_id=None, db_path=db_path)
-        rows = [r for r in rows if (str(r.get("frame_type")) == frame_type and str(r.get("zipcode")) == z.key())]
+        rows = db.list_raw_files_scoped(frame_type=frame_type, start_date=ALL_START, end_date=ALL_END, zipcode=z, db_path=db_path)
+    except Exception:
+        # Fallback: attempt unscoped listing and filter client-side when older APIs are present
+        raw = db.list_raw_files(exposure_id=None, db_path=db_path)
+        rows = []
+        for r in raw:
+            try:
+                if str(getattr(r, "frame_type", getattr(r, "frame_type", None))) == frame_type and getattr(r, "zipcode", None) and r.zipcode.key() == z.key():
+                    rows.append((0, r))
+            except Exception:
+                pass
     if len(rows) < int(min_n_inputs):
         return []
     # In a future refinement, split by every_days buckets and enforce per-bucket counts.
@@ -46,18 +54,83 @@ def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_d
 def exposure_count_windows(*, db_path: str, scope: Scope, frame_type: str, min_n: int, max_span_days: int) -> List[TemporalWindow]:
     """Enumerate windows by rolling exposure counts.
 
-    Minimal stub behavior:
-    - If at least min_n raw files exist for the given frame_type and zipcode, return a single open window.
-    - Otherwise, return empty.
+    Implementation notes:
+    - Uses registry.database.list_raw_files_scoped with a wide date range to fetch all
+      raw rows for the zipcode and frame_type, then orders by exposure_id (which is
+      time-encoded as YYYYMMDDTHHMMSS[.N]) as a stable proxy for observation time.
+    - Emits non-overlapping windows where each window starts at the first exposure in
+      the bucket and closes when either:
+        a) we have accumulated >= min_n exposures, or
+        b) the span between the first and current exposure exceeds max_span_days.
+    - Window bounds are precise datetimes derived from exposure_id; end is set to the
+      time of the last exposure in the window (half-open semantics left to callers).
     """
     z = scope.zipcode
     if z is None:
         return []
+    # Fetch all rows for this zipcode+frame_type across a generous date range
+    ALL_START = "19000101"
+    ALL_END = "21000101"
     try:
-        rows = db.list_raw_files_scoped(frame_type=frame_type, start_date=None, end_date=None, zipcode=z, db_path=db_path)
+        rows = db.list_raw_files_scoped(frame_type=frame_type, start_date=ALL_START, end_date=ALL_END, zipcode=z, db_path=db_path)
     except TypeError:
-        rows = db.list_raw_files(exposure_id=None, db_path=db_path)
-        rows = [r for r in rows if (str(r.get("frame_type")) == frame_type and str(r.get("zipcode")) == z.key())]
-    if len(rows) < int(min_n):
+        # Fallback path: list_raw_files (no zipcode scoping available); filter client-side
+        raw = db.list_raw_files(exposure_id=None, db_path=db_path)
+        rows = []
+        for r in raw:
+            try:
+                if str(getattr(r, "frame_type", getattr(r, "frame_type", None))) == frame_type and getattr(r, "zipcode", None) and r.zipcode.key() == z.key():
+                    rows.append((0, r))  # id unknown; we don't use it here
+            except Exception:
+                pass
+    if not rows:
         return []
-    return [TemporalWindow(start=None, end=None)]
+    # Parse exposure_id → datetime and sort
+    def _parse_exposure_id(eid: str):
+        from datetime import datetime as _dt
+        s = str(eid)
+        # Expect formats like 20260511T035810.4 or 20260511T035810
+        base = s.split(".")[0]
+        try:
+            return _dt.strptime(base, "%Y%m%dT%H%M%S")
+        except Exception:
+            # As a fallback, try YYYYMMDD only
+            try:
+                return _dt.strptime(base[:8], "%Y%m%d")
+            except Exception:
+                return None
+    items = []
+    for (_rid, rf) in rows:
+        t = _parse_exposure_id(getattr(rf, "exposure_id", None))
+        if t is not None:
+            items.append((t, rf))
+    items.sort(key=lambda x: x[0])
+    if not items:
+        return []
+    # Roll windows
+    from datetime import timedelta
+    out: List[TemporalWindow] = []
+    i = 0
+    n = len(items)
+    while i < n:
+        start_t, _ = items[i]
+        count = 1
+        j = i
+        last_t = start_t
+        while j + 1 < n:
+            nxt_t, _ = items[j + 1]
+            span_days = (nxt_t - start_t).days
+            if span_days > int(max_span_days):
+                break
+            count += 1
+            j += 1
+            last_t = nxt_t
+            if count >= int(min_n):
+                break
+        if count >= int(min_n) or (last_t - start_t).days >= int(max_span_days):
+            out.append(TemporalWindow(start=start_t, end=last_t))
+            i = j + 1
+        else:
+            # Not enough exposures and span not exceeded; stop accumulating further
+            break
+    return out

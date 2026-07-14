@@ -58,6 +58,26 @@ class Task:
                     params["target"] = str(t)
             except Exception:
                 params["target"] = str(self.target)
+            # Also thread validity_start/end (as datetimes) derived from target window when available
+            try:
+                from datetime import datetime as _dt
+                sd = getattr(self.target, "start_date", None)
+                ed = getattr(self.target, "end_date", None)
+                def _parse_ymd(s):
+                    if not s:
+                        return None
+                    s = str(s)
+                    if len(s) >= 8:
+                        return _dt.strptime(s[:8], "%Y%m%d")
+                    return None
+                vstart = _parse_ymd(sd)
+                vend = _parse_ymd(ed)
+                if vstart is not None:
+                    params.setdefault("validity_start", vstart)
+                if vend is not None:
+                    params.setdefault("validity_end", vend)
+            except Exception:
+                pass
 
         # Construct service scope
         from ..artifacts import ArtifactService, Scope, Artifact as NewArtifact, StorageRef, Provenance
@@ -131,13 +151,41 @@ class CalibrationTask(Task):
         Searches by zipcode and, when possible, selects the artifact valid at the
         midpoint of the target window via ArtifactService.select_best. Falls back
         to the latest by zipcode if a time-qualified match is not found.
+
+        When the feature flag is enabled (ctx.config.use_mapping_helper or
+        environment VF_MAP_HELPER=1), consult the planning.mapping.select_for_edge
+        helper to centralize policy+tolerance handling. Optional tolerance can be
+        configured via ctx.config.mapping_tolerance_days.
         """
+        import os as _os
         self._require_target()
         zipcode = getattr(self.target, "zipcode", None)
         at_time = self._target_mid_time()
         svc = ArtifactService(self.ctx.db_path)
         scope = Scope(zipcode=zipcode)
-        row = svc.select_best(kind=kind, scope=scope, at_time=at_time, policy="latest_valid")
+        use_helper = False
+        try:
+            use_helper = bool(getattr(self.ctx, "config", {}).get("use_mapping_helper", False))
+        except Exception:
+            use_helper = False
+        if not use_helper:
+            use_helper = (_os.environ.get("VF_MAP_HELPER", "0") == "1")
+        if use_helper:
+            try:
+                from ..planning import select_for_edge as _select_for_edge  # type: ignore
+            except Exception:
+                _select_for_edge = None  # type: ignore
+            tol = None
+            try:
+                tol = getattr(self.ctx, "config", {}).get("mapping_tolerance_days")
+            except Exception:
+                tol = None
+            if _select_for_edge is not None:
+                row = _select_for_edge(kind=kind, scope=scope, at_time=at_time, policy="latest_valid", tolerance_days=tol, service=svc)
+            else:
+                row = svc.select_best(kind=kind, scope=scope, at_time=at_time, policy="latest_valid")
+        else:
+            row = svc.select_best(kind=kind, scope=scope, at_time=at_time, policy="latest_valid")
         if not row:
             row = svc.select_best(kind=kind, scope=scope, at_time=None, policy="latest")
         if not row:

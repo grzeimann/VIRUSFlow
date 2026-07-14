@@ -24,17 +24,26 @@ class RegistryAdapter:
         """
         # Map to a simple dict structure expected by db.save_artifact (decoupled from legacy dataclasses)
         zipcode = art.scope.zipcode if art.scope else None
+        # Extract optional validity_start/end from provenance params if provided
+        vstart = None
+        vend = None
+        try:
+            p = (art.provenance.params if art.provenance else {}) or {}
+            vstart = p.get("validity_start")
+            vend = p.get("validity_end")
+        except Exception:
+            p = {}
         legacy_like = {
             "kind": art.kind,
             "name": art.kind,
             "path": art.storage.uri if art.storage else None,
             "zipcode": zipcode,
-            "validity_start": None,
-            "validity_end": None,
+            "validity_start": vstart,
+            "validity_end": vend,
         }
         prov = {
             "algorithm": art.provenance.algorithm if art.provenance else "unknown",
-            "params": (art.provenance.params if art.provenance else {}),
+            "params": p,
             "parents": [int(p) for p in (art.provenance.parents if art.provenance else [])],
         }
         from ..artifacts.provenance import build_provenance

@@ -279,7 +279,7 @@ def cmd_run(args: argparse.Namespace) -> None:
 
     # Optional planning phase (configurable via --planning-yaml / --plan-only)
     did_plan = False
-    if getattr(args, "planning_yaml", None) or getattr(args, "plan_only", False) or getattr(args, "plan_start_date", None) or getattr(args, "plan_end_date", None):
+    if getattr(args, "planning_yaml", None) or getattr(args, "plan_only", False) or getattr(args, "plan_start_date", None) or getattr(args, "plan_end_date", None) or getattr(args, "execute_planned", False):
         from ..planning import (
             load_planning_config,
             PlanningConfig,
@@ -294,6 +294,12 @@ def cmd_run(args: argparse.Namespace) -> None:
             cfg_obj = load_planning_config(args.planning_yaml)
         # Build default graph and apply overrides
         nodes, edges = default_calibration_graph(cfg_obj)
+        # Preflight: validate planning graph
+        try:
+            from ..planning import validate_graph, PlanningValidationError
+            validate_graph(nodes, edges)
+        except Exception as _ve:
+            raise SystemExit(f"Planning graph validation failed: {_ve}")
         G = ReductionGraph(nodes, edges)
         # Determine scopes: list zipcodes that have any raw files in optional date window
         zcs = _db.list_zipcodes(db_path=args.db, frame_type=None, start_date=getattr(args, "plan_start_date", None), end_date=getattr(args, "plan_end_date", None))
@@ -355,6 +361,47 @@ def cmd_run(args: argparse.Namespace) -> None:
             pass
         print(f"Planning complete: wrote {rep_path}")
         did_plan = True
+        # Optional execution of planned calibrations using the thin scheduler
+        if bool(getattr(args, "execute_planned", False)) or os.environ.get("VF_RUN_PLANNED", "0") == "1":
+            try:
+                from ..planning import schedule as _schedule, ScheduledTask as _ScheduledTask, adapt_target as _adapt_target
+                from ..planning import default_calibration_graph as _unused  # keep import for completeness
+                from ..tasks.mapping import default_kind_to_task as _default_kind_to_task
+                from ..tasks.base import TaskContext as _TaskContext
+                if _schedule is None:
+                    raise RuntimeError("planning.schedule is unavailable")
+                # Build context and mapping
+                cfg = {"workers": args.workers, "debug_timing": bool(args.debug_timing)}
+                if getattr(args, "qa_out_dir", None):
+                    cfg["qa_out_dir"] = args.qa_out_dir
+                # Experimental mapping helper controls
+                if getattr(args, "use_mapping_helper", False):
+                    cfg["use_mapping_helper"] = True
+                if getattr(args, "mapping_tolerance_days", None) is not None:
+                    cfg["mapping_tolerance_days"] = int(args.mapping_tolerance_days)
+                ctx = _TaskContext(db_path=args.db, workdir=args.workdir, config=cfg)
+                def _ctx_factory():
+                    return ctx
+                kind_map = _default_kind_to_task()
+                scheduled = _schedule(
+                    targets=report.planned,
+                    nodes=nodes,
+                    edges=edges,
+                    kind_to_task=kind_map,
+                    task_context_factory=_ctx_factory,
+                    target_adapter=_adapt_target,
+                )
+                # Submit to LocalExecutor
+                exec = LocalExecutor(max_workers=(args.workers if args.workers and args.workers > 0 else 1), debug=bool(args.debug_timing))
+                # Add tasks preserving dependencies
+                for st in scheduled:
+                    exec.add_task(st.id, st.task, depends_on=st.depends_on)
+                ensure_dir(args.workdir)
+                exec.run()
+                print("Run complete (planning-first path)")
+                return
+            except Exception as e:
+                print(f"Planning-first execution path failed: {e}. Falling back to legacy plan file path.")
         if getattr(args, "plan_only", False):
             return
 
@@ -374,6 +421,11 @@ def cmd_run(args: argparse.Namespace) -> None:
     cfg = {"workers": args.workers, "debug_timing": bool(args.debug_timing)}
     if getattr(args, "qa_out_dir", None):
         cfg["qa_out_dir"] = args.qa_out_dir
+    # Experimental mapping helper controls (also apply to legacy run path)
+    if getattr(args, "use_mapping_helper", False):
+        cfg["use_mapping_helper"] = True
+    if getattr(args, "mapping_tolerance_days", None) is not None:
+        cfg["mapping_tolerance_days"] = int(args.mapping_tolerance_days)
     ctx = TaskContext(db_path=args.db, workdir=args.workdir, config=cfg)
 
     # Instantiate tasks (target-scoped when provided)
@@ -550,6 +602,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("--plan-only", action="store_true", help="Only perform planning and write planning_report.yml to --workdir, do not execute tasks")
     sp.add_argument("--plan-start-date", help="Planning date window start (YYYYMMDD)")
     sp.add_argument("--plan-end-date", help="Planning date window end (YYYYMMDD)")
+    sp.add_argument("--execute-planned", action="store_true", help="Execute planned calibrations directly using the thin scheduler (bypasses legacy plan file)")
+    # Mapping helper controls (science→calib selection centralization)
+    sp.add_argument("--use-mapping-helper", action="store_true", help="Use planning.mapping.select_for_edge for artifact selection inside tasks (experimental)")
+    sp.add_argument("--mapping-tolerance-days", type=int, help="Optional tolerance window (days) for mapping helper when selecting parent calibrations")
     sp.set_defaults(func=cmd_run)
 
     args = p.parse_args(argv)

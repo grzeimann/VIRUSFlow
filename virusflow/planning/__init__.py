@@ -10,6 +10,9 @@ from .config import (
     load_planning_config,
     load_planning_config_from_dict,
 )
+from .adapter import PlanningTargetAdapter, adapt_target
+from .validate import validate_edges, validate_graph, PlanningValidationError
+from .mapping import select_for_edge
 # Optional thin scheduler (planning-first execution assembly)
 try:
     from .scheduler import schedule, ScheduledTask  # type: ignore
@@ -24,6 +27,9 @@ __all__ = [
     "CadencePolicy",
     "TimeCadence",
     "ExposureCountCadence",
+    # adapter
+    "PlanningTargetAdapter",
+    "adapt_target",
     # graph
     "TaskSpec",
     "Edge",
@@ -35,6 +41,8 @@ __all__ = [
     "PlanningConfig",
     "load_planning_config",
     "load_planning_config_from_dict",
+    # mapping helper
+    "select_for_edge",
     # scheduler (optional)
     "schedule",
     "ScheduledTask",

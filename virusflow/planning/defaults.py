@@ -32,6 +32,11 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
     - master_cmp: TimeCadence(every_days=90, min_n_inputs=1), inputs_artifacts=["master_flat"]
     - trace: derived, inputs_artifacts=["master_flat"], no cadence
     - wave: derived, inputs_artifacts=["master_cmp", "trace"], no cadence
+
+    Config surface:
+    - To declare preprocessing prerequisites for master_flat (e.g., master_bias/master_dark),
+      provide nodes.master_flat.params.preprocess_requires: ["master_bias", "master_dark"] in the planning YAML.
+      When set, edges from each listed kind to master_flat are added by default.
     """
     # Nodes
     bias = TaskSpec(
@@ -85,13 +90,36 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
 
     nodes = [bias, dark, flat, cmpn, trace, wave]
 
-    # Edges
+    # Edges (base)
     edges: List[Edge] = [
         Edge(src=flat, dst=trace, policy="latest_valid", tolerance_days=90),
         Edge(src=cmpn, dst=wave, policy="latest_valid", tolerance_days=90),
     ]
 
-    # Apply external overrides if provided
+    # Optional preprocessing dependencies for master_flat via config params
+    if config is not None:
+        try:
+            ncfg = config.nodes.get("master_flat") if hasattr(config, "nodes") else None
+            params = getattr(ncfg, "params", None)
+            reqs = []
+            if isinstance(params, dict):
+                val = params.get("preprocess_requires")
+                if isinstance(val, (list, tuple)):
+                    reqs = [str(x).strip() for x in val if str(x).strip()]
+            if reqs:
+                by_kind = {n.kind: n for n in nodes}
+                for rk in reqs:
+                    src_n = by_kind.get(rk)
+                    if src_n is None:
+                        continue
+                    # Avoid duplicates
+                    exists = any((e.src.kind == rk and e.dst.kind == "master_flat") for e in edges)
+                    if not exists:
+                        edges.append(Edge(src=src_n, dst=flat, policy="latest_valid", tolerance_days=90))
+        except Exception:
+            pass
+
+    # Apply external overrides if provided (edges replaced only if config.edges is non-empty)
     if config is not None:
         nodes, edges = config.apply_overrides(nodes, edges)
 
