@@ -33,6 +33,18 @@ class RegistryAdapter:
             vend = p.get("validity_end")
         except Exception:
             p = {}
+            vstart = None
+            vend = None
+        # Ensure JSON-serializable params: convert datetime values to ISO strings for provenance params
+        def _jsonable(val):
+            try:
+                from datetime import datetime as _dt
+                if isinstance(val, _dt):
+                    return val.isoformat()
+            except Exception:
+                pass
+            return val
+        p = {k: (_jsonable(v)) for k, v in dict(p).items()}
         legacy_like = {
             "kind": art.kind,
             "name": art.kind,

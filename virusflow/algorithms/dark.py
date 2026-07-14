@@ -97,6 +97,8 @@ def step_dark(
             img, _err = base_reduction(p, tm, return_header=False)
             return img, i, None
         except Exception as e:
+            # Do not implement test-only fallbacks in production algorithms; tests should
+            # provide inputs via fixtures/mocks. Propagate error for the caller to handle.
             return None, i, str(e)
 
     frames: List[np.ndarray] = []

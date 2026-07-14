@@ -51,6 +51,16 @@ class Node:
 
 class TaskGraph:
     def __init__(self) -> None:
+        # Emit deprecation warning on use: TaskGraph is superseded by planning scheduler
+        try:
+            import warnings as _warnings
+            _warnings.warn(
+                "TaskGraph is deprecated; prefer the planning-first path and thin scheduler (virusflow.planning.scheduler).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        except Exception:
+            pass
         self.nodes: Dict[str, Node] = {}
 
     def add(self, node_id: str, task: object, depends_on: List[str] | None = None) -> None:

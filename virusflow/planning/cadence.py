@@ -22,9 +22,10 @@ from .targets import TemporalWindow
 def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_days: int, min_n_inputs: int = 1) -> List[TemporalWindow]:
     """Enumerate periodic windows for a zipcode.
 
-    Minimal behavior:
+    Refined minimal behavior:
     - If there are at least `min_n_inputs` raw files of the given frame_type for the scope.zipcode
-      across all time, return a single open window (start=None, end=None) to indicate "build a target".
+      across all time, return a single concrete window covering the min..max exposure timestamps
+      observed for that frame_type in this zipcode.
     - Otherwise, return an empty list.
     """
     z = scope.zipcode
@@ -47,8 +48,29 @@ def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_d
                 pass
     if len(rows) < int(min_n_inputs):
         return []
-    # In a future refinement, split by every_days buckets and enforce per-bucket counts.
-    return [TemporalWindow(start=None, end=None)]
+    # Derive concrete window bounds from exposure_id timestamps
+    def _parse_exposure_id(eid: str):
+        from datetime import datetime as _dt
+        s = str(eid)
+        base = s.split(".")[0]
+        try:
+            return _dt.strptime(base, "%Y%m%dT%H%M%S")
+        except Exception:
+            try:
+                return _dt.strptime(base[:8], "%Y%m%d")
+            except Exception:
+                return None
+    times: List[datetime] = []
+    for (_rid, rf) in rows:
+        t = _parse_exposure_id(getattr(rf, "exposure_id", None))
+        if t is not None:
+            times.append(t)
+    if not times:
+        # Fallback to open window if no parsable timestamps are present
+        return [TemporalWindow(start=None, end=None)]
+    start_t = min(times)
+    end_t = max(times)
+    return [TemporalWindow(start=start_t, end=end_t)]
 
 
 def exposure_count_windows(*, db_path: str, scope: Scope, frame_type: str, min_n: int, max_span_days: int) -> List[TemporalWindow]:

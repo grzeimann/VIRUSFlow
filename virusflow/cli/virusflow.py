@@ -16,19 +16,7 @@ from ..registry import database as db
 from ..storage.filesystem import FileSystemStorage
 from ..tasks import available_tasks, get_task_class
 from ..tasks.base import TaskContext
-from ..executors.local import LocalExecutor
 from ..core.identity import ZipCode, parse_zipcode_key
-from ..core.targets import (
-    BiasTarget,
-    DarkTarget,
-    FlatTarget,
-    TwiTarget,
-    TraceTarget,
-    WaveTarget,
-    CmpTarget,
-    CalibrationNeed,
-    build_calibration_tasks,
-)
 from .formatting import format_artifacts_table, format_exposures_table
 
 
@@ -187,69 +175,8 @@ def cmd_qa_list(args: argparse.Namespace) -> None:
 
 
 def cmd_plan_calibrations(args: argparse.Namespace) -> None:
-    # Discover zipcodes for the calibration window, optionally filter/limit for debugging
-    if not args.start_date or not args.end_date:
-        raise SystemExit("plan calibrations requires --start-date and --end-date (YYYYMMDD)")
-
-    # Developer-only filter: --only-zipcode allows comma-separated ZipCode keys
-    zipcodes: List[ZipCode] = []
-    if args.only_zipcode:
-        zkeys = [z.strip() for z in args.only_zipcode.split(",") if z.strip()]
-        zipcodes = [parse_zipcode_key(z) for z in zkeys]
-    else:
-        # Defer discovery until needs are established (we will compute union across needs)
-        zipcodes = []
-    # Define calibrations to plan by default: bias, dark, flat, cmp, trace, wave
-    needs = [
-        CalibrationNeed(name="bias", frame_type="zro", target_cls=BiasTarget),
-        CalibrationNeed(name="dark", frame_type="drk", target_cls=DarkTarget),
-        CalibrationNeed(name="flat", frame_type="flt", target_cls=FlatTarget),
-        CalibrationNeed(name="cmp", frame_type="cmp", target_cls=CmpTarget),
-        # Trace depends on an existing master_flat; use 'flt' for zipcode discovery
-        CalibrationNeed(name="trace", frame_type="flt", target_cls=TraceTarget),
-        # Wave depends on existing master_cmp and trace; use 'cmp' for zipcode discovery
-        CalibrationNeed(name="wave", frame_type="cmp", target_cls=WaveTarget),
-    ]
-
-    # If user provided explicit zipcodes, use them as-is.
-    # Otherwise, discover union of zipcodes across all needs (frame types) for the window.
-    if not args.only_zipcode:
-        zc_set = []
-        seen = set()
-        for need in needs:
-            zlist = db.list_zipcodes(
-                db_path=args.db,
-                frame_type=need.frame_type,
-                start_date=args.start_date,
-                end_date=args.end_date,
-                limit=args.limit,
-            )
-            for z in zlist:
-                k = z.key()
-                if k not in seen:
-                    seen.add(k)
-                    zc_set.append(z)
-        zipcodes = zc_set
-        if not zipcodes:
-            raise SystemExit(f"No zipcodes found for date window {args.start_date}..{args.end_date}")
-
-    # Map from calibration name to requested version (None means latest/default)
-    versions = {
-        "bias": args.bias_version,
-        "dark": args.dark_version,
-        "flat": args.flat_version,
-        "cmp": args.cmp_version,
-        "twi": args.twi_version,
-        "trace": args.trace_version,
-        "wave": args.wave_version,
-    }
-
-    # Build tasks keeping the clean outer loop over zipcodes (zipcode-major order)
-    tasks = build_calibration_tasks(zipcodes, args.start_date, args.end_date, needs, versions=versions)
-
-
-    plan = {"tasks": tasks}
-    print(yaml.safe_dump(plan, sort_keys=False))
+    # Legacy plan-file generation has been removed. Use the planning-first run path instead.
+    raise SystemExit("'virusflow plan calibrations' is removed. Use 'virusflow run --plan-start-date YYYYMMDD --plan-end-date YYYYMMDD' for planning-first execution.")
 
 
 def cmd_plan_night(args: argparse.Namespace) -> None:
@@ -270,231 +197,139 @@ def cmd_plan_observation_set(args: argparse.Namespace) -> None:
 
 # ------------------ Runner ------------------
 
-def cmd_run(args: argparse.Namespace) -> None:
-    # Enforce DB mode: require an existing registry DB path
-    if not os.path.exists(args.db):
-        raise SystemExit(f"Registry DB not found at {args.db}. Initialize and scan first: 'virusflow init --db {args.db}' then 'virusflow scan --db {args.db} <root>'.")
-
+def _run_planned(args: argparse.Namespace) -> None:
     from ..core.pathutils import ensure_dir
+    from ..planning import (
+        load_planning_config,
+        PlanningConfig,
+        default_calibration_graph,
+    )
+    from ..planning.graph import ReductionGraph
+    from ..artifacts.models import Scope
+    from ..registry import database as _db
 
-    # Optional planning phase (configurable via --planning-yaml / --plan-only)
-    did_plan = False
-    if getattr(args, "planning_yaml", None) or getattr(args, "plan_only", False) or getattr(args, "plan_start_date", None) or getattr(args, "plan_end_date", None) or getattr(args, "execute_planned", False):
-        from ..planning import (
-            load_planning_config,
-            PlanningConfig,
-            default_calibration_graph,
-        )
-        from ..planning.graph import ReductionGraph
-        from ..artifacts.models import Scope
-        from ..registry import database as _db
-        # Load external planning YAML if provided
-        cfg_obj: PlanningConfig | None = None
-        if getattr(args, "planning_yaml", None):
-            cfg_obj = load_planning_config(args.planning_yaml)
-        # Build default graph and apply overrides
-        nodes, edges = default_calibration_graph(cfg_obj)
-        # Preflight: validate planning graph
-        try:
-            from ..planning import validate_graph, PlanningValidationError
-            validate_graph(nodes, edges)
-        except Exception as _ve:
-            raise SystemExit(f"Planning graph validation failed: {_ve}")
-        G = ReductionGraph(nodes, edges)
-        # Determine scopes: list zipcodes that have any raw files in optional date window
-        zcs = _db.list_zipcodes(db_path=args.db, frame_type=None, start_date=getattr(args, "plan_start_date", None), end_date=getattr(args, "plan_end_date", None))
-        scopes = [Scope(zc) for zc in zcs]
-        planned, report = G.plan(db_path=args.db, scopes=scopes)
-        # Persist a simple planning report YAML alongside workdir
-        ensure_dir(args.workdir)
-        rep_path = Path(args.workdir) / "planning_report.yml"
-        import json as _json
-        def _tgt(t: object) -> dict:
-            try:
-                # Target from planning layer
-                kind = getattr(t, "kind", None)
-                scope = getattr(t, "scope", None)
-                window = getattr(t, "window", None)
-                z = getattr(scope, "zipcode", None)
-                zd = {
-                    "ifuslot": getattr(z, "ifuslot", None),
-                    "ifuid": getattr(z, "ifuid", None),
-                    "specid": getattr(z, "specid", None),
-                    "amp": getattr(z, "amp", None),
-                    "controller": getattr(z, "controller", None),
-                } if z is not None else None
-                ws = getattr(window, "start", None)
-                we = getattr(window, "end", None)
-                return {
-                    "kind": kind,
-                    "zipcode": zd,
-                    "window": {
-                        "start": (ws.isoformat() if ws else None),
-                        "end": (we.isoformat() if we else None),
-                    } if window is not None else None,
-                }
-            except Exception:
-                return {"repr": repr(t)}
-        rep = {
-            "planned": [_tgt(t) for t in report.planned],
-            "existing": [_tgt(t) for t in report.existing],
-            "skipped": [_tgt(t) for t in report.skipped],
-            "reasons": report.reasons,
-            "summary": {
-                "n_planned": len(report.planned),
-                "n_existing": len(report.existing),
-                "n_skipped": len(report.skipped),
-                "n_scopes": len(scopes),
-            },
-        }
-        try:
-            import yaml as _yaml
-            rep_text = _yaml.safe_dump(rep, sort_keys=False)
-        except Exception:
-            rep_text = _json.dumps(rep, indent=2, sort_keys=True)
-        rep_path.write_text(rep_text)
-        # Print concise summary to stdout
-        try:
-            s = rep.get("summary", {})
-            print(f"Planning summary: planned={s.get('n_planned', 0)} existing={s.get('n_existing', 0)} skipped={s.get('n_skipped', 0)} scopes={s.get('n_scopes', 0)}")
-        except Exception:
-            pass
-        print(f"Planning complete: wrote {rep_path}")
-        did_plan = True
-        # Optional execution of planned calibrations using the thin scheduler
-        if bool(getattr(args, "execute_planned", False)) or os.environ.get("VF_RUN_PLANNED", "0") == "1":
-            try:
-                from ..planning import schedule as _schedule, ScheduledTask as _ScheduledTask, adapt_target as _adapt_target
-                from ..planning import default_calibration_graph as _unused  # keep import for completeness
-                from ..tasks.mapping import default_kind_to_task as _default_kind_to_task
-                from ..tasks.base import TaskContext as _TaskContext
-                if _schedule is None:
-                    raise RuntimeError("planning.schedule is unavailable")
-                # Build context and mapping
-                cfg = {"workers": args.workers, "debug_timing": bool(args.debug_timing)}
-                if getattr(args, "qa_out_dir", None):
-                    cfg["qa_out_dir"] = args.qa_out_dir
-                # Experimental mapping helper controls
-                if getattr(args, "use_mapping_helper", False):
-                    cfg["use_mapping_helper"] = True
-                if getattr(args, "mapping_tolerance_days", None) is not None:
-                    cfg["mapping_tolerance_days"] = int(args.mapping_tolerance_days)
-                ctx = _TaskContext(db_path=args.db, workdir=args.workdir, config=cfg)
-                def _ctx_factory():
-                    return ctx
-                kind_map = _default_kind_to_task()
-                scheduled = _schedule(
-                    targets=report.planned,
-                    nodes=nodes,
-                    edges=edges,
-                    kind_to_task=kind_map,
-                    task_context_factory=_ctx_factory,
-                    target_adapter=_adapt_target,
-                )
-                # Submit to LocalExecutor
-                exec = LocalExecutor(max_workers=(args.workers if args.workers and args.workers > 0 else 1), debug=bool(args.debug_timing))
-                # Add tasks preserving dependencies
-                for st in scheduled:
-                    exec.add_task(st.id, st.task, depends_on=st.depends_on)
-                ensure_dir(args.workdir)
-                exec.run()
-                print("Run complete (planning-first path)")
-                return
-            except Exception as e:
-                print(f"Planning-first execution path failed: {e}. Falling back to legacy plan file path.")
-        if getattr(args, "plan_only", False):
-            return
+    # Load external planning YAML if provided
+    cfg_obj: PlanningConfig | None = None
+    if getattr(args, "planning_yaml", None):
+        cfg_obj = load_planning_config(args.planning_yaml)
+    # Build default graph and apply overrides
+    nodes, edges = default_calibration_graph(cfg_obj)
+    # Preflight: validate planning graph
+    from ..planning import validate_graph
+    validate_graph(nodes, edges)
+    G = ReductionGraph(nodes, edges)
+    # Determine scopes: list zipcodes that have any raw files in optional date window
+    zcs = _db.list_zipcodes(db_path=args.db, frame_type=None, start_date=getattr(args, "plan_start_date", None), end_date=getattr(args, "plan_end_date", None))
+    scopes = [Scope(zc) for zc in zcs]
+    planned, report = G.plan(db_path=args.db, scopes=scopes)
+    # Persist a simple planning report YAML alongside workdir
+    ensure_dir(args.workdir)
+    rep_path = Path(args.workdir) / "planning_report.yml"
+    import json as _json
 
-    plan_path = Path(args.plan)
-    text = plan_path.read_text()
+    def _tgt(t: object) -> dict:
+        try:
+            # Target from planning layer
+            kind = getattr(t, "kind", None)
+            scope = getattr(t, "scope", None)
+            window = getattr(t, "window", None)
+            z = getattr(scope, "zipcode", None)
+            zd = {
+                "ifuslot": getattr(z, "ifuslot", None),
+                "ifuid": getattr(z, "ifuid", None),
+                "specid": getattr(z, "specid", None),
+                "amp": getattr(z, "amp", None),
+                "controller": getattr(z, "controller", None),
+            } if z is not None else None
+            ws = getattr(window, "start", None)
+            we = getattr(window, "end", None)
+            return {
+                "kind": kind,
+                "zipcode": zd,
+                "window": {
+                    "start": (ws.isoformat() if ws else None),
+                    "end": (we.isoformat() if we else None),
+                } if window is not None else None,
+            }
+        except Exception:
+            return {"repr": repr(t)}
+
+    rep = {
+        "planned": [_tgt(t) for t in report.planned],
+        "existing": [_tgt(t) for t in report.existing],
+        "skipped": [_tgt(t) for t in report.skipped],
+        "reasons": report.reasons,
+        "summary": {
+            "n_planned": len(report.planned),
+            "n_existing": len(report.existing),
+            "n_skipped": len(report.skipped),
+            "n_scopes": len(scopes),
+        },
+    }
     try:
-        plan = yaml.safe_load(text)
+        import yaml as _yaml
+        rep_text = _yaml.safe_dump(rep, sort_keys=False)
     except Exception:
-        # Fallback to JSON for backward compatibility
-        plan = json.loads(text)
-
-    # Configure I/O layer with registry DB for DB-backed tar indexing (mandatory for tar-backed FITS)
-    from ..algorithms import io as aio
-    aio.set_registry_db_path(args.db)
-
-    # Build TaskContext config and propagate optional QA output directory so tasks/algorithms can write QA
+        rep_text = _json.dumps(rep, indent=2, sort_keys=True)
+    rep_path.write_text(rep_text)
+    # Print concise summary to stdout
+    try:
+        s = rep.get("summary", {})
+        print(f"Planning summary: planned={s.get('n_planned', 0)} existing={s.get('n_existing', 0)} skipped={s.get('n_skipped', 0)} scopes={s.get('n_scopes', 0)}")
+    except Exception:
+        pass
+    print(f"Planning complete: wrote {rep_path}")
+    # Automatic execution of planned calibrations unless --plan-only is passed
+    if getattr(args, "plan_only", False):
+        return
+    # Execute scheduled tasks
+    from ..planning import schedule as _schedule, adapt_target as _adapt_target
+    from ..tasks.mapping import default_kind_to_task as _default_kind_to_task
+    from ..tasks.base import TaskContext as _TaskContext
+    if _schedule is None:
+        raise RuntimeError("planning.schedule is unavailable")
+    # Build context and mapping
     cfg = {"workers": args.workers, "debug_timing": bool(args.debug_timing)}
     if getattr(args, "qa_out_dir", None):
         cfg["qa_out_dir"] = args.qa_out_dir
-    # Experimental mapping helper controls (also apply to legacy run path)
+    # Experimental mapping helper controls
     if getattr(args, "use_mapping_helper", False):
         cfg["use_mapping_helper"] = True
     if getattr(args, "mapping_tolerance_days", None) is not None:
         cfg["mapping_tolerance_days"] = int(args.mapping_tolerance_days)
-    ctx = TaskContext(db_path=args.db, workdir=args.workdir, config=cfg)
+    ctx = _TaskContext(db_path=args.db, workdir=args.workdir, config=cfg)
 
-    # Instantiate tasks (target-scoped when provided)
-    instances = {}
-    target_key_by_id = {}
-    for t in plan.get("tasks", []):
-        cls = get_task_class(t["name"], t.get("version"))
-        target_obj = None
-        tgt = t.get("target")
-        zc = None
-        if tgt and t["name"] in ("bias", "dark", "flat", "cmp", "twi", "trace", "wave"):
-            z = tgt.get("zipcode", {})
-            zc = ZipCode(
-                ifuslot=z.get("ifuslot", "000"),
-                ifuid=z.get("ifuid", "000"),
-                specid=z.get("specid", "000"),
-                amp=z.get("amp", "XX"),
-                controller=z.get("controller", "X"),
-            )
-            if t["name"] == "bias":
-                target_obj = BiasTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
-            elif t["name"] == "dark":
-                target_obj = DarkTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
-            elif t["name"] == "flat":
-                target_obj = FlatTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
-            elif t["name"] == "cmp":
-                target_obj = CmpTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
-            elif t["name"] == "trace":
-                target_obj = TraceTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
-            elif t["name"] == "wave":
-                target_obj = WaveTarget(zc, tgt.get("start_date"), tgt.get("end_date"))
-        instances[t["id"]] = cls(ctx, target=target_obj)
-        # Build a scope key for auto-dependency resolution (zipcode + date window)
-        if tgt and zc is not None:
-            target_key_by_id[t["id"]] = (
-                zc.ifuslot, zc.ifuid, zc.specid, zc.amp, zc.controller,
-                tgt.get("start_date"), tgt.get("end_date"),
-            )
-        else:
-            target_key_by_id[t["id"]] = None
+    def _ctx_factory():
+        return ctx
 
-    # Build simple graph and execute in-order, deriving dependencies from Task.requires
-    exec = LocalExecutor(max_workers=(args.workers if args.workers and args.workers > 0 else 1), debug=bool(args.debug_timing))
-
-    # Pre-index tasks by (name, target_key)
-    name_target_to_id = {}
-    for t in plan.get("tasks", []):
-        name_target_to_id[(t.get("name"), target_key_by_id.get(t["id"]))] = t["id"]
-
-    for t in plan.get("tasks", []):
-        node_id = t["id"]
-        task_obj = instances[node_id]
-        # Start with any explicit deps present in plan for backward compatibility
-        deps = list(t.get("deps", []) or [])
-        # Add declarative requires mapped within the same target scope
-        try:
-            req_names = list(getattr(task_obj, "requires", []) or [])
-        except Exception:
-            req_names = []
-        tgt_key = target_key_by_id.get(node_id)
-        for req in req_names:
-            dep_id = name_target_to_id.get((req, tgt_key))
-            if dep_id and dep_id not in deps:
-                deps.append(dep_id)
-        exec.add_task(node_id, task_obj, depends_on=deps)
-
+    kind_map = _default_kind_to_task()
+    scheduled = _schedule(
+        targets=report.planned,
+        nodes=nodes,
+        edges=edges,
+        kind_to_task=kind_map,
+        task_context_factory=_ctx_factory,
+        target_adapter=_adapt_target,
+    )
+    # Submit to PlanningExecutor (planning-native; no TaskGraph dependency)
+    from ..executors.planning_executor import PlanningExecutor as _PlanningExecutor
+    execp = _PlanningExecutor(max_workers=(args.workers if args.workers and args.workers > 0 else 1), debug=bool(args.debug_timing))
+    # Add tasks preserving dependencies
+    for st in scheduled:
+        execp.add_task(st.id, st.task, kind=st.kind, depends_on=st.depends_on)
     ensure_dir(args.workdir)
-    exec.run()
-    print("Run complete")
+    execp.run()
+    print("Run complete (planning-first default path)")
+
+
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    # Enforce DB mode: require an existing registry DB path
+    if not os.path.exists(args.db):
+        raise SystemExit(f"Registry DB not found at {args.db}. Initialize and scan first: 'virusflow init --db {args.db}' then 'virusflow scan --db {args.db} <root>'.")
+    # Planning-first is the only supported path
+    _run_planned(args)
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -591,18 +426,16 @@ def main(argv: Optional[list[str]] = None) -> None:
     spo.set_defaults(func=cmd_plan_observation_set)
 
     # run
-    sp = sub.add_parser("run", help="Run a previously created YAML plan file", parents=[global_opts])
-    sp.add_argument("plan", help="Path to plan YAML file (JSON still accepted)")
+    sp = sub.add_parser("run", help="Plan and execute calibrations (planning-first)", parents=[global_opts])
     sp.add_argument("--workdir", default=str(Path.cwd() / "work"), help="Working directory")
     sp.add_argument("--workers", type=int, default=4, help="Worker threads for algorithms and task batches (set 0 for serial)")
     sp.add_argument("--qa-out-dir", help="Directory to write QA outputs (plots and JSON packets)")
     sp.add_argument("--debug-timing", action="store_true", help="Print timing diagnostics during run")
-    # Planning options (optional): external YAML to override defaults and a plan-only dry run
+    # Planning options
     sp.add_argument("--planning-yaml", help="Path to planning rules YAML to override defaults (see docs/planning_config.md)")
     sp.add_argument("--plan-only", action="store_true", help="Only perform planning and write planning_report.yml to --workdir, do not execute tasks")
     sp.add_argument("--plan-start-date", help="Planning date window start (YYYYMMDD)")
     sp.add_argument("--plan-end-date", help="Planning date window end (YYYYMMDD)")
-    sp.add_argument("--execute-planned", action="store_true", help="Execute planned calibrations directly using the thin scheduler (bypasses legacy plan file)")
     # Mapping helper controls (science→calib selection centralization)
     sp.add_argument("--use-mapping-helper", action="store_true", help="Use planning.mapping.select_for_edge for artifact selection inside tasks (experimental)")
     sp.add_argument("--mapping-tolerance-days", type=int, help="Optional tolerance window (days) for mapping helper when selecting parent calibrations")

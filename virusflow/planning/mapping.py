@@ -43,30 +43,59 @@ def select_for_edge(
     - service: an initialized ArtifactService
 
     Returns the selected registry row (dict) if a match passes tolerance checks,
-    otherwise None.
+    otherwise None. If the best match is outside tolerance, the helper searches
+    nearby candidates and returns the nearest within tolerance, if any.
     """
     row = service.select_best(kind=kind, scope=scope, at_time=at_time, policy=policy)
-    if row is None:
-        return None
+    # Fast-path when no tolerance logic needed
     if tolerance_days is None or at_time is None:
         return row
-    # Parse created_at from row if available; fall back to acceptance on parse issues
-    try:
-        created = row.get("created_at")
-        if isinstance(created, str):
+    # Parse created_at and apply tolerance; if outside, try alternate candidates
+    def _parse_dt(val):
+        if val is None:
+            return None
+        if isinstance(val, str):
             from datetime import datetime as _dt
             try:
-                created_dt = _dt.fromisoformat(created)
+                return _dt.fromisoformat(val)
             except Exception:
-                created_dt = _dt.strptime(created.split(".")[0], "%Y-%m-%d %H:%M:%S")
-        else:
-            created_dt = created  # may be datetime or None
-        if created_dt is None:
-            return row
-        delta_days = abs((created_dt - at_time).days)
-        if delta_days <= int(tolerance_days):
-            return row
-        return None
+                try:
+                    return _dt.strptime(val.split(".")[0], "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    return None
+        return val
+    def _within_tol(r) -> bool:
+        ct = _parse_dt(r.get("created_at")) if isinstance(r, dict) else None
+        if ct is None:
+            return True  # accept if unknown
+        return abs((ct - at_time).days) <= int(tolerance_days)
+    # If initial selection is acceptable, return it
+    if row is not None and _within_tol(row):
+        return row
+    # Otherwise, query additional candidates around at_time and pick nearest within tol
+    try:
+        # Use adapter.find to retrieve a small set of candidates ordered by policy
+        candidates = service.adapter.find(kind=kind, zipcode=scope.zipcode, at_time=at_time, limit=25)
+        # Fallback search without time filter if no rows were returned (tight validity windows)
+        if not candidates:
+            candidates = service.adapter.find(kind=kind, zipcode=scope.zipcode, at_time=None, limit=25)
+        # Filter within tolerance and select by minimal absolute delta days
+        best = None
+        best_delta = None
+        for r in candidates:
+            ct = _parse_dt(r.get("created_at"))
+            if ct is None:
+                # treat unknown created_at as acceptable but with worst ranking
+                if best is None:
+                    best = r
+                    best_delta = 10**9
+                continue
+            d = abs((ct - at_time).days)
+            if d <= int(tolerance_days):
+                if best is None or d < (best_delta or 10**9):
+                    best = r
+                    best_delta = d
+        return best
     except Exception:
-        # On any parsing/field error, accept the selection rather than failing hard
+        # If anything goes wrong during alternate selection, fall back to initial row
         return row

@@ -38,7 +38,20 @@ def _date8(s: str) -> str:
 
 
 def _connect(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    # Use autocommit and WAL-friendly settings to reduce 'database is locked' during
+    # concurrent writer scenarios common in tests and planner runs.
+    # - isolation_level=None enables autocommit (each statement is its own transaction),
+    #   avoiding long-lived write transactions held open by context managers.
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+    try:
+        # Busy timeout applies per-connection; keep it generous.
+        conn.execute("PRAGMA busy_timeout=5000")
+        # Prefer WAL; if already configured, this is a no-op.
+        conn.execute("PRAGMA journal_mode=WAL")
+        # In WAL mode, NORMAL synchronous is generally safe and reduces writer stalls.
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -545,62 +558,86 @@ def list_raw_files_scoped(
 
 
 def save_artifact(artifact, prov, db_path: str = DEFAULT_DB_PATH) -> int:
-    with connect(db_path) as conn:
-        # Normalize artifact fields from either a dict-like or object with attributes
-        akind = artifact.get("kind") if isinstance(artifact, dict) else getattr(artifact, "kind", None)
-        aname = artifact.get("name") if isinstance(artifact, dict) else getattr(artifact, "name", None)
-        apath = artifact.get("path") if isinstance(artifact, dict) else getattr(artifact, "path", None)
-        azip = artifact.get("zipcode") if isinstance(artifact, dict) else getattr(artifact, "zipcode", None)
-        vstart = artifact.get("validity_start") if isinstance(artifact, dict) else getattr(artifact, "validity_start", None)
-        vend = artifact.get("validity_end") if isinstance(artifact, dict) else getattr(artifact, "validity_end", None)
-        amp_key = azip.key() if azip is not None else None
-        vstart_iso = vstart.isoformat() if hasattr(vstart, "isoformat") and vstart is not None else None
-        vend_iso = vend.isoformat() if hasattr(vend, "isoformat") and vend is not None else None
-        cur = conn.execute(
-            """
-            INSERT INTO artifacts(kind, name, path, amp_key, validity_start, validity_end)
-            VALUES(?, ?, ?, ?, ?, ?)
-            """,
-            (
-                akind,
-                aname or akind,
-                apath,
-                amp_key,
-                vstart_iso,
-                vend_iso,
-            ),
-        )
-        artifact_id = cur.lastrowid
-        # Normalize provenance fields from either dict-like or object
-        def _get(obj, name):
-            return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
-        sw = _get(prov, "software_version")
-        git = _get(prov, "git_commit")
-        algo = _get(prov, "algorithm")
-        phash = _get(prov, "parameters_hash")
-        created = _get(prov, "created_at")
-        parents_list = _get(prov, "parents") or []
-        if isinstance(parents_list, str):
-            parents_list = [parents_list]
-        parents_list = [str(p) for p in parents_list]
-        created_iso = created.isoformat() if hasattr(created, "isoformat") and created is not None else datetime.utcnow().isoformat()
-        parents = ",".join(parents_list)
-        conn.execute(
-            """
-            INSERT INTO provenance(artifact_id, software_version, git_commit, algorithm, parameters_hash, created_at, parents)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                artifact_id,
-                sw,
-                git,
-                algo,
-                phash,
-                created_iso,
-                parents,
-            ),
-        )
-        return artifact_id
+    """Persist artifact and provenance rows with basic retry on SQLite lock.
+
+    In concurrent test/execution scenarios, a separate connection may hold a write lock
+    momentarily. We enable autocommit on connections, but still add a bounded retry here
+    to improve robustness.
+    """
+    import sqlite3 as _sqlite3
+    import time as _time
+
+    last_err: Exception | None = None
+    for attempt in range(5):
+        try:
+            with connect(db_path) as conn:
+                # Normalize artifact fields from either a dict-like or object with attributes
+                akind = artifact.get("kind") if isinstance(artifact, dict) else getattr(artifact, "kind", None)
+                aname = artifact.get("name") if isinstance(artifact, dict) else getattr(artifact, "name", None)
+                apath = artifact.get("path") if isinstance(artifact, dict) else getattr(artifact, "path", None)
+                azip = artifact.get("zipcode") if isinstance(artifact, dict) else getattr(artifact, "zipcode", None)
+                vstart = artifact.get("validity_start") if isinstance(artifact, dict) else getattr(artifact, "validity_start", None)
+                vend = artifact.get("validity_end") if isinstance(artifact, dict) else getattr(artifact, "validity_end", None)
+                amp_key = azip.key() if azip is not None else None
+                vstart_iso = vstart.isoformat() if hasattr(vstart, "isoformat") and vstart is not None else None
+                vend_iso = vend.isoformat() if hasattr(vend, "isoformat") and vend is not None else None
+                cur = conn.execute(
+                    """
+                    INSERT INTO artifacts(kind, name, path, amp_key, validity_start, validity_end)
+                    VALUES(?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        akind,
+                        aname or akind,
+                        apath,
+                        amp_key,
+                        vstart_iso,
+                        vend_iso,
+                    ),
+                )
+                artifact_id = cur.lastrowid
+                # Normalize provenance fields from either dict-like or object
+                def _get(obj, name):
+                    return obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
+                sw = _get(prov, "software_version")
+                git = _get(prov, "git_commit")
+                algo = _get(prov, "algorithm")
+                phash = _get(prov, "parameters_hash")
+                created = _get(prov, "created_at")
+                parents_list = _get(prov, "parents") or []
+                if isinstance(parents_list, str):
+                    parents_list = [parents_list]
+                parents_list = [str(p) for p in parents_list]
+                created_iso = created.isoformat() if hasattr(created, "isoformat") and created is not None else datetime.utcnow().isoformat()
+                parents = ",".join(parents_list)
+                conn.execute(
+                    """
+                    INSERT INTO provenance(artifact_id, software_version, git_commit, algorithm, parameters_hash, created_at, parents)
+                    VALUES(?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        artifact_id,
+                        sw,
+                        git,
+                        algo,
+                        phash,
+                        created_iso,
+                        parents,
+                    ),
+                )
+                return artifact_id
+        except _sqlite3.OperationalError as e:
+            # Retry only on locking errors
+            msg = str(e).lower()
+            if "database is locked" in msg or "database locked" in msg or "busy" in msg:
+                last_err = e
+                _time.sleep(0.1 * (attempt + 1))
+                continue
+            raise
+    # If retries exhausted, re-raise the last locking error
+    if last_err:
+        raise last_err
+    raise RuntimeError("save_artifact failed unexpectedly without an exception")
 
 
 def get_artifact(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict]:
