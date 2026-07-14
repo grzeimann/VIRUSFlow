@@ -481,7 +481,8 @@ def step_trace(
         "version": ALGO_VERSION,
         "trace_len": int(nx),
         "output_path": output_path,
-        "source_master_flat": str(mf_path),
+        # Use the resolved source master-flat path used for this run
+        "source_master_flat": str(src_mf_path),
         # Expose per-fiber RMS metrics for QA diagnostics (aliases for compatibility)
         "rms_fibers": rms_fibers,
         "trace_rms_per_fiber": rms_fibers,

@@ -6,7 +6,7 @@ This module focuses on building a master flat used for tracing and pixelmasking:
 - step_flt: reduce raw flat exposures with CCD base_reduction and combine them
   robustly (biweight) into a master flat; compute a flat-specific pixel mask
   using a median-filter deviation rule and simple column heuristics; persist
-  via core.artifacts.save_master_flat.
+  via artifacts.io_fits.write_array_fits with an explicit sidecar.
 
 Exports: step_flt
 """

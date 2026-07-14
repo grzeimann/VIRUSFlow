@@ -7,7 +7,7 @@ This module exposes a single public routine:
   and robustly combine them (biweight) into a master comparison frame. When
   available, it also builds the union of existing flat/dark pixel masks and
   attempts a light-weight column repair on the master using that mask before
-  persisting via core.artifacts.save_master_cmp.
+  persisting via artifacts.io_fits.write_array_fits with an explicit sidecar.
 
 Exports: step_cmp
 """

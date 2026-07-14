@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
-# Legacy core.artifacts types are no longer used in new artifact subsystem
+# Legacy artifact dataclasses are no longer used in the new artifacts subsystem
 from ..registry import database as db
 from ..artifacts import Artifact as NewArtifact, ArtifactService, Scope, StorageRef, Provenance
 
@@ -66,13 +66,21 @@ class Task:
 
         # Build new-model Artifact and register
         svc = ArtifactService(self.ctx.db_path)
+        # Prefer the existing storage reference from the provided artifact (has correct URI)
+        _existing_storage = getattr(art, "storage", None)
+        _sfmt = getattr(_existing_storage, "storage_format", "fits") if _existing_storage else "fits"
+        _suri = getattr(_existing_storage, "uri", None)
+        if not _suri:
+            # Fallback to legacy `.path` attribute if present
+            _suri = str(getattr(art, "path", None) or "")
+        storage_ref = StorageRef(uri=str(_suri), storage_format=_sfmt, backend=getattr(_existing_storage, "backend", "fs"))
         new_art = NewArtifact(
             id=None,
             kind=str(getattr(art, "kind", self.name)),
             role=getattr(art, "role", "calibration"),
             payload_type=getattr(art, "payload_type", "array"),
-            storage_format="fits",  # current savers use FITS primary HDU
-            storage=StorageRef(uri=str(getattr(art, "path", None) or ""), storage_format="fits", backend="fs"),
+            storage_format=_sfmt,  # current savers use FITS primary HDU
+            storage=storage_ref,
             scope=scope,
             metadata=dict(getattr(art, "metadata", {}) or {}),
             provenance=Provenance(

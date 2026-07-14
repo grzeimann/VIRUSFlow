@@ -6,7 +6,7 @@ import numpy as np
 from astropy.io import fits
 
 # Generic FITS array I/O with compact JSON sidecar next to the FITS file.
-# This module replaces product-specific helpers from core.artifacts with
+# This module replaces legacy product-specific helpers with
 # clean, generic read/write utilities and a few thin wrappers used by
 # algorithms and tasks today.
 

@@ -416,8 +416,8 @@ def step_wave(*,
       (same shape as master_cmp) to extract spectra via fiber.get_spectra.
 
     The routine delegates the core modeling to the internal _get_wave function
-    and returns a dictionary with results and metadata. No artifact persistence is
-    currently performed because core.artifacts has no wave saver yet.
+    and returns a dictionary with results and metadata. Artifact persistence is
+    handled by tasks via the generic artifacts materializer.
 
     Parameters
     ----------

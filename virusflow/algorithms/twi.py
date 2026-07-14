@@ -5,7 +5,7 @@ from __future__ import annotations
 This module exposes a single public routine:
 - step_twi: reduce raw twilight exposures with CCD base_reduction and combine
   them robustly (biweight) into a master twilight frame for tracing/extraction
-  support. The result is persisted via core.artifacts.save_master_twi.
+  support. The result is persisted via artifacts.io_fits.write_array_fits with an explicit sidecar.
 
 Exports: step_twi
 """

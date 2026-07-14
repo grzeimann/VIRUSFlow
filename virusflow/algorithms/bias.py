@@ -6,7 +6,7 @@ This module provides a single public routine:
 - step_bias: reduce a set of raw bias frames with CCD base_reduction and
   robustly combine them into a master bias. It also computes a robust
   per-pixel scatter (MAD) and reports a scalar readnoise estimate. The
-  resulting master is persisted via core.artifacts.save_master_bias.
+  resulting master is persisted via artifacts.io_fits.write_array_fits with an explicit sidecar.
 
 Exports: step_bias
 """

@@ -6,7 +6,7 @@ This module provides:
 - step_dark: reduce raw dark frames with CCD base_reduction and robustly combine
   them (biweight) into a master dark; derive a dark pixel mask using
   sigma-clipped residual logic and simple full-column heuristics; persist via
-  core.artifacts.save_master_dark.
+  artifacts.io_fits.write_array_fits with an explicit sidecar.
 
 Exports: step_dark
 """
