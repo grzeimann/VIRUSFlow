@@ -276,6 +276,88 @@ def cmd_run(args: argparse.Namespace) -> None:
         raise SystemExit(f"Registry DB not found at {args.db}. Initialize and scan first: 'virusflow init --db {args.db}' then 'virusflow scan --db {args.db} <root>'.")
 
     from ..core.pathutils import ensure_dir
+
+    # Optional planning phase (configurable via --planning-yaml / --plan-only)
+    did_plan = False
+    if getattr(args, "planning_yaml", None) or getattr(args, "plan_only", False) or getattr(args, "plan_start_date", None) or getattr(args, "plan_end_date", None):
+        from ..planning import (
+            load_planning_config,
+            PlanningConfig,
+            default_calibration_graph,
+        )
+        from ..planning.graph import ReductionGraph
+        from ..artifacts.models import Scope
+        from ..registry import database as _db
+        # Load external planning YAML if provided
+        cfg_obj: PlanningConfig | None = None
+        if getattr(args, "planning_yaml", None):
+            cfg_obj = load_planning_config(args.planning_yaml)
+        # Build default graph and apply overrides
+        nodes, edges = default_calibration_graph(cfg_obj)
+        G = ReductionGraph(nodes, edges)
+        # Determine scopes: list zipcodes that have any raw files in optional date window
+        zcs = _db.list_zipcodes(db_path=args.db, frame_type=None, start_date=getattr(args, "plan_start_date", None), end_date=getattr(args, "plan_end_date", None))
+        scopes = [Scope(zc) for zc in zcs]
+        planned, report = G.plan(db_path=args.db, scopes=scopes)
+        # Persist a simple planning report YAML alongside workdir
+        ensure_dir(args.workdir)
+        rep_path = Path(args.workdir) / "planning_report.yml"
+        import json as _json
+        def _tgt(t: object) -> dict:
+            try:
+                # Target from planning layer
+                kind = getattr(t, "kind", None)
+                scope = getattr(t, "scope", None)
+                window = getattr(t, "window", None)
+                z = getattr(scope, "zipcode", None)
+                zd = {
+                    "ifuslot": getattr(z, "ifuslot", None),
+                    "ifuid": getattr(z, "ifuid", None),
+                    "specid": getattr(z, "specid", None),
+                    "amp": getattr(z, "amp", None),
+                    "controller": getattr(z, "controller", None),
+                } if z is not None else None
+                ws = getattr(window, "start", None)
+                we = getattr(window, "end", None)
+                return {
+                    "kind": kind,
+                    "zipcode": zd,
+                    "window": {
+                        "start": (ws.isoformat() if ws else None),
+                        "end": (we.isoformat() if we else None),
+                    } if window is not None else None,
+                }
+            except Exception:
+                return {"repr": repr(t)}
+        rep = {
+            "planned": [_tgt(t) for t in report.planned],
+            "existing": [_tgt(t) for t in report.existing],
+            "skipped": [_tgt(t) for t in report.skipped],
+            "reasons": report.reasons,
+            "summary": {
+                "n_planned": len(report.planned),
+                "n_existing": len(report.existing),
+                "n_skipped": len(report.skipped),
+                "n_scopes": len(scopes),
+            },
+        }
+        try:
+            import yaml as _yaml
+            rep_text = _yaml.safe_dump(rep, sort_keys=False)
+        except Exception:
+            rep_text = _json.dumps(rep, indent=2, sort_keys=True)
+        rep_path.write_text(rep_text)
+        # Print concise summary to stdout
+        try:
+            s = rep.get("summary", {})
+            print(f"Planning summary: planned={s.get('n_planned', 0)} existing={s.get('n_existing', 0)} skipped={s.get('n_skipped', 0)} scopes={s.get('n_scopes', 0)}")
+        except Exception:
+            pass
+        print(f"Planning complete: wrote {rep_path}")
+        did_plan = True
+        if getattr(args, "plan_only", False):
+            return
+
     plan_path = Path(args.plan)
     text = plan_path.read_text()
     try:
@@ -463,6 +545,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("--workers", type=int, default=4, help="Worker threads for algorithms and task batches (set 0 for serial)")
     sp.add_argument("--qa-out-dir", help="Directory to write QA outputs (plots and JSON packets)")
     sp.add_argument("--debug-timing", action="store_true", help="Print timing diagnostics during run")
+    # Planning options (optional): external YAML to override defaults and a plan-only dry run
+    sp.add_argument("--planning-yaml", help="Path to planning rules YAML to override defaults (see docs/planning_config.md)")
+    sp.add_argument("--plan-only", action="store_true", help="Only perform planning and write planning_report.yml to --workdir, do not execute tasks")
+    sp.add_argument("--plan-start-date", help="Planning date window start (YYYYMMDD)")
+    sp.add_argument("--plan-end-date", help="Planning date window end (YYYYMMDD)")
     sp.set_defaults(func=cmd_run)
 
     args = p.parse_args(argv)

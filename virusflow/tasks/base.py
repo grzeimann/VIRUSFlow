@@ -129,22 +129,23 @@ class CalibrationTask(Task):
         """Find the best existing artifact of a given kind for this task's target.
 
         Searches by zipcode and, when possible, selects the artifact valid at the
-        midpoint of the target window. Falls back to the latest by zipcode if a
-        time-qualified match is not found.
+        midpoint of the target window via ArtifactService.select_best. Falls back
+        to the latest by zipcode if a time-qualified match is not found.
         """
-        from ..registry import database as _db
         self._require_target()
         zipcode = getattr(self.target, "zipcode", None)
         at_time = self._target_mid_time()
-        rows = _db.find_artifacts(kind=kind, zipcode=zipcode, at_time=at_time, db_path=self.ctx.db_path, limit=1)
-        if not rows:
-            rows = _db.find_artifacts(kind=kind, zipcode=zipcode, db_path=self.ctx.db_path, limit=1)
-        if not rows:
+        svc = ArtifactService(self.ctx.db_path)
+        scope = Scope(zipcode=zipcode)
+        row = svc.select_best(kind=kind, scope=scope, at_time=at_time, policy="latest_valid")
+        if not row:
+            row = svc.select_best(kind=kind, scope=scope, at_time=None, policy="latest")
+        if not row:
             if required:
                 zkey = zipcode.key() if zipcode else "UNKNOWN"
                 raise RuntimeError(f"{self.__class__.__name__} requires an existing {kind} for zipcode={zkey} in the given date window")
             return None
-        return rows[0]
+        return row
 
     def query_inputs(self):
         from ..registry import database as _db
@@ -235,9 +236,9 @@ class CalibrationTask(Task):
         t4 = time.perf_counter()
         # Automatic QA: evaluate and persist based on algorithm metadata and artifact kind
         try:
-            from ..qa import diagnostics as qa_diag
+            svc = ArtifactService(self.ctx.db_path)
             qa_kind = (self.artifact_name or "").strip().lower()
-            status = qa_diag.evaluate_and_save(artifact_id=art_id, kind=qa_kind, meta=dict(meta or {}), db_path=self.ctx.db_path)
+            status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind=qa_kind, meta=dict(meta or {}))
             if dbg and status:
                 print(f"[QA] {self.__class__.__name__}: auto-qa status={status} kind={qa_kind} artifact_id={art_id}")
         except Exception:

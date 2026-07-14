@@ -3,6 +3,44 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Set, Tuple, Callable, Optional
 
+# Begin migration: expose planning-layer graph interfaces via core for compatibility
+try:
+    from ..planning.graph import (
+        TaskSpec as PlanningTaskSpec,
+        Edge as PlanningEdge,
+        PlanningReport as PlanningPlanningReport,
+        ReductionGraph as PlanningReductionGraph,
+    )
+    # Back-compat exported names
+    TaskSpec = PlanningTaskSpec  # type: ignore
+    Edge = PlanningEdge  # type: ignore
+    PlanningReport = PlanningPlanningReport  # type: ignore
+    ReductionGraph = PlanningReductionGraph  # type: ignore
+except Exception:
+    # If planning layer is unavailable, continue without re-exports
+    pass
+
+__all__ = [
+    # Legacy execution graph
+    "TaskGraph",
+    # Planning-layer re-exports (new API)
+    "TaskSpec",
+    "Edge",
+    "PlanningReport",
+    "ReductionGraph",
+]
+
+# Emit a gentle deprecation warning for consumers relying on core.graph directly
+try:
+    import warnings as _warnings
+    _warnings.warn(
+        "virusflow.core.graph is deprecated; prefer virusflow.planning.graph (TaskSpec/ReductionGraph).",
+        DeprecationWarning,
+        stacklevel=1,
+    )
+except Exception:
+    pass
+
 
 @dataclass
 class Node:

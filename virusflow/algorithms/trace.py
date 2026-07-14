@@ -25,9 +25,7 @@ from scipy.ndimage import percentile_filter
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.linear_model import HuberRegressor
 
-from ..artifacts.io_fits import read_array_fits
-from ..artifacts import ArtifactService, Scope
-from ..artifacts.materialize import ArtifactMaterializer
+from ..artifacts.io_fits import read_array_fits, write_array_fits
 
 # Algorithm version string for this module
 ALGO_VERSION = "trace-1.0"
@@ -347,44 +345,26 @@ def step_trace(
     """
     params = dict(params or {})
 
-    # Prefer artifact-centric resolution when registry context is provided
+    # Resolve master flat strictly via explicit path or provided artifact row.
     master = None
     hdr = {}
     nx = None
-    used_row = None
-    try:
-        db_path = params.get("db_path")
-        zc = params.get("zipcode")
-        at_time = params.get("at_time")
-        if db_path and zc is not None:
-            svc = ArtifactService(str(db_path))
-            mat = ArtifactMaterializer(svc)
-            lr = mat.load_best(kind="master_flat", scope=Scope(zc), at_time=at_time, policy="latest_valid", expect=("array", "fits"))
-            master = lr.data
-            hdr = lr.header
-            used_row = lr.row
-            nx = master.shape[1] if master is not None else None
-    except Exception:
-        # Fallbacks handled below
-        pass
 
-    # If artifact-centric load not used, fall back to explicit path provided by params
-    if master is None:
-        mf_path: Optional[str] = params.get("master_flat_path")
-        if not mf_path:
-            mf_art = params.get("master_flat_artifact") or {}
-            try:
-                mf_path = mf_art.get("path") if isinstance(mf_art, dict) else None
-            except Exception:
-                mf_path = None
-        if not mf_path:
-            raise ValueError("step_trace requires either registry context (db_path+zipcode) to locate master_flat, or 'master_flat_path'/'master_flat_artifact' with a 'path'")
-        payload = read_array_fits(str(mf_path))
-        master = payload.get("data")
-        hdr = payload.get("header", {})
-        nx = master.shape[1] if master is not None else None
+    mf_path: Optional[str] = params.get("master_flat_path")
+    if not mf_path:
+        mf_art = params.get("master_flat_artifact") or {}
+        try:
+            mf_path = mf_art.get("path") if isinstance(mf_art, dict) else None
+        except Exception:
+            mf_path = None
+    if not mf_path:
+        raise ValueError("step_trace requires 'master_flat_path' or 'master_flat_artifact' with a 'path' provided by the task")
+    payload = read_array_fits(str(mf_path))
+    master = payload.get("data")
+    hdr = payload.get("header", {})
+    nx = master.shape[1] if master is not None else None
     if master is None or nx is None:
-        raise RuntimeError("Failed to load master flat for step_trace")
+        raise RuntimeError("Failed to load master flat for step_trace from path: %s" % str(mf_path))
 
     # Gather and validate required parameters
     specid = str(params.get("specid")) if params.get("specid") is not None else None
@@ -451,14 +431,9 @@ def step_trace(
     if output_path is None:
         raise ValueError("step_trace requires an explicit output_path")
 
-    # Persist the trace solution via the generic materializer
-    try:
-        svc = ArtifactService(str(params.get("db_path"))) if params.get("db_path") else ArtifactService("")
-    except Exception:
-        svc = ArtifactService("")
-    mat = ArtifactMaterializer(svc)
-    src_mf_path = str(params.get("master_flat_path") or (used_row.get("path") if isinstance(used_row, dict) else ""))
-    mat.persist_array(
+    # Persist the trace solution via generic FITS I/O with explicit sidecar (no registry/service coupling here)
+    src_mf_path = str(params.get("master_flat_path") or (params.get("master_flat_artifact") or {}).get("path") or "")
+    write_array_fits(
         output_path,
         data=trace_2d,
         n_inputs=int(hdr.get("NINPUTS", 0)),

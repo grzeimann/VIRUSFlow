@@ -6,6 +6,57 @@ from typing import Dict, List, Optional, Type, Iterable
 
 from .identity import ZipCode
 
+# Begin migration: expose planning-layer target/cadence interfaces via core for compatibility
+try:
+    from ..planning.targets import (
+        TemporalWindow as PlanningTemporalWindow,
+        Target as PlanningTarget,
+        CadencePolicy as PlanningCadencePolicy,
+        TimeCadence as PlanningTimeCadence,
+        ExposureCountCadence as PlanningExposureCountCadence,
+    )
+    # Back-compat exported names
+    TemporalWindow = PlanningTemporalWindow  # type: ignore
+    Target = PlanningTarget  # type: ignore
+    CadencePolicy = PlanningCadencePolicy  # type: ignore
+    TimeCadence = PlanningTimeCadence  # type: ignore
+    ExposureCountCadence = PlanningExposureCountCadence  # type: ignore
+except Exception:
+    # If planning layer is unavailable, continue without re-exports
+    pass
+
+__all__ = [
+    # Legacy target classes
+    "BiasTarget",
+    "DarkTarget",
+    "FlatTarget",
+    "TwiTarget",
+    "TraceTarget",
+    "WaveTarget",
+    "CmpTarget",
+    "CalibrationNeed",
+    "default_calibration_needs",
+    "build_tasks_for_zipcode",
+    "build_calibration_tasks",
+    # Planning-layer re-exports (new API)
+    "TemporalWindow",
+    "Target",
+    "CadencePolicy",
+    "TimeCadence",
+    "ExposureCountCadence",
+]
+
+# Emit a gentle deprecation warning for consumers relying on core.targets directly
+try:
+    import warnings as _warnings
+    _warnings.warn(
+        "virusflow.core.targets is deprecated; prefer virusflow.planning.targets (TemporalWindow/Target/CadencePolicy).",
+        DeprecationWarning,
+        stacklevel=1,
+    )
+except Exception:
+    pass
+
 
 _DATE_FMT = "%Y%m%d"
 

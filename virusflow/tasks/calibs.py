@@ -198,7 +198,8 @@ class TraceTask(CalibrationTask):
 
         # QA hook for 'trace'
         try:
-            status = qa_diag.evaluate_and_save(artifact_id=art_id, kind="trace", meta=dict(meta or {}), db_path=self.ctx.db_path)
+            svc = ArtifactService(self.ctx.db_path)
+            status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind="trace", meta=dict(meta or {}))
             if dbg and status:
                 print(f"[QA] TraceTask: auto-qa status={status} artifact_id={art_id}")
         except Exception:
@@ -303,7 +304,8 @@ class WaveTask(CalibrationTask):
 
         # QA hook for 'wave'
         try:
-            status = qa_diag.evaluate_and_save(artifact_id=art_id, kind="wave", meta=dict(meta or {}), db_path=self.ctx.db_path)
+            svc = ArtifactService(self.ctx.db_path)
+            status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind="wave", meta=dict(meta or {}))
             if dbg and status:
                 print(f"[QA] WaveTask: auto-qa status={status} artifact_id={art_id}")
         except Exception:
