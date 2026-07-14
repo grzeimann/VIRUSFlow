@@ -10,6 +10,12 @@ from .config import (
     load_planning_config,
     load_planning_config_from_dict,
 )
+# Optional thin scheduler (planning-first execution assembly)
+try:
+    from .scheduler import schedule, ScheduledTask  # type: ignore
+except Exception:  # pragma: no cover - scheduler is optional for now
+    schedule = None  # type: ignore
+    ScheduledTask = None  # type: ignore
 
 __all__ = [
     # targets
@@ -29,4 +35,7 @@ __all__ = [
     "PlanningConfig",
     "load_planning_config",
     "load_planning_config_from_dict",
+    # scheduler (optional)
+    "schedule",
+    "ScheduledTask",
 ]

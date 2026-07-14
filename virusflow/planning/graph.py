@@ -79,9 +79,10 @@ class ReductionGraph:
     def __init__(self, nodes: Sequence[TaskSpec], edges: Sequence[Edge]):
         self.nodes = list(nodes)
         self.edges = list(edges)
-        self._deps: Dict[str, List[Edge]] = {}
+        # Index incoming edges by destination kind for tolerance/mapping policies
+        self._incoming: Dict[str, List[Edge]] = {}
         for e in self.edges:
-            self._deps.setdefault(e.dst.kind, []).append(e)
+            self._incoming.setdefault(e.dst.kind, []).append(e)
 
     def plan(
         self,
@@ -96,11 +97,19 @@ class ReductionGraph:
         - For nodes with cadence, enumerate calibration targets using cadence helpers.
         - For nodes without cadence, do not auto-emit (expect an external list of
           science exposures or ad-hoc targets for now).
-        - Skip targets already satisfied according to ArtifactService.select_best.
+        - Skip targets already satisfied according to ArtifactService.select_best,
+          honoring tolerance where applicable.
         """
         svc = (service_factory or ArtifactService)(db_path)
         planned: List[Target] = []
         report = PlanningReport()
+
+        def _edge_tolerance_for(kind: str) -> Optional[int]:
+            # Use the strictest (minimum) tolerance across incoming edges to this kind, if any.
+            es = self._incoming.get(kind) or []
+            if not es:
+                return None
+            return min(int(getattr(e, "tolerance_days", 0) or 0) for e in es) or None
 
         for node in self.nodes:
             if node.cadence is None:
@@ -128,13 +137,42 @@ class ReductionGraph:
                     else:
                         windows = [TemporalWindow(start=None, end=None)]
 
+                tol_days = _edge_tolerance_for(node.kind)
                 for win in windows:
                     tgt = Target(kind=node.kind, scope=scope, window=win)
-                    # Idempotency: skip if already satisfied
+                    # Idempotency: consult registry for an existing artifact
                     existing = svc.select_best(kind=node.kind, scope=scope, at_time=win.start, policy="latest_valid")
                     if existing is not None:
+                        # If a tolerance applies and we have a concrete window start,
+                        # check whether the existing artifact is within tolerance.
+                        reason = "already_registered"
+                        if tol_days is not None and getattr(win, "start", None) is not None:
+                            try:
+                                created = existing.get("created_at")
+                                if isinstance(created, str):
+                                    from datetime import datetime as _dt
+                                    try:
+                                        created_dt = _dt.fromisoformat(created)
+                                    except Exception:
+                                        # Some rows may store dates without tz; attempt loose parsing
+                                        created_dt = _dt.strptime(created.split(".")[0], "%Y-%m-%d %H:%M:%S")
+                                else:
+                                    created_dt = created  # assume datetime
+                                ws = win.start  # type: ignore[assignment]
+                                delta_days = abs((created_dt - ws).days) if (created_dt and ws) else 0
+                                if delta_days <= int(tol_days):
+                                    report.existing.append(tgt)
+                                    report.reasons[_tkey(tgt)] = "already_registered_within_tolerance"
+                                    continue
+                                else:
+                                    # Outside tolerance: plan a new one
+                                    reason = "existing_outside_tolerance"
+                            except Exception:
+                                # On any parsing error, fall back to skipping as already registered
+                                pass
+                        # Default: treat as existing and skip
                         report.existing.append(tgt)
-                        report.reasons[_tkey(tgt)] = "already_registered"
+                        report.reasons[_tkey(tgt)] = reason
                         continue
                     planned.append(tgt)
 

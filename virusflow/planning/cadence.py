@@ -22,25 +22,24 @@ from .targets import TemporalWindow
 def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_days: int, min_n_inputs: int = 1) -> List[TemporalWindow]:
     """Enumerate periodic windows for a zipcode.
 
-    Minimal stub behavior:
-    - If there is at least one raw file of the given frame_type for the scope.zipcode,
+    Minimal stub behavior (DB-lite):
+    - If there are at least `min_n_inputs` raw files of the given frame_type for the scope.zipcode,
       return a single open window (start=None, end=None) to indicate "build a target".
     - Otherwise, return an empty list.
     """
     z = scope.zipcode
     if z is None:
         return []
-    # Probe raw files presence for the zipcode and frame_type, limiting to a tiny range by listing the exposure table
-    # and using list_raw_files_scoped over approximate broad dates. As a safe stub, just check existence via list_raw_filesScop ed with None window.
+    # Probe raw files presence for the zipcode and frame_type across the DB.
     try:
         rows = db.list_raw_files_scoped(frame_type=frame_type, start_date=None, end_date=None, zipcode=z, db_path=db_path)
     except TypeError:
         # Older signature might not accept None dates; fall back to list_raw_files and filter exposure table
         rows = db.list_raw_files(exposure_id=None, db_path=db_path)
         rows = [r for r in rows if (str(r.get("frame_type")) == frame_type and str(r.get("zipcode")) == z.key())]
-    if not rows:
+    if len(rows) < int(min_n_inputs):
         return []
-    # In a future refinement, split by every_days buckets and enforce min_n_inputs in each.
+    # In a future refinement, split by every_days buckets and enforce per-bucket counts.
     return [TemporalWindow(start=None, end=None)]
 
 
