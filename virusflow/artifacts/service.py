@@ -18,6 +18,7 @@ class ArtifactService:
     - No product-specific branching
     - Serializer dispatch by (payload_type, storage_format)
     - Lightweight by default: numeric payloads only when requested
+    - Provides logical payload accessors for analytics to remain storage-agnostic
     """
 
     def __init__(self, db_path: str) -> None:
@@ -68,6 +69,38 @@ class ArtifactService:
             "qa": (self.adapter.get_diagnostics(int(desc.id)) if desc.id is not None else None),
             "model_type": desc.model_type,
         }
+
+    def load_payload(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Load a payload for a registry row using logical identifiers only.
+
+        - Determines payload_type/storage_format from describe() if not present in the row.
+        - Dispatches to the registered serializer; returns serializer.load(path) or None.
+        - Keeps analytics decoupled from storage backends.
+        """
+        if not isinstance(row, dict):
+            return None
+        # Prefer explicit hints on the row
+        path = row.get("path")
+        payload_type = row.get("payload_type")
+        storage_format = row.get("storage_format")
+        if not (path and payload_type and storage_format):
+            try:
+                d = self.describe(row)
+            except Exception:
+                d = None
+            if d:
+                path = path or d.get("path")
+                payload_type = payload_type or d.get("payload_type")
+                storage_format = storage_format or d.get("storage_format")
+        if not (path and payload_type and storage_format):
+            return None
+        ser = self.serializers.get(str(payload_type), str(storage_format))
+        if not ser:
+            return None
+        try:
+            return ser.load(str(path))
+        except Exception:
+            return None
 
     def set_diagnostics(self, artifact_id: int, *, status: str, metrics: Optional[Dict[str, Any]] = None) -> None:
         self.diagnostics.set(int(artifact_id), status=status, metrics=metrics)

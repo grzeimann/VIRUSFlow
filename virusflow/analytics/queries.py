@@ -43,19 +43,13 @@ def list_artifacts(
 def load_array(
     *, svc: ArtifactService, row: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
-    """Attempt to load an array payload for array/fits artifacts.
+    """Load an array payload using logical artifact information only.
 
-    Returns dict with keys {data, header} or None if not an array/fits artifact or load fails.
+    Delegates to ArtifactService.load_payload so studies remain storage-agnostic.
+    Returns a dict like {data, header} when available.
     """
     try:
-        path = row.get("path")
-        if not path:
-            return None
-        # Use serializers assuming array/fits; tolerant to failures
-        ser = svc.serializers.get("array", "fits")
-        if not ser:
-            return None
-        return ser.load(str(path))
+        return svc.load_payload(row)
     except Exception:
         return None
 
