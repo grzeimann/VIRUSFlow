@@ -467,30 +467,17 @@ def step_wave(*,
     # Compute wavelength solution (collect QA bundle for failure diagnostics)
     wave, ref_img, rms_rows, qa_bundle = _get_wave(cmp_spec, trace, T_array=None, res_lim=res_lim, order=order, qa=None)
 
+    # Include qa_bundle for downstream compact extras persistence (bounded in task sidecar)
     result = {
         "wave": wave,
         "rms_rows": rms_rows,
+        "qa_bundle": qa_bundle,
         "algo": "algorithms.wave.step_wave",
         "version": ALGO_VERSION,
         "output_path": output_path,
     }
 
-    # Build algo_meta for QA and always emit a QA packet if qa_out_dir is provided
-    qa_dir = None
-    identifiers = {}
-    db_path = None
-    artifact_id = None
-    if isinstance(params, dict):
-        qa_dir = params.get("qa_out_dir")
-        identifiers = {
-            "amp_id": params.get("amp_id"),
-            "run_id": params.get("run_id"),
-            "obs_time": params.get("obs_time"),
-            "zip_code": params.get("zip_code"),
-        }
-        db_path = params.get("qa_db_path")
-        artifact_id = params.get("artifact_id")
-
+    # Build algo_meta for QA (returned to task for centralized YAML-driven evaluation)
     algo_meta = {
         "rms_rows": rms_rows,
     }
@@ -511,24 +498,7 @@ def step_wave(*,
         result["failure_reason"] = failure_reason
         algo_meta["failure_reason"] = failure_reason
 
-    if qa_dir is not None:
-        try:
-            from pathlib import Path as _Path
-            from ..qa.build_qa import build_qa
-            qa_dir_path = _Path(str(qa_dir))
-            pkt = build_qa(
-                kind="wave",
-                qa_dir=qa_dir,
-                algo_meta=algo_meta,
-                qa_bundle=qa_bundle,
-                identifiers=identifiers,
-                artifact_id=artifact_id,
-                db_path=db_path,
-                always_plot=True,
-            )
-            result["qa_packet_path"] = str(qa_dir_path / "wave_qa.json")
-            result["qa_plots"] = pkt.plots
-        except Exception:
-            pass
+    # Note: Algorithm no longer emits QA plots or packets. Post-run analytics should be used to
+    # generate human-readable QA artifacts from the registry (see virusflow.analytics.studies.wavelength).
 
     return result

@@ -484,29 +484,5 @@ def step_trace(
         "trace_len": int(nx),
     }
 
-    if qa_dir is not None:
-        try:
-            from pathlib import Path as _Path
-            from ..qa.build_qa import build_qa
-            qa_dir_path = _Path(str(qa_dir))
-            qa_bundle = {
-                "xchunks": xchunks,
-                "trace_chunks": Trace_samples,
-                "trace": trace_2d,
-            }
-            pkt = build_qa(
-                kind="trace",
-                qa_dir=qa_dir_path,
-                algo_meta=algo_meta,
-                qa_bundle=qa_bundle,
-                identifiers=identifiers,
-                artifact_id=artifact_id,
-                db_path=db_path,
-                always_plot=True,
-            )
-            result["qa_packet_path"] = str(qa_dir_path / "trace_qa.json")
-            result["qa_plots"] = pkt.plots
-        except Exception:
-            pass
 
     return result

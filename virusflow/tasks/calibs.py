@@ -307,6 +307,49 @@ class WaveTask(CalibrationTask):
         }
         if rms_med is not None:
             sidecar["rms_median"] = float(rms_med)
+        # Persist compact extras for analytics identify-arc parity and trending (bounded size)
+        try:
+            qa_bundle = meta.get("qa_bundle") if isinstance(meta, dict) else None
+            if isinstance(qa_bundle, dict):
+                best = qa_bundle.get("best") or {}
+                # Scalar summaries
+                if "nmatch" in best:
+                    try:
+                        sidecar["best_nmatch"] = int(best.get("nmatch"))
+                    except Exception:
+                        pass
+                if "rms" in best:
+                    try:
+                        sidecar["best_rms"] = float(best.get("rms"))
+                    except Exception:
+                        pass
+                # Downsample reference profile for lightweight plotting
+                refp = qa_bundle.get("ref_profile")
+                if refp is not None:
+                    import numpy as _np
+                    arr = _np.asarray(refp, dtype=float).ravel()
+                    if arr.size:
+                        # Downsample to at most 1024 points
+                        if arr.size > 1024:
+                            idx = _np.linspace(0, arr.size - 1, 1024).astype(int)
+                            sidecar["ref_profile_ds"] = arr[idx].astype(float).tolist()
+                        else:
+                            sidecar["ref_profile_ds"] = arr.astype(float).tolist()
+        except Exception:
+            pass
+        # Optionally persist a compact rms_rows downsample
+        try:
+            if rms_rows is not None:
+                import numpy as _np
+                arr = _np.asarray(rms_rows, dtype=float).ravel()
+                if arr.size:
+                    if arr.size > 4096:
+                        idx = _np.linspace(0, arr.size - 1, 1024).astype(int)
+                        sidecar["rms_rows_ds"] = arr[idx].astype(float).tolist()
+                    else:
+                        sidecar["rms_rows_ds"] = arr.astype(float).tolist()
+        except Exception:
+            pass
         mat.persist_array(
             out_path,
             data=wave,

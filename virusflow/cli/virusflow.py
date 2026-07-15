@@ -251,6 +251,44 @@ def cmd_qa_backfill(args: argparse.Namespace) -> None:
     if not args.dry_run:
         print(f"Backfill complete: evaluated={n}, failures={n_fail}")
 
+# ------------------ Analytics subcommands ------------------
+
+def cmd_analyze(args: argparse.Namespace) -> None:
+    from ..analytics.service import AnalyticsService, AnalyticsRequest
+    svc = AnalyticsService(args.db)
+    params = {
+        "out": args.out,
+        "zipcode": args.zipcode,
+        "limit": args.limit,
+        # Trace/Wavelength toggles
+        "make_preview": (not getattr(args, "no_preview", False)),
+        "make_row_dispersion": (not getattr(args, "no_row_dispersion", False)),
+        "make_value_hist": (not getattr(args, "no_value_hist", False)),
+        # Calibration study parameters
+        "kinds": getattr(args, "kinds", None),
+        "make_p95_hist": (not getattr(args, "no_p95_hist", False)),
+        "make_badfrac_trend": (not getattr(args, "no_badfrac_trend", False)),
+        "make_zero_map": (not getattr(args, "no_zero_map", False)),
+        # Instrument health
+        "make_throughput_trend": (not getattr(args, "no_throughput_trend", False)),
+        "make_bad_fiber_map": (not getattr(args, "no_bad_fiber_map", False)),
+        # Trending
+        "trend_kind": getattr(args, "trend_kind", None),
+        "metric": getattr(args, "metric", None),
+        "since": getattr(args, "since", None),
+        "until": getattr(args, "until", None),
+        # Reports
+        "report_kind": getattr(args, "report_kind", None),
+    }
+    try:
+        res = svc.run(AnalyticsRequest(name=args.study, params=params))
+    except Exception as e:
+        raise SystemExit(f"analyze failed: {e}")
+    try:
+        print(yaml.safe_dump(res, sort_keys=False))
+    except Exception:
+        print(res)
+
 # ------------------ Debugging helpers ------------------
 
 def cmd_debug_raw(args: argparse.Namespace) -> None:
@@ -599,6 +637,33 @@ def main(argv: Optional[list[str]] = None) -> None:
     qab.add_argument("--from-summary", action="store_true", help="Use ArtifactService.describe(summary) as meta for each artifact")
     qab.add_argument("--dry-run", action="store_true", help="Do not write results, just show planned actions")
     qab.set_defaults(func=cmd_qa_backfill)
+
+    # analyze (analytics)
+    sp_an = sub.add_parser("analyze", help="Run analytics studies on existing artifacts", parents=[global_opts])
+    sp_an.add_argument("--study", required=True, choices=["trace", "wavelength", "calibration", "instrument_health", "trending", "reports"], help="Analytics study to run")
+    sp_an.add_argument("--zipcode", help="ZipCode key filter (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
+    sp_an.add_argument("--limit", type=int, help="Limit number of source artifacts")
+    sp_an.add_argument("--out", required=True, help="Output root directory for generated files")
+    # Common toggles used by specific studies
+    sp_an.add_argument("--no-preview", action="store_true", help="Do not generate preview image (trace/wavelength)")
+    sp_an.add_argument("--no-row-dispersion", action="store_true", help="Do not generate per-row dispersion plot (trace study)")
+    sp_an.add_argument("--no-value-hist", action="store_true", help="Do not generate wavelength value histogram (wavelength study)")
+    # Calibration study toggles
+    sp_an.add_argument("--kinds", help="Calibration kinds to analyze (comma-separated: master_flat,master_cmp)")
+    sp_an.add_argument("--no-p95-hist", action="store_true", help="Do not generate per-artifact p95 histogram (calibration study)")
+    sp_an.add_argument("--no-badfrac-trend", action="store_true", help="Do not generate BADFRAC trend (master_flat only)")
+    sp_an.add_argument("--no-zero-map", action="store_true", help="Do not generate zero-map thumbnail (master_cmp only)")
+    # Instrument health toggles
+    sp_an.add_argument("--no-throughput-trend", action="store_true", help="Do not generate fiber throughput trend (instrument_health study)")
+    sp_an.add_argument("--no-bad-fiber-map", action="store_true", help="Do not generate bad fiber heuristic map (instrument_health study)")
+    # Trending study parameters
+    sp_an.add_argument("--kind", dest="trend_kind", help="Artifact kind to trend QA metrics for (e.g., trace, wave)")
+    sp_an.add_argument("--metric", help="QA metric name to trend (e.g., rms_median)")
+    sp_an.add_argument("--since", help="Only include artifacts created since YYYYMMDD (optional)")
+    sp_an.add_argument("--until", help="Only include artifacts created until YYYYMMDD (optional)")
+    # Reports study parameters
+    sp_an.add_argument("--report-kind", choices=["daily_calib", "weekly_health"], help="Report kind for 'reports' study")
+    sp_an.set_defaults(func=cmd_analyze)
 
     # debug-raw helper
     sp_dbg = sub.add_parser("debug-raw", help="Probe raw inputs for a zipcode and frame type", parents=[global_opts])
