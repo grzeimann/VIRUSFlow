@@ -4,10 +4,11 @@ from __future__ import annotations
 
 This module exposes a single public routine:
 - step_cmp: reduce a set of raw comparison-lamp exposures using CCD base_reduction
-  and robustly combine them (biweight) into a master comparison frame. When
-  available, it also builds the union of existing flat/dark pixel masks and
-  attempts a light-weight column repair on the master using that mask before
-  persisting via artifacts.io_fits.write_array_fits with an explicit sidecar.
+  and robustly combine them (biweight) into a master comparison frame.
+
+Architecture: algorithms are storage-neutral. step_cmp performs computation only
+and returns an AlgoResult; it does not read previously published artifacts,
+construct masks from disk, or perform persistence/registration/QA.
 
 Exports: step_cmp
 """
@@ -18,9 +19,8 @@ import logging
 import numpy as np
 from astropy.stats import biweight_location
 
-from .ccd import base_reduction, repair_masked_columns
-from ..artifacts.io_fits import write_array_fits
-from .utils.masks import build_union_pixelmask
+from .ccd import base_reduction
+# persistence and storage-coupled mask logic removed per architecture
 
 __all__ = ["step_cmp"]
 logger = logging.getLogger(__name__)
@@ -32,24 +32,17 @@ ALGO_VERSION = "cmp-1.0"
 CmpInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
 
 
+from ..core.algo_result import AlgoResult
+
 def step_cmp(
     raw_cmp_inputs: Optional[Iterable[CmpInput]] = None,
     output_path: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[CmpInput]] = None,
-) -> Dict[str, Any]:
+) -> AlgoResult:
     """Construct a master comparison (cmp) frame from input comparison frames.
 
-    Contract:
-    - Inputs: iterable of dicts with keys:
-        - 'path': outer container path (FITS file or .tar archive path)
-        - 'tar_member': optional member path inside the tar when applicable
-    - Output: write a master-cmp FITS file to output_path, and return metadata.
-
-    Algorithm (mirrors twilight/flat stacking without mask computation):
-    - For each input frame, run CCD base_reduction (overscan subtraction, trim, orientation, gain, error)
-    - Stack the reduced images robustly via biweight location to produce the master comparison frame
-    - Persist the master using save_master_cmp (no mask)
+    Storage-neutral: compute and return AlgoResult only. No persistence here.
     """
     params = params or {}
     # Prefer explicit raw_inputs if provided
@@ -90,57 +83,22 @@ def step_cmp(
     stack = np.stack(frames, axis=0)
     master = biweight_location(stack, axis=0, ignore_nan=True)
 
-    # Optional: build a current pixelmask = union(flat_mask, dark_mask) if paths/artifacts are provided
-    params = params or {}
-    flat_path = params.get("master_flat_path") or (params.get("master_flat_artifact") or {}).get("path") if isinstance(params.get("master_flat_artifact"), dict) else params.get("master_flat_path")
-    dark_path = params.get("master_dark_path") or (params.get("master_dark_artifact") or {}).get("path") if isinstance(params.get("master_dark_artifact"), dict) else params.get("master_dark_path")
-
-    union_mask = None
-    frac_mask = 0.0
-    try:
-        union_mask, frac_mask = build_union_pixelmask(flat_path=flat_path, dark_path=dark_path,
-                                                      flat_artifact=params.get("master_flat_artifact") if isinstance(params.get("master_flat_artifact"), dict) else None,
-                                                      dark_artifact=params.get("master_dark_artifact") if isinstance(params.get("master_dark_artifact"), dict) else None)
-        if union_mask is not None and union_mask.shape != master.shape:
-            logger.warning("Union mask shape %s does not match master CMP shape %s; ignoring mask",
-                           getattr(union_mask, 'shape', None), master.shape)
-            union_mask = None
-    except Exception as e:
-        logger.warning("Failed to build union pixel mask: %s", e)
-        union_mask = None
-
-    # Attempt to repair masked columns using the union mask
-    repaired = master
-    if union_mask is not None and np.any(union_mask):
-        try:
-            repaired = repair_masked_columns(master, np.asarray(union_mask, dtype=bool), sigma=1.0)
-            logger.info("Applied repair_masked_columns to CMP using union mask (bad_fraction=%.4f)", float(frac_mask))
-        except Exception as e:
-            logger.warning("repair_masked_columns failed; proceeding with unmodified master: %s", e)
-
-    if output_path is not None:
-        # Persist the repaired image (if repairs were applied) as the master CMP
-        write_array_fits(
-            output_path,
-            data=repaired,
-            n_inputs=len(frames),
-            algo_version=ALGO_VERSION,
-            sidecar={
-                "kind": "master_cmp",
-                "role": "calibration",
-                "payload_type": "array",
-                "storage_format": "fits",
-            },
-        )
+    # Per architecture, do not read other artifacts or construct masks here.
+    # Any masking/repair decisions belong to tasks/persistence policies.
 
     if errors:
         logger.warning("step_cmp encountered %d reduction errors; proceeding with %d good frames", len(errors), len(frames))
 
-    return {
-        "n_inputs": len(frames),
-        "shape": list(master.shape),
-        "bad_fraction_mask": float(frac_mask),
-        "output_path": output_path,
-        "algo": "algorithms.cmp.step_cmp",
-        "version": ALGO_VERSION,
-    }
+    return AlgoResult(
+        kind="cmp",
+        version=ALGO_VERSION,
+        meta={
+            "shape": list(master.shape),
+        },
+        scalars={
+            "n_inputs": len(frames),
+        },
+        arrays={
+            "master": master,
+        },
+    )

@@ -398,6 +398,8 @@ def _get_wave(spec: np.ndarray,
 
 
 
+from ..core.algo_result import AlgoResult
+
 def step_wave(*,
               cmp_spec: Optional[np.ndarray] = None,
               master_cmp: Optional[np.ndarray] = None,
@@ -406,7 +408,7 @@ def step_wave(*,
               res_lim: float = 1.0,
               order: int = 4,
               output_path: Optional[str] = None,
-              params: Optional[dict] = None) -> dict:
+              params: Optional[dict] = None) -> AlgoResult:
     """
     Build the wavelength solution from spectra of the master comparison (arc) frame.
 
@@ -467,21 +469,27 @@ def step_wave(*,
     # Compute wavelength solution (collect QA bundle for failure diagnostics)
     wave, ref_img, rms_rows, qa_bundle = _get_wave(cmp_spec, trace, T_array=None, res_lim=res_lim, order=order, qa=None)
 
-    # Include qa_bundle for downstream compact extras persistence (bounded in task sidecar)
-    result = {
-        "wave": wave,
-        "rms_rows": rms_rows,
-        "qa_bundle": qa_bundle,
-        "algo": "algorithms.wave.step_wave",
-        "version": ALGO_VERSION,
-        "output_path": output_path,
-    }
+    # Build storage-neutral AlgoResult
+    scalars = {}
+    # Extract compact best-match metrics if available
+    try:
+        if isinstance(qa_bundle, dict):
+            best = qa_bundle.get("best") or {}
+            if "nmatch" in best:
+                try:
+                    scalars["best_nmatch"] = int(best.get("nmatch"))
+                except Exception:
+                    pass
+            if "rms" in best:
+                try:
+                    scalars["best_rms"] = float(best.get("rms"))
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
-    # Build algo_meta for QA (returned to task for centralized YAML-driven evaluation)
-    algo_meta = {
-        "rms_rows": rms_rows,
-    }
-
+    # Include a failure_reason in meta if modeling failed (wave is None)
+    meta = {}
     if wave is None:
         failure_reason = "wavelength modeling failed"
         try:
@@ -495,10 +503,24 @@ def step_wave(*,
                                    f"tried_rows={tried}/{arr.size}; median_rms={med if (med==med) else 'nan'}")
         except Exception:
             pass
-        result["failure_reason"] = failure_reason
-        algo_meta["failure_reason"] = failure_reason
+        meta["failure_reason"] = failure_reason
 
-    # Note: Algorithm no longer emits QA plots or packets. Post-run analytics should be used to
-    # generate human-readable QA artifacts from the registry (see virusflow.analytics.studies.wavelength).
+    # Determine shape summary if available
+    try:
+        if trace is not None:
+            meta.setdefault("shape", list(np.asarray(trace).shape))
+        elif cmp_spec is not None:
+            meta.setdefault("shape", list(np.asarray(cmp_spec).shape))
+    except Exception:
+        pass
 
-    return result
+    return AlgoResult(
+        kind="wave",
+        version=ALGO_VERSION,
+        meta=meta,
+        scalars=scalars,
+        arrays={
+            "wave": wave,
+            "rms_rows": rms_rows,
+        },
+    )

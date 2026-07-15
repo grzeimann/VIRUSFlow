@@ -57,26 +57,17 @@ def _compute_dark_pixelmask(dark: np.ndarray) -> np.ndarray:
     return mask.astype(np.uint8)
 
 
+from ..core.algo_result import AlgoResult
+
 def step_dark(
     raw_dark_inputs: Optional[Iterable[DarkInput]] = None,
     output_path: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[DarkInput]] = None,
-) -> Dict[str, Any]:
+) -> AlgoResult:
     """Construct a master dark frame from input dark frames.
 
-    Contract:
-    - Inputs: iterable of dicts with keys:
-        - 'path': outer container path (FITS file or .tar archive path)
-        - 'tar_member': optional member path inside the tar when applicable
-    - Output: write a master-dark FITS file to output_path, and return metadata.
-
-    Algorithm (mirrors algorithms.bias.step_bias with minor differences):
-    - For each input frame, run CCD base_reduction (overscan subtraction, trim, orientation, gain, error)
-    - Stack the reduced images (converted to float)
-    - Master dark = biweight location across the stack (axis=0)
-    - Dark pixel mask derived from master using logic consistent with reference fiber_utils.get_pixelmask
-    - Unlike bias, we do not compute or return a scalar readnoise here.
+    Storage-neutral implementation: compute and return AlgoResult only. No persistence.
     """
     params = params or {}
     # Accept either alias name; prefer explicit raw_inputs if provided
@@ -97,8 +88,6 @@ def step_dark(
             img, _err = _ccd.base_reduction(p, tm, return_header=False)
             return img, i, None
         except Exception as e:
-            # Do not implement test-only fallbacks in production algorithms; tests should
-            # provide inputs via fixtures/mocks. Propagate error for the caller to handle.
             return None, i, str(e)
 
     frames: List[np.ndarray] = []
@@ -112,7 +101,6 @@ def step_dark(
             errors.append(f"[{idx}] {err}")
 
     if not frames:
-        # Aggregate a few input errors to aid debugging without changing behavior
         detail = ("; ".join(errors[:5])) if errors else "no per-input errors captured"
         raise RuntimeError(f"No readable dark frames provided to step_dark (n_inputs={n_inputs}). Sample errors: {detail}")
 
@@ -122,39 +110,24 @@ def step_dark(
         raise ValueError(f"Input dark frames have differing shapes: {sorted(shapes)}")
 
     stack = np.stack(frames, axis=0)
-    # Robust combination via biweight location (avoid digitization bias)
     master = biweight_location(stack, axis=0, ignore_nan=True)
 
-    # Build dark pixel mask from the master dark
     dark_mask = _compute_dark_pixelmask(master)
     n_bad = int(dark_mask.sum())
     frac_bad = float(n_bad) / float(dark_mask.size)
 
-    # Write artifact via generic FITS I/O with explicit sidecar and DARKMASK extension
-    if output_path is not None:
-        write_array_fits(
-            output_path,
-            data=master,
-            n_inputs=len(frames),
-            algo_version=ALGO_VERSION,
-            extra_primary_cards={"BADFRAC": float(frac_bad)},
-            mask=dark_mask,
-            mask_name="DARKMASK",
-            sidecar={
-                "kind": "master_dark",
-                "role": "calibration",
-                "payload_type": "array",
-                "storage_format": "fits",
-                "bad_fraction": float(frac_bad),
-            },
-        )
-
-    return {
-        "n_inputs": len(frames),
-        "shape": list(master.shape),
-        "n_bad": n_bad,
-        "bad_fraction": frac_bad,
-        "output_path": output_path,
-        "algo": "algorithms.dark.step_dark",
-        "version": ALGO_VERSION,
-    }
+    return AlgoResult(
+        kind="dark",
+        version=ALGO_VERSION,
+        meta={
+            "shape": list(master.shape),
+        },
+        scalars={
+            "n_inputs": len(frames),
+            "bad_fraction": float(frac_bad),
+        },
+        arrays={
+            "master": master,
+            "mask": dark_mask,
+        },
+    )

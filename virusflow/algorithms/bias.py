@@ -17,7 +17,6 @@ import logging
 import numpy as np
 from astropy.stats import biweight_location
 from . import ccd as _ccd
-from ..artifacts.io_fits import write_array_fits
 
 __all__ = ["step_bias"]
 logger = logging.getLogger(__name__)
@@ -29,12 +28,14 @@ ALGO_VERSION = "bias-1.0"
 BiasInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
 
 
+from ..core.algo_result import AlgoResult
+
 def step_bias(
     raw_bias_inputs: Optional[Iterable[BiasInput]] = None,
     output_path: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[BiasInput]] = None,
-) -> Dict[str, Any]:
+) -> AlgoResult:
     """
     Construct a master bias frame from input zero (bias) frames using numpy/astropy.
 
@@ -103,28 +104,19 @@ def step_bias(
     # Scalar readnoise estimate
     readnoise = float(np.nanmedian(mad))
 
-    # Write artifact via generic FITS I/O with explicit sidecar
-    if output_path is not None:
-        write_array_fits(
-            output_path,
-            data=master,
-            n_inputs=len(frames),
-            algo_version=ALGO_VERSION,
-            extra_primary_cards={"BIASRN": float(readnoise)},
-            sidecar={
-                "kind": "master_bias",
-                "role": "calibration",
-                "payload_type": "array",
-                "storage_format": "fits",
-                "readnoise": float(readnoise),
-            },
-        )
-
-    return {
-        "readnoise": readnoise,
-        "n_inputs": len(frames),
-        "shape": list(master.shape),
-        "output_path": output_path,
-        "algo": "algorithms.bias.step_bias",
-        "version": ALGO_VERSION,
-    }
+    # Return pure computational result; no persistence here per architecture.
+    return AlgoResult(
+        kind="bias",
+        version=ALGO_VERSION,
+        meta={
+            "n_inputs": len(frames),
+            "shape": list(master.shape),
+        },
+        scalars={
+            "readnoise": readnoise,
+            "n_inputs": len(frames),
+        },
+        arrays={
+            "master": master,
+        },
+    )

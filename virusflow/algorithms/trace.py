@@ -25,7 +25,7 @@ from scipy.ndimage import percentile_filter
 from sklearn.preprocessing import PolynomialFeatures
 from sklearn.linear_model import HuberRegressor
 
-from ..artifacts.io_fits import read_array_fits, write_array_fits
+from ..artifacts.io_fits import read_array_fits
 
 # Algorithm version string for this module
 ALGO_VERSION = "trace-1.0"
@@ -324,11 +324,13 @@ def _get_trace(twilight: np.ndarray, specid: str, ifuslot: str, ifuid: str, amp:
     except Exception as e:
         raise RuntimeError(f"_get_trace failed: {e}") from e
 
+from ..core.algo_result import AlgoResult
+
 def step_trace(
     raw_inputs: Optional[Iterable[TraceInput]] = None,
     output_path: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+) -> AlgoResult:
     """Build a trace solution using the existing master flat artifact.
 
     Contract:
@@ -350,21 +352,32 @@ def step_trace(
     hdr = {}
     nx = None
 
-    mf_path: Optional[str] = params.get("master_flat_path")
-    if not mf_path:
-        mf_art = params.get("master_flat_artifact") or {}
-        try:
-            mf_path = mf_art.get("path") if isinstance(mf_art, dict) else None
-        except Exception:
-            mf_path = None
-    if not mf_path:
-        raise ValueError("step_trace requires 'master_flat_path' or 'master_flat_artifact' with a 'path' provided by the task")
-    payload = read_array_fits(str(mf_path))
-    master = payload.get("data")
-    hdr = payload.get("header", {})
-    nx = master.shape[1] if master is not None else None
-    if master is None or nx is None:
-        raise RuntimeError("Failed to load master flat for step_trace from path: %s" % str(mf_path))
+    # Prefer a materialized array provided by the Task; fall back to path-based load
+    master = None
+    hdr = {}
+    nx = None
+    try:
+        if isinstance(params.get("master_flat_array"), (list, tuple, np.ndarray)):
+            master = np.asarray(params.get("master_flat_array"))
+            nx = master.shape[1] if master is not None else None
+    except Exception:
+        master = None
+    if master is None:
+        mf_path: Optional[str] = params.get("master_flat_path")
+        if not mf_path:
+            mf_art = params.get("master_flat_artifact") or {}
+            try:
+                mf_path = mf_art.get("path") if isinstance(mf_art, dict) else None
+            except Exception:
+                mf_path = None
+        if not mf_path:
+            raise ValueError("step_trace requires a 'master_flat_array' or ('master_flat_path'|'master_flat_artifact') with a 'path'")
+        payload = read_array_fits(str(mf_path))
+        master = payload.get("data")
+        hdr = payload.get("header", {})
+        nx = master.shape[1] if master is not None else None
+        if master is None or nx is None:
+            raise RuntimeError("Failed to load master flat for step_trace from path: %s" % str(mf_path))
 
     # Gather and validate required parameters
     specid = str(params.get("specid")) if params.get("specid") is not None else None
@@ -428,61 +441,17 @@ def step_trace(
         # If anything goes wrong, leave rms_fibers as None
         rms_fibers = None
 
-    if output_path is None:
-        raise ValueError("step_trace requires an explicit output_path")
-
-    # Persist the trace solution via generic FITS I/O with explicit sidecar (no registry/service coupling here)
-    src_mf_path = str(params.get("master_flat_path") or (params.get("master_flat_artifact") or {}).get("path") or "")
-    write_array_fits(
-        output_path,
-        data=trace_2d,
-        n_inputs=int(hdr.get("NINPUTS", 0)),
-        algo_version=ALGO_VERSION,
-        extra_header={
-            "SRCMFLAT": src_mf_path,
-            "MFBADFR": float(hdr.get("BADFRAC", np.nan)) if "BADFRAC" in hdr else np.nan,
+    # Build storage-neutral AlgoResult (no persistence here)
+    scalars = {"trace_len": int(nx) if nx is not None else int(trace_2d.shape[1])}
+    return AlgoResult(
+        kind="trace",
+        version=ALGO_VERSION,
+        meta={
+            "shape": list(trace_2d.shape),
         },
-        sidecar={
-            "kind": "trace",
-            "role": "calibration",
-            "payload_type": "array",
-            "storage_format": "fits",
-            "trace_len": int(trace_2d.size),
+        scalars=scalars,
+        arrays={
+            "trace_2d": trace_2d,
+            "rms_fibers": rms_fibers,
         },
     )
-
-    result: Dict[str, Any] = {
-        "algo": "algorithms.trace.step_trace",
-        "version": ALGO_VERSION,
-        "trace_len": int(nx),
-        "output_path": output_path,
-        # Use the resolved source master-flat path used for this run
-        "source_master_flat": str(src_mf_path),
-        # Expose per-fiber RMS metrics for QA diagnostics (aliases for compatibility)
-        "rms_fibers": rms_fibers,
-        "trace_rms_per_fiber": rms_fibers,
-    }
-
-    # Build algo_meta for QA and emit a QA packet if qa_out_dir is provided
-    qa_dir = None
-    identifiers: Dict[str, Optional[str]] = {}
-    db_path = None
-    artifact_id = None
-    if isinstance(params, dict):
-        qa_dir = params.get("qa_out_dir")
-        identifiers = {
-            "amp_id": params.get("amp_id"),
-            "run_id": params.get("run_id"),
-            "obs_time": params.get("obs_time"),
-            "zip_code": params.get("zip_code"),
-        }
-        db_path = params.get("qa_db_path")
-        artifact_id = params.get("artifact_id")
-
-    algo_meta = {
-        "rms_fibers": rms_fibers,
-        "trace_len": int(nx),
-    }
-
-
-    return result

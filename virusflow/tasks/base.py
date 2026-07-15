@@ -300,7 +300,7 @@ class CalibrationTask(Task):
         try:
             svc = ArtifactService(self.ctx.db_path)
             qa_kind = (self.artifact_name or "").strip().lower()
-            status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind=qa_kind, meta=dict(meta or {}))
+            status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind=qa_kind, meta=meta)
             if dbg and status:
                 print(f"[QA] {self.__class__.__name__}: auto-qa status={status} kind={qa_kind} artifact_id={art_id}")
             # Enforce policy: hard-fail kinds with status=fail

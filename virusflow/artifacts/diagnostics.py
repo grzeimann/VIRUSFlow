@@ -65,9 +65,12 @@ class DiagnosticsFacade:
         try:
             import os as _os
             import numpy as _np
+            from ..core.algo_result import ensure_algo_result  # lightweight, no heavy deps
             eng = self._engine_or_load()
-            # Prepare meta and, for certain kinds, enrich with computed metrics (e.g., p95 from payload)
-            m = dict(meta or {})
+            # Prepare meta from flexible inputs (dict or AlgoResult) and, for certain kinds,
+            # enrich with computed metrics (e.g., p95 from payload)
+            ar = ensure_algo_result(meta or {}, kind=kind)
+            m = dict(ar.as_meta() or {})
             k = (kind or "").strip().lower()
             if k in {"master_flat", "master_cmp"} and (m.get("p95") is None):
                 try:

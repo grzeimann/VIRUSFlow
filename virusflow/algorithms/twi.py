@@ -16,7 +16,7 @@ import numpy as np
 from astropy.stats import biweight_location
 
 from .ccd import base_reduction
-from ..artifacts.io_fits import write_array_fits
+# persistence removed per architecture
 
 # Algorithm version string for this module
 ALGO_VERSION = "twi-1.0"
@@ -25,24 +25,17 @@ ALGO_VERSION = "twi-1.0"
 TwiInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
 
 
+from ..core.algo_result import AlgoResult
+
 def step_twi(
     raw_twi_inputs: Optional[Iterable[TwiInput]] = None,
     output_path: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[TwiInput]] = None,
-) -> Dict[str, Any]:
+) -> AlgoResult:
     """Construct a master twilight (twi) frame from input twilight frames.
 
-    Contract:
-    - Inputs: iterable of dicts with keys:
-        - 'path': outer container path (FITS file or .tar archive path)
-        - 'tar_member': optional member path inside the tar when applicable
-    - Output: write a master-twi FITS file to output_path, and return metadata.
-
-    Algorithm (mirrors flat but without pixel mask computation):
-    - For each input frame, run CCD base_reduction (overscan subtraction, trim, orientation, gain, error)
-    - Stack the reduced images robustly via biweight location to produce the master twilight
-    - Persist the master using save_master_twi (no mask)
+    Storage-neutral: compute and return AlgoResult only. No persistence here.
     """
     params = params or {}
     # Prefer explicit raw_inputs if provided
@@ -83,24 +76,16 @@ def step_twi(
     stack = np.stack(frames, axis=0)
     master = biweight_location(stack, axis=0, ignore_nan=True)
 
-    if output_path is not None:
-        write_array_fits(
-            output_path,
-            data=master,
-            n_inputs=len(frames),
-            algo_version=ALGO_VERSION,
-            sidecar={
-                "kind": "master_twi",
-                "role": "calibration",
-                "payload_type": "array",
-                "storage_format": "fits",
-            },
-        )
-
-    return {
-        "n_inputs": len(frames),
-        "shape": list(master.shape),
-        "output_path": output_path,
-        "algo": "algorithms.twi.step_twi",
-        "version": ALGO_VERSION,
-    }
+    return AlgoResult(
+        kind="twi",
+        version=ALGO_VERSION,
+        meta={
+            "shape": list(master.shape),
+        },
+        scalars={
+            "n_inputs": len(frames),
+        },
+        arrays={
+            "master": master,
+        },
+    )

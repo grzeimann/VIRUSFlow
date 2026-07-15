@@ -14,7 +14,12 @@ from ..artifacts.materialize import ArtifactMaterializer
 
 
 class BiasTask(CalibrationTask):
-    """Bias master-frame task scoped by a BiasTarget, using the generic CalibrationTask template."""
+    """Bias master-frame task scoped by a BiasTarget.
+
+    Section 3 implementation: Override run() to use PublicationService with
+    ArtifactRequest and PublicationContext. Algorithm performs computation only
+    and returns AlgoResult; no persistence occurs in the algorithm.
+    """
     name = "bias"
     version = "v1"
 
@@ -23,13 +28,96 @@ class BiasTask(CalibrationTask):
     artifact_name = "master_bias"
     algorithm = step_bias
 
+    def run(self, inputs):
+        import time
+        from ..contracts.result import BiasResultContract
+        from ..artifacts.requests import ArtifactRequest, LogicalComponent
+        from ..artifacts.models import Scope
+        from ..publication.service import DefaultPublicationService
+        from ..publication.context import PublicationContext
+        from ..persistence.policy import DefaultPersistencePolicy
+        from ..core.algo_result import ensure_algo_result
+        from ..artifacts import ArtifactService
+
+        self._require_target()
+        dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
+        t0 = time.perf_counter()
+        raw_inputs, parent_ids = self.query_inputs()
+        t1 = time.perf_counter()
+
+        # Execute algorithm (compute only)
+        algo_params = dict(self.params or {})
+        if isinstance(self.ctx.config, dict):
+            for k, v in self.ctx.config.items():
+                algo_params.setdefault(k, v)
+        t2 = time.perf_counter()
+        ar = self.algorithm(raw_inputs=raw_inputs, output_path=None, params=algo_params)
+        t3 = time.perf_counter()
+
+        # Normalize and validate result
+        ar = ensure_algo_result(ar, kind="bias")
+        rep = BiasResultContract().validate(ar)
+        if not rep.ok:
+            raise ValueError("BiasTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
+
+        # Compose ArtifactRequest (logical, multi-component)
+        master = ar.get_array("master")
+        if master is None:
+            raise RuntimeError("BiasTask: missing 'master' array in AlgoResult")
+        comp_master = LogicalComponent(name="master", model_type="array2d", value=master)
+        scope = Scope(zipcode=getattr(self.target, "zipcode", None))
+        summaries = {"readnoise": float(ar.as_meta().get("readnoise")), "n_inputs": int(ar.as_meta().get("n_inputs", 0))}
+        req = ArtifactRequest(
+            kind=str(self.artifact_name or "master_bias"),
+            components={"master": comp_master},
+            summaries=summaries,
+            metadata={},
+            scope=scope,
+            parents=[int(p) for p in (parent_ids or [])],
+            labels=["calibration", "bias"],
+        )
+
+        # Publish via DefaultPublicationService
+        svc = ArtifactService(self.ctx.db_path)
+        pub = DefaultPublicationService(svc=svc, policy=DefaultPersistencePolicy(), base_dir=self.ctx.workdir)
+        ctx = PublicationContext(
+            task_name=self.name,
+            task_version=self.version,
+            algorithm_name="algorithms.bias.step_bias",
+            algorithm_version=ar.version,
+            parameters=dict(self.params or {}),
+            parent_ids=[int(p) for p in (parent_ids or [])],
+            timings={"resolve": t1 - t0, "execute": t3 - t2},
+        )
+        arts = pub.publish([req], ctx)
+        if not arts:
+            raise RuntimeError("BiasTask: publication produced no artifacts")
+        art = arts[0]
+
+        # QA after publication
+        try:
+            status = svc.diagnostics.evaluate_and_save(artifact_id=int(getattr(art, "id", 0)), kind=str(self.artifact_name), meta=ar)
+            if dbg and status:
+                print(f"[QA] BiasTask: status={status} artifact_id={getattr(art, 'id', None)}")
+            try:
+                if svc.diagnostics.should_block(kind=str(self.artifact_name), status=status):
+                    raise RuntimeError(f"QA hard-fail for {self.artifact_name} (artifact_id={getattr(art, 'id', None)})")
+            except Exception:
+                pass
+        except Exception:
+            # Do not fail task on QA errors
+            pass
+
+        if dbg:
+            print(f"[Timing] BiasTask: resolve={t1 - t0:.3f}s, execute={t3 - t2:.3f}s")
+        return {self.artifact_name: art}
+
 
 class DarkTask(CalibrationTask):
-    """Dark master-frame task scoped by a target, using the generic CalibrationTask template.
+    """Dark master-frame task scoped by a target.
 
-    Differences from BiasTask:
-    - Uses dark frames (frame_type='drk')
-    - Produces 'master_dark' artifact via algorithms.dark.step_dark
+    Section 4 implementation mirrors BiasTask: algorithm returns AlgoResult; task composes
+    ArtifactRequest and publishes via PublicationService; QA runs post-publication.
     """
     name = "dark"
     version = "v1"
@@ -39,12 +127,100 @@ class DarkTask(CalibrationTask):
     artifact_name = "master_dark"
     algorithm = step_dark
 
+    def run(self, inputs):
+        import time
+        from ..contracts.result import DarkResultContract
+        from ..artifacts.requests import ArtifactRequest, LogicalComponent
+        from ..artifacts.models import Scope
+        from ..publication.service import DefaultPublicationService
+        from ..publication.context import PublicationContext
+        from ..persistence.policy import DefaultPersistencePolicy
+        from ..core.algo_result import ensure_algo_result
+        from ..artifacts import ArtifactService
+
+        self._require_target()
+        dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
+        t0 = time.perf_counter()
+        raw_inputs, parent_ids = self.query_inputs()
+        t1 = time.perf_counter()
+
+        # Execute algorithm (compute only)
+        algo_params = dict(self.params or {})
+        if isinstance(self.ctx.config, dict):
+            for k, v in self.ctx.config.items():
+                algo_params.setdefault(k, v)
+        t2 = time.perf_counter()
+        ar = self.algorithm(raw_inputs=raw_inputs, output_path=None, params=algo_params)
+        t3 = time.perf_counter()
+
+        # Normalize and validate result
+        ar = ensure_algo_result(ar, kind="dark")
+        rep = DarkResultContract().validate(ar)
+        if not rep.ok:
+            raise ValueError("DarkTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
+
+        # Compose ArtifactRequest (logical, include optional mask component if present)
+        master = ar.get_array("master")
+        if master is None:
+            raise RuntimeError("DarkTask: missing 'master' array in AlgoResult")
+        comp_master = LogicalComponent(name="master", model_type="array2d", value=master)
+        components = {"master": comp_master}
+        msk = ar.get_array("mask")
+        if msk is not None:
+            components["mask"] = LogicalComponent(name="mask", model_type="array2d", value=msk)
+        scope = Scope(zipcode=getattr(self.target, "zipcode", None))
+        mm = ar.as_meta()
+        summaries = {"bad_fraction": float(mm.get("bad_fraction")), "n_inputs": int(mm.get("n_inputs", 0))}
+        req = ArtifactRequest(
+            kind=str(self.artifact_name or "master_dark"),
+            components=components,
+            summaries=summaries,
+            metadata={},
+            scope=scope,
+            parents=[int(p) for p in (parent_ids or [])],
+            labels=["calibration", "dark"],
+        )
+
+        # Publish via DefaultPublicationService
+        svc = ArtifactService(self.ctx.db_path)
+        pub = DefaultPublicationService(svc=svc, policy=DefaultPersistencePolicy(), base_dir=self.ctx.workdir)
+        ctx = PublicationContext(
+            task_name=self.name,
+            task_version=self.version,
+            algorithm_name="algorithms.dark.step_dark",
+            algorithm_version=ar.version,
+            parameters=dict(self.params or {}),
+            parent_ids=[int(p) for p in (parent_ids or [])],
+            timings={"resolve": t1 - t0, "execute": t3 - t2},
+        )
+        arts = pub.publish([req], ctx)
+        if not arts:
+            raise RuntimeError("DarkTask: publication produced no artifacts")
+        art = arts[0]
+
+        # QA after publication
+        try:
+            status = svc.diagnostics.evaluate_and_save(artifact_id=int(getattr(art, "id", 0)), kind=str(self.artifact_name), meta=ar)
+            if dbg and status:
+                print(f"[QA] DarkTask: status={status} artifact_id={getattr(art, 'id', None)}")
+            try:
+                if svc.diagnostics.should_block(kind=str(self.artifact_name), status=status):
+                    raise RuntimeError(f"QA hard-fail for {self.artifact_name} (artifact_id={getattr(art, 'id', None)})")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        if dbg:
+            print(f"[Timing] DarkTask: resolve={t1 - t0:.3f}s, execute={t3 - t2:.3f}s")
+        return {self.artifact_name: art}
+
 
 class FlatTask(CalibrationTask):
-    """Flat master-frame task using generic CalibrationTask.
+    """Flat master-frame task.
 
-    - Uses flat frames (frame_type='flt')
-    - Produces 'master_flat' artifact via algorithms.flat.step_flt
+    Section 4 implementation mirrors BiasTask/DarkTask: algorithm returns AlgoResult; task composes
+    ArtifactRequest and publishes via PublicationService; QA runs post-publication.
     """
     name = "flat"
     version = "v1"
@@ -54,12 +230,100 @@ class FlatTask(CalibrationTask):
     artifact_name = "master_flat"
     algorithm = step_flt
 
+    def run(self, inputs):
+        import time
+        from ..contracts.result import FlatResultContract
+        from ..artifacts.requests import ArtifactRequest, LogicalComponent
+        from ..artifacts.models import Scope
+        from ..publication.service import DefaultPublicationService
+        from ..publication.context import PublicationContext
+        from ..persistence.policy import DefaultPersistencePolicy
+        from ..core.algo_result import ensure_algo_result
+        from ..artifacts import ArtifactService
+
+        self._require_target()
+        dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
+        t0 = time.perf_counter()
+        raw_inputs, parent_ids = self.query_inputs()
+        t1 = time.perf_counter()
+
+        # Execute algorithm (compute only)
+        algo_params = dict(self.params or {})
+        if isinstance(self.ctx.config, dict):
+            for k, v in self.ctx.config.items():
+                algo_params.setdefault(k, v)
+        t2 = time.perf_counter()
+        ar = self.algorithm(raw_inputs=raw_inputs, output_path=None, params=algo_params)
+        t3 = time.perf_counter()
+
+        # Normalize and validate result
+        ar = ensure_algo_result(ar, kind="flat")
+        rep = FlatResultContract().validate(ar)
+        if not rep.ok:
+            raise ValueError("FlatTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
+
+        # Compose ArtifactRequest (logical, include optional mask component if present)
+        master = ar.get_array("master")
+        if master is None:
+            raise RuntimeError("FlatTask: missing 'master' array in AlgoResult")
+        comp_master = LogicalComponent(name="master", model_type="array2d", value=master)
+        components = {"master": comp_master}
+        msk = ar.get_array("mask")
+        if msk is not None:
+            components["mask"] = LogicalComponent(name="mask", model_type="array2d", value=msk)
+        scope = Scope(zipcode=getattr(self.target, "zipcode", None))
+        mm = ar.as_meta()
+        summaries = {"bad_fraction": float(mm.get("bad_fraction")), "n_inputs": int(mm.get("n_inputs", 0))}
+        req = ArtifactRequest(
+            kind=str(self.artifact_name or "master_flat"),
+            components=components,
+            summaries=summaries,
+            metadata={},
+            scope=scope,
+            parents=[int(p) for p in (parent_ids or [])],
+            labels=["calibration", "flat"],
+        )
+
+        # Publish via DefaultPublicationService
+        svc = ArtifactService(self.ctx.db_path)
+        pub = DefaultPublicationService(svc=svc, policy=DefaultPersistencePolicy(), base_dir=self.ctx.workdir)
+        ctx = PublicationContext(
+            task_name=self.name,
+            task_version=self.version,
+            algorithm_name="algorithms.flat.step_flt",
+            algorithm_version=ar.version,
+            parameters=dict(self.params or {}),
+            parent_ids=[int(p) for p in (parent_ids or [])],
+            timings={"resolve": t1 - t0, "execute": t3 - t2},
+        )
+        arts = pub.publish([req], ctx)
+        if not arts:
+            raise RuntimeError("FlatTask: publication produced no artifacts")
+        art = arts[0]
+
+        # QA after publication
+        try:
+            status = svc.diagnostics.evaluate_and_save(artifact_id=int(getattr(art, "id", 0)), kind=str(self.artifact_name), meta=ar)
+            if dbg and status:
+                print(f"[QA] FlatTask: status={status} artifact_id={getattr(art, 'id', None)}")
+            try:
+                if svc.diagnostics.should_block(kind=str(self.artifact_name), status=status):
+                    raise RuntimeError(f"QA hard-fail for {self.artifact_name} (artifact_id={getattr(art, 'id', None)})")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        if dbg:
+            print(f"[Timing] FlatTask: resolve={t1 - t0:.3f}s, execute={t3 - t2:.3f}s")
+        return {self.artifact_name: art}
+
 
 class CmpTask(CalibrationTask):
-    """Comparison-lamp master-frame task using generic CalibrationTask.
+    """Comparison-lamp master-frame task.
 
-    - Uses comparison frames (frame_type='cmp')
-    - Produces 'master_cmp' artifact via algorithms.cmp.step_cmp
+    Section 4 implementation mirrors other simple calibs: algorithm returns AlgoResult; task composes
+    ArtifactRequest and publishes via PublicationService; QA runs post-publication.
     """
     name = "cmp"
     version = "v1"
@@ -68,12 +332,95 @@ class CmpTask(CalibrationTask):
     artifact_name = "master_cmp"
     algorithm = step_cmp
 
+    def run(self, inputs):
+        import time
+        from ..contracts.result import CmpResultContract
+        from ..artifacts.requests import ArtifactRequest, LogicalComponent
+        from ..artifacts.models import Scope
+        from ..publication.service import DefaultPublicationService
+        from ..publication.context import PublicationContext
+        from ..persistence.policy import DefaultPersistencePolicy
+        from ..core.algo_result import ensure_algo_result
+        from ..artifacts import ArtifactService
+
+        self._require_target()
+        dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
+        t0 = time.perf_counter()
+        raw_inputs, parent_ids = self.query_inputs()
+        t1 = time.perf_counter()
+
+        # Execute algorithm (compute only)
+        algo_params = dict(self.params or {})
+        if isinstance(self.ctx.config, dict):
+            for k, v in self.ctx.config.items():
+                algo_params.setdefault(k, v)
+        t2 = time.perf_counter()
+        ar = self.algorithm(raw_inputs=raw_inputs, output_path=None, params=algo_params)
+        t3 = time.perf_counter()
+
+        # Normalize and validate result
+        ar = ensure_algo_result(ar, kind="cmp")
+        rep = CmpResultContract().validate(ar)
+        if not rep.ok:
+            raise ValueError("CmpTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
+
+        # Compose ArtifactRequest (logical, single component)
+        master = ar.get_array("master")
+        if master is None:
+            raise RuntimeError("CmpTask: missing 'master' array in AlgoResult")
+        comp_master = LogicalComponent(name="master", model_type="array2d", value=master)
+        scope = Scope(zipcode=getattr(self.target, "zipcode", None))
+        mm = ar.as_meta()
+        summaries = {"n_inputs": int(mm.get("n_inputs", 0))}
+        req = ArtifactRequest(
+            kind=str(self.artifact_name or "master_cmp"),
+            components={"master": comp_master},
+            summaries=summaries,
+            metadata={},
+            scope=scope,
+            parents=[int(p) for p in (parent_ids or [])],
+            labels=["calibration", "cmp"],
+        )
+
+        svc = ArtifactService(self.ctx.db_path)
+        pub = DefaultPublicationService(svc=svc, policy=DefaultPersistencePolicy(), base_dir=self.ctx.workdir)
+        ctx = PublicationContext(
+            task_name=self.name,
+            task_version=self.version,
+            algorithm_name="algorithms.cmp.step_cmp",
+            algorithm_version=ar.version,
+            parameters=dict(self.params or {}),
+            parent_ids=[int(p) for p in (parent_ids or [])],
+            timings={"resolve": t1 - t0, "execute": t3 - t2},
+        )
+        arts = pub.publish([req], ctx)
+        if not arts:
+            raise RuntimeError("CmpTask: publication produced no artifacts")
+        art = arts[0]
+
+        # QA after publication (kind=master_cmp)
+        try:
+            status = svc.diagnostics.evaluate_and_save(artifact_id=int(getattr(art, "id", 0)), kind=str(self.artifact_name), meta=ar)
+            if dbg and status:
+                print(f"[QA] CmpTask: status={status} artifact_id={getattr(art, 'id', None)}")
+            try:
+                if svc.diagnostics.should_block(kind=str(self.artifact_name), status=status):
+                    raise RuntimeError(f"QA hard-fail for {self.artifact_name} (artifact_id={getattr(art, 'id', None)})")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        if dbg:
+            print(f"[Timing] CmpTask: resolve={t1 - t0:.3f}s, execute={t3 - t2:.3f}s")
+        return {self.artifact_name: art}
+
 
 class TwiTask(CalibrationTask):
-    """Twilight master-frame task using generic CalibrationTask.
+    """Twilight master-frame task.
 
-    - Uses twilight frames (frame_type='twi')
-    - Produces 'master_twi' artifact via algorithms.twi.step_twi
+    Section 4 implementation mirrors other simple calibs: algorithm returns AlgoResult; task composes
+    ArtifactRequest and publishes via PublicationService; QA runs post-publication.
     """
     name = "twi"
     version = "v1"
@@ -82,6 +429,89 @@ class TwiTask(CalibrationTask):
     frame_type = "twi"
     artifact_name = "master_twi"
     algorithm = step_twi
+
+    def run(self, inputs):
+        import time
+        from ..contracts.result import TwiResultContract
+        from ..artifacts.requests import ArtifactRequest, LogicalComponent
+        from ..artifacts.models import Scope
+        from ..publication.service import DefaultPublicationService
+        from ..publication.context import PublicationContext
+        from ..persistence.policy import DefaultPersistencePolicy
+        from ..core.algo_result import ensure_algo_result
+        from ..artifacts import ArtifactService
+
+        self._require_target()
+        dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
+        t0 = time.perf_counter()
+        raw_inputs, parent_ids = self.query_inputs()
+        t1 = time.perf_counter()
+
+        # Execute algorithm (compute only)
+        algo_params = dict(self.params or {})
+        if isinstance(self.ctx.config, dict):
+            for k, v in self.ctx.config.items():
+                algo_params.setdefault(k, v)
+        t2 = time.perf_counter()
+        ar = self.algorithm(raw_inputs=raw_inputs, output_path=None, params=algo_params)
+        t3 = time.perf_counter()
+
+        # Normalize and validate result
+        ar = ensure_algo_result(ar, kind="twi")
+        rep = TwiResultContract().validate(ar)
+        if not rep.ok:
+            raise ValueError("TwiTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
+
+        # Compose ArtifactRequest (logical, single component)
+        master = ar.get_array("master")
+        if master is None:
+            raise RuntimeError("TwiTask: missing 'master' array in AlgoResult")
+        comp_master = LogicalComponent(name="master", model_type="array2d", value=master)
+        scope = Scope(zipcode=getattr(self.target, "zipcode", None))
+        mm = ar.as_meta()
+        summaries = {"n_inputs": int(mm.get("n_inputs", 0))}
+        req = ArtifactRequest(
+            kind=str(self.artifact_name or "master_twi"),
+            components={"master": comp_master},
+            summaries=summaries,
+            metadata={},
+            scope=scope,
+            parents=[int(p) for p in (parent_ids or [])],
+            labels=["calibration", "twi"],
+        )
+
+        svc = ArtifactService(self.ctx.db_path)
+        pub = DefaultPublicationService(svc=svc, policy=DefaultPersistencePolicy(), base_dir=self.ctx.workdir)
+        ctx = PublicationContext(
+            task_name=self.name,
+            task_version=self.version,
+            algorithm_name="algorithms.twi.step_twi",
+            algorithm_version=ar.version,
+            parameters=dict(self.params or {}),
+            parent_ids=[int(p) for p in (parent_ids or [])],
+            timings={"resolve": t1 - t0, "execute": t3 - t2},
+        )
+        arts = pub.publish([req], ctx)
+        if not arts:
+            raise RuntimeError("TwiTask: publication produced no artifacts")
+        art = arts[0]
+
+        # QA after publication (kind=master_twi)
+        try:
+            status = svc.diagnostics.evaluate_and_save(artifact_id=int(getattr(art, "id", 0)), kind=str(self.artifact_name), meta=ar)
+            if dbg and status:
+                print(f"[QA] TwiTask: status={status} artifact_id={getattr(art, 'id', None)}")
+            try:
+                if svc.diagnostics.should_block(kind=str(self.artifact_name), status=status):
+                    raise RuntimeError(f"QA hard-fail for {self.artifact_name} (artifact_id={getattr(art, 'id', None)})")
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        if dbg:
+            print(f"[Timing] TwiTask: resolve={t1 - t0:.3f}s, execute={t3 - t2:.3f}s")
+        return {self.artifact_name: art}
 
 
 class TraceTask(CalibrationTask):
@@ -108,7 +538,6 @@ class TraceTask(CalibrationTask):
     def _parse_date(self, s: str):
         return super()._parse_date(s)
 
-
     def query_inputs(self):
         # Provide no raw inputs to the algorithm, but return parent_ids for provenance
         self._require_target()
@@ -126,6 +555,14 @@ class TraceTask(CalibrationTask):
 
     def run(self, inputs):
         import time
+        from ..contracts.result import TraceResultContract
+        from ..artifacts.requests import ArtifactRequest, LogicalComponent
+        from ..artifacts.models import Scope
+        from ..publication.service import DefaultPublicationService
+        from ..publication.context import PublicationContext
+        from ..persistence.policy import DefaultPersistencePolicy
+        from ..core.algo_result import ensure_algo_result
+        from ..artifacts import ArtifactService
 
         self._require_target()
         dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
@@ -133,28 +570,28 @@ class TraceTask(CalibrationTask):
 
         # Resolve dependency master_flat and parent provenance
         mf = self._resolve_artifact("master_flat", required=True)
-        parent_ids = [str(mf.get("id"))] if mf.get("id") is not None else []
+        parent_ids = [int(mf.get("id"))] if mf.get("id") is not None else []
 
-        out_path = self.output_path()
+        # Materialize master_flat array via serializers
+        svc = ArtifactService(self.ctx.db_path)
+        try:
+            payload = svc.serializers.get("array", "fits").load(str(mf.get("path"))) if mf.get("path") else None
+            master_flat = payload.get("data") if payload else None
+        except Exception:
+            master_flat = None
+        if master_flat is None:
+            raise RuntimeError("TraceTask: failed to materialize master_flat array from registry row")
 
-        # Build algorithm params: merge self.params, ctx.config and required identifiers
+        # Build algorithm params
         algo_params = dict(self.params or {})
         if isinstance(self.ctx.config, dict):
             for k, v in self.ctx.config.items():
                 algo_params.setdefault(k, v)
-        # Inject registry context for artifact-centric loading
-        try:
-            algo_params.setdefault("db_path", self.ctx.db_path)
-        except Exception:
-            pass
-        if getattr(self.target, "zipcode", None) is not None:
-            algo_params.setdefault("zipcode", getattr(self.target, "zipcode"))
-        # Inject required fields for step_trace (direct path fallback)
-        algo_params.setdefault("master_flat_path", mf.get("path"))
+        # Provide materialized array and identifiers
+        algo_params["master_flat_array"] = master_flat
         zc = getattr(self.target, "zipcode", None)
         if zc is not None:
             try:
-                # Normalize numeric IDs to 3-digit zero-padded strings for reference lookup consistency
                 def _pad3(v: object) -> str:
                     s = str(v).strip()
                     return s.zfill(3) if s.isdigit() and len(s) < 3 else s
@@ -166,7 +603,6 @@ class TraceTask(CalibrationTask):
                 pass
         if getattr(self.target, "start_date", None) is not None:
             algo_params.setdefault("obsdate", str(self.target.start_date))
-        # virusconfig root if available in config
         try:
             vc = self.ctx.config.get("virusconfig") if isinstance(self.ctx.config, dict) else None
             vc = vc or (self.ctx.config.get("trace_config") if isinstance(self.ctx.config, dict) else None)
@@ -176,42 +612,72 @@ class TraceTask(CalibrationTask):
         if vc:
             algo_params.setdefault("virusconfig", str(vc))
         else:
-            # Default to repository root (containing Fiber_Locations) when available
             try:
                 from ..algorithms.trace import default_virusconfig_root as _vf_default_root
                 algo_params.setdefault("virusconfig", _vf_default_root())
             except Exception:
-                # Last-resort historical path
-                algo_params.setdefault("virusconfig", "/work/03946/hetdex/maverick/virus_config")
+                pass
 
         t1 = time.perf_counter()
-        meta = self.algorithm(output_path=out_path, params=algo_params)
+        ar = self.algorithm(raw_inputs=[], output_path=None, params=algo_params)
         t2 = time.perf_counter()
 
-        artifact = self.make_artifact(out_path)
-        art_id = self.save_artifact(artifact, parent_ids=parent_ids)
-        try:
-            setattr(artifact, "id", int(art_id))
-        except Exception:
-            pass
+        # Normalize and validate
+        ar = ensure_algo_result(ar, kind="trace")
+        rep = TraceResultContract().validate(ar)
+        if not rep.ok:
+            raise ValueError("TraceTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
 
-        # QA hook for 'trace'
+        # Compose ArtifactRequest
+        trace2d = ar.get_array("trace_2d")
+        if trace2d is None:
+            raise RuntimeError("TraceTask: missing 'trace_2d' in AlgoResult")
+        comp = LogicalComponent(name="trace_2d", model_type="array2d", value=trace2d)
+        scope = Scope(zipcode=getattr(self.target, "zipcode", None))
+        mm = ar.as_meta()
+        summaries = {"trace_len": int(mm.get("trace_len", trace2d.shape[1]))}
+        req = ArtifactRequest(
+            kind="trace",
+            components={"trace_2d": comp},
+            summaries=summaries,
+            metadata={},
+            scope=scope,
+            parents=parent_ids,
+            labels=["calibration", "trace"],
+        )
+
+        # Publish
+        pub = DefaultPublicationService(svc=svc, policy=DefaultPersistencePolicy(), base_dir=self.ctx.workdir)
+        ctx = PublicationContext(
+            task_name=self.name,
+            task_version=self.version,
+            algorithm_name="algorithms.trace.step_trace",
+            algorithm_version=ar.version,
+            parameters=dict(self.params or {}),
+            parent_ids=parent_ids,
+            timings={"resolve+materialize": t1 - t0, "execute": t2 - t1},
+        )
+        arts = pub.publish([req], ctx)
+        if not arts:
+            raise RuntimeError("TraceTask: publication produced no artifacts")
+        art = arts[0]
+
+        # QA
         try:
-            svc = ArtifactService(self.ctx.db_path)
-            status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind="trace", meta=dict(meta or {}))
+            status = svc.diagnostics.evaluate_and_save(artifact_id=int(getattr(art, "id", 0)), kind="trace", meta=ar)
             if dbg and status:
-                print(f"[QA] TraceTask: auto-qa status={status} artifact_id={art_id}")
+                print(f"[QA] TraceTask: status={status} artifact_id={getattr(art, 'id', None)}")
             try:
                 if svc.diagnostics.should_block(kind="trace", status=status):
-                    raise RuntimeError(f"QA hard-fail for trace (artifact_id={art_id})")
+                    raise RuntimeError(f"QA hard-fail for trace (artifact_id={getattr(art, 'id', None)})")
             except Exception:
                 pass
         except Exception:
             pass
 
         if dbg:
-            print(f"[Timing] TraceTask: dependency+io={t1 - t0:.3f}s, algo={t2 - t1:.3f}s, total={time.perf_counter() - t0:.3f}s")
-        return {self.artifact_name or "trace": artifact}
+            print(f"[Timing] TraceTask: resolve+materialize={t1 - t0:.3f}s, execute={t2 - t1:.3f}s")
+        return {self.artifact_name: art}
 
 
 class WaveTask(CalibrationTask):
@@ -243,146 +709,119 @@ class WaveTask(CalibrationTask):
 
     def run(self, inputs):
         import time
+        from ..contracts.result import WaveResultContract
+        from ..artifacts.requests import ArtifactRequest, LogicalComponent
+        from ..artifacts.models import Scope
+        from ..publication.service import DefaultPublicationService
+        from ..publication.context import PublicationContext
+        from ..persistence.policy import DefaultPersistencePolicy
+        from ..core.algo_result import ensure_algo_result
+        from ..artifacts import ArtifactService
+
         self._require_target()
         dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
         t0 = time.perf_counter()
 
-        mc = self._resolve_artifact("master_cmp", required=True)
-        tr = self._resolve_artifact("trace", required=True)
-        parent_ids = [str(x) for x in (mc.get("id"), tr.get("id")) if x is not None]
+        # Resolve parents and materialize payloads
+        mc_row = self._resolve_artifact("master_cmp", required=True)
+        tr_row = self._resolve_artifact("trace", required=True)
+        parent_ids = [int(x) for x in (mc_row.get("id"), tr_row.get("id")) if x is not None]
 
-        out_path = self.output_path()
-
-        # Load required arrays using artifact-centric materializer
         svc = ArtifactService(self.ctx.db_path)
-        mat = ArtifactMaterializer(svc)
-        def _load_with_fallback(row: dict, kind: str):
-            from pathlib import Path as _Path
+        def _load_array(row: dict) -> np.ndarray | None:
             try:
-                return mat.load_by_id(int(row.get("id"))), row
-            except FileNotFoundError:
-                # Attempt to reselect a better candidate that actually exists on disk
-                scope = Scope(getattr(self.target, "zipcode", None))
-                at_time = self._target_mid_time()
-                # Prefer latest_valid at target time
-                cand = svc.select_best(kind=kind, scope=scope, at_time=at_time, policy="latest_valid")
-                if not cand or not cand.get("path") or not _Path(str(cand.get("path"))).exists():
-                    # Fallback to latest regardless of time
-                    cand = svc.select_best(kind=kind, scope=scope, at_time=None, policy="latest")
-                if cand and cand.get("id") and cand.get("path") and _Path(str(cand.get("path"))).exists():
-                    try:
-                        return mat.load_by_id(int(cand.get("id"))), cand
-                    except Exception:
-                        pass
-                # Re-raise original if no viable candidate found
-                raise
+                path = row.get("path")
+                if not path:
+                    return None
+                payload = svc.serializers.get("array", "fits").load(str(path))
+                return payload.get("data") if isinstance(payload, dict) else None
+            except Exception:
+                return None
+        master_cmp = _load_array(mc_row)
+        trace2d = _load_array(tr_row)
+        if master_cmp is None or trace2d is None:
+            raise RuntimeError("WaveTask: failed to materialize required parent arrays (master_cmp and trace)")
 
-        lr_cmp_obj, mc = _load_with_fallback(mc, "master_cmp")
-        lr_tr_obj, tr = _load_with_fallback(tr, "trace")
-        master_cmp, hdr_cmp = lr_cmp_obj.data, lr_cmp_obj.header
-        trace_2d, hdr_tr = lr_tr_obj.data, lr_tr_obj.header
+        # Build union defect mask from available flat/dark masks and repair master_cmp
+        try:
+            from ..algorithms.utils.masks import build_union_pixelmask, repair_masked_columns
+            flat_row = self._resolve_artifact("master_flat", required=False)
+            dark_row = self._resolve_artifact("master_dark", required=False)
+            umask, _frac = build_union_pixelmask(flat_artifact=flat_row, dark_artifact=dark_row)
+            if umask is not None:
+                import numpy as _np
+                m = _np.asarray(umask)
+                if m.shape == _np.asarray(master_cmp).shape:
+                    master_cmp = repair_masked_columns(_np.asarray(master_cmp, dtype=float), m)
+        except Exception:
+            # Mask unification/repair is best-effort; continue on any error
+            pass
 
         t1 = time.perf_counter()
-        # Build algorithm params: merge task params with context config so CLI-provided qa_out_dir flows through
+        # Execute wavelength algorithm (storage-neutral)
         algo_params = dict(self.params or {})
         if isinstance(self.ctx.config, dict):
             for k, v in self.ctx.config.items():
                 algo_params.setdefault(k, v)
-        # Run wavelength algorithm
-        meta = step_wave(master_cmp=master_cmp, trace=trace_2d, output_path=None, params=algo_params)
+        ar = step_wave(master_cmp=master_cmp, trace=trace2d, output_path=None, params=algo_params)
         t2 = time.perf_counter()
 
-        wave = meta.get("wave") if isinstance(meta, dict) else None
-        if wave is None:
-            raise RuntimeError("WaveTask: step_wave returned no wavelength solution")
+        # Normalize and validate result
+        ar = ensure_algo_result(ar, kind="wave")
+        rep = WaveResultContract().validate(ar)
+        if not rep.ok:
+            raise ValueError("WaveTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
 
-        # Persist wavelength solution via materializer
-        rms_rows = meta.get("rms_rows") if isinstance(meta, dict) else None
-        rms_med = float(np.nanmedian(np.asarray(rms_rows))) if (rms_rows is not None and np.asarray(rms_rows).size) else None
-        sidecar = {
-            "kind": "wave",
-            "role": "calibration",
-            "payload_type": "array",
-            "storage_format": "fits",
-        }
-        if rms_med is not None:
-            sidecar["rms_median"] = float(rms_med)
-        # Persist compact extras for analytics identify-arc parity and trending (bounded size)
-        try:
-            qa_bundle = meta.get("qa_bundle") if isinstance(meta, dict) else None
-            if isinstance(qa_bundle, dict):
-                best = qa_bundle.get("best") or {}
-                # Scalar summaries
-                if "nmatch" in best:
-                    try:
-                        sidecar["best_nmatch"] = int(best.get("nmatch"))
-                    except Exception:
-                        pass
-                if "rms" in best:
-                    try:
-                        sidecar["best_rms"] = float(best.get("rms"))
-                    except Exception:
-                        pass
-                # Downsample reference profile for lightweight plotting
-                refp = qa_bundle.get("ref_profile")
-                if refp is not None:
-                    import numpy as _np
-                    arr = _np.asarray(refp, dtype=float).ravel()
-                    if arr.size:
-                        # Downsample to at most 1024 points
-                        if arr.size > 1024:
-                            idx = _np.linspace(0, arr.size - 1, 1024).astype(int)
-                            sidecar["ref_profile_ds"] = arr[idx].astype(float).tolist()
-                        else:
-                            sidecar["ref_profile_ds"] = arr.astype(float).tolist()
-        except Exception:
-            pass
-        # Optionally persist a compact rms_rows downsample
-        try:
-            if rms_rows is not None:
-                import numpy as _np
-                arr = _np.asarray(rms_rows, dtype=float).ravel()
-                if arr.size:
-                    if arr.size > 4096:
-                        idx = _np.linspace(0, arr.size - 1, 1024).astype(int)
-                        sidecar["rms_rows_ds"] = arr[idx].astype(float).tolist()
-                    else:
-                        sidecar["rms_rows_ds"] = arr.astype(float).tolist()
-        except Exception:
-            pass
-        mat.persist_array(
-            out_path,
-            data=wave,
-            n_inputs=int(hdr_cmp.get("NINPUTS", 0)),
-            algo_version=meta.get("version", "wave-1.0"),
-            extra_header={
-                "SRCCMP": str(mc.get("path")),
-                "SRCTRACE": str(tr.get("path")),
-            },
-            sidecar=sidecar,
+        # Compose ArtifactRequest
+        wave = ar.get_array("wave")
+        if wave is None:
+            raise RuntimeError("WaveTask: missing 'wave' array in AlgoResult")
+        comp = LogicalComponent(name="wave", model_type="array2d", value=wave)
+        scope = Scope(zipcode=getattr(self.target, "zipcode", None))
+        mm = ar.as_meta()
+        summaries = {}
+        for k in ("best_nmatch", "best_rms"):
+            if mm.get(k) is not None:
+                summaries[k] = mm.get(k)
+        req = ArtifactRequest(
+            kind="wave",
+            components={"wave": comp},
+            summaries=summaries,
+            metadata={},
+            scope=scope,
+            parents=parent_ids,
+            labels=["calibration", "wave"],
         )
 
-        artifact = self.make_artifact(out_path)
-        art_id = self.save_artifact(artifact, parent_ids=parent_ids)
-        try:
-            setattr(artifact, "id", int(art_id))
-        except Exception:
-            pass
+        # Publish via PublicationService
+        pub = DefaultPublicationService(svc=svc, policy=DefaultPersistencePolicy(), base_dir=self.ctx.workdir)
+        ctx = PublicationContext(
+            task_name=self.name,
+            task_version=self.version,
+            algorithm_name="algorithms.wave.step_wave",
+            algorithm_version=ar.version,
+            parameters=dict(self.params or {}),
+            parent_ids=parent_ids,
+            timings={"resolve+materialize": t1 - t0, "execute": t2 - t1},
+        )
+        arts = pub.publish([req], ctx)
+        if not arts:
+            raise RuntimeError("WaveTask: publication produced no artifacts")
+        art = arts[0]
 
-        # QA hook for 'wave'
+        # QA after publication
         try:
-            svc = ArtifactService(self.ctx.db_path)
-            status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind="wave", meta=dict(meta or {}))
+            status = svc.diagnostics.evaluate_and_save(artifact_id=int(getattr(art, "id", 0)), kind="wave", meta=ar)
             if dbg and status:
-                print(f"[QA] WaveTask: auto-qa status={status} artifact_id={art_id}")
+                print(f"[QA] WaveTask: status={status} artifact_id={getattr(art, 'id', None)}")
             try:
                 if svc.diagnostics.should_block(kind="wave", status=status):
-                    raise RuntimeError(f"QA hard-fail for wave (artifact_id={art_id})")
+                    raise RuntimeError(f"QA hard-fail for wave (artifact_id={getattr(art, 'id', None)})")
             except Exception:
                 pass
         except Exception:
             pass
 
         if dbg:
-            print(f"[Timing] WaveTask: dependency+io={t1 - t0:.3f}s, algo={t2 - t1:.3f}s, total={time.perf_counter() - t0:.3f}s")
-        return {self.artifact_name or "wave": artifact}
+            print(f"[Timing] WaveTask: resolve+materialize={t1 - t0:.3f}s, execute={t2 - t1:.3f}s")
+        return {self.artifact_name: art}

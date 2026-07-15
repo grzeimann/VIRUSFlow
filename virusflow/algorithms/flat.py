@@ -19,7 +19,7 @@ from astropy.stats import biweight_location
 from scipy.signal import medfilt
 
 from .ccd import base_reduction
-from ..artifacts.io_fits import write_array_fits
+# persistence removed per architecture
 
 __all__ = ["step_flt"]
 logger = logging.getLogger(__name__)
@@ -64,24 +64,17 @@ def _compute_flat_pixelmask(image: np.ndarray) -> np.ndarray:
     return mask.astype(np.uint8)
 
 
+from ..core.algo_result import AlgoResult
+
 def step_flt(
     raw_flt_inputs: Optional[Iterable[FlatInput]] = None,
     output_path: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[FlatInput]] = None,
-) -> Dict[str, Any]:
+) -> AlgoResult:
     """Construct a master flat frame from input flat (continuum) frames.
 
-    Contract:
-    - Inputs: iterable of dicts with keys:
-        - 'path': outer container path (FITS file or .tar archive path)
-        - 'tar_member': optional member path inside the tar when applicable
-    - Output: write a master-flat FITS file to output_path, and return metadata.
-
-    Algorithm (similar to dark/bias):
-    - For each input frame, run CCD base_reduction (overscan subtraction, trim, orientation, gain, error)
-    - Stack the reduced images robustly via biweight location to produce the master flat
-    - Compute flat pixel mask using the ported get_pixelmask_flt logic
+    Storage-neutral: compute and return AlgoResult only. No persistence here.
     """
     params = params or {}
     # Prefer explicit raw_inputs if provided
@@ -126,30 +119,18 @@ def step_flt(
     n_bad = int(flat_mask.sum())
     frac_bad = float(n_bad) / float(flat_mask.size)
 
-    if output_path is not None:
-        write_array_fits(
-            output_path,
-            data=master,
-            n_inputs=len(frames),
-            algo_version=ALGO_VERSION,
-            extra_primary_cards={"BADFRAC": float(frac_bad)},
-            mask=flat_mask,
-            mask_name="FLATMASK",
-            sidecar={
-                "kind": "master_flat",
-                "role": "calibration",
-                "payload_type": "array",
-                "storage_format": "fits",
-                "bad_fraction": float(frac_bad),
-            },
-        )
-
-    return {
-        "n_inputs": len(frames),
-        "shape": list(master.shape),
-        "n_bad": n_bad,
-        "bad_fraction": frac_bad,
-        "output_path": output_path,
-        "algo": "algorithms.flat.step_flt",
-        "version": ALGO_VERSION,
-    }
+    return AlgoResult(
+        kind="flat",
+        version=ALGO_VERSION,
+        meta={
+            "shape": list(master.shape),
+        },
+        scalars={
+            "n_inputs": len(frames),
+            "bad_fraction": float(frac_bad),
+        },
+        arrays={
+            "master": master,
+            "mask": flat_mask,
+        },
+    )
