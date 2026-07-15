@@ -45,9 +45,21 @@ class QAEngine:
 
     def policy_for(self, kind: str) -> str:
         k = (kind or "").strip().lower()
-        dfl = str(((self._cfg.get("defaults") or {}).get("policy")) or "soft").lower()
+        dfl_raw = (self._cfg.get("defaults") or {}).get("policy")
+        # Normalize default policy (handle YAML 1.1 bools like 'off' -> False)
+        if isinstance(dfl_raw, bool):
+            dfl = "off" if dfl_raw is False else "soft"
+        else:
+            dfl = str(dfl_raw or "soft").lower()
         sec = (self._cfg.get("kinds") or {}).get(k) or {}
-        return str(sec.get("policy") or dfl or "soft").lower()
+        pol_raw = sec.get("policy")
+        if isinstance(pol_raw, bool):
+            pol = "off" if pol_raw is False else dfl
+        elif isinstance(pol_raw, str):
+            pol = pol_raw.lower()
+        else:
+            pol = dfl
+        return pol
 
     def evaluate(self, *, kind: str, meta: Optional[Dict[str, Any]] = None) -> Decision:
         k = (kind or "").strip().lower()
@@ -203,10 +215,11 @@ def _safe_eval(expr: str, ns: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
             self.ok = True
 
         def generic_visit(self, node):
-            if isinstance(node, (ast.Module, ast.Expr, ast.Load)):
+            # Allow top-level Expression produced by ast.parse(..., mode="eval") and simple expr/load nodes
+            if isinstance(node, (ast.Module, ast.Expression, ast.Expr, ast.Load)):
                 super().generic_visit(node)
                 return
-            if isinstance(node, (ast.BoolOp, ast.UnaryOp, ast.BinOp, ast.Compare, ast.Name, ast.Constant, ast.And, ast.Or, ast.Not, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.USub, ast.UAdd)):
+            if isinstance(node, (ast.BoolOp, ast.UnaryOp, ast.BinOp, ast.Compare, ast.Name, ast.Constant, ast.And, ast.Or, ast.Not, ast.Eq, ast.NotEq, ast.Is, ast.IsNot, ast.Lt, ast.LtE, ast.Gt, ast.GtE, ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.USub, ast.UAdd)):
                 super().generic_visit(node)
                 return
             # Everything else is disallowed
@@ -271,6 +284,10 @@ def _safe_eval(expr: str, ns: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
                     ok = ok and (cur == right)
                 elif isinstance(op, ast.NotEq):
                     ok = ok and (cur != right)
+                elif isinstance(op, ast.Is):
+                    ok = ok and (cur is right)
+                elif isinstance(op, ast.IsNot):
+                    ok = ok and (cur is not right)
                 elif isinstance(op, ast.Lt):
                     ok = ok and (cur < right)
                 elif isinstance(op, ast.LtE):

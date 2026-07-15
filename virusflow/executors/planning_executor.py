@@ -58,11 +58,13 @@ class PlanningExecutor:
 
     def run(self) -> None:
         from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        import time as _time
 
         indeg, dependents = self._indeg_and_dependents()
         ready = [k for k, v in indeg.items() if v == 0]
         done: Dict[str, bool] = {}
         failed: Dict[str, str] = {}
+        _start_ts = _time.perf_counter()
 
         def _has_failed_dep(nid: str) -> bool:
             return any((d in failed) for d in self._nodes[nid].deps)
@@ -98,12 +100,22 @@ class PlanningExecutor:
                 _sys.stdout.write("\x1b[" + str(_printed_lines) + "A")  # move back up
             # Compose table
             rows = []
-            header = "Task Kind                    | total | running | ok | fail"
+            # Pull a snapshot of QA tallies to render per-kind columns
+            try:
+                from ..artifacts.diagnostics import qa_tallies_snapshot as _qa_snap  # type: ignore
+                q = _qa_snap() or {}
+            except Exception:
+                q = {}
+            header = "Task Kind                    | total | running | ok | fail | qa_pass | qa_warn | qa_fail"
             sep = "-" * len(header)
             rows.append(header)
             rows.append(sep)
             for k in sorted(totals.keys()):
-                rows.append(f"{k:<28} | {totals.get(k,0):>5} | {running.get(k,0):>7} | {ok.get(k,0):>2} | {fl.get(k,0):>4}")
+                qk = q.get(str(k).lower(), {}) or {}
+                qp = int(qk.get("pass", 0))
+                qw = int(qk.get("warn", 0))
+                qf = int(qk.get("fail", 0))
+                rows.append(f"{k:<28} | {totals.get(k,0):>5} | {running.get(k,0):>7} | {ok.get(k,0):>2} | {fl.get(k,0):>4} | {qp:>7} | {qw:>7} | {qf:>7}")
             # Overall summary
             rows.append(sep)
             all_total = sum(totals.values())
@@ -113,13 +125,21 @@ class PlanningExecutor:
             rows.append(f"Overall                      | {all_total:>5} | {all_running:>7} | {all_ok:>2} | {all_fail:>4}")
             # Optional QA footer with warn/fail tallies
             try:
-                from ..artifacts.diagnostics import qa_tallies_snapshot as _qa_snap  # type: ignore
-                q = _qa_snap() or {}
                 qt = q.get("__all__", {}) or {}
                 q_pass = int(qt.get("pass", 0))
                 q_warn = int(qt.get("warn", 0))
                 q_fail = int(qt.get("fail", 0))
                 rows.append(f"QA totals                    |  pass={q_pass}  warn={q_warn}  fail={q_fail}")
+            except Exception:
+                pass
+            # Elapsed time footer
+            try:
+                elapsed = max(0.0, _time.perf_counter() - _start_ts)
+                esec = int(elapsed)
+                hh = esec // 3600
+                mm = (esec % 3600) // 60
+                ss = esec % 60
+                rows.append(f"Elapsed time                 |  {hh:02d}:{mm:02d}:{ss:02d}")
             except Exception:
                 pass
             text = "\n".join(rows) + "\n"
@@ -264,5 +284,12 @@ class PlanningExecutor:
         # Always print a one-line execution summary for user feedback
         try:
             print(f"Execution summary: total={total_nodes}, ok={succeeded}, failed={failed_total}")
+            if failed_total > 0:
+                # Print a few failure reasons for visibility even when not in debug mode
+                try:
+                    for f in (failures_list[:3] if isinstance(failures_list, list) else []):
+                        print(f"[Failure] {f.get('kind','?')} {f.get('id','?')}: {f.get('reason','')}")
+                except Exception:
+                    pass
         except Exception:
             pass

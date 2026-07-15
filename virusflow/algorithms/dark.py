@@ -17,7 +17,7 @@ import logging
 import numpy as np
 from astropy.stats import biweight_location, sigma_clipped_stats
 
-from .ccd import base_reduction
+from . import ccd as _ccd
 from ..artifacts.io_fits import write_array_fits
 
 __all__ = ["step_dark"]
@@ -94,7 +94,7 @@ def step_dark(
         if not p:
             return None, i, "no-path"
         try:
-            img, _err = base_reduction(p, tm, return_header=False)
+            img, _err = _ccd.base_reduction(p, tm, return_header=False)
             return img, i, None
         except Exception as e:
             # Do not implement test-only fallbacks in production algorithms; tests should

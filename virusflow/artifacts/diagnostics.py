@@ -63,12 +63,50 @@ class DiagnosticsFacade:
         Returns the status string (e.g., pass/warn/fail). Swallows errors for task safety.
         """
         try:
+            import os as _os
+            import numpy as _np
             eng = self._engine_or_load()
-            decision = eng.evaluate(kind=kind, meta=dict(meta or {}))
-            # persist
-            self.adapter.set_diagnostics(int(artifact_id), status=decision.status, metrics=decision.metrics)
+            # Prepare meta and, for certain kinds, enrich with computed metrics (e.g., p95 from payload)
+            m = dict(meta or {})
+            k = (kind or "").strip().lower()
+            if k in {"master_flat", "master_cmp"} and (m.get("p95") is None):
+                try:
+                    row = self.adapter.get_row(int(artifact_id))
+                    path = row.get("path") if isinstance(row, dict) else None
+                    if path:
+                        # Load array payload and compute 95th percentile (NaN-aware)
+                        from .serializers import array_fits as _array_fits  # type: ignore
+                        payload = _array_fits.load(str(path))
+                        data = payload.get("data")
+                        if data is not None:
+                            arr = _np.asarray(data, dtype=float)
+                            with _np.errstate(all="ignore"):
+                                val = float(_np.nanpercentile(arr, 95)) if arr.size else None
+                            if val is not None and val == val:  # not NaN
+                                m["p95"] = val
+                except Exception:
+                    # Best-effort enrichment; ignore on failure
+                    pass
+            decision = eng.evaluate(kind=kind, meta=m)
+            # persist: include messages as a special key in metrics for visibility in CLI/DB
+            metrics = dict(decision.metrics or {})
+            if getattr(decision, "messages", None):
+                try:
+                    metrics["__messages"] = list(decision.messages)
+                except Exception:
+                    pass
+            self.adapter.set_diagnostics(int(artifact_id), status=decision.status, metrics=metrics)
             # update live tallies
             _qa_inc(kind, decision.status)
+            # Optional verbose print for debugging misconfigured rules
+            try:
+                if _os.environ.get("VF_QA_VERBOSE", "0") == "1":
+                    # Print a concise line with key metrics (limit size) and messages
+                    kv = ", ".join(f"{k}={v}" for k, v in list(metrics.items())[:6])
+                    msgs = "; ".join(decision.messages or [])
+                    print(f"[QA] kind={kind} status={decision.status} metrics: {kv} messages: {msgs}")
+            except Exception:
+                pass
             return decision.status
         except Exception:
             return None

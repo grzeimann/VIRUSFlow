@@ -1,0 +1,126 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from virusflow.registry import database as db
+from virusflow.core.identity import ZipCode
+from virusflow.artifacts.models import Scope
+from virusflow.artifacts.provenance import build_provenance
+from virusflow.planning.mapping import select_for_edge
+from virusflow.planning.defaults import default_calibration_graph
+from virusflow.planning.graph import ReductionGraph
+
+
+def _seed_zipcode(conn, z: ZipCode) -> None:
+    conn.execute(
+        """
+        INSERT INTO amplifiers(key, ifuslot, ifuid, specid, amp, controller)
+        VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO NOTHING
+        """,
+        (z.key(), z.ifuslot, z.ifuid, z.specid, z.amp, z.controller),
+    )
+
+
+def _seed_exposure(conn, *, exposure_id: str, when_ymd: str, frame_type: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO exposures(id, when_utc, frame_type) VALUES(?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET when_utc=excluded.when_utc, frame_type=excluded.frame_type
+        """,
+        (exposure_id, when_ymd, frame_type),
+    )
+
+
+def _seed_raw_file(conn, *, exposure_id: str, frame_type: str, amp_key: str) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO raw_files(exposure_id, frame_type, path, tar_member, storage_backend, amp_key)
+        VALUES(?, ?, ?, ?, ?, ?)
+        """,
+        (exposure_id, frame_type, f"/tmp/{exposure_id}_{frame_type}.fits", None, "filesystem", amp_key),
+    )
+
+
+def _seed_artifact(conn, *, kind: str, z: ZipCode, created_at: datetime, vstart: datetime | None = None, vend: datetime | None = None, path_suffix: str = "") -> int:
+    """Insert a minimal artifact + provenance row directly for deterministic created_at.
+
+    Returns the inserted artifact id.
+    """
+    art = {
+        "kind": kind,
+        "name": kind,
+        "path": f"/tmp/{kind}{path_suffix or ''}.fits",
+        "zipcode": z,
+        "validity_start": vstart,
+        "validity_end": vend,
+    }
+    prov = build_provenance(algorithm=f"test:{kind}", params={})
+    # Override created_at deterministically
+    prov["created_at"] = created_at
+    return db.save_artifact(art, prov, db_path=conn.execute("PRAGMA database_list").fetchone()[2])
+
+
+def test_mapping_tolerance_selection(tmp_path: Path):
+    db_path = str(tmp_path / "test.sqlite3")
+    db.init_db(db_path=db_path)
+    z = ZipCode(ifuslot="010", ifuid="001", specid="001", amp="LL", controller="A")
+    with db.connect(db_path) as conn:
+        _seed_zipcode(conn, z)
+        # Seed two artifacts at known created_at times
+        t0 = datetime(2026, 7, 1, 0, 0, 0)
+        t1 = t0 + timedelta(days=10)
+        t2 = t0 + timedelta(days=40)
+        # within 15-day tolerance around t1, expect selection of the nearer one if service.best returns latest_valid
+        _ = _seed_artifact(conn, kind="master_flat", z=z, created_at=t0, vstart=t0, vend=t0 + timedelta(days=1), path_suffix="_old")
+        aid_new = _seed_artifact(conn, kind="master_flat", z=z, created_at=t2, vstart=t2, vend=t2 + timedelta(days=1), path_suffix="_new")
+
+    scope = Scope(zipcode=z)
+    from virusflow.artifacts.service import ArtifactService
+
+    svc = ArtifactService(db_path)
+    # With small tolerance (<=15 days) around t1, neither artifact is within tolerance 15 (t0 is 10 days before, which is within; t2 is 30 days after)
+    # select_for_edge should return a row within tolerance if any; the service.select_best(policy=latest_valid) will likely pick the newer (t2),
+    # but tolerance filter should reject it and allow the older one (t0) since it's within 15 days.
+    row = select_for_edge(kind="master_flat", scope=scope, at_time=t1, policy="latest_valid", tolerance_days=15, service=svc)
+    assert row is not None
+    # Ensure the returned created_at is within tolerance
+    created = row.get("created_at")
+    if isinstance(created, str):
+        from datetime import datetime as _dt
+        created = _dt.fromisoformat(created.split(".")[0])
+    assert abs((created - t1).days) <= 15
+
+    # With very small tolerance (<=5 days), expect no row (both 10 and 40 days away)
+    row2 = select_for_edge(kind="master_flat", scope=scope, at_time=t1, policy="latest_valid", tolerance_days=5, service=svc)
+    assert row2 is None
+
+
+def test_planner_idempotent_skip_with_existing_artifact(tmp_path: Path):
+    db_path = str(tmp_path / "test2.sqlite3")
+    db.init_db(db_path=db_path)
+    # Prepare zipcode and enough raw zero frames to satisfy TimeCadence min_n_inputs=25
+    z = ZipCode(ifuslot="011", ifuid="001", specid="001", amp="LL", controller="A")
+    with db.connect(db_path) as conn:
+        _seed_zipcode(conn, z)
+        base = datetime(2026, 5, 1)
+        for i in range(25):
+            t = base + timedelta(days=i // 5)
+            eid = t.strftime("%Y%m%dT%H%M%S")
+            _seed_exposure(conn, exposure_id=eid, when_ymd=t.strftime("%Y%m%d"), frame_type="zro")
+            _seed_raw_file(conn, exposure_id=eid, frame_type="zro", amp_key=z.key())
+        # Seed an existing master_bias artifact (created_at near base)
+        _seed_artifact(conn, kind="master_bias", z=z, created_at=base + timedelta(days=1), vstart=base, vend=base + timedelta(days=30))
+
+    nodes, edges = default_calibration_graph()
+    G = ReductionGraph(nodes, edges)
+    scopes = [Scope(zipcode=z)]
+    planned, report = G.plan(db_path=db_path, scopes=scopes)
+
+    # Since an existing master_bias is present and time-cadence emits an open window, planner should mark it as existing/skip
+    existing_keys = set()
+    for t in report.existing:
+        if t.kind == "master_bias":
+            existing_keys.add(t.kind)
+    assert "master_bias" in existing_keys or all(t.kind != "master_bias" for t in report.planned)
