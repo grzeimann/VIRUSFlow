@@ -159,8 +159,8 @@ class WavelengthStudy:
                                 study_name="wavelength",
                             )
                             produced += 1
-                    # 4) Residual histogram from rms_rows_ds if available
-                    rr = summ.get("rms_rows_ds")
+                    # 4) Residual histogram from per_fiber_wavelength_residual_rms_ds if available
+                    rr = summ.get("per_fiber_wavelength_residual_rms_ds")
                     if isinstance(rr, (list, tuple)) and len(rr) > 0:
                         import numpy as _np
                         valsr = _np.asarray(rr, dtype=float)

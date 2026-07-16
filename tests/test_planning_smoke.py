@@ -85,7 +85,7 @@ def test_planning_scheduler_executor_smoke(tmp_path: Path, monkeypatch):
         # algorithms expect a tuple (img, header_or_err)
         return (img, None)
 
-    monkeypatch.setattr(_ccd, "base_reduction", _synth_reader, raising=True)
+    monkeypatch.setattr(_ccd, "reduce_raw_amplifier_frame", _synth_reader, raising=True)
 
     # Schedule only the planned targets and execute
     kind_map = default_kind_to_task()

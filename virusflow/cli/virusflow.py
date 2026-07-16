@@ -337,7 +337,7 @@ def cmd_debug_raw(args: argparse.Namespace) -> None:
                             print("   [verify] FITS header read OK")
             except Exception as e:
                 print(f"   [verify] error: {e}")
-    # Optional single base_reduction probe
+    # Optional single reduce_raw_amplifier_frame probe
     if args.probe:
         try:
             import virusflow.algorithms.ccd as _ccd
@@ -346,7 +346,7 @@ def cmd_debug_raw(args: argparse.Namespace) -> None:
             return
         (rid0, rf0) = rows[0]
         try:
-            img, _hdr = _ccd.base_reduction(rf0.path, rf0.tar_member, return_header=False)
+            img, _hdr = _ccd.reduce_raw_amplifier_frame(rf0.path, rf0.tar_member, return_header=False)
             print(f"Probe success: shape={getattr(img, 'shape', None)} from path={rf0.path} member={rf0.tar_member}")
         except Exception as e:
             print(f"Probe failed: {e}")
@@ -673,7 +673,7 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp_dbg.add_argument("--end-date", help="Filter end date YYYYMMDD")
     sp_dbg.add_argument("--limit", type=int, help="Show up to N sample rows (default 10)")
     sp_dbg.add_argument("--verify", action="store_true", help="For tar members, verify FITS header readability via tarfile+astropy")
-    sp_dbg.add_argument("--probe", action="store_true", help="Attempt a single algorithms.ccd.base_reduction on the first candidate and report")
+    sp_dbg.add_argument("--probe", action="store_true", help="Attempt a single algorithms.ccd.reduce_raw_amplifier_frame on the first candidate and report")
     sp_dbg.set_defaults(func=cmd_debug_raw)
 
     # plan group with subcommands

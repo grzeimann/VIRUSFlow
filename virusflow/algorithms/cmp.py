@@ -3,7 +3,7 @@ from __future__ import annotations
 """Comparison (arc-lamp) master-frame construction.
 
 This module exposes a single public routine:
-- step_cmp: reduce a set of raw comparison-lamp exposures using CCD base_reduction
+- step_cmp: reduce a set of raw comparison-lamp exposures using CCD reduce_raw_amplifier_frame
   and robustly combine them (biweight) into a master comparison frame.
 
 Architecture: algorithms are storage-neutral. step_cmp performs computation only
@@ -57,7 +57,7 @@ def step_cmp(
         if not p:
             return None, i, "no-path"
         try:
-            img, _err = _ccd.base_reduction(p, tm, return_header=False)
+            img, _err = _ccd.reduce_raw_amplifier_frame(p, tm, return_header=False)
             return img, i, None
         except Exception as e:
             return None, i, str(e)
@@ -92,12 +92,12 @@ def step_cmp(
         kind="cmp",
         version=ALGO_VERSION,
         meta={
-            "shape": list(master.shape),
+            "image_shape": list(master.shape),
         },
         scalars={
             "n_inputs": len(frames),
         },
         arrays={
-            "master": master,
+            "master_comparison_lamp": master,
         },
     )

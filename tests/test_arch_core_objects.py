@@ -20,14 +20,14 @@ def test_algo_result_as_meta_includes_kind_and_version():
         kind="bias",  # computation identity, not artifact kind
         version="bias-1.0",
         meta={"n_inputs": 3},
-        scalars={"readnoise": 4.2},
+        scalars={"read_noise": 4.2},
         arrays={"master": np.zeros((2, 2), dtype=float)},
     )
     m = ar.as_meta()
     assert m["_algo_version"] == "bias-1.0"
     assert m["_algo_kind"] == "bias"
     # Scalars merged into meta
-    assert m["readnoise"] == 4.2
+    assert m["read_noise"] == 4.2
     # Shapes summary is optional but if present should include key
     if "_arrays_shape" in m:
         assert "master" in m["_arrays_shape"]
@@ -36,13 +36,13 @@ def test_algo_result_as_meta_includes_kind_and_version():
 essential_arr = np.arange(6, dtype=float).reshape(2, 3)
 
 def test_artifact_request_multi_component():
-    comp_master = LogicalComponent(name="master", model_type="array2d", value=essential_arr)
-    comp_mask = LogicalComponent(name="mask", model_type="array2d", value=np.ones_like(essential_arr))
+    comp_master = LogicalComponent(name="master_flat", model_type="array2d", value=essential_arr)
+    comp_mask = LogicalComponent(name="flat_response_mask", model_type="array2d", value=np.ones_like(essential_arr))
     req = ArtifactRequest(
         kind="master_flat",
         components={
-            "master": comp_master,
-            "mask": comp_mask,
+            "master_flat": comp_master,
+            "flat_response_mask": comp_mask,
         },
         summaries={"bad_fraction": 0.12},
         metadata={"role": "calibration"},
@@ -50,14 +50,14 @@ def test_artifact_request_multi_component():
         labels=["calib", "flat"],
     )
     names = req.component_names()
-    assert set(names) == {"master", "mask"}
-    assert req.get_component("master").model_type == "array2d"
+    assert set(names) == {"master_flat", "flat_response_mask"}
+    assert req.get_component("master_flat").model_type == "array2d"
 
 
 def test_result_contract_smoke_validation():
     import numpy as _np
-    # For bias, the contract requires 'master' array and 'readnoise' scalar/meta
-    ar = AlgoResult(kind="bias", version="bias-1.0", meta={}, scalars={"readnoise": 4.2}, arrays={"master": _np.zeros((2, 2))})
+    # For bias, the contract requires 'master' array and 'read_noise' scalar/meta
+    ar = AlgoResult(kind="bias", version="bias-1.0", meta={}, scalars={"read_noise": 4.2}, arrays={"master": _np.zeros((2, 2))})
     rep = BiasResultContract().validate(ar)
     assert rep.ok, f"unexpected errors: {rep.errors}"
 

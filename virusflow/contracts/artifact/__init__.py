@@ -48,7 +48,7 @@ class MasterBiasContract:
             kind="master_bias",
             components=[LogicalComponentSpec(name="master", model_type="array2d", required=True)],
             optional_components=[],
-            summaries=["readnoise"],
+            summaries=["read_noise"],
             required_metadata=[],
             applicability="Bias calibration products",
             validity_semantics="Valid for instrument zipcode and date window",
@@ -60,8 +60,8 @@ class MasterDarkContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
             kind="master_dark",
-            components=[LogicalComponentSpec(name="master", model_type="array2d", required=True)],
-            optional_components=[LogicalComponentSpec(name="mask", model_type="array2d", required=False)],
+            components=[LogicalComponentSpec(name="master_dark", model_type="array2d", required=True)],
+            optional_components=[LogicalComponentSpec(name="dark_pixel_mask", model_type="array2d", required=False)],
             summaries=["bad_fraction"],
             required_metadata=[],
             applicability="Dark calibration products",
@@ -74,8 +74,8 @@ class MasterFlatContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
             kind="master_flat",
-            components=[LogicalComponentSpec(name="master", model_type="array2d", required=True)],
-            optional_components=[LogicalComponentSpec(name="mask", model_type="array2d", required=False)],
+            components=[LogicalComponentSpec(name="master_flat", model_type="array2d", required=True)],
+            optional_components=[LogicalComponentSpec(name="flat_response_mask", model_type="array2d", required=False)],
             summaries=["bad_fraction"],
             required_metadata=[],
             applicability="Flat calibration products",
@@ -88,9 +88,9 @@ class TraceContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
             kind="trace",
-            components=[LogicalComponentSpec(name="trace_2d", model_type="array2d", required=True)],
+            components=[LogicalComponentSpec(name="fiber_trace_map", model_type="array2d", required=True)],
             optional_components=[],
-            summaries=["rms_fibers_ds", "trace_len"],
+            summaries=["per_fiber_trace_residual_rms_ds", "trace_len"],
             required_metadata=[],
             applicability="Trace solution for fiber extraction",
             validity_semantics="Valid with master_flat parent",
@@ -102,9 +102,9 @@ class WaveContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
             kind="wave",
-            components=[LogicalComponentSpec(name="wave", model_type="array2d", required=True)],
+            components=[LogicalComponentSpec(name="wavelength_map", model_type="array2d", required=True)],
             optional_components=[],
-            summaries=["rms_rows_ds", "best_nmatch", "best_rms"],
+            summaries=["per_fiber_wavelength_residual_rms_ds", "best_nmatch", "best_rms"],
             required_metadata=[],
             applicability="Wavelength calibration",
             validity_semantics="Valid with master_cmp and trace parents",
@@ -116,7 +116,7 @@ class MasterCmpContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
             kind="master_cmp",
-            components=[LogicalComponentSpec(name="master", model_type="array2d", required=True)],
+            components=[LogicalComponentSpec(name="master_comparison_lamp", model_type="array2d", required=True)],
             optional_components=[],
             summaries=[],
             required_metadata=[],
@@ -130,7 +130,7 @@ class MasterTwiContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
             kind="master_twi",
-            components=[LogicalComponentSpec(name="master", model_type="array2d", required=True)],
+            components=[LogicalComponentSpec(name="master_twilight", model_type="array2d", required=True)],
             optional_components=[],
             summaries=[],
             required_metadata=[],

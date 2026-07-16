@@ -3,7 +3,7 @@ from __future__ import annotations
 """Flat-field master-frame construction.
 
 This module focuses on building a master flat used for tracing and pixelmasking:
-- step_flt: reduce raw flat exposures with CCD base_reduction and combine them
+- step_flt: reduce raw flat exposures with CCD reduce_raw_amplifier_frame and combine them
   robustly (biweight) into a master flat; compute a flat-specific pixel mask
   using a median-filter deviation rule and simple column heuristics; returns a storage-neutral AlgoResult (no file I/O here).
 
@@ -17,7 +17,7 @@ import numpy as np
 from astropy.stats import biweight_location
 from scipy.signal import medfilt
 
-from .ccd import base_reduction
+from .ccd import reduce_raw_amplifier_frame
 # persistence removed per architecture
 
 __all__ = ["step_flt"]
@@ -30,7 +30,7 @@ ALGO_VERSION = "flat-1.0"
 FlatInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
 
 
-def _compute_flat_pixelmask(image: np.ndarray) -> np.ndarray:
+def detect_flat_response_outliers(image: np.ndarray) -> np.ndarray:
     """Port of reference.get_pixelmask_flt for flat-field images.
 
     Logic (per reference):
@@ -88,7 +88,7 @@ def step_flt(
         if not p:
             return None, i, "no-path"
         try:
-            img, _err = base_reduction(p, tm, return_header=False)
+            img, _err = reduce_raw_amplifier_frame(p, tm, return_header=False)
             return img, i, None
         except Exception as e:
             return None, i, str(e)
@@ -113,7 +113,7 @@ def step_flt(
     stack = np.stack(frames, axis=0)
     master = biweight_location(stack, axis=0, ignore_nan=True)
 
-    flat_mask = _compute_flat_pixelmask(master)
+    flat_mask = detect_flat_response_outliers(master)
     n_bad = int(flat_mask.sum())
     frac_bad = float(n_bad) / float(flat_mask.size)
 
@@ -121,14 +121,14 @@ def step_flt(
         kind="flat",
         version=ALGO_VERSION,
         meta={
-            "shape": list(master.shape),
+            "image_shape": list(master.shape),
         },
         scalars={
             "n_inputs": len(frames),
             "bad_fraction": float(frac_bad),
         },
         arrays={
-            "master": master,
-            "mask": flat_mask,
+            "master_flat": master,
+            "flat_response_mask": flat_mask,
         },
     )

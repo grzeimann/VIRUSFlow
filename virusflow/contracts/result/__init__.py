@@ -50,16 +50,16 @@ class _BaseSimpleContract:
 
 class BiasResultContract(_BaseSimpleContract):
     required_arrays = ["master"]
-    required_scalars = ["readnoise"]
+    required_scalars = ["read_noise"]
 
 
 class DarkResultContract(_BaseSimpleContract):
-    required_arrays = ["master"]
+    required_arrays = ["master_dark"]
     required_scalars = ["bad_fraction"]
 
 
 class FlatResultContract(_BaseSimpleContract):
-    required_arrays = ["master"]
+    required_arrays = ["master_flat"]
     required_scalars = ["bad_fraction"]
 
 
@@ -71,7 +71,7 @@ class WaveResultContract(_BaseSimpleContract):
     pass
 
 class CmpResultContract(_BaseSimpleContract):
-    required_arrays = ["master"]
+    required_arrays = ["master_comparison_lamp"]
 
 class TwiResultContract(_BaseSimpleContract):
-    required_arrays = ["master"]
+    required_arrays = ["master_twilight"]

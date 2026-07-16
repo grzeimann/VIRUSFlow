@@ -26,7 +26,7 @@ def test_publication_records_publication_context_in_provenance(tmp_path: Path, m
     req = ArtifactRequest(
         kind="master_bias",
         components={"master": comp},
-        summaries={"readnoise": 2.5},
+        summaries={"read_noise": 2.5},
         metadata={"n_inputs": 3, "algo_version": "bias-1.0"},
         scope=Scope(zipcode=None),
         parents=[42],

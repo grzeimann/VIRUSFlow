@@ -52,10 +52,10 @@ def test_metric_defaults_applied_when_missing(tmp_path):
         "  bias:\n"
         "    policy: soft\n"
         "    metrics:\n"
-        "      readnoise: { from: meta.readnoise, default: 3.2 }\n"
+        "      read_noise: { from: meta.read_noise, default: 3.2 }\n"
         "    checks:\n"
         "      - id: rn_range\n"
-        "        where: 'readnoise is not None and readnoise > 0 and readnoise < 6'\n"
+        "        where: 'read_noise is not None and read_noise > 0 and read_noise < 6'\n"
         "        severity: fail_if_false\n"
     )
     ypath = write_yaml(tmp_path, yaml_text)
@@ -63,7 +63,7 @@ def test_metric_defaults_applied_when_missing(tmp_path):
 
     # No readnoise provided; default should be used and pass
     d = eng.evaluate(kind="bias", meta={})
-    assert d.metrics.get("readnoise") == 3.2
+    assert d.metrics.get("read_noise") == 3.2
     assert d.status == "pass"
 
 
@@ -75,8 +75,8 @@ def test_reducers_and_status_priority_warn_over_pass_fail_over_warn(tmp_path):
         "  wave:\n"
         "    policy: hard\n"
         "    metrics:\n"
-        "      rms_median: { from: reduce.median(meta.rms_rows) }\n"
-        "      rms_p95: { from: reduce.percentile(meta.rms_rows, 95) }\n"
+        "      rms_median: { from: reduce.median(meta.per_fiber_wavelength_residual_rms) }\n"
+        "      rms_p95: { from: reduce.percentile(meta.per_fiber_wavelength_residual_rms, 95) }\n"
         "    checks:\n"
         "      - id: med_lt_1_0\n"
         "        where: 'rms_median is not None and rms_median < 1.0'\n"
@@ -89,13 +89,13 @@ def test_reducers_and_status_priority_warn_over_pass_fail_over_warn(tmp_path):
     eng = QAEngine(ypath)
 
     # Case 1: median passes (<1.0), but p95 >= 1.8 → status warn
-    meta_warn = {"rms_rows": [0.4, 0.8, 2.1, float("nan")]}  # p95 ~ 2.1
+    meta_warn = {"per_fiber_wavelength_residual_rms": [0.4, 0.8, 2.1, float("nan")]}  # p95 ~ 2.1
     d_warn = eng.evaluate(kind="wave", meta=meta_warn)
     assert d_warn.metrics["rms_median"] < 1.0
     assert d_warn.status == "warn"
 
     # Case 2: median fails (>=1.0) → status fail regardless of warn check
-    meta_fail = {"rms_rows": [1.2, 1.1, 0.9]}
+    meta_fail = {"per_fiber_wavelength_residual_rms": [1.2, 1.1, 0.9]}
     d_fail = eng.evaluate(kind="wave", meta=meta_fail)
     assert d_fail.metrics["rms_median"] >= 1.0
     assert d_fail.status == "fail"
@@ -130,22 +130,22 @@ def test_master_bias_like_rule_passes_for_readnoise_near_three(tmp_path):
         "  master_bias:\n"
         "    policy: soft\n"
         "    metrics:\n"
-        "      readnoise: { from: meta.readnoise }\n"
+        "      read_noise: { from: meta.read_noise }\n"
         "    checks:\n"
-        "      - id: readnoise_valid\n"
-        "        where: 'readnoise is not None and readnoise > 1e-4 and readnoise < 6.0'\n"
+        "      - id: read_noise_valid\n"
+        "        where: 'read_noise is not None and read_noise > 1e-4 and read_noise < 6.0'\n"
         "        severity: fail_if_false\n"
     )
     ypath = write_yaml(tmp_path, yaml_text)
     eng = QAEngine(ypath)
 
-    d = eng.evaluate(kind="master_bias", meta={"readnoise": 3.0})
+    d = eng.evaluate(kind="master_bias", meta={"read_noise": 3.0})
     assert d.status == "pass"
 
-    d_hi = eng.evaluate(kind="master_bias", meta={"readnoise": 6.5})
+    d_hi = eng.evaluate(kind="master_bias", meta={"read_noise": 6.5})
     assert d_hi.status == "fail"
 
-    d_none = eng.evaluate(kind="master_bias", meta={"readnoise": None})
+    d_none = eng.evaluate(kind="master_bias", meta={"read_noise": None})
     assert d_none.status == "fail"
 
 

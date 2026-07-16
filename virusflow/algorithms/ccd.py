@@ -3,14 +3,14 @@ from __future__ import annotations
 """CCD-level utilities for VIRUS/LRS2 reductions.
 
 This module contains low-level image operations shared across algorithms:
-- orient_image: normalize amplifier images to a common orientation (blue→red left-to-right)
+- orient_amplifier_image: normalize amplifier images to a common orientation (blue→red left-to-right)
   and consistent fiber order based on header metadata.
-- base_reduction: perform overscan subtraction, trimming, orientation, gain application,
+- reduce_raw_amplifier_frame: perform overscan subtraction, trimming, orientation, gain application,
   and error propagation, returning (image, error[, header]).
-- repair_masked_columns: fill masked/bad pixels in arc/continuum images via row-wise
+- interpolate_masked_detector_pixels: fill masked/bad pixels in arc/continuum images via row-wise
   interpolation and gentle Gaussian smoothing to avoid artifacts.
 
-Exports: orient_image, base_reduction, repair_masked_columns
+Exports: orient_amplifier_image, reduce_raw_amplifier_frame, interpolate_masked_detector_pixels
 """
 
 from typing import Optional, Tuple
@@ -22,14 +22,14 @@ from scipy.ndimage import gaussian_filter1d
 
 from .io import read_fits
 
-__all__ = ["orient_image", "base_reduction", "repair_masked_columns"]
+__all__ = ["orient_amplifier_image", "reduce_raw_amplifier_frame", "repair_masked_columns"]
 logger = logging.getLogger(__name__)
 
 
-def orient_image(image: np.ndarray, amp: str, ampname: Optional[str]) -> np.ndarray:
+def orient_amplifier_image(image: np.ndarray, amp: str, ampname: Optional[str]) -> np.ndarray:
     """Orient the detector image from blue->red (left-to-right) and proper fiber order.
 
-    This mirrors the behavior in reference/fiber_utils.py::orient_image for VIRUS/LRS2.
+    This mirrors the behavior in reference/fiber_utils.py::orient_amplifier_image for VIRUS/LRS2.
 
     Flips are amplifier-dependent:
     - For LU and RL, flip both axes.
@@ -46,14 +46,14 @@ def orient_image(image: np.ndarray, amp: str, ampname: Optional[str]) -> np.ndar
     return img
 
 
-def base_reduction(
+def reduce_raw_amplifier_frame(
     path: str,
     tar_member: Optional[str] = None,
     return_header: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, dict]:
     """Basic CCD reduction for a single amplifier image.
 
-    Steps (following reference fiber_utils.base_reduction):
+    Steps (following reference fiber_utils.reduce_raw_amplifier_frame):
       1) Overscan subtraction (robust per-row estimate)
       2) Trim overscan region
       3) Orientation (blue->red left-to-right, proper fiber order)
@@ -114,7 +114,7 @@ def base_reduction(
     ampname = hdr.get("AMPNAME")
     ampname = str(ampname) if ampname is not None else None
 
-    oriented = orient_image(img, amp, ampname)
+    oriented = orient_amplifier_image(img, amp, ampname)
     image = (oriented * gain).astype(np.float32, copy=False)
 
     # 5) Error propagation

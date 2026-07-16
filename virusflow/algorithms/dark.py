@@ -3,7 +3,7 @@ from __future__ import annotations
 """Dark-current master-frame construction.
 
 This module provides:
-- step_dark: reduce raw dark frames with CCD base_reduction and robustly combine
+- step_dark: reduce raw dark frames with CCD reduce_raw_amplifier_frame and robustly combine
   them (biweight) into a master dark; derive a dark pixel mask using
   sigma-clipped residual logic and simple full-column heuristics; returns a storage-neutral AlgoResult (no file I/O here).
 
@@ -28,7 +28,7 @@ ALGO_VERSION = "dark-1.0"
 DarkInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
 
 
-def _compute_dark_pixelmask(dark: np.ndarray) -> np.ndarray:
+def detect_dark_current_outliers(dark: np.ndarray) -> np.ndarray:
     """Compute a dark pixel mask following reference/fiber_utils.get_pixelmask.
 
     Steps:
@@ -82,7 +82,7 @@ def step_dark(
         if not p:
             return None, i, "no-path"
         try:
-            img, _err = _ccd.base_reduction(p, tm, return_header=False)
+            img, _err = _ccd.reduce_raw_amplifier_frame(p, tm, return_header=False)
             return img, i, None
         except Exception as e:
             return None, i, str(e)
@@ -109,7 +109,7 @@ def step_dark(
     stack = np.stack(frames, axis=0)
     master = biweight_location(stack, axis=0, ignore_nan=True)
 
-    dark_mask = _compute_dark_pixelmask(master)
+    dark_mask = detect_dark_current_outliers(master)
     n_bad = int(dark_mask.sum())
     frac_bad = float(n_bad) / float(dark_mask.size)
 
@@ -117,14 +117,14 @@ def step_dark(
         kind="dark",
         version=ALGO_VERSION,
         meta={
-            "shape": list(master.shape),
+            "image_shape": list(master.shape),
         },
         scalars={
             "n_inputs": len(frames),
             "bad_fraction": float(frac_bad),
         },
         arrays={
-            "master": master,
-            "mask": dark_mask,
+            "master_dark": master,
+            "dark_pixel_mask": dark_mask,
         },
     )

@@ -8,10 +8,10 @@ fit smooth polynomials suitable for building a 2D trace map:
 - preprocess_flat_for_detection: background-remove and smooth 1D profiles to
   aid robust peak finding.
 - robust_polyfit_predict: stable polynomial fit/predict with robust fallback.
-- step_trace: end-to-end routine to produce and persist a trace solution
+- fit_fiber_traces: end-to-end routine to produce and persist a trace solution
   artifact for downstream extraction/wavelength steps.
 
-Exports: step_trace
+Exports: fit_fiber_traces
 """
 
 from typing import Iterable, Optional, Dict, Any, List
@@ -30,7 +30,7 @@ from ..artifacts.io_fits import read_array_fits
 # Algorithm version string for this module
 ALGO_VERSION = "trace-1.0"
 
-# Input item type accepted by step_trace (kept for interface symmetry)
+# Input item type accepted by fit_fiber_traces (kept for interface symmetry)
 TraceInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
 
 
@@ -326,7 +326,7 @@ def _get_trace(twilight: np.ndarray, specid: str, ifuslot: str, ifuid: str, amp:
 
 from ..core.algo_result import AlgoResult
 
-def step_trace(
+def fit_fiber_traces(
     raw_inputs: Optional[Iterable[TraceInput]] = None,
     params: Optional[Dict[str, Any]] = None,
 ) -> AlgoResult:
@@ -370,13 +370,13 @@ def step_trace(
             except Exception:
                 mf_path = None
         if not mf_path:
-            raise ValueError("step_trace requires a 'master_flat_array' or ('master_flat_path'|'master_flat_artifact') with a 'path'")
+            raise ValueError("fit_fiber_traces requires a 'master_flat_array' or ('master_flat_path'|'master_flat_artifact') with a 'path'")
         payload = read_array_fits(str(mf_path))
         master = payload.get("data")
         hdr = payload.get("header", {})
         nx = master.shape[1] if master is not None else None
         if master is None or nx is None:
-            raise RuntimeError("Failed to load master flat for step_trace from path: %s" % str(mf_path))
+            raise RuntimeError("Failed to load master flat for fit_fiber_traces from path: %s" % str(mf_path))
 
     # Gather and validate required parameters
     specid = str(params.get("specid")) if params.get("specid") is not None else None
@@ -406,7 +406,7 @@ def step_trace(
 
     if missing:
         raise ValueError(
-            "step_trace missing required parameters: " + ", ".join(missing) +
+            "fit_fiber_traces missing required parameters: " + ", ".join(missing) +
             ". Provide specid, ifuslot, ifuid, amp, obsdate (YYYYMMDD), and virusconfig/tr_folder."
         )
 
@@ -414,7 +414,7 @@ def step_trace(
     try:
         trace_2d, ref, xchunks, Trace_samples = _get_trace(master, specid, ifuslot, ifuid, amp, obsdate, tr_folder)
     except Exception as e:
-        raise RuntimeError(f"step_trace failed to compute trace via _get_trace: {e}") from e
+        raise RuntimeError(f"fit_fiber_traces failed to compute trace via _get_trace: {e}") from e
 
     # Compute per-fiber robust dispersion between sampled chunk traces and the modeled trace2d at xchunks
     # Use MAD-based standard deviation (astropy.stats.mad_std) for robustness to outliers.
@@ -446,13 +446,13 @@ def step_trace(
         kind="trace",
         version=ALGO_VERSION,
         meta={
-            "shape": list(trace_2d.shape),
+            "trace_map_shape": list(trace_2d.shape),
         },
         scalars=scalars,
         arrays={
-            "trace_2d": trace_2d,
-            "rms_fibers": rms_fibers,
-            "xchunks": np.asarray(xchunks, dtype=float) if xchunks is not None else None,
-            "trace_samples": Trace_samples,
+            "fiber_trace_map": trace_2d,
+            "per_fiber_trace_residual_rms": rms_fibers,
+            "trace_sample_columns": np.asarray(xchunks, dtype=float) if xchunks is not None else None,
+            "sampled_trace_positions": Trace_samples,
         },
     )

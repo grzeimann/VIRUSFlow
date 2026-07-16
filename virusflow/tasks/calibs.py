@@ -4,10 +4,10 @@ from .base import CalibrationTask
 from ..algorithms.bias import step_bias
 from ..algorithms.dark import step_dark
 from ..algorithms.flat import step_flt
-from ..algorithms.trace import step_trace
+from ..algorithms.trace import fit_fiber_traces
 from ..algorithms.twi import step_twi
 import numpy as np
-from ..algorithms.wave import step_wave
+from ..algorithms.wave import fit_wavelength_solution
 from ..algorithms.cmp import step_cmp
 from ..artifacts import ArtifactService, Scope
 from ..artifacts.materialize import ArtifactMaterializer
@@ -66,7 +66,7 @@ class BiasTask(CalibrationTask):
             raise RuntimeError("BiasTask: missing 'master' array in AlgoResult")
         comp_master = LogicalComponent(name="master", model_type="array2d", value=master)
         scope = Scope(zipcode=getattr(self.target, "zipcode", None))
-        summaries = {"readnoise": float(ar.as_meta().get("readnoise")), "n_inputs": int(ar.as_meta().get("n_inputs", 0))}
+        summaries = {"read_noise": float(ar.as_meta().get("read_noise")), "n_inputs": int(ar.as_meta().get("n_inputs", 0))}
         req = ArtifactRequest(
             kind=str(self.artifact_name or "master_bias"),
             components={"master": comp_master},
@@ -160,14 +160,14 @@ class DarkTask(CalibrationTask):
             raise ValueError("DarkTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
 
         # Compose ArtifactRequest (logical, include optional mask component if present)
-        master = ar.get_array("master")
+        master = ar.get_array("master_dark")
         if master is None:
-            raise RuntimeError("DarkTask: missing 'master' array in AlgoResult")
-        comp_master = LogicalComponent(name="master", model_type="array2d", value=master)
-        components = {"master": comp_master}
-        msk = ar.get_array("mask")
+            raise RuntimeError("DarkTask: missing 'master_dark' array in AlgoResult")
+        comp_master = LogicalComponent(name="master_dark", model_type="array2d", value=master)
+        components = {"master_dark": comp_master}
+        msk = ar.get_array("dark_pixel_mask")
         if msk is not None:
-            components["mask"] = LogicalComponent(name="mask", model_type="array2d", value=msk)
+            components["dark_pixel_mask"] = LogicalComponent(name="dark_pixel_mask", model_type="array2d", value=msk)
         scope = Scope(zipcode=getattr(self.target, "zipcode", None))
         mm = ar.as_meta()
         summaries = {"bad_fraction": float(mm.get("bad_fraction")), "n_inputs": int(mm.get("n_inputs", 0))}
@@ -263,14 +263,14 @@ class FlatTask(CalibrationTask):
             raise ValueError("FlatTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
 
         # Compose ArtifactRequest (logical, include optional mask component if present)
-        master = ar.get_array("master")
+        master = ar.get_array("master_flat")
         if master is None:
-            raise RuntimeError("FlatTask: missing 'master' array in AlgoResult")
-        comp_master = LogicalComponent(name="master", model_type="array2d", value=master)
-        components = {"master": comp_master}
-        msk = ar.get_array("mask")
+            raise RuntimeError("FlatTask: missing 'master_flat' array in AlgoResult")
+        comp_master = LogicalComponent(name="master_flat", model_type="array2d", value=master)
+        components = {"master_flat": comp_master}
+        msk = ar.get_array("flat_response_mask")
         if msk is not None:
-            components["mask"] = LogicalComponent(name="mask", model_type="array2d", value=msk)
+            components["flat_response_mask"] = LogicalComponent(name="flat_response_mask", model_type="array2d", value=msk)
         scope = Scope(zipcode=getattr(self.target, "zipcode", None))
         mm = ar.as_meta()
         summaries = {"bad_fraction": float(mm.get("bad_fraction")), "n_inputs": int(mm.get("n_inputs", 0))}
@@ -365,16 +365,16 @@ class CmpTask(CalibrationTask):
             raise ValueError("CmpTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
 
         # Compose ArtifactRequest (logical, single component)
-        master = ar.get_array("master")
+        master = ar.get_array("master_comparison_lamp")
         if master is None:
-            raise RuntimeError("CmpTask: missing 'master' array in AlgoResult")
-        comp_master = LogicalComponent(name="master", model_type="array2d", value=master)
+            raise RuntimeError("CmpTask: missing 'master_comparison_lamp' array in AlgoResult")
+        comp_master = LogicalComponent(name="master_comparison_lamp", model_type="array2d", value=master)
         scope = Scope(zipcode=getattr(self.target, "zipcode", None))
         mm = ar.as_meta()
         summaries = {"n_inputs": int(mm.get("n_inputs", 0))}
         req = ArtifactRequest(
             kind=str(self.artifact_name or "master_cmp"),
-            components={"master": comp_master},
+            components={"master_comparison_lamp": comp_master},
             summaries=summaries,
             metadata={},
             scope=scope,
@@ -463,16 +463,16 @@ class TwiTask(CalibrationTask):
             raise ValueError("TwiTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
 
         # Compose ArtifactRequest (logical, single component)
-        master = ar.get_array("master")
+        master = ar.get_array("master_twilight")
         if master is None:
-            raise RuntimeError("TwiTask: missing 'master' array in AlgoResult")
-        comp_master = LogicalComponent(name="master", model_type="array2d", value=master)
+            raise RuntimeError("TwiTask: missing 'master_twilight' array in AlgoResult")
+        comp_master = LogicalComponent(name="master_twilight", model_type="array2d", value=master)
         scope = Scope(zipcode=getattr(self.target, "zipcode", None))
         mm = ar.as_meta()
         summaries = {"n_inputs": int(mm.get("n_inputs", 0))}
         req = ArtifactRequest(
             kind=str(self.artifact_name or "master_twi"),
-            components={"master": comp_master},
+            components={"master_twilight": comp_master},
             summaries=summaries,
             metadata={},
             scope=scope,
@@ -518,7 +518,7 @@ class TraceTask(CalibrationTask):
     """Trace calibration task implemented as a CalibrationTask.
 
     - Depends on an existing 'master_flat' artifact for the same zipcode/window.
-    - Produces a 'trace' artifact using algorithms.trace.step_trace.
+    - Produces a 'trace' artifact using algorithms.trace.fit_fiber_traces.
     - Registers provenance with the master_flat as parent and runs QA(kind='trace').
     """
     name = "trace"
@@ -530,7 +530,7 @@ class TraceTask(CalibrationTask):
     # CalibrationTask configuration (no raw inputs gathered via frame_type)
     frame_type = None  # override query_inputs to supply parent master_flat only
     artifact_name = "trace"
-    algorithm = step_trace
+    algorithm = fit_fiber_traces
 
     def _require_target(self) -> None:
         return super()._require_target()
@@ -622,16 +622,16 @@ class TraceTask(CalibrationTask):
             raise ValueError("TraceTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
 
         # Compose ArtifactRequest
-        trace2d = ar.get_array("trace_2d")
+        trace2d = ar.get_array("fiber_trace_map")
         if trace2d is None:
-            raise RuntimeError("TraceTask: missing 'trace_2d' in AlgoResult")
-        comp = LogicalComponent(name="trace_2d", model_type="array2d", value=trace2d)
+            raise RuntimeError("TraceTask: missing 'fiber_trace_map' in AlgoResult")
+        comp = LogicalComponent(name="fiber_trace_map", model_type="array2d", value=trace2d)
         scope = Scope(zipcode=getattr(self.target, "zipcode", None))
         mm = ar.as_meta()
         summaries = {"trace_len": int(mm.get("trace_len", trace2d.shape[1]))}
         req = ArtifactRequest(
             kind="trace",
-            components={"trace_2d": comp},
+            components={"fiber_trace_map": comp},
             summaries=summaries,
             metadata={},
             scope=scope,
@@ -644,7 +644,7 @@ class TraceTask(CalibrationTask):
         ctx = PublicationContext(
             task_name=self.name,
             task_version=self.version,
-            algorithm_name="algorithms.trace.step_trace",
+            algorithm_name="algorithms.trace.fit_fiber_traces",
             algorithm_version=ar.version,
             parameters=dict(self.params or {}),
             parent_ids=parent_ids,
@@ -677,7 +677,7 @@ class WaveTask(CalibrationTask):
     """Wavelength calibration task implemented as a CalibrationTask.
 
     - Depends on existing 'master_cmp' and 'trace' artifacts for the same zipcode/window.
-    - Produces a 'wave' artifact using algorithms.wave.step_wave.
+    - Produces a 'wave' artifact using algorithms.wave.fit_wavelength_solution.
     - Registers provenance with both master_cmp and trace as parents and runs QA(kind='wave').
     """
     name = "wave"
@@ -737,7 +737,7 @@ class WaveTask(CalibrationTask):
 
         # Build union defect mask from available flat/dark masks and repair master_cmp
         try:
-            from ..algorithms.utils.masks import build_union_pixelmask, repair_masked_columns
+            from ..algorithms.utils.masks import build_union_pixelmask, interpolate_masked_detector_pixels
             flat_row = self._resolve_artifact("master_flat", required=False)
             dark_row = self._resolve_artifact("master_dark", required=False)
             umask, _frac = build_union_pixelmask(flat_artifact=flat_row, dark_artifact=dark_row)
@@ -745,7 +745,7 @@ class WaveTask(CalibrationTask):
                 import numpy as _np
                 m = _np.asarray(umask)
                 if m.shape == _np.asarray(master_cmp).shape:
-                    master_cmp = repair_masked_columns(_np.asarray(master_cmp, dtype=float), m)
+                    master_cmp = interpolate_masked_detector_pixels(_np.asarray(master_cmp, dtype=float), m)
         except Exception:
             # Mask unification/repair is best-effort; continue on any error
             pass
@@ -756,7 +756,7 @@ class WaveTask(CalibrationTask):
         if isinstance(self.ctx.config, dict):
             for k, v in self.ctx.config.items():
                 algo_params.setdefault(k, v)
-        ar = step_wave(master_cmp=master_cmp, trace=trace2d, params=algo_params)
+        ar = fit_wavelength_solution(master_comparison_lamp=master_cmp, fiber_trace_map=trace2d, params=algo_params)
         t2 = time.perf_counter()
 
         # Normalize and validate result
@@ -766,10 +766,10 @@ class WaveTask(CalibrationTask):
             raise ValueError("WaveTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
 
         # Compose ArtifactRequest
-        wave = ar.get_array("wave")
+        wave = ar.get_array("wavelength_map")
         if wave is None:
-            raise RuntimeError("WaveTask: missing 'wave' array in AlgoResult")
-        comp = LogicalComponent(name="wave", model_type="array2d", value=wave)
+            raise RuntimeError("WaveTask: missing 'wavelength_map' array in AlgoResult")
+        comp = LogicalComponent(name="wavelength_map", model_type="array2d", value=wave)
         scope = Scope(zipcode=getattr(self.target, "zipcode", None))
         mm = ar.as_meta()
         summaries = {}
@@ -778,7 +778,7 @@ class WaveTask(CalibrationTask):
                 summaries[k] = mm.get(k)
         req = ArtifactRequest(
             kind="wave",
-            components={"wave": comp},
+            components={"wavelength_map": comp},
             summaries=summaries,
             metadata={},
             scope=scope,
@@ -791,7 +791,7 @@ class WaveTask(CalibrationTask):
         ctx = PublicationContext(
             task_name=self.name,
             task_version=self.version,
-            algorithm_name="algorithms.wave.step_wave",
+            algorithm_name="algorithms.wave.fit_wavelength_solution",
             algorithm_version=ar.version,
             parameters=dict(self.params or {}),
             parent_ids=parent_ids,

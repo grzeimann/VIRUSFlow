@@ -3,7 +3,7 @@ from __future__ import annotations
 """Bias (zero) master-frame construction.
 
 This module provides a single public routine:
-- step_bias: reduce a set of raw bias frames with CCD base_reduction and
+- step_bias: reduce a set of raw bias frames with CCD reduce_raw_amplifier_frame and
   robustly combine them into a master bias. It also computes a robust
   per-pixel scatter (MAD) and reports a scalar readnoise estimate. The
   resulting master is returned in a storage-neutral AlgoResult; no file I/O occurs in the algorithm.
@@ -45,11 +45,11 @@ def step_bias(
     - Output: returns a storage-neutral AlgoResult; no file I/O or persistence here.
 
     Algorithm (aligned with reference step_zro):
-    - For each input frame, run CCD base_reduction (overscan subtraction, trim, orientation, gain, error)
+    - For each input frame, run CCD reduce_raw_amplifier_frame (overscan subtraction, trim, orientation, gain, error)
     - Stack the reduced images (converted to float)
     - Master bias = median across the stack (axis=0)
     - Per-pixel robust scatter = 1.4826 * median(|frame - master|) over frames
-    - Readnoise scalar = median of the scatter map
+    - Read noise scalar = median of the scatter map
     """
     params = params or {}
     # Accept either alias name; prefer explicit raw_inputs if provided
@@ -68,7 +68,7 @@ def step_bias(
         if not p:
             return None, i, "no-path"
         try:
-            img, _err = _ccd.base_reduction(p, tm, return_header=False)
+            img, _err = _ccd.reduce_raw_amplifier_frame(p, tm, return_header=False)
             return img, i, None
         except Exception as e:
             # Do not implement test-only fallbacks in production algorithms; tests should
@@ -100,8 +100,8 @@ def step_bias(
     master = biweight_location(stack, axis=0, ignore_nan=True)
     # Robust per-pixel scatter via MAD (kept as median-of-abs-dev for now)
     mad = np.median(np.abs(stack - master[None, :, :]), axis=0) * 1.4826
-    # Scalar readnoise estimate
-    readnoise = float(np.nanmedian(mad))
+    # Scalar read-noise estimate
+    read_noise = float(np.nanmedian(mad))
 
     # Return pure computational result; no persistence here per architecture.
     return AlgoResult(
@@ -109,13 +109,14 @@ def step_bias(
         version=ALGO_VERSION,
         meta={
             "n_inputs": len(frames),
-            "shape": list(master.shape),
+            "image_shape": list(master.shape),
         },
         scalars={
-            "readnoise": readnoise,
+            "read_noise": read_noise,
             "n_inputs": len(frames),
         },
         arrays={
             "master": master,
+            "per_pixel_bias_scatter": mad,
         },
     )

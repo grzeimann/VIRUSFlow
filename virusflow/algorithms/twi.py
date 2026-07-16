@@ -3,7 +3,7 @@ from __future__ import annotations
 """Twilight (continuum) master-frame construction.
 
 This module exposes a single public routine:
-- step_twi: reduce raw twilight exposures with CCD base_reduction and combine
+- step_twi: reduce raw twilight exposures with CCD reduce_raw_amplifier_frame and combine
   them robustly (biweight) into a master twilight frame for tracing/extraction
   support. Returns a storage-neutral AlgoResult; no persistence or file I/O occurs here.
 
@@ -15,7 +15,7 @@ from typing import Iterable, Optional, Dict, Any, List
 import numpy as np
 from astropy.stats import biweight_location
 
-from .ccd import base_reduction
+from .ccd import reduce_raw_amplifier_frame
 # persistence removed per architecture
 
 # Algorithm version string for this module
@@ -50,7 +50,7 @@ def step_twi(
         if not p:
             return None, i, "no-path"
         try:
-            img, _err = base_reduction(p, tm, return_header=False)
+            img, _err = reduce_raw_amplifier_frame(p, tm, return_header=False)
             return img, i, None
         except Exception as e:
             return None, i, str(e)
@@ -79,12 +79,12 @@ def step_twi(
         kind="twi",
         version=ALGO_VERSION,
         meta={
-            "shape": list(master.shape),
+            "image_shape": list(master.shape),
         },
         scalars={
             "n_inputs": len(frames),
         },
         arrays={
-            "master": master,
+            "master_twilight": master,
         },
     )

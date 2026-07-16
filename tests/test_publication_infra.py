@@ -27,7 +27,7 @@ def test_publication_roundtrip_master_bias(tmp_path: Path):
     req = ArtifactRequest(
         kind="master_bias",
         components={"master": comp},
-        summaries={"readnoise": 1.23},
+        summaries={"read_noise": 1.23},
         metadata={"n_inputs": 3, "algo_version": "bias-1.0"},
         scope=Scope(zipcode=None),
         parents=[],
@@ -58,7 +58,7 @@ def test_publication_roundtrip_master_bias(tmp_path: Path):
     assert sc.get("payload_type") == "array"
     assert sc.get("storage_format") == "fits"
     assert sc.get("shape") == [5, 7]
-    assert "readnoise" in sc
+    assert "read_noise" in sc
 
     # Verify describe surfaces logical summaries independent of storage format
     desc = svc.describe(art.id)

@@ -4,13 +4,13 @@ from __future__ import annotations
 
 This module implements a robust per-fiber arc identification and expands it to
 build a full 2D wavelength map:
-- _get_wave_single: detect arc peaks, match to a reference line list with
+- fit_single_fiber_wavelength_solution: detect arc peaks, match to a reference line list with
   polynomial modeling and sigma-clipping, and return a per-fiber wavelength fit
   with RMS residuals.
 - _get_wave: apply per-row seeds, fit across fibers/rows and along dispersion to
   produce a smooth wavelength solution for all pixels.
 
-Exports: step_wave
+Exports: fit_wavelength_solution
 """
 
 import numpy as np
@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from .fiber import find_peaks, get_spectra
 from pathlib import Path
 
-__all__ = ["step_wave"]
+__all__ = ["fit_wavelength_solution"]
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ ALGO_VERSION = "wave-1.0"
 PIXELS = 1032
 
 # Reference arc line list (Hg, Cd, etc.) used for matching
-LINE_LIST = [3610.508, 3650.153, 4046.565, 4358.335, 4678.149, 4799.912, 4916.068, 5085.822, 5460.750]
+REFERENCE_ARC_WAVELENGTHS = [3610.508, 3650.153, 4046.565, 4358.335, 4678.149, 4799.912, 4916.068, 5085.822, 5460.750]
 
 
 
@@ -262,11 +262,11 @@ def _identify_arc(
     return best, len(matches)
 
 
-def _get_wave_single(fiber_arc_spectrum, final_order=4, qa: Optional[dict] = None):
+def fit_single_fiber_wavelength_solution(fiber_arc_spectrum, final_order=4, qa: Optional[dict] = None):
     """
     Derive a per-fiber wavelength solution from an arc spectrum.
 
-    Detected arc peaks are matched to a fixed reference line list (``LINE_LIST``)
+    Detected arc peaks are matched to a fixed reference line list (``REFERENCE_ARC_WAVELENGTHS``)
     and a polynomial wavelength model is fit in pixel space.
 
     Args:
@@ -278,7 +278,7 @@ def _get_wave_single(fiber_arc_spectrum, final_order=4, qa: Optional[dict] = Non
     Returns:
         tuple[np.ndarray, float, dict]:
             - ``wave``: 1D array giving the wavelength (same units as
-              ``LINE_LIST``) for each pixel index.
+              ``REFERENCE_ARC_WAVELENGTHS``) for each pixel index.
             - ``rms``: RMS of residuals (in wavelength units) across matched
               lines.
             - ``best``: dictionary with arc-identification details for QA plotting
@@ -291,7 +291,7 @@ def _get_wave_single(fiber_arc_spectrum, final_order=4, qa: Optional[dict] = Non
     best, _ = _identify_arc(
         peak_loc,
         peaks,
-        LINE_LIST,
+        REFERENCE_ARC_WAVELENGTHS,
         min_sep=10,
         max_keep=15,
         anchor_tol_pix=12.0,
@@ -300,7 +300,7 @@ def _get_wave_single(fiber_arc_spectrum, final_order=4, qa: Optional[dict] = Non
     wave = np.polyval(best["coeff"], x_indices)
     return wave, best["rms"], best
 
-def _get_wave(spec: np.ndarray,
+def fit_amplifier_wavelength_map(spec: np.ndarray,
               trace: np.ndarray,
               T_array: Optional[np.ndarray] = None,
               res_lim: float = 1.0,
@@ -345,7 +345,7 @@ def _get_wave(spec: np.ndarray,
             j0 = max(0, j - 2)
             j1 = min(nrows, j + 3)
             S = np.nanmedian(spec[j0:j1], axis=0)
-            wave_j, res, best = _get_wave_single(S, final_order=order)
+            wave_j, res, best = fit_single_fiber_wavelength_solution(S, final_order=order)
             w_seed[j] = wave_j
             rms[j] = res
             # Track best identification for QA plotting on failure
@@ -400,14 +400,14 @@ def _get_wave(spec: np.ndarray,
 
 from ..core.algo_result import AlgoResult
 
-def step_wave(*,
-              cmp_spec: Optional[np.ndarray] = None,
-              master_cmp: Optional[np.ndarray] = None,
-              trace: Optional[np.ndarray] = None,
-              npix_extract: int = 5,
-              res_lim: float = 1.0,
-              order: int = 4,
-              params: Optional[dict] = None) -> AlgoResult:
+def fit_wavelength_solution(*,
+                            comparison_lamp_fiber_spectra: Optional[np.ndarray] = None,
+                            master_comparison_lamp: Optional[np.ndarray] = None,
+                            fiber_trace_map: Optional[np.ndarray] = None,
+                            npix_extract: int = 5,
+                            res_lim: float = 1.0,
+                            order: int = 4,
+                            params: Optional[dict] = None) -> AlgoResult:
     """
     Build the wavelength solution from spectra of the master comparison (arc) frame.
 
@@ -447,21 +447,20 @@ def step_wave(*,
     """
     params = params or {}
 
-    if trace is None:
-        raise ValueError("step_wave requires a trace array (Nrows x Npix)")
+    if fiber_trace_map is None:
+        raise ValueError("fit_wavelength_solution requires a fiber_trace_map array (Nrows x Npix)")
 
-    if cmp_spec is None:
-        if master_cmp is None:
-            raise ValueError("step_wave requires either cmp_spec, or (master_cmp and trace)")
-        # Extract per-row spectra from the master CMP image using the provided trace
+    if comparison_lamp_fiber_spectra is None:
+        if master_comparison_lamp is None:
+            raise ValueError("fit_wavelength_solution requires either comparison_lamp_fiber_spectra, or (master_comparison_lamp and fiber_trace_map)")
+        # Extract per-row spectra from the master comparison lamp image using the provided trace map
         try:
-            cmp_spec = get_spectra(master_cmp, trace, npix=npix_extract)
+            comparison_lamp_fiber_spectra = get_spectra(master_comparison_lamp, fiber_trace_map, npix=npix_extract)
         except Exception as e:
-            raise RuntimeError(f"Failed to extract spectra from master_cmp/trace: {e}")
+            raise RuntimeError(f"Failed to extract spectra from master_comparison_lamp/fiber_trace_map: {e}")
 
-    # Delegate to internal _get_wave to compute the wavelength map
-    # Compute wavelength solution (collect QA bundle for failure diagnostics)
-    wave, ref_img, rms_rows, qa_bundle = _get_wave(cmp_spec, trace, T_array=None, res_lim=res_lim, order=order, qa=None)
+    # Compute wavelength solution (collect diagnostics for failures)
+    wave, ref_img, rms_rows, qa_bundle = fit_amplifier_wavelength_map(comparison_lamp_fiber_spectra, fiber_trace_map, T_array=None, res_lim=res_lim, order=order, qa=None)
 
     # Build storage-neutral AlgoResult
     scalars = {}
@@ -501,10 +500,10 @@ def step_wave(*,
 
     # Determine shape summary if available
     try:
-        if trace is not None:
-            meta.setdefault("shape", list(np.asarray(trace).shape))
-        elif cmp_spec is not None:
-            meta.setdefault("shape", list(np.asarray(cmp_spec).shape))
+        if fiber_trace_map is not None:
+            meta.setdefault("wavelength_map_shape", list(np.asarray(fiber_trace_map).shape))
+        elif comparison_lamp_fiber_spectra is not None:
+            meta.setdefault("wavelength_map_shape", list(np.asarray(comparison_lamp_fiber_spectra).shape))
     except Exception:
         pass
 
@@ -514,7 +513,7 @@ def step_wave(*,
         meta=meta,
         scalars=scalars,
         arrays={
-            "wave": wave,
-            "rms_rows": rms_rows,
+            "wavelength_map": wave,
+            "per_fiber_wavelength_residual_rms": rms_rows,
         },
     )
