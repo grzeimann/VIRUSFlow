@@ -26,7 +26,7 @@ class BiasTask(CalibrationTask):
     # CalibrationTask configuration
     frame_type = "zro"
     artifact_name = "master_bias"
-    algorithm = step_bias
+    algorithm = staticmethod(step_bias)
 
     def run(self, inputs):
         import time
@@ -125,7 +125,7 @@ class DarkTask(CalibrationTask):
     # CalibrationTask configuration
     frame_type = "drk"
     artifact_name = "master_dark"
-    algorithm = step_dark
+    algorithm = staticmethod(step_dark)
 
     def run(self, inputs):
         import time
@@ -228,7 +228,7 @@ class FlatTask(CalibrationTask):
     # CalibrationTask configuration
     frame_type = "flt"
     artifact_name = "master_flat"
-    algorithm = step_flt
+    algorithm = staticmethod(step_flt)
 
     def run(self, inputs):
         import time
@@ -330,7 +330,7 @@ class CmpTask(CalibrationTask):
 
     frame_type = "cmp"
     artifact_name = "master_cmp"
-    algorithm = step_cmp
+    algorithm = staticmethod(step_cmp)
 
     def run(self, inputs):
         import time
@@ -428,7 +428,7 @@ class TwiTask(CalibrationTask):
     # CalibrationTask configuration
     frame_type = "twi"
     artifact_name = "master_twi"
-    algorithm = step_twi
+    algorithm = staticmethod(step_twi)
 
     def run(self, inputs):
         import time
@@ -530,7 +530,7 @@ class TraceTask(CalibrationTask):
     # CalibrationTask configuration (no raw inputs gathered via frame_type)
     frame_type = None  # override query_inputs to supply parent master_flat only
     artifact_name = "trace"
-    algorithm = fit_fiber_traces
+    algorithm = staticmethod(fit_fiber_traces)
 
     def _require_target(self) -> None:
         return super()._require_target()
