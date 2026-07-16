@@ -19,7 +19,7 @@ import logging
 import numpy as np
 from astropy.stats import biweight_location
 
-from .ccd import base_reduction
+from . import ccd as _ccd
 # persistence and storage-coupled mask logic removed per architecture
 
 __all__ = ["step_cmp"]
@@ -36,7 +36,6 @@ from ..core.algo_result import AlgoResult
 
 def step_cmp(
     raw_cmp_inputs: Optional[Iterable[CmpInput]] = None,
-    output_path: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[CmpInput]] = None,
 ) -> AlgoResult:
@@ -58,7 +57,7 @@ def step_cmp(
         if not p:
             return None, i, "no-path"
         try:
-            img, _err = base_reduction(p, tm, return_header=False)
+            img, _err = _ccd.base_reduction(p, tm, return_header=False)
             return img, i, None
         except Exception as e:
             return None, i, str(e)

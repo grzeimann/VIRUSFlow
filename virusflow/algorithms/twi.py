@@ -5,7 +5,7 @@ from __future__ import annotations
 This module exposes a single public routine:
 - step_twi: reduce raw twilight exposures with CCD base_reduction and combine
   them robustly (biweight) into a master twilight frame for tracing/extraction
-  support. The result is persisted via artifacts.io_fits.write_array_fits with an explicit sidecar.
+  support. Returns a storage-neutral AlgoResult; no persistence or file I/O occurs here.
 
 Exports: step_twi
 """
@@ -29,7 +29,6 @@ from ..core.algo_result import AlgoResult
 
 def step_twi(
     raw_twi_inputs: Optional[Iterable[TwiInput]] = None,
-    output_path: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[TwiInput]] = None,
 ) -> AlgoResult:

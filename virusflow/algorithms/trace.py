@@ -328,7 +328,6 @@ from ..core.algo_result import AlgoResult
 
 def step_trace(
     raw_inputs: Optional[Iterable[TraceInput]] = None,
-    output_path: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
 ) -> AlgoResult:
     """Build a trace solution using the existing master flat artifact.
@@ -338,7 +337,7 @@ def step_trace(
     - params must include one of:
         - 'master_flat_path': direct filesystem path to a master_flat FITS
         - 'master_flat_artifact': dict-like with key 'path' to the artifact
-    - Output: write a trace solution FITS to output_path and return metadata.
+    - Output: returns a storage-neutral AlgoResult; no file I/O or persistence here.
 
     Note: This is a minimal scaffolding that migrates the get_trace concept into
     the standard step_* algorithm form used by VIRUSFlow. A full trace solution

@@ -6,7 +6,7 @@ This module provides a single public routine:
 - step_bias: reduce a set of raw bias frames with CCD base_reduction and
   robustly combine them into a master bias. It also computes a robust
   per-pixel scatter (MAD) and reports a scalar readnoise estimate. The
-  resulting master is persisted via artifacts.io_fits.write_array_fits with an explicit sidecar.
+  resulting master is returned in a storage-neutral AlgoResult; no file I/O occurs in the algorithm.
 
 Exports: step_bias
 """
@@ -32,7 +32,6 @@ from ..core.algo_result import AlgoResult
 
 def step_bias(
     raw_bias_inputs: Optional[Iterable[BiasInput]] = None,
-    output_path: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[BiasInput]] = None,
 ) -> AlgoResult:
@@ -43,7 +42,7 @@ def step_bias(
     - Inputs: iterable of dicts with keys:
         - 'path': outer container path (FITS file or .tar archive path)
         - 'tar_member': optional member path inside the tar when applicable
-    - Output: write a master-bias FITS file to output_path, and return metadata.
+    - Output: returns a storage-neutral AlgoResult; no file I/O or persistence here.
 
     Algorithm (aligned with reference step_zro):
     - For each input frame, run CCD base_reduction (overscan subtraction, trim, orientation, gain, error)

@@ -116,7 +116,7 @@ class Task:
 class CalibrationTask(Task):
     # To be set by subclasses
     frame_type: Optional[str] = None  # e.g., "zro", "drk", "flt"
-    algorithm = None  # callable(raw_inputs=[...], output_path=..., params=...)
+    algorithm = None  # callable(raw_inputs=[...], params=...)
     artifact_name: Optional[str] = None  # e.g., "master_bias"
 
     def _require_target(self) -> None:
@@ -231,88 +231,3 @@ class CalibrationTask(Task):
                 pass
         return raw_inputs, parent_ids
 
-    def output_path(self) -> str:
-        import os
-        from ..core.pathutils import ensure_dir, sanitize_for_filename
-        self._require_target()
-        if not self.artifact_name:
-            raise ValueError(f"{self.__class__.__name__}.artifact_name is not set")
-        ensure_dir(self.ctx.workdir)
-        zkey_raw = self.target.zipcode.key() if getattr(self.target, "zipcode", None) else "UNKNOWN"
-        zkey = sanitize_for_filename(zkey_raw)
-        start_s, end_s = self.target.start_date, self.target.end_date
-        fname = f"{self.artifact_name}_{zkey}_{start_s}_{end_s}.fits"
-        return os.path.join(self.ctx.workdir, fname)
-
-    def make_artifact(self, out_path: str) -> NewArtifact:
-        # Build a new-model Artifact with explicit representation fields
-        zipcode = getattr(self.target, "zipcode", None)
-        scope = Scope(zipcode=zipcode)
-        art_kind = self.artifact_name or "calibration"
-        return NewArtifact(
-            id=None,
-            kind=art_kind,
-            role="calibration",
-            payload_type="array",
-            storage_format="fits",
-            storage=StorageRef(uri=str(out_path), storage_format="fits", backend="fs"),
-            scope=scope,
-            metadata={},
-            provenance=None,
-        )
-
-    def run(self, inputs: Dict[str, NewArtifact]):
-        import time
-        if not callable(self.algorithm):
-            raise ValueError(f"{self.__class__.__name__}.algorithm is not set to a callable")
-        dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
-        t0 = time.perf_counter()
-        raw_inputs, parent_ids = self.query_inputs()
-        t1 = time.perf_counter()
-        out = self.output_path()
-        # Merge context config into params so algorithms can see workers/debug flags
-        algo_params = dict(self.params)
-        if isinstance(self.ctx.config, dict):
-            for k, v in self.ctx.config.items():
-                algo_params.setdefault(k, v)
-        if dbg:
-            print(f"[Timing] {self.__class__.__name__}: query_inputs={t1 - t0:.3f}s, n_inputs={len(raw_inputs)}")
-        # Ensure algorithms receive db_path and zipcode for artifact-centric loading
-        algo_params.setdefault("db_path", self.ctx.db_path)
-        try:
-            if getattr(self.target, "zipcode", None) is not None:
-                algo_params.setdefault("zipcode", getattr(self.target, "zipcode"))
-        except Exception:
-            pass
-        # Call the algorithm; support both raw_inputs and legacy raw_bias_inputs kw
-        t2 = time.perf_counter()
-        meta = self.algorithm(raw_inputs=raw_inputs, output_path=out, params=algo_params)
-        t3 = time.perf_counter()
-        artifact = self.make_artifact(out)
-        art_id = self.save_artifact(artifact, parent_ids=parent_ids)
-        # Attach the generated artifact id to the Artifact instance for downstream inspection
-        try:
-            setattr(artifact, "id", int(art_id))
-        except Exception:
-            pass
-        t4 = time.perf_counter()
-        # Automatic QA: evaluate and persist based on algorithm metadata and artifact kind
-        try:
-            svc = ArtifactService(self.ctx.db_path)
-            qa_kind = (self.artifact_name or "").strip().lower()
-            status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind=qa_kind, meta=meta)
-            if dbg and status:
-                print(f"[QA] {self.__class__.__name__}: auto-qa status={status} kind={qa_kind} artifact_id={art_id}")
-            # Enforce policy: hard-fail kinds with status=fail
-            try:
-                if svc.diagnostics.should_block(kind=qa_kind, status=status):
-                    raise RuntimeError(f"QA hard-fail for {qa_kind} (artifact_id={art_id})")
-            except Exception:
-                # Do not block on errors computing policy
-                pass
-        except Exception:
-            # Never fail the task on QA evaluation errors
-            pass
-        if dbg:
-            print(f"[Timing] {self.__class__.__name__}: algorithm={t3 - t2:.3f}s, save_artifact={t4 - t3:.3f}s, total={t4 - t0:.3f}s")
-        return {self.artifact_name or "calibration": artifact}

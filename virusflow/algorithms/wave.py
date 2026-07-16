@@ -407,7 +407,6 @@ def step_wave(*,
               npix_extract: int = 5,
               res_lim: float = 1.0,
               order: int = 4,
-              output_path: Optional[str] = None,
               params: Optional[dict] = None) -> AlgoResult:
     """
     Build the wavelength solution from spectra of the master comparison (arc) frame.
@@ -435,21 +434,16 @@ def step_wave(*,
         Maximum acceptable RMS for a row to be used as a seed in _get_wave.
     order : int
         Polynomial order for cross-row and along-dispersion fits in _get_wave.
-    output_path : Optional[str]
-        Reserved for future use (no-op for now).
     params : Optional[dict]
         Reserved for future use.
 
     Returns
     -------
-    dict
-        {
-          "wave": 2D wavelength array or None on failure,
-          "rms_rows": 1D RMS residuals per seed row (or None),
-          "algo": "algorithms.wave.step_wave",
-          "version": ALGO_VERSION,
-          "output_path": output_path,
-        }
+    AlgoResult
+        Storage-neutral result with arrays and scalars:
+        - arrays: {"wave": 2D wavelength array or None on failure, "rms_rows": 1D RMS per seed row or None}
+        - scalars: may include compact best-match metrics (e.g., best_nmatch, best_rms)
+        - meta: may include failure_reason and shape
     """
     params = params or {}
 

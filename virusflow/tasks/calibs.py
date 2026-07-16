@@ -51,7 +51,7 @@ class BiasTask(CalibrationTask):
             for k, v in self.ctx.config.items():
                 algo_params.setdefault(k, v)
         t2 = time.perf_counter()
-        ar = self.algorithm(raw_inputs=raw_inputs, output_path=None, params=algo_params)
+        ar = self.algorithm(raw_inputs=raw_inputs, params=algo_params)
         t3 = time.perf_counter()
 
         # Normalize and validate result
@@ -150,7 +150,7 @@ class DarkTask(CalibrationTask):
             for k, v in self.ctx.config.items():
                 algo_params.setdefault(k, v)
         t2 = time.perf_counter()
-        ar = self.algorithm(raw_inputs=raw_inputs, output_path=None, params=algo_params)
+        ar = self.algorithm(raw_inputs=raw_inputs, params=algo_params)
         t3 = time.perf_counter()
 
         # Normalize and validate result
@@ -253,7 +253,7 @@ class FlatTask(CalibrationTask):
             for k, v in self.ctx.config.items():
                 algo_params.setdefault(k, v)
         t2 = time.perf_counter()
-        ar = self.algorithm(raw_inputs=raw_inputs, output_path=None, params=algo_params)
+        ar = self.algorithm(raw_inputs=raw_inputs, params=algo_params)
         t3 = time.perf_counter()
 
         # Normalize and validate result
@@ -355,7 +355,7 @@ class CmpTask(CalibrationTask):
             for k, v in self.ctx.config.items():
                 algo_params.setdefault(k, v)
         t2 = time.perf_counter()
-        ar = self.algorithm(raw_inputs=raw_inputs, output_path=None, params=algo_params)
+        ar = self.algorithm(raw_inputs=raw_inputs, params=algo_params)
         t3 = time.perf_counter()
 
         # Normalize and validate result
@@ -453,7 +453,7 @@ class TwiTask(CalibrationTask):
             for k, v in self.ctx.config.items():
                 algo_params.setdefault(k, v)
         t2 = time.perf_counter()
-        ar = self.algorithm(raw_inputs=raw_inputs, output_path=None, params=algo_params)
+        ar = self.algorithm(raw_inputs=raw_inputs, params=algo_params)
         t3 = time.perf_counter()
 
         # Normalize and validate result
@@ -545,13 +545,6 @@ class TraceTask(CalibrationTask):
         parent_ids = [pid for pid in [mf.get("id")] if pid is not None]
         return [], parent_ids
 
-    def output_path(self) -> str:
-        # Reuse CalibrationTask output_path which uses artifact_name
-        return super().output_path()
-
-    def make_artifact(self, out_path: str):
-        # Reuse CalibrationTask make_artifact but ensure kind/name = 'trace'
-        return super().make_artifact(out_path)
 
     def run(self, inputs):
         import time
@@ -619,7 +612,7 @@ class TraceTask(CalibrationTask):
                 pass
 
         t1 = time.perf_counter()
-        ar = self.algorithm(raw_inputs=[], output_path=None, params=algo_params)
+        ar = self.algorithm(raw_inputs=[], params=algo_params)
         t2 = time.perf_counter()
 
         # Normalize and validate
@@ -763,7 +756,7 @@ class WaveTask(CalibrationTask):
         if isinstance(self.ctx.config, dict):
             for k, v in self.ctx.config.items():
                 algo_params.setdefault(k, v)
-        ar = step_wave(master_cmp=master_cmp, trace=trace2d, output_path=None, params=algo_params)
+        ar = step_wave(master_cmp=master_cmp, trace=trace2d, params=algo_params)
         t2 = time.perf_counter()
 
         # Normalize and validate result

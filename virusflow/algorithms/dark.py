@@ -5,8 +5,7 @@ from __future__ import annotations
 This module provides:
 - step_dark: reduce raw dark frames with CCD base_reduction and robustly combine
   them (biweight) into a master dark; derive a dark pixel mask using
-  sigma-clipped residual logic and simple full-column heuristics; persist via
-  artifacts.io_fits.write_array_fits with an explicit sidecar.
+  sigma-clipped residual logic and simple full-column heuristics; returns a storage-neutral AlgoResult (no file I/O here).
 
 Exports: step_dark
 """
@@ -18,7 +17,6 @@ import numpy as np
 from astropy.stats import biweight_location, sigma_clipped_stats
 
 from . import ccd as _ccd
-from ..artifacts.io_fits import write_array_fits
 
 __all__ = ["step_dark"]
 logger = logging.getLogger(__name__)
@@ -61,7 +59,6 @@ from ..core.algo_result import AlgoResult
 
 def step_dark(
     raw_dark_inputs: Optional[Iterable[DarkInput]] = None,
-    output_path: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[DarkInput]] = None,
 ) -> AlgoResult:

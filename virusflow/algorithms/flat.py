@@ -5,8 +5,7 @@ from __future__ import annotations
 This module focuses on building a master flat used for tracing and pixelmasking:
 - step_flt: reduce raw flat exposures with CCD base_reduction and combine them
   robustly (biweight) into a master flat; compute a flat-specific pixel mask
-  using a median-filter deviation rule and simple column heuristics; persist
-  via artifacts.io_fits.write_array_fits with an explicit sidecar.
+  using a median-filter deviation rule and simple column heuristics; returns a storage-neutral AlgoResult (no file I/O here).
 
 Exports: step_flt
 """
@@ -68,7 +67,6 @@ from ..core.algo_result import AlgoResult
 
 def step_flt(
     raw_flt_inputs: Optional[Iterable[FlatInput]] = None,
-    output_path: Optional[str] = None,
     params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[FlatInput]] = None,
 ) -> AlgoResult:

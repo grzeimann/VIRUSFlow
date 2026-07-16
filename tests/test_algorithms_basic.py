@@ -26,7 +26,7 @@ def test_step_bias_returns_algo_result(monkeypatch):
 
     monkeypatch.setattr(alg_ccd, "base_reduction", fake_reduce)
 
-    ar = alg_bias.step_bias(raw_inputs=_mk_inputs(3), output_path=None, params={})
+    ar = alg_bias.step_bias(raw_inputs=_mk_inputs(3), params={})
     # Expect an AlgoResult-like object with arrays and scalars accessible
     from virusflow.core.algo_result import AlgoResult, ensure_algo_result
     ar2 = ensure_algo_result(ar, kind="bias")
@@ -45,7 +45,7 @@ def test_step_dark_returns_algo_result_with_mask(monkeypatch):
 
     monkeypatch.setattr(alg_ccd, "base_reduction", fake_reduce)
 
-    ar = alg_dark.step_dark(raw_inputs=_mk_inputs(4), output_path=None, params={})
+    ar = alg_dark.step_dark(raw_inputs=_mk_inputs(4), params={})
     from virusflow.core.algo_result import ensure_algo_result, AlgoResult
     ar2 = ensure_algo_result(ar, kind="dark")
     assert isinstance(ar2, AlgoResult)
@@ -65,7 +65,7 @@ def test_step_flat_returns_algo_result_with_mask(monkeypatch):
 
     monkeypatch.setattr(alg_flat, "base_reduction", fake_reduce)
 
-    ar = alg_flat.step_flt(raw_inputs=_mk_inputs(5), output_path=None, params={})
+    ar = alg_flat.step_flt(raw_inputs=_mk_inputs(5), params={})
     from virusflow.core.algo_result import ensure_algo_result, AlgoResult
     ar2 = ensure_algo_result(ar, kind="flat")
     assert isinstance(ar2, AlgoResult)
@@ -86,7 +86,7 @@ def test_step_cmp_returns_algo_result(monkeypatch):
 
     monkeypatch.setattr(alg_ccd, "base_reduction", fake_reduce)
 
-    ar = alg_cmp.step_cmp(raw_inputs=_mk_inputs(3), output_path=None, params={})
+    ar = alg_cmp.step_cmp(raw_inputs=_mk_inputs(3), params={})
     from virusflow.core.algo_result import ensure_algo_result, AlgoResult
     ar2 = ensure_algo_result(ar, kind="cmp")
     assert isinstance(ar2, AlgoResult)
