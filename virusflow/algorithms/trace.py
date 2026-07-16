@@ -452,5 +452,7 @@ def step_trace(
         arrays={
             "trace_2d": trace_2d,
             "rms_fibers": rms_fibers,
+            "xchunks": np.asarray(xchunks, dtype=float) if xchunks is not None else None,
+            "trace_samples": Trace_samples,
         },
     )
