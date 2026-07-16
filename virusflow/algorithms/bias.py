@@ -31,9 +31,8 @@ BiasInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|No
 from ..core.algo_result import AlgoResult
 
 def step_bias(
-    raw_bias_inputs: Optional[Iterable[BiasInput]] = None,
-    params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[BiasInput]] = None,
+    params: Optional[Dict[str, Any]] = None,
 ) -> AlgoResult:
     """
     Construct a master bias frame from input zero (bias) frames using numpy/astropy.
@@ -52,13 +51,11 @@ def step_bias(
     - Read noise scalar = median of the scatter map
     """
     params = params or {}
-    # Accept either alias name; prefer explicit raw_inputs if provided
-    effective = raw_inputs if raw_inputs is not None else raw_bias_inputs
-    inputs: List[BiasInput] = list(effective or [])
+    inputs: List[BiasInput] = list(raw_inputs or [])
     n_inputs = len(inputs)
     if n_inputs == 0:
         # Fail fast per architecture guidance: empty inputs indicate a planning/scoping error
-        raise ValueError("step_bias requires at least one raw bias input in raw_bias_inputs")
+        raise ValueError("step_bias requires at least one raw bias input in raw_inputs")
 
     # Read all frames serially. Parallelism is handled by the task/executor layer.
     def _reduce_one(idx_item):

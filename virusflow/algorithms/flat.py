@@ -66,20 +66,24 @@ def detect_flat_response_outliers(image: np.ndarray) -> np.ndarray:
 from ..core.algo_result import AlgoResult
 
 def step_flt(
-    raw_flt_inputs: Optional[Iterable[FlatInput]] = None,
-    params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[FlatInput]] = None,
+    params: Optional[Dict[str, Any]] = None,
 ) -> AlgoResult:
     """Construct a master flat frame from input flat (continuum) frames.
 
     Storage-neutral: compute and return AlgoResult only. No persistence here.
+
+    Parameters
+    ----------
+    raw_inputs : Optional[Iterable[FlatInput]]
+        Iterable of raw flat frame references (path, tar_member).
+    params : Optional[Dict[str, Any]]
+        Algorithm tuning parameters (reserved; none currently used).
     """
     params = params or {}
-    # Prefer explicit raw_inputs if provided
-    effective = raw_inputs if raw_inputs is not None else raw_flt_inputs
-    inputs: List[FlatInput] = list(effective or [])
+    inputs: List[FlatInput] = list(raw_inputs or [])
     if len(inputs) == 0:
-        raise ValueError("step_flt requires at least one raw flat input in raw_flt_inputs")
+        raise ValueError("step_flt requires at least one raw flat input in raw_inputs")
 
     def _reduce_one(idx_item):
         i, it = idx_item

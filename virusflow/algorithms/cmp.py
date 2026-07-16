@@ -35,20 +35,24 @@ CmpInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|Non
 from ..core.algo_result import AlgoResult
 
 def step_cmp(
-    raw_cmp_inputs: Optional[Iterable[CmpInput]] = None,
-    params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[CmpInput]] = None,
+    params: Optional[Dict[str, Any]] = None,
 ) -> AlgoResult:
     """Construct a master comparison (cmp) frame from input comparison frames.
 
     Storage-neutral: compute and return AlgoResult only. No persistence here.
+
+    Parameters
+    ----------
+    raw_inputs : Optional[Iterable[CmpInput]]
+        Iterable of raw comparison-lamp frame references (path, tar_member).
+    params : Optional[Dict[str, Any]]
+        Algorithm tuning parameters (reserved; none currently used).
     """
     params = params or {}
-    # Prefer explicit raw_inputs if provided
-    effective = raw_inputs if raw_inputs is not None else raw_cmp_inputs
-    inputs: List[CmpInput] = list(effective or [])
+    inputs: List[CmpInput] = list(raw_inputs or [])
     if len(inputs) == 0:
-        raise ValueError("step_cmp requires at least one raw comparison input in raw_cmp_inputs")
+        raise ValueError("step_cmp requires at least one raw comparison input in raw_inputs")
 
     def _reduce_one(idx_item):
         i, it = idx_item

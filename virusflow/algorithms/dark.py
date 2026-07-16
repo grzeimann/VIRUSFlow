@@ -58,21 +58,25 @@ def detect_dark_current_outliers(dark: np.ndarray) -> np.ndarray:
 from ..core.algo_result import AlgoResult
 
 def step_dark(
-    raw_dark_inputs: Optional[Iterable[DarkInput]] = None,
-    params: Optional[Dict[str, Any]] = None,
     raw_inputs: Optional[Iterable[DarkInput]] = None,
+    params: Optional[Dict[str, Any]] = None,
 ) -> AlgoResult:
     """Construct a master dark frame from input dark frames.
 
     Storage-neutral implementation: compute and return AlgoResult only. No persistence.
+
+    Parameters
+    ----------
+    raw_inputs : Optional[Iterable[DarkInput]]
+        Iterable of raw dark frame references (path, tar_member).
+    params : Optional[Dict[str, Any]]
+        Algorithm tuning parameters (reserved; none currently used).
     """
     params = params or {}
-    # Accept either alias name; prefer explicit raw_inputs if provided
-    effective = raw_inputs if raw_inputs is not None else raw_dark_inputs
-    inputs: List[DarkInput] = list(effective or [])
+    inputs: List[DarkInput] = list(raw_inputs or [])
     n_inputs = len(inputs)
     if n_inputs == 0:
-        raise ValueError("step_dark requires at least one raw dark input in raw_dark_inputs")
+        raise ValueError("step_dark requires at least one raw dark input in raw_inputs")
 
     # Read all frames serially. Parallelism is handled by the task/executor layer.
     def _reduce_one(idx_item):

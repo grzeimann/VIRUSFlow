@@ -6,7 +6,7 @@ import numpy as np
 from astropy.io import fits
 from scipy.ndimage import gaussian_filter1d
 
-def repair_masked_columns(image: np.ndarray, mask: np.ndarray, sigma: float = 1.0) -> np.ndarray:
+def interpolate_masked_detector_pixels(image: np.ndarray, mask: np.ndarray, sigma: float = 1.0) -> np.ndarray:
     """Fill masked pixels in an IFU arc image using row-wise interpolation and Gaussian smoothing.
 
     - Operates along spectral columns (x) within each detector row (y).
