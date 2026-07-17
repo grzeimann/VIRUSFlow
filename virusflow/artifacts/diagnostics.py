@@ -72,24 +72,28 @@ class DiagnosticsFacade:
             ar = ensure_algo_result(meta or {}, kind=kind)
             m = dict(ar.as_meta() or {})
             k = (kind or "").strip().lower()
-            if k in {"master_flat", "master_cmp"} and (m.get("p95") is None):
-                try:
-                    row = self.adapter.get_row(int(artifact_id))
-                    path = row.get("path") if isinstance(row, dict) else None
-                    if path:
-                        # Load array payload and compute 95th percentile (NaN-aware)
-                        from .serializers import array_fits as _array_fits  # type: ignore
-                        payload = _array_fits.load(str(path))
-                        data = payload.get("data")
-                        if data is not None:
-                            arr = _np.asarray(data, dtype=float)
+            # Generic component payload exposure for reducers: load primary array as meta.component.data
+            try:
+                row = self.adapter.get_row(int(artifact_id))
+                path = row.get("path") if isinstance(row, dict) else None
+                if path:
+                    from .serializers import array_fits as _array_fits  # type: ignore
+                    payload = _array_fits.load(str(path))
+                    data = payload.get("data") if isinstance(payload, dict) else None
+                    if data is not None:
+                        arr = _np.asarray(data, dtype=float)
+                        comp = dict(m.get("component") or {})
+                        comp.setdefault("data", arr)
+                        m["component"] = comp
+                        # Backward-compatible enrichment for legacy configs expecting meta.p95 on some kinds
+                        if k in {"master_flat", "master_cmp"} and (m.get("p95") is None):
                             with _np.errstate(all="ignore"):
                                 val = float(_np.nanpercentile(arr, 95)) if arr.size else None
-                            if val is not None and val == val:  # not NaN
+                            if val is not None and val == val:
                                 m["p95"] = val
-                except Exception:
-                    # Best-effort enrichment; ignore on failure
-                    pass
+            except Exception:
+                # Best-effort enrichment; ignore on failure
+                pass
             decision = eng.evaluate(kind=kind, meta=m)
             # persist: include messages as a special key in metrics for visibility in CLI/DB
             metrics = dict(decision.metrics or {})

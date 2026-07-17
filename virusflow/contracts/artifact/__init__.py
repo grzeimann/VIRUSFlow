@@ -138,3 +138,17 @@ class MasterTwiContract:
             validity_semantics="Valid for instrument zipcode and date window",
             provenance_expectations=[],
         )
+
+
+class MasterSciContract:
+    def spec(self) -> ArtifactContractSpec:
+        return ArtifactContractSpec(
+            kind="master_sci",
+            components=[LogicalComponentSpec(name="master_science", model_type="array2d", required=True)],
+            optional_components=[],
+            summaries=["n_inputs"],
+            required_metadata=[],
+            applicability="Science exposure stack for detector/fiber diagnostics",
+            validity_semantics="Valid for instrument zipcode and date window (diagnostic)",
+            provenance_expectations=[],
+        )

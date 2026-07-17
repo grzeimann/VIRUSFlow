@@ -10,7 +10,7 @@ import this to obtain a baseline kind→task mapping.
 from typing import Dict, Type
 
 from .base import Task
-from .calibs import BiasTask, DarkTask, FlatTask, CmpTask, TraceTask, WaveTask, TwiTask
+from .calibs import BiasTask, DarkTask, FlatTask, CmpTask, TraceTask, WaveTask, TwiTask, SciTask
 
 
 def default_kind_to_task() -> Dict[str, Type[Task]]:

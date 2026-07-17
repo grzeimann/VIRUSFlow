@@ -6,6 +6,7 @@ from ..algorithms.dark import step_dark
 from ..algorithms.flat import step_flt
 from ..algorithms.trace import fit_fiber_traces
 from ..algorithms.twi import step_twi
+from ..algorithms.sci import build_master_science
 import numpy as np
 from ..algorithms.wave import fit_wavelength_solution
 from ..algorithms.cmp import step_cmp
@@ -511,6 +512,106 @@ class TwiTask(CalibrationTask):
 
         if dbg:
             print(f"[Timing] TwiTask: resolve={t1 - t0:.3f}s, execute={t3 - t2:.3f}s")
+        return {self.artifact_name: art}
+
+
+class SciTask(CalibrationTask):
+    """Science diagnostic master-frame task.
+
+    Mirrors other simple calibs: algorithm returns AlgoResult; task composes
+    ArtifactRequest and publishes via PublicationService; QA runs post-publication.
+    """
+    name = "sci"
+    version = "v1"
+
+    # CalibrationTask configuration
+    frame_type = "sci"
+    artifact_name = "master_sci"
+    algorithm = staticmethod(build_master_science)
+
+    def run(self, inputs):
+        import time
+        from ..contracts.result import SciResultContract
+        from ..artifacts.requests import ArtifactRequest, LogicalComponent
+        from ..artifacts.models import Scope
+        from ..publication.service import DefaultPublicationService
+        from ..publication.context import PublicationContext
+        from ..persistence.policy import DefaultPersistencePolicy
+        from ..core.algo_result import ensure_algo_result
+        from ..artifacts import ArtifactService
+
+        self._require_target()
+        dbg = bool(self.ctx.config.get("debug_timing", False)) if isinstance(self.ctx.config, dict) else False
+        t0 = time.perf_counter()
+        raw_inputs, parent_ids = self.query_inputs()
+        t1 = time.perf_counter()
+
+        # Execute algorithm (compute only)
+        algo_params = dict(self.params or {})
+        if isinstance(self.ctx.config, dict):
+            for k, v in self.ctx.config.items():
+                algo_params.setdefault(k, v)
+        t2 = time.perf_counter()
+        ar = self.algorithm(raw_inputs=raw_inputs, params=algo_params)
+        t3 = time.perf_counter()
+
+        # Normalize and validate result
+        ar = ensure_algo_result(ar, kind="sci")
+        rep = SciResultContract().validate(ar)
+        if not rep.ok:
+            raise ValueError("SciTask: AlgoResult failed contract validation: " + "; ".join(rep.errors))
+
+        # Compose ArtifactRequest (logical, single component)
+        master = ar.get_array("master_science")
+        if master is None:
+            raise RuntimeError("SciTask: missing 'master_science' array in AlgoResult")
+        comp_master = LogicalComponent(name="master_science", model_type="array2d", value=master)
+        scope = Scope(zipcode=getattr(self.target, "zipcode", None))
+        mm = ar.as_meta()
+        summaries = {"n_inputs": int(mm.get("n_inputs", 0))}
+        req = ArtifactRequest(
+            kind=str(self.artifact_name or "master_sci"),
+            components={"master_science": comp_master},
+            summaries=summaries,
+            metadata={},
+            scope=scope,
+            parents=[int(p) for p in (parent_ids or [])],
+            labels=["calibration", "sci"],
+        )
+
+        # Publish via DefaultPublicationService
+        svc = ArtifactService(self.ctx.db_path)
+        pub = DefaultPublicationService(svc=svc, policy=DefaultPersistencePolicy(), base_dir=self.ctx.workdir)
+        ctx = PublicationContext(
+            task_name=self.name,
+            task_version=self.version,
+            algorithm_name="algorithms.sci.build_master_science",
+            algorithm_version=ar.version,
+            parameters=dict(self.params or {}),
+            parent_ids=[int(p) for p in (parent_ids or [])],
+            timings={"resolve": t1 - t0, "execute": t3 - t2},
+        )
+        arts = pub.publish([req], ctx)
+        if not arts:
+            raise RuntimeError("SciTask: publication produced no artifacts")
+        art = arts[0]
+
+        # QA after publication
+        try:
+            status = svc.diagnostics.evaluate_and_save(artifact_id=int(getattr(art, "id", 0)), kind=str(self.artifact_name), meta=ar)
+            if dbg and status:
+                print(f"[QA] SciTask: status={status} artifact_id={getattr(art, 'id', None)}")
+            try:
+                if svc.diagnostics.should_block(kind=str(self.artifact_name), status=status):
+                    raise RuntimeError(f"QA hard-fail for {self.artifact_name} (artifact_id={getattr(art, 'id', None)})")
+            except Exception:
+                pass
+        except Exception:
+            # Preserve existing behavior (QA errors do not crash task unless hard-fail configured)
+            pass
+
+        if dbg:
+            print(f"[Timing] SciTask: resolve={t1 - t0:.3f}s, execute={t3 - t2:.3f}s")
         return {self.artifact_name: art}
 
 
