@@ -394,3 +394,19 @@ All Step 1–7 exit criteria are satisfied. The documented rollback remains addi
 ## 9. Next review gate
 
 Do not begin Step 8 until this implementation record and its acceptance evidence are reviewed. The recommended next task is the narrow Step 8 physical-CCD characterization/contract slice: test `upper_y = 2063 - y` endpoints, invertibility, row coverage, and LL/LU plus RU/RL ordering; then introduce paired-amplifier assembly and separate scatter-model/scatter-subtracted Products. Do not expand to full exposures in that task.
+
+## 10. Committed Steps 1–7 verification command
+
+Run the accepted 20260609 amplifier path in a new isolated temporary registry and artifact directory with:
+
+```bash
+python -m virusflow.cli.verify_steps_1_7
+```
+
+The command verifies ZipCode `060+003+206+LL+S/N 0039`, the exact raw inventory, all seven canonical Products, named-component ArtifactService loading and checksums, normalized lineage, QA status/usability, revision, and validity. It prints the manifest and writes a unique temporary report directory containing:
+
+- `steps_1_7_manifest.json`;
+- `steps_1_7_scientific_acceptance.md`;
+- `steps_1_7_scientific_acceptance.png` with Bias, Dark, LDLS, Arc, Twilight, Trace, and Wavelength diagnostics.
+
+Use `--data-root`, `--configuration-root`, or `--output-dir` only when the default accepted paths are unavailable.
