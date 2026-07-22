@@ -65,6 +65,41 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
         CoordinateConvention.PHYSICAL_CCD_ZERO_INDEXED,
         ("image", "variance", "pixel_mask", "seam_mask", "inter_amplifier_gap_mask", "source_amplifier_map", "source_y_coordinate"),
     ),
+    "aperture_extracted_spectrum": _spec(
+        "aperture_extracted_spectrum", PhysicalScope.FIBER, Unit.ELECTRON.value,
+        CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
+        ("spectrum", "valid_pixel_fraction", "effective_aperture_width", "aperture_start_row", "fractional_weights", "extraction_valid"),
+    ),
+    "extracted_variance": _spec("extracted_variance", PhysicalScope.FIBER, Unit.ELECTRON_VARIANCE.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("variance",)),
+    "within_amp_fiber_normalization": _spec(
+        "within_amp_fiber_normalization", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value,
+        CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
+        ("raw_ratio", "normalization", "valid_mask", "common_twilight"),
+    ),
+    "amp_to_amp_normalization": _spec(
+        "amp_to_amp_normalization", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value,
+        CoordinateConvention.NONE, ("amplifier_factors", "amplifier_twilight_levels", "reference_level", "amplifier_identity"),
+    ),
+    "fiber_normalization": _spec(
+        "fiber_normalization", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value,
+        CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
+        ("normalization", "within_amp_factor", "amp_to_amp_factor"),
+    ),
+    "initial_astrometry": _spec("initial_astrometry", PhysicalScope.EXPOSURE, "deg", CoordinateConvention.ICRS, ("parameters", "header_evidence")),
+    "source_detection_catalog": _spec("source_detection_catalog", PhysicalScope.EXPOSURE, Unit.ELECTRON.value, CoordinateConvention.ICRS, ("detections",)),
+    "catalog_match_table": _spec("catalog_match_table", PhysicalScope.EXPOSURE, "arcsec", CoordinateConvention.ICRS, ("matches", "catalog_rows")),
+    "final_astrometry": _spec("final_astrometry", PhysicalScope.EXPOSURE, "deg", CoordinateConvention.ICRS, ("parameters", "fit_evidence")),
+    "fiber_sky_coordinates": _spec("fiber_sky_coordinates", PhysicalScope.FIBER, "deg", CoordinateConvention.ICRS, ("coordinates", "fiber_identity", "focal_plane_coordinates")),
+    "sky_fiber_mask": _spec("sky_fiber_mask", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value, CoordinateConvention.NONE, ("mask", "broadband_flux", "fiber_identity")),
+    "incident_sky_spectrum": _spec("incident_sky_spectrum", PhysicalScope.EXPOSURE, Unit.ELECTRON.value, CoordinateConvention.WAVELENGTH_ANGSTROM, ("wavelength", "spectrum", "variance", "sample_count")),
+    "fiber_sky_prediction": _spec("fiber_sky_prediction", PhysicalScope.FIBER, Unit.ELECTRON.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("prediction", "fiber_identity")),
+    "sky_subtracted_spectrum": _spec("sky_subtracted_spectrum", PhysicalScope.FIBER, Unit.ELECTRON.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("spectrum", "variance", "fiber_identity")),
+    "baseline_relative_response": _spec("baseline_relative_response", PhysicalScope.INSTRUMENT_EPOCH, Unit.DIMENSIONLESS.value, CoordinateConvention.WAVELENGTH_ANGSTROM, ("wavelength", "response")),
+    "exposure_illumination_correction": _spec("exposure_illumination_correction", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.NONE, ("fiber_factor", "amplifier_factor", "fiber_identity")),
+    "final_exposure_response": _spec("final_exposure_response", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("response", "baseline_response", "illumination_factor", "fiber_identity")),
+    "exposure_mode_classification": _spec("exposure_mode_classification", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.NONE, ("classification", "source_fields")),
+    "effective_exposure_time": _spec("effective_exposure_time", PhysicalScope.EXPOSURE, Unit.SECOND.value, CoordinateConvention.NONE, ("effective_seconds", "source_fields")),
+    "exposure_completion_manifest": _spec("exposure_completion_manifest", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.NONE, ("coverage", "amplifier_identity")),
 }
 
 

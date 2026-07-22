@@ -80,8 +80,46 @@ class ReducedScienceAmplifierTask(_SciencePublisher):
         image = np.asarray(reduced.get_array("oriented_detector_image"), dtype=np.float32)
         variance = np.asarray(reduced.get_array("detector_variance"), dtype=np.float32)
         mask = (~np.isfinite(image) | ~np.isfinite(variance)).astype(np.uint8)
-        spec = kind_spec("reduced_science_image")
+        service = ArtifactService(self.ctx.db_path)
         at = _instant(exposure_id)
+        calibration_parents = []
+        calibration_policy = "overscan_orientation_gain_only"
+        science_exptime = float(frame.header.get("EXPTIME") or 0.0)
+        dark_exptime = None
+        dark_scale = 0.0
+        if bool(self.params.get("apply_calibrations", True)):
+            cal_scope = Scope(zipcode=zipcode)
+            bias_row = service.select_best(kind="master_bias", scope=cal_scope, at_time=at)
+            dark_row = service.select_best(kind="master_dark", scope=cal_scope, at_time=at)
+            ldls_row = service.select_best(kind="master_ldls", scope=cal_scope, at_time=at)
+            if bias_row is None or dark_row is None:
+                raise RuntimeError(f"Missing Bias/Dark calibration for {exposure_id}/{zipcode.key()}")
+            bias = np.asarray(service.load_component(bias_row, "master")["data"], dtype=np.float32)
+            bias_scatter = np.asarray(
+                service.load_component(bias_row, "per_pixel_bias_scatter")["data"], dtype=np.float32
+            )
+            dark = np.asarray(service.load_component(dark_row, "master_dark")["data"], dtype=np.float32)
+            dark_rows = db.list_raw_files_scoped(
+                frame_type="drk", start_date=exposure_id[:8], end_date=exposure_id[:8],
+                zipcode=zipcode, db_path=self.ctx.db_path,
+            )
+            dark_exptime = None
+            if dark_rows:
+                dark_raw = dark_rows[0][1]
+                dark_frame = (loader or RawFrameLoader()).load(dark_raw.path, dark_raw.tar_member)
+                dark_exptime = float(dark_frame.header.get("EXPTIME") or 0.0)
+            dark_scale = science_exptime / dark_exptime if science_exptime > 0 and dark_exptime and dark_exptime > 0 else 1.0
+            dark_residual = dark - bias
+            image = image - bias - np.float32(dark_scale) * dark_residual
+            variance = variance + np.square(bias_scatter, dtype=np.float32)
+            mask |= np.asarray(service.load_component(dark_row, "dark_pixel_mask")["data"], dtype=np.uint8)
+            calibration_parents.extend([int(bias_row["id"]), int(dark_row["id"])])
+            if ldls_row is not None:
+                mask |= np.asarray(service.load_component(ldls_row, "flat_response_mask")["data"], dtype=np.uint8)
+                calibration_parents.append(int(ldls_row["id"]))
+            mask |= (~np.isfinite(image) | ~np.isfinite(variance)).astype(np.uint8)
+            calibration_policy = "bias_plus_exptime_scaled_dark_residual-1"
+        spec = kind_spec("reduced_science_image")
         request = ArtifactRequest(
             kind="reduced_science_image", role="reduction",
             components={
@@ -93,18 +131,25 @@ class ReducedScienceAmplifierTask(_SciencePublisher):
                 "invalid_pixel_fraction": float(mask.mean()),
                 "gain": float(reduced.scalars["gain"]),
                 "read_noise": float(reduced.scalars["read_noise"]),
+                "science_exptime": science_exptime,
+                "dark_exptime": float(dark_exptime or 0.0),
+                "dark_scale": float(dark_scale),
             },
             metadata={
                 "exposure_id": exposure_id,
                 "zipcode": zipcode.key(),
-                "reduction_stage": "overscan_orientation_gain",
+                "reduction_stage": "overscan_orientation_gain_bias_dark_mask",
+                "calibration_policy": calibration_policy,
                 "source_header": {key: frame.header.get(key) for key in ("DATE", "OBJECT", "EXPTIME", "PEXPTIME", "OBSID", "DITHER", "QRA", "QDEC", "PARANGLE")},
             },
             scope=Scope(zipcode=zipcode, exposure_id=exposure_id, physical_scope=PhysicalScope.AMPLIFIER),
-            parents=[int(row_id)],
+            parents=[int(row_id), *calibration_parents],
             validity=Validity(at, at, "exposure_identity"),
             configuration_refs=[ConfigurationReference("amplifier_orientation", "legacy-characterized-1", zipcode.key(), "verified")],
-            assumptions=["Step 8 source amplifier Product retains the overscan/orientation/gain detector state."],
+            assumptions=[
+                "Master Dark contains the Master Bias level; only its residual above Master Bias is exposure-time scaled.",
+                "Detector covariance is not propagated in the baseline slice.",
+            ],
         )
         artifact = self._publish(
             request, algorithm_name="virusflow.algorithms.ccd.reduce_amplifier_array",

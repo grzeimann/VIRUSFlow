@@ -40,7 +40,10 @@ def load(path_str: str) -> Dict:
     p = Path(path_str)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {p}")
-    with fits.open(str(p), memmap=True) as hdul:
+    # Unsigned FITS images use BZERO/BSCALE and cannot be materialized with
+    # strict memory mapping. Named components are checksum-verified and loaded
+    # as complete arrays at this boundary, so use the general scaled reader.
+    with fits.open(str(p), memmap=False) as hdul:
         data = hdul[0].data
         hdr = dict(hdul[0].header)
     return {"data": data, "header": hdr}

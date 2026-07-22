@@ -43,5 +43,6 @@ def available_tasks() -> Dict[str, list[str]]:
         out[n].sort()
     return out
 from .science import PhysicalCCDTask, ReducedScienceAmplifierTask
+from .exposure import ExposureTask
 
-__all__ = ["PhysicalCCDTask", "ReducedScienceAmplifierTask"]
+__all__ = ["ExposureTask", "PhysicalCCDTask", "ReducedScienceAmplifierTask"]

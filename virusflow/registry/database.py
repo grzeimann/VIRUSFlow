@@ -579,6 +579,13 @@ def list_raw_files(exposure_id: Optional[str] = None, db_path: str = DEFAULT_DB_
         out: List[RawFileId] = []
         for r in rows:
             zipcode = None
+            if r[5]:
+                try:
+                    from ..core.identity import parse_zipcode_key
+
+                    zipcode = parse_zipcode_key(str(r[5]))
+                except (SystemExit, ValueError):
+                    zipcode = None
             out.append(
                 RawFileId(
                     exposure_id=r[0], frame_type=r[1], path=r[2], tar_member=r[3], storage_backend=r[4], zipcode=zipcode
@@ -603,21 +610,28 @@ def list_raw_files_scoped(
     with connect(db_path) as conn:
         base = (
             "SELECT rf.id, rf.exposure_id, rf.frame_type, rf.path, rf.tar_member, rf.storage_backend, "
-            "a.ifuslot, a.ifuid, a.specid, a.amp, a.controller "
+            "rf.amp_key, a.ifuslot, a.ifuid, a.specid, a.amp, a.controller "
             "FROM raw_files rf JOIN exposures e ON rf.exposure_id = e.id "
             "LEFT JOIN amplifiers a ON rf.amp_key = a.key "
             "WHERE LOWER(rf.frame_type)=LOWER(?) AND e.when_utc IS NOT NULL AND substr(replace(e.when_utc,'-',''),1,8) BETWEEN ? AND ?"
         )
         params: List[str] = [frame_type, sd, ed]
         if zipcode is not None:
-            base += " AND a.ifuslot=? AND a.ifuid=? AND a.specid=? AND a.amp=? AND a.controller=?"
-            params.extend([zipcode.ifuslot, zipcode.ifuid, zipcode.specid, zipcode.amp, zipcode.controller])
+            base += " AND rf.amp_key=?"
+            params.append(zipcode.key())
         rows = conn.execute(base, tuple(params)).fetchall()
         out: List[Tuple[int, RawFileId]] = []
         for r in rows:
             zc: Optional[ZipCode] = None
-            if r[6] is not None:
-                zc = ZipCode(ifuslot=r[6], ifuid=r[7], specid=r[8], amp=r[9], controller=r[10])
+            if r[7] is not None:
+                zc = ZipCode(ifuslot=r[7], ifuid=r[8], specid=r[9], amp=r[10], controller=r[11])
+            elif r[6]:
+                try:
+                    from ..core.identity import parse_zipcode_key
+
+                    zc = parse_zipcode_key(str(r[6]))
+                except (SystemExit, ValueError):
+                    zc = None
             rf = RawFileId(
                 exposure_id=r[1], frame_type=r[2], path=r[3], tar_member=r[4], storage_backend=r[5], zipcode=zc
             )

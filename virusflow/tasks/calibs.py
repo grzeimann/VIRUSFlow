@@ -15,7 +15,9 @@ from ..algorithms.trace import fit_fiber_traces
 from ..algorithms.twi import step_twi
 from ..algorithms.wave import fit_wavelength_solution
 from ..artifacts import ArtifactService, Scope
+from ..artifacts.models import ConfigurationReference
 from ..artifacts.requests import ArtifactRequest, LogicalComponent
+from ..config.defaults import WAVELENGTH_INPUT_MASK_CONFIGURATION
 from ..contracts.result import (
     BiasResultContract,
     CmpResultContract,
@@ -283,11 +285,22 @@ class WaveTask(_CanonicalTask):
 
         mask = None
         masks = []
+        mask_facts = {"flat_mask_fraction": 0.0, "dark_mask_fraction": 0.0, "flat_mask_applied": 0}
+        mask_policy = WAVELENGTH_INPUT_MASK_CONFIGURATION
         for kind, component in (("master_ldls", "flat_response_mask"), ("master_dark", "dark_pixel_mask")):
             row = self._resolve_artifact(kind, required=False)
             if row is not None:
                 try:
-                    masks.append(np.asarray(service.load_component(row, component)["data"], dtype=bool))
+                    candidate = np.asarray(service.load_component(row, component)["data"], dtype=bool)
+                    fraction = float(candidate.mean())
+                    if kind == "master_ldls":
+                        mask_facts["flat_mask_fraction"] = fraction
+                        if fraction <= float(mask_policy.value["maximum_flat_mask_fraction"]):
+                            masks.append(candidate)
+                            mask_facts["flat_mask_applied"] = 1
+                    else:
+                        mask_facts["dark_mask_fraction"] = fraction
+                        masks.append(candidate)
                 except KeyError:
                     pass
         if masks:
@@ -297,14 +310,28 @@ class WaveTask(_CanonicalTask):
 
                 arc = interpolate_masked_detector_pixels(np.asarray(arc, dtype=float), mask)
 
+        algorithm_params = self._params()
         result = fit_wavelength_solution(
             master_comparison_lamp=arc,
             fiber_trace_map=trace,
-            params={**self._params(), "mask_applied": bool(mask is not None)},
+            npix_extract=int(algorithm_params.get("npix_extract", 5)),
+            res_lim=float(algorithm_params.get("res_lim", 1.0)),
+            order=int(algorithm_params.get("order", 4)),
+            params={**algorithm_params, "mask_applied": bool(mask is not None), **mask_facts},
         )
         result = ensure_algo_result(result, kind="wave")
+        result.scalars.update(mask_facts)
+        result.meta.update({
+            "input_mask_policy_version": mask_policy.version,
+            "input_mask_policy_evidence": mask_policy.evidence_state,
+        })
         report = self.result_contract().validate(result)
         if not report.ok:
             raise ValueError("WaveTask result contract: " + "; ".join(report.errors))
-        artifact = self._publish(result, [int(arc_row["id"]), int(trace_row["id"])])
+        refs = self.configuration_references() + [ConfigurationReference(
+            mask_policy.kind, mask_policy.version, self.target.zipcode.key(), mask_policy.evidence_state
+        )]
+        artifact = self._publish(
+            result, [int(arc_row["id"]), int(trace_row["id"])], configuration_refs=refs
+        )
         return {self.artifact_name: artifact, "wave": artifact}

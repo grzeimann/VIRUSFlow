@@ -36,3 +36,14 @@ kinds:
     policy: soft
     metrics: {}
     checks: []
+
+  master_arc:
+    policy: soft
+    metrics:
+      p95:
+        from: "reduce.percentile(meta.component.data,95)"
+        default: 0.0
+    checks:
+      - id: "arc_signal_present"
+        where: "p95 > 0.0"
+        severity: warn_if_false

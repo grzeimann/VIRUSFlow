@@ -9,6 +9,7 @@ dependencies:
   - matplotlib>=3.7
   - pyyaml>=6
   - scikit-learn
+  - astroquery
   - pip
   - pip:
       - -e .[dev]

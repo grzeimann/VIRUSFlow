@@ -39,13 +39,14 @@ def write_array_fits(
 ) -> None:
     """Write a 1D/2D array as a FITS artifact with a compact sidecar JSON.
 
-    - Primary HDU stores data as float32
+    - Primary HDU preserves numeric precision (boolean arrays use uint8)
     - Adds NINPUTS and ALGOVER cards to header
     - Optional mask written as uint8 ImageHDU with provided name
     - Writes a small JSON sidecar with generic fields and any extra keys in 'sidecar'
     """
     arr = np.asarray(data)
-    phdu = fits.PrimaryHDU(arr.astype(np.float32))
+    storage_array = arr.astype(np.uint8) if arr.dtype.kind == "b" else arr
+    phdu = fits.PrimaryHDU(storage_array)
     hdr = phdu.header
     hdr["NINPUTS"] = (int(n_inputs), "number of inputs contributing to artifact")
     hdr["ALGOVER"] = (str(algo_version), "algorithm version")
@@ -157,5 +158,4 @@ def read_array_fits(path: str) -> Dict:
         data = hdul[0].data
         hdr = dict(hdul[0].header)
     return {"data": data, "header": hdr}
-
 

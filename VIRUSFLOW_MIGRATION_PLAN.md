@@ -173,6 +173,8 @@ Use the simplest accepted methods from the knowledge notes:
 
 Amp-to-amp normalization is not a contract blocker. Infer an exposure-wide robust scale under the uniform twilight assumption, retain both factors and verify the statistic through characterization/analytics.
 
+Implementation gate passed on 2026-07-22. `ExposureTask` executed real exposure `20260609T031649.6` through all 300 raw amplifiers and 75 IFUSLOTs in an isolated registry. All 300 amplifiers produced reduced detector Products and all 150 physical CCDs produced scatter Products. Exactly 299 amplifiers produced wavelength-dependent extraction Products; `095+004+426+RU+S/N 0048` is explicitly unavailable because every one of its eight real comparison-lamp frames is identically zero. This limitation is retained in coverage/QA and was not filled or propagated to its healthy physical-CCD partner. Live Pan-STARRS DR2 catalog refinement succeeded. Exact fractional weights and variance, decomposed normalization, astrometry, sky, response, effective time, checksums, revisions, configuration, usability, and normalized lineage are queryable. Detailed values are retained in `VIRUSFLOW_STEPS_8_10_ACCEPTANCE.md`.
+
 ### Step 10 — One observation/dither set
 
 Exposure remains atomic. Observation and DitherSet rows relate exposures but never merge away per-exposure sky, seeing, transparency, illumination, astrometry, response, time or detector state.
