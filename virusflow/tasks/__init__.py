@@ -16,6 +16,10 @@ _TASK_REGISTRY: Dict[tuple[str, str], Type[Task]] = {
     (WaveTask.name, WaveTask.version): WaveTask,
 }
 
+# Explicit legacy version selectors remain valid compatibility entry points.
+for _task in (BiasTask, DarkTask, FlatTask, CmpTask, TwiTask, TraceTask, WaveTask):
+    _TASK_REGISTRY.setdefault((_task.name, "v1"), _task)
+
 
 def get_task_class(name: str, version: str | None = None) -> Type[Task]:
     if version is None:

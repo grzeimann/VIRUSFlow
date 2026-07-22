@@ -13,6 +13,7 @@ from virusflow.planning import ReductionGraph, adapt_target, default_calibration
 from virusflow.registry import database as db
 from virusflow.tasks.base import TaskContext
 from virusflow.tasks.mapping import default_kind_to_task
+from virusflow.tasks import get_task_class
 
 
 def _seed(conn, zipcode, frame_type, count):
@@ -50,6 +51,10 @@ def test_canonical_graph_declares_raw_arc_and_trace_to_wavelength_dependency():
         ("master_arc", "wavelength_map"),
         ("trace_map", "wavelength_map"),
     }
+    assert get_task_class("flat", "v1").artifact_name == "master_ldls"
+    aliases = default_kind_to_task()
+    assert aliases["master_flat"] is aliases["master_ldls"]
+    assert aliases["master_cmp"] is aliases["master_arc"]
 
 
 def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_path, monkeypatch):

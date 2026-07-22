@@ -157,6 +157,11 @@ class FlatTask(_RawCalibrationTask):
     result_contract = FlatResultContract
     component_map = {"master_flat": "master_ldls", "flat_response_mask": "flat_response_mask"}
 
+    def run(self, inputs):
+        result = super().run(inputs)
+        result["master_flat"] = result[self.artifact_name]
+        return result
+
 
 class CmpTask(_RawCalibrationTask):
     """Legacy public class name producing aggregate Master Arc from raw cmp."""
@@ -171,6 +176,11 @@ class CmpTask(_RawCalibrationTask):
     result_contract = CmpResultContract
     component_map = {"master_comparison_lamp": "master_arc"}
 
+    def run(self, inputs):
+        result = super().run(inputs)
+        result["master_cmp"] = result[self.artifact_name]
+        return result
+
 
 class TwiTask(_RawCalibrationTask):
     name = "twi"
@@ -182,6 +192,11 @@ class TwiTask(_RawCalibrationTask):
     result_kind = "twi"
     result_contract = TwiResultContract
     component_map = {"master_twilight": "master_twilight"}
+
+    def run(self, inputs):
+        result = super().run(inputs)
+        result["master_twi"] = result[self.artifact_name]
+        return result
 
 
 class SciTask(_RawCalibrationTask):
@@ -240,7 +255,7 @@ class TraceTask(_CanonicalTask):
             raise ValueError("TraceTask result contract: " + "; ".join(report.errors))
         refs = self.configuration_references() + [trace_ref]
         artifact = self._publish(result, [int(parent["id"])], configuration_refs=refs)
-        return {self.artifact_name: artifact}
+        return {self.artifact_name: artifact, "trace": artifact}
 
 
 class WaveTask(_CanonicalTask):
@@ -292,4 +307,4 @@ class WaveTask(_CanonicalTask):
         if not report.ok:
             raise ValueError("WaveTask result contract: " + "; ".join(report.errors))
         artifact = self._publish(result, [int(arc_row["id"]), int(trace_row["id"])])
-        return {self.artifact_name: artifact}
+        return {self.artifact_name: artifact, "wave": artifact}

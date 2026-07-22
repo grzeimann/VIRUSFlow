@@ -334,12 +334,32 @@ def _get_trace(
 from ..core.algo_result import AlgoResult
 
 def fit_fiber_traces(
+    raw_inputs: Optional[Iterable[TraceInput]] = None,
+    params: Optional[Dict[str, Any]] = None,
     *,
-    master_ldls_array: np.ndarray,
-    trace_reference: np.ndarray,
-    zipcode,
+    master_ldls_array: Optional[np.ndarray] = None,
+    trace_reference: Optional[np.ndarray] = None,
+    zipcode=None,
 ) -> AlgoResult:
     """Build a trace solution from arrays supplied by Task/configuration boundaries."""
+    # Compatibility call shape: legacy callers may still pass (raw_inputs, params),
+    # but the params must contain arrays and identity. Path loading is intentionally
+    # not restored to this migrated algorithm boundary.
+    params = dict(params or {})
+    master_ldls_array = master_ldls_array if master_ldls_array is not None else params.get("master_ldls_array", params.get("master_flat_array"))
+    trace_reference = trace_reference if trace_reference is not None else params.get("trace_reference")
+    if zipcode is None and all(params.get(name) is not None for name in ("ifuslot", "ifuid", "specid", "amp")):
+        from ..core.identity import ZipCode
+
+        zipcode = ZipCode(
+            str(params["ifuslot"]), str(params["ifuid"]), str(params["specid"]),
+            str(params["amp"]), str(params.get("controller") or "unknown"),
+        )
+    if master_ldls_array is None or trace_reference is None or zipcode is None:
+        raise TypeError(
+            "fit_fiber_traces requires already-loaded master_ldls_array, explicit "
+            "trace_reference, and zipcode; legacy path parameters are not accepted"
+        )
     master = np.asarray(master_ldls_array, dtype=float)
     reference = np.asarray(trace_reference, dtype=float)
     if master.ndim != 2 or reference.ndim != 2 or reference.shape[1] < 2:

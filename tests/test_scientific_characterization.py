@@ -138,6 +138,17 @@ def test_trace_hardware_exception_and_sample_residual_outputs(monkeypatch):
     )
     assert result.get_array("trace_sample_columns").tolist() == [1.0, 4.0, 7.0]
     assert np.all(np.isfinite(result.get_array("per_fiber_trace_residual_rms")))
+    legacy_shape = fit_fiber_traces(
+        [],
+        {
+            "master_flat_array": np.ones((20, 8)),
+            "trace_reference": reference,
+            "ifuslot": "060", "ifuid": "018", "specid": "504", "amp": "RU",
+        },
+    )
+    assert legacy_shape.get_array("fiber_trace_map").shape == (2, 8)
+    with pytest.raises(TypeError, match="legacy path parameters are not accepted"):
+        fit_fiber_traces([], {"master_flat_path": "legacy.fits"})
 
 
 def test_arc_matching_rejection_recovery_and_residual_evidence(monkeypatch):
