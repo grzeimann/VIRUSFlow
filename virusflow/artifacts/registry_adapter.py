@@ -117,7 +117,12 @@ class RegistryAdapter:
         return db.list_artifact_relations(int(artifact_id), db_path=self.db_path)
 
     def find(self, *, kind: Optional[str], zipcode, at_time: Optional[datetime], limit: Optional[int] = None) -> List[dict]:
-        return db.find_artifacts(kind=kind, zipcode=zipcode, at_time=at_time, db_path=self.db_path, limit=limit)
+        rows = db.find_artifacts(kind=kind, zipcode=zipcode, at_time=at_time, db_path=self.db_path, limit=limit)
+        for row in rows:
+            details = db.get_artifact_details(int(row["id"]), db_path=self.db_path)
+            if details:
+                row.update(details)
+        return rows
 
     # --- Diagnostics ---
     def get_diagnostics(self, artifact_id: int) -> Optional[dict]:

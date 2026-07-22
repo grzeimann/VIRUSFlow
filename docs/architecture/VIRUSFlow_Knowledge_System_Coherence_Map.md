@@ -817,14 +817,14 @@ Right CCD:
     RL upper, reflected y
 ```
 
-with `x` unchanged and the upper member represented by approximately:
+with `x` unchanged and the upper member represented exactly by:
 
 ```text
-y_CCD = 2064 - y
+y_CCD = 2063 - y
 ```
 
-The remaining question is the exact indexed seam convention when assembling
-arrays, not the amplifier ordering itself.
+The indexed seam convention is resolved. Endpoint, round-trip, row-coverage,
+and physical ordering remain required validation tests.
 
 ---
 

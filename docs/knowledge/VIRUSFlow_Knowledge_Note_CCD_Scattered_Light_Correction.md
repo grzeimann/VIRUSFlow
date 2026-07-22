@@ -115,11 +115,11 @@ therefore be written as:
 ```text
 Left CCD:
     LL: x_CCD = x, y_CCD = y
-    LU: x_CCD = x, y_CCD = 2064 - y
+    LU: x_CCD = x, y_CCD = 2063 - y
 
 Right CCD:
     RU: x_CCD = x, y_CCD = y
-    RL: x_CCD = x, y_CCD = 2064 - y
+    RL: x_CCD = x, y_CCD = 2063 - y
 ```
 
 Thus the physical vertical ordering is:
@@ -147,31 +147,28 @@ LU or RL current coordinates:
 
 These are equivalent relative-coordinate descriptions of the same reflection.
 
-The use of:
+The legacy use of:
 
 ```text
 2064 - y
 ```
 
-rather than an array-index transform such as:
+rather than the canonical array-index transform:
 
 ```text
 2063 - y
 ```
 
-indicates that the legacy calculation is operating in a continuous trace
-coordinate convention, possibly preserving a seam or center-to-center spacing,
-rather than directly concatenating two zero-indexed arrays.
+is pre-refactor characterization evidence from a one-indexed interpretation.
+It is not an alternative coordinate convention.
 
-Before materializing a physical `2064 × 1032` CCD image, VIRUSFlow should verify:
+When materializing a physical `2064 × 1032` CCD image, VIRUSFlow must verify:
 
 - the pixel-center convention;
 - whether the CCD seam contains a physical or coordinate gap;
-- and whether the correct indexed image transform is `2063 - y`, `2064 - y`, or
-  an equivalent edge-coordinate mapping.
+- that the indexed image transform is exactly `2063 - y`.
 
-This is now a narrow implementation-validation question rather than an unknown
-amplifier orientation.
+This is a required implementation-validation test, not an open convention.
 
 The transform should be stored as versioned instrument configuration and tested
 by confirming continuity of:

@@ -54,6 +54,17 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
     "oriented_detector_image": _spec("oriented_detector_image", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("image",)),
     "overscan_model": _spec("overscan_model", PhysicalScope.AMPLIFIER, Unit.ADU.value, CoordinateConvention.RAW_AMPLIFIER, ("row_model",)),
     "overscan_corrected_image": _spec("overscan_corrected_image", PhysicalScope.AMPLIFIER, Unit.ADU.value, CoordinateConvention.RAW_AMPLIFIER, ("image",)),
+    "reduced_science_image": _spec("reduced_science_image", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("image", "variance", "pixel_mask")),
+    "ccd_scattered_light_model": _spec(
+        "ccd_scattered_light_model", PhysicalScope.PHYSICAL_CCD, Unit.ELECTRON.value,
+        CoordinateConvention.PHYSICAL_CCD_ZERO_INDEXED,
+        ("model", "gap_sample_mask", "fit_sample_mask", "holdout_sample_mask", "fit_residual", "model_parameters", "seam_mask", "inter_amplifier_gap_mask", "source_amplifier_map", "source_y_coordinate"),
+    ),
+    "scatter_subtracted_image": _spec(
+        "scatter_subtracted_image", PhysicalScope.PHYSICAL_CCD, Unit.ELECTRON.value,
+        CoordinateConvention.PHYSICAL_CCD_ZERO_INDEXED,
+        ("image", "variance", "pixel_mask", "seam_mask", "inter_amplifier_gap_mask", "source_amplifier_map", "source_y_coordinate"),
+    ),
 }
 
 
@@ -85,4 +96,3 @@ def kind_candidates(name: str) -> Tuple[str, ...]:
     canonical = canonical_kind(name)
     aliases = [legacy for legacy, target in LEGACY_KIND_ALIASES.items() if target == canonical]
     return tuple(dict.fromkeys([canonical, str(name).strip().lower(), *aliases]))
-

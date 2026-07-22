@@ -200,23 +200,19 @@ lower amplifier:
     y_CCD = y
 
 upper amplifier:
-    y_CCD = 2064 - y
+    y_CCD = 2063 - y
 ```
 
-Implementation must add a characterization test to determine the correct indexed
-array convention at the seam, including whether materialized image indices use:
+Implementation must characterize the canonical indexed-array convention at the
+seam. Materialized image and trace indices use exactly:
 
 ```text
 2063 - y
 ```
 
-while continuous trace coordinates retain:
-
-```text
-2064 - y
-```
-
-This is no longer a blocker to architecture or task implementation.
+The historical `2064 - y` expression is retained only as pre-refactor
+characterization evidence and is not an alternative convention. This is no
+longer a blocker to architecture or task implementation.
 
 ## 5.4 Acceptance criteria
 

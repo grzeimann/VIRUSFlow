@@ -494,6 +494,10 @@ For `LL` and `RU` amplifiers:
 trace_mirror = 2064 - trace
 ```
 
+This is retained only as pre-refactor one-indexed characterization evidence.
+The canonical zero-indexed image and trace transform is exactly
+`trace_mirror = 2063 - trace`; `2064 - trace` is not an alternative convention.
+
 For the other amplifier orientations:
 
 ```text

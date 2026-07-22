@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Optional, List
 
 from ..artifacts.models import Scope
+from ..core.identity import ZipCode
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,37 @@ class Target:
     kind: str
     scope: Scope
     window: Optional[TemporalWindow] = None
+    at_time: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
+class PhysicalCCDTarget:
+    """One paired physical CCD in one atomic science exposure."""
+
+    exposure_id: str
+    specid: str
+    side: str
+    lower_zipcode: ZipCode
+    upper_zipcode: ZipCode
+    at_time: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        side = str(self.side).lower()
+        expected = {"left": ("LL", "LU"), "right": ("RU", "RL")}
+        if side not in expected:
+            raise ValueError("PhysicalCCDTarget.side must be 'left' or 'right'")
+        actual = (self.lower_zipcode.amp, self.upper_zipcode.amp)
+        if actual != expected[side]:
+            raise ValueError(f"{side} physical CCD requires amplifier pair {expected[side]}, got {actual}")
+        if self.lower_zipcode.specid != self.upper_zipcode.specid or self.lower_zipcode.specid != self.specid:
+            raise ValueError("PhysicalCCDTarget amplifier SPECIDs must match target.specid")
+
+
+@dataclass(frozen=True)
+class ExposureTarget:
+    """One atomic science exposure, preserving all available amplifier identities."""
+
+    exposure_id: str
     at_time: Optional[datetime] = None
 
 

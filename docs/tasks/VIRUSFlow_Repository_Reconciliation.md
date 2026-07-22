@@ -590,13 +590,13 @@ RU lower
 RL upper and reflected in y
 ```
 
-with continuous-coordinate behavior resembling:
+with historical one-indexed behavior resembling:
 
 ```text
 upper_y = 2064 - y
 ```
 
-Determine how this maps to zero-indexed image assembly and whether the seam uses `2063 - y`, `2064 - y`, or an edge-coordinate convention.
+This historical expression is characterization evidence only. The reviewed zero-indexed image and trace transform is exactly `2063 - y`; `2064 - y` is not an alternative convention.
 
 Do not treat amplifier ordering as unknown.
 

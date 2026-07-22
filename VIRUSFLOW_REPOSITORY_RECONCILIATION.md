@@ -1,6 +1,6 @@
 # VIRUSFlow Repository Reconciliation
 
-Status: authoritative reconciliation; Migration Plan Steps 1–7 implemented and accepted on 2026-07-22. Steps 8–10 are authorized as one autonomous tranche. Step 11 remains unauthorized and unstarted.
+Status: authoritative reconciliation; Migration Plan Steps 1–7 are accepted and Step 8 is implemented with its internal gate passed. Steps 9–10 remain authorized as one autonomous tranche. Step 11 remains unauthorized and unstarted.
 
 ## 1. Evidence and decision rules
 
@@ -369,7 +369,7 @@ Minimum characterization additions before behavior refactoring:
 
 ### Cannot be inferred from current evidence
 
-- Exact indexed-array physical-CCD seam mapping (`2063-y` versus an edge-coordinate materialization of continuous `2064-y`). Amplifier ordering is known.
+- The physical size of any non-imaging inter-amplifier separation; it is represented explicitly as configuration/metadata and never as an invented detector row.
 - Lamp composition of current `cmp` rows: the registry has no Hg/Cd/combined discriminator, so `master_hg`, `master_cd`, and `master_hgcd` cannot be selected from current data-model evidence.
 - Exact historical meaning and validity of legacy `AMPNAME=LR/UL` behavior.
 - Authoritative historical configuration datasets/timelines where the notes specify entities but provide no source data.
@@ -514,3 +514,14 @@ No Step 1–7 exit criterion remains unsatisfied. These evidence gaps remain exp
 - final numerical QA thresholds remain versioned policy.
 
 Steps 8–10 are authorized as one autonomous tranche; Step 11 remains prohibited. The canonical zero-indexed upper-amplifier transform is exactly `upper_y = 2063 - y`; `2064 - y` is not an alternative convention. Pre-refactor numerical behavior is characterization evidence, not scientific truth. Intentional differences are acceptable when justified by retained comparisons, quantified differences, QA, analytics, algorithm/configuration versions, and documented scientific reasoning. No legacy reader, Task, alias, database row, or file may be retired in Steps 8–10.
+
+## Step 8 implementation record
+
+Verified — source, focused tests, full suite, and real-data execution on 2026-07-22:
+
+- `PhysicalCCDTarget` enforces LL+LU for the left CCD and RU+RL for the right CCD.
+- `assemble_physical_ccd` maps every reflected upper row with exactly `upper_y = 2063 - y`; endpoint, inverse, unique-row, source-coordinate, seam, and zero-imaging-gap evidence are retained.
+- `fit_gap_scattered_light` implements the versioned robust quadratic gap-constrained baseline with explicit core exclusion, fit mask, deterministic holdout mask, coefficients, residual image, and boundary/cross-amplifier QA.
+- `PhysicalCCDTask` loads source and trace components only through ArtifactService and publishes immutable, separate `ccd_scattered_light_model` and `scatter_subtracted_image` Products without modifying the amplifier Products.
+- The isolated real run inventoried 14,100 raw members and used exposure `20260609T031649.6`, SPECID `206`. Left/right holdout robust residuals were `2.99245/2.94504 electron`; seam model discontinuities were `2.28016e-4/1.74002e-4 electron`; model/source p95 ratios were `0.08230/0.07745`. Both were pass/usable and every named component checksum-loaded through ArtifactService.
+- The complete suite is `61 passed` after the Step 8 additions. No Step 9, Step 10, or Step 11 completion claim is made here.

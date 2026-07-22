@@ -1,6 +1,6 @@
 # VIRUSFlow Migration Plan
 
-Status: Steps 1–7 complete and accepted on 2026-07-22. Steps 8–10 are authorized on 2026-07-22 as one autonomous implementation tranche. Step 11 remains unauthorized.
+Status: Steps 1–7 complete and accepted on 2026-07-22. Step 8 is implemented and has passed its internal gate. Steps 9–10 remain authorized in the same autonomous tranche. Step 11 remains unauthorized.
 
 ## 1. Migration strategy
 
@@ -156,6 +156,8 @@ Known physical pairing is not open:
 The canonical indexed seam materialization is exactly `upper_y = 2063 - y`. `2064 - y` is not an alternative convention. The transform and its configuration version must be tested before joint scatter fitting.
 
 Produce separate `ccd_scattered_light_model` and `scatter_subtracted_image` Products. Never hide scatter inside an overwritten amplifier array.
+
+Implementation gate passed on 2026-07-22. The canonical path is implemented by `PhysicalCCDTarget`, `ReducedScienceAmplifierTask`, `PhysicalCCDTask`, and the array-only `virusflow.algorithms.physical_ccd` functions. Real exposure `20260609T031649.6`, SPECID `206`, exercised LL+LU and RU+RL in an isolated registry. Both orientations preserved source amplifier Products, complete named components, checksums, normalized lineage, explicit seam/zero-row-gap evidence, fit/holdout masks, residuals, and QA. Detailed values are retained in `VIRUSFLOW_STEPS_8_10_ACCEPTANCE.md`.
 
 ### Step 9 — One exposure
 

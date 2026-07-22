@@ -85,7 +85,13 @@ class ArtifactService:
         validity = request.validity
         if validity.start is None and scope.start_time is not None:
             validity = Validity(scope.start_time, scope.end_time, validity.policy)
-        scope_token = scope.zipcode.key() if scope.zipcode is not None else (scope.exposure_id or "global")
+        scope_parts = []
+        if scope.zipcode is not None:
+            scope_parts.append(scope.zipcode.key())
+        for value in (scope.exposure_id, scope.observation_id, scope.dither_set_id):
+            if value:
+                scope_parts.append(str(value))
+        scope_token = "__".join(scope_parts) or "global"
         validity_token = "open"
         if validity.start is not None or validity.end is not None:
             start = validity.start.strftime("%Y%m%dT%H%M%S") if validity.start else "open"
@@ -126,7 +132,7 @@ class ArtifactService:
             metadata = {
                 "kind": kind,
                 "component": name,
-                "role": "calibration",
+                "role": request.role,
                 "payload_type": payload_type,
                 "storage_format": decision.storage_format,
                 "model_type": component.model_type,
@@ -186,7 +192,7 @@ class ArtifactService:
         artifact = Artifact(
             id=None,
             kind=kind,
-            role="calibration",
+            role=request.role,
             payload_type=component_records[0]["payload_type"],
             storage_format=component_records[0]["storage_format"],
             storage=StorageRef(primary_path or "", component_records[0]["storage_format"], component_records[0]["storage_format"]),
@@ -218,6 +224,16 @@ class ArtifactService:
         rows = []
         for candidate in kind_candidates(kind):
             rows.extend(self.adapter.find(kind=candidate, zipcode=(scope.zipcode if scope else None), at_time=at, limit=None))
+        if scope is not None:
+            filters = {
+                "exposure_id": scope.exposure_id,
+                "observation_id": scope.observation_id,
+                "dither_set_id": scope.dither_set_id,
+            }
+            rows = [
+                row for row in rows
+                if all(value is None or row.get(field) == value for field, value in filters.items())
+            ]
         if not rows:
             return None
         rows.sort(key=lambda row: (str(row.get("created_at") or ""), int(row.get("id") or 0)), reverse=True)

@@ -32,6 +32,7 @@ class ArtifactRequest:
     """
 
     kind: str
+    role: str = "calibration"
     components: Mapping[str, LogicalComponent] = field(default_factory=dict)
     summaries: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
