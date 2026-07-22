@@ -4,6 +4,8 @@ from typing import Dict
 from pathlib import Path
 from astropy.io import fits
 
+from ..io_fits import write_array_fits
+
 
 def _read_header_only(path: Path) -> Dict:
     with fits.open(str(path), memmap=True) as hdul:
@@ -42,3 +44,14 @@ def load(path_str: str) -> Dict:
         data = hdul[0].data
         hdr = dict(hdul[0].header)
     return {"data": data, "header": hdr}
+
+
+def save(path_str: str, value, *, metadata: Dict | None = None) -> None:
+    meta = dict(metadata or {})
+    write_array_fits(
+        path_str,
+        data=value,
+        n_inputs=int(meta.get("n_inputs", 0) or 0),
+        algo_version=str(meta.get("algo_version") or "unknown"),
+        sidecar=meta,
+    )

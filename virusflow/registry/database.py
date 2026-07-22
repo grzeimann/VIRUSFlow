@@ -155,6 +155,48 @@ CREATE TABLE IF NOT EXISTS dependencies (
     PRIMARY KEY(parent_id, child_id)
 );
 
+CREATE TABLE IF NOT EXISTS artifact_records (
+    artifact_id INTEGER PRIMARY KEY,
+    canonical_kind TEXT NOT NULL,
+    role TEXT,
+    payload_type TEXT,
+    storage_format TEXT,
+    physical_scope TEXT,
+    exposure_id TEXT,
+    observation_id TEXT,
+    dither_set_id TEXT,
+    revision TEXT UNIQUE,
+    checksum TEXT,
+    units_json TEXT,
+    coordinates_json TEXT,
+    configuration_refs_json TEXT,
+    metadata_json TEXT,
+    created_at TEXT,
+    FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
+);
+
+CREATE TABLE IF NOT EXISTS artifact_components (
+    artifact_id INTEGER,
+    name TEXT,
+    model_type TEXT,
+    path TEXT,
+    payload_type TEXT,
+    storage_format TEXT,
+    checksum TEXT,
+    units TEXT,
+    coordinates TEXT,
+    metadata_json TEXT,
+    PRIMARY KEY(artifact_id, name),
+    FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
+);
+
+CREATE TABLE IF NOT EXISTS artifact_relations (
+    parent_id INTEGER,
+    child_id INTEGER,
+    relation TEXT,
+    PRIMARY KEY(parent_id, child_id, relation)
+);
+
 CREATE TABLE IF NOT EXISTS qa_results (
     artifact_id INTEGER PRIMARY KEY,
     status TEXT,
@@ -162,9 +204,30 @@ CREATE TABLE IF NOT EXISTS qa_results (
     FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
 );
 
+CREATE TABLE IF NOT EXISTS qa_facts (
+    artifact_id INTEGER,
+    name TEXT,
+    value_json TEXT,
+    units TEXT,
+    component TEXT,
+    PRIMARY KEY(artifact_id, name),
+    FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
+);
+
+CREATE TABLE IF NOT EXISTS qa_decisions (
+    artifact_id INTEGER PRIMARY KEY,
+    status TEXT,
+    usability TEXT,
+    policy_version TEXT,
+    rules_json TEXT,
+    FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
+);
+
 -- Helpful indexes (safe no-ops if already present)
 CREATE INDEX IF NOT EXISTS artifacts_kind_amp ON artifacts(kind, amp_key);
 CREATE INDEX IF NOT EXISTS provenance_created_at ON provenance(created_at);
+CREATE INDEX IF NOT EXISTS artifact_records_kind_scope ON artifact_records(canonical_kind, physical_scope);
+CREATE INDEX IF NOT EXISTS artifact_relations_child ON artifact_relations(child_id);
 """
 
 
@@ -640,6 +703,150 @@ def save_artifact(artifact, prov, db_path: str = DEFAULT_DB_PATH) -> int:
     raise RuntimeError("save_artifact failed unexpectedly without an exception")
 
 
+def save_artifact_details(
+    artifact_id: int,
+    *,
+    record: Dict[str, Any],
+    components: Iterable[Dict[str, Any]],
+    relations: Iterable[Dict[str, Any]],
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """Persist additive canonical Artifact details without rewriting legacy rows."""
+    import json
+
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO artifact_records(
+                artifact_id, canonical_kind, role, payload_type, storage_format,
+                physical_scope, exposure_id, observation_id, dither_set_id,
+                revision, checksum, units_json, coordinates_json,
+                configuration_refs_json, metadata_json, created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(artifact_id) DO UPDATE SET
+                canonical_kind=excluded.canonical_kind,
+                role=excluded.role,
+                payload_type=excluded.payload_type,
+                storage_format=excluded.storage_format,
+                physical_scope=excluded.physical_scope,
+                exposure_id=excluded.exposure_id,
+                observation_id=excluded.observation_id,
+                dither_set_id=excluded.dither_set_id,
+                revision=excluded.revision,
+                checksum=excluded.checksum,
+                units_json=excluded.units_json,
+                coordinates_json=excluded.coordinates_json,
+                configuration_refs_json=excluded.configuration_refs_json,
+                metadata_json=excluded.metadata_json
+            """,
+            (
+                int(artifact_id),
+                record.get("canonical_kind"),
+                record.get("role"),
+                record.get("payload_type"),
+                record.get("storage_format"),
+                record.get("physical_scope"),
+                record.get("exposure_id"),
+                record.get("observation_id"),
+                record.get("dither_set_id"),
+                record.get("revision"),
+                record.get("checksum"),
+                json.dumps(record.get("units") or {}, sort_keys=True),
+                json.dumps(record.get("coordinates") or {}, sort_keys=True),
+                json.dumps(record.get("configuration_refs") or [], sort_keys=True),
+                json.dumps(record.get("metadata") or {}, sort_keys=True, default=str),
+                record.get("created_at") or datetime.utcnow().isoformat(),
+            ),
+        )
+        for component in components:
+            conn.execute(
+                """
+                INSERT INTO artifact_components(
+                    artifact_id, name, model_type, path, payload_type,
+                    storage_format, checksum, units, coordinates, metadata_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(artifact_id, name) DO UPDATE SET
+                    model_type=excluded.model_type,
+                    path=excluded.path,
+                    payload_type=excluded.payload_type,
+                    storage_format=excluded.storage_format,
+                    checksum=excluded.checksum,
+                    units=excluded.units,
+                    coordinates=excluded.coordinates,
+                    metadata_json=excluded.metadata_json
+                """,
+                (
+                    int(artifact_id),
+                    component.get("name"),
+                    component.get("model_type"),
+                    component.get("path"),
+                    component.get("payload_type"),
+                    component.get("storage_format"),
+                    component.get("checksum"),
+                    component.get("units"),
+                    component.get("coordinates"),
+                    json.dumps(component.get("metadata") or {}, sort_keys=True, default=str),
+                ),
+            )
+        for relation in relations:
+            parent_id = int(relation["parent_id"])
+            relation_name = str(relation.get("relation") or "derived_from")
+            conn.execute(
+                "INSERT OR IGNORE INTO dependencies(parent_id, child_id) VALUES(?,?)",
+                (parent_id, int(artifact_id)),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO artifact_relations(parent_id, child_id, relation) VALUES(?,?,?)",
+                (parent_id, int(artifact_id), relation_name),
+            )
+
+
+def get_artifact_details(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    import json
+
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute("SELECT * FROM artifact_records WHERE artifact_id=?", (int(artifact_id),)).fetchone()
+        if row is None:
+            return None
+        out = dict(row)
+        for column in ("units_json", "coordinates_json", "configuration_refs_json", "metadata_json"):
+            key = column.removesuffix("_json")
+            try:
+                out[key] = json.loads(out.pop(column) or ("[]" if key == "configuration_refs" else "{}"))
+            except Exception:
+                out[key] = [] if key == "configuration_refs" else {}
+        return out
+
+
+def list_artifact_components(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    import json
+
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM artifact_components WHERE artifact_id=? ORDER BY name", (int(artifact_id),)
+        ).fetchall()
+        out = _rows_to_dicts(rows)
+        for row in out:
+            try:
+                row["metadata"] = json.loads(row.pop("metadata_json") or "{}")
+            except Exception:
+                row["metadata"] = {}
+        return out
+
+
+def list_artifact_relations(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT parent_id, child_id, relation FROM artifact_relations WHERE child_id=? ORDER BY parent_id, relation",
+            (int(artifact_id),),
+        ).fetchall()
+        return _rows_to_dicts(rows)
+
+
 def get_artifact(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict]:
     with connect(db_path) as conn:
         row = conn.execute(
@@ -760,6 +967,53 @@ def save_qa_results(
             """,
             (int(artifact_id), str(status), payload),
         )
+
+
+def save_qa_bundle(
+    artifact_id: int,
+    *,
+    facts: Dict[str, Dict[str, Any]],
+    status: str,
+    usability: str,
+    policy_version: str,
+    rules: Iterable[Dict[str, Any]] = (),
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    import json
+
+    init_db(db_path)
+    with connect(db_path) as conn:
+        for name, fact in facts.items():
+            conn.execute(
+                """
+                INSERT INTO qa_facts(artifact_id, name, value_json, units, component)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(artifact_id, name) DO UPDATE SET
+                    value_json=excluded.value_json,
+                    units=excluded.units,
+                    component=excluded.component
+                """,
+                (
+                    int(artifact_id),
+                    str(name),
+                    json.dumps(fact.get("value"), default=str),
+                    fact.get("units"),
+                    fact.get("component"),
+                ),
+            )
+        conn.execute(
+            """
+            INSERT INTO qa_decisions(artifact_id, status, usability, policy_version, rules_json)
+            VALUES(?,?,?,?,?)
+            ON CONFLICT(artifact_id) DO UPDATE SET
+                status=excluded.status,
+                usability=excluded.usability,
+                policy_version=excluded.policy_version,
+                rules_json=excluded.rules_json
+            """,
+            (int(artifact_id), str(status), str(usability), str(policy_version), json.dumps(list(rules), default=str)),
+        )
+    save_qa_results(artifact_id, status=status, metrics={name: fact.get("value") for name, fact in facts.items()}, db_path=db_path)
 
 
 def get_qa_results(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:

@@ -86,71 +86,9 @@ class DefaultPublicationService:
 
     # ---- internals ----
     def _publish_one(self, req: ArtifactRequest, ctx: PublicationContext) -> Artifact:
-        # 1) Validate against ArtifactContract
         spec = _get_contract(req.kind).spec()
         self._validate_against_contract(req, spec)
-        # 2) For now, expect a single required component to persist
-        comp_name, comp = self._select_primary_component(req, spec)
-        # 3) Ask policy for representation decision + filename
-        dec = self.policy.decide(artifact_kind=req.kind, component_name=comp_name, model_type=comp.model_type)
-        tokens = self._filename_tokens(req=req, ctx=ctx)
-        out_path = self.policy.filename(artifact_kind=req.kind, component_name=comp_name, base_dir=self.base_dir, tokens=tokens)
-        # 4) Persist component according to decision (arrays via write_array_fits)
-        storage_format = (dec.storage_format or "fits").lower()
-        payload_type = self._payload_type_for(comp.model_type)
-        if payload_type == "array" and storage_format == "fits":
-            # Build a minimal, policy-owned sidecar from logical summaries/metadata
-            sidecar: Dict[str, Any] = {"kind": req.kind, "role": "calibration", "payload_type": payload_type, "storage_format": storage_format}
-            # Merge logical summaries (bounded-size decisions belong to policy; here we just pass through)
-            for k, v in (req.summaries or {}).items():
-                sidecar[k] = v
-            # Include shape in sidecar for describe()
-            try:
-                import numpy as _np
-                sidecar.setdefault("shape", list(_np.asarray(comp.value).shape))
-            except Exception:
-                pass
-            write_array_fits(
-                out_path,
-                data=comp.value,
-                n_inputs=int(req.metadata.get("n_inputs", 0)),
-                algo_version=str(ctx.algorithm_version or req.metadata.get("algo_version" or "unknown")),
-                extra_primary_cards=None,
-                extra_header=None,
-                mask=None,
-                mask_name=None,
-                sidecar=sidecar,
-            )
-        else:
-            raise NotImplementedError(f"No serializer for payload_type={payload_type} storage_format={storage_format}")
-        # 5) Register via ArtifactService
-        scope = req.scope or Scope(zipcode=None)
-        art = Artifact(
-            id=None,
-            kind=req.kind,
-            role="calibration",
-            payload_type=payload_type,
-            storage_format=storage_format,
-            storage=StorageRef(uri=str(out_path), storage_format=storage_format, backend=dec.uri_scheme or "fs"),
-            scope=scope,
-            metadata=dict(req.summaries or {}),
-            provenance=Provenance(
-                algorithm=f"{ctx.algorithm_name or 'unknown'}:{ctx.algorithm_version or 'unknown'}",
-                params={
-                    **dict(ctx.parameters or {}),
-                    "task": {"name": ctx.task_name, "version": ctx.task_version},
-                    "algorithm": {"name": ctx.algorithm_name, "version": ctx.algorithm_version},
-                    "timings": dict(ctx.timings or {}),
-                },
-                parents=[int(p) for p in (ctx.parent_ids or [])],
-            ),
-        )
-        art_id = self.svc.register(art)
-        try:
-            setattr(art, "id", int(art_id))
-        except Exception:
-            pass
-        return art
+        return self.svc.persist_request(req, context=ctx, policy=self.policy, base_dir=self.base_dir)
 
     def _payload_type_for(self, model_type: str) -> str:
         mt = (model_type or "").strip().lower()
