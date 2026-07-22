@@ -1,6 +1,6 @@
 # VIRUSFlow Legacy Vocabulary Map
 
-Status: compatibility design, not an implemented rename. Review this document with the repository reconciliation and migration plan before changing any public name, persisted kind, or schema.
+Status: authoritative compatibility map; Steps 1–7 aliases and adapters implemented on 2026-07-22. No legacy term has been retired.
 
 ## Mapping rules
 
@@ -62,3 +62,21 @@ This differs from declaring the knowledge note wrong: the note provides a scient
 - Removal requires parity tests, migrated consumers, and a documented rollback reader.
 
 No compatibility mechanism above may be implemented until all three reconciliation documents are reviewed.
+
+## Implemented compatibility status through Step 7
+
+The review gate was satisfied and the following additive compatibility mechanisms are now active:
+
+| Legacy read/run term | Canonical new-write term | Implemented adapter |
+|---|---|---|
+| `master_flat`, `masterflt` | `master_ldls` | ontology alias, ArtifactService selection candidates, planning/task mapping alias, `FlatTask` legacy output key |
+| `master_cmp`, `mastercmp` | `master_arc` | ontology alias, ArtifactService selection candidates, planning/task mapping alias, `CmpTask` legacy output key |
+| `master_twi` | `master_twilight` | ontology alias, planning/task mapping alias, `TwiTask` legacy output key |
+| `trace` | `trace_map` | ontology alias, ArtifactService selection candidates, planning/task mapping alias, `TraceTask` legacy output key |
+| `wave` | `wavelength_map` | ontology alias, ArtifactService selection candidates, planning/task mapping alias, `WaveTask` legacy output key |
+| Task version `v1` | canonical Task implementation `v2` | explicit `get_task_class(name, "v1")` compatibility registrations |
+| `fit_fiber_traces(raw_inputs, params)` | explicit array/reference inputs | compatible call shape retained; path parameters fail explicitly rather than performing algorithm-side I/O |
+
+New writes use the canonical kinds and complete component contracts. `ArtifactService.describe` exposes the historical stored kind and `canonical_kind`; it does not rewrite old rows. The repository's historical database and files were not migrated, deleted, or renamed. Optional `master_hg`, `master_cd`, and `master_hgcd` remain unresolved because neither 20260609 nor 20260604 inventory adds usable lamp-state identity.
+
+Compatibility duration remains as specified in the table. Step 11 retirement has not begun, and no alias or public entry point may be removed as a consequence of Steps 1–7 acceptance.

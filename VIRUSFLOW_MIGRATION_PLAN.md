@@ -1,6 +1,6 @@
 # VIRUSFlow Migration Plan
 
-Status: implementation-ready sequence pending review. **No implementation task, including Step 1, may begin until this document, `VIRUSFLOW_REPOSITORY_RECONCILIATION.md`, and `VIRUSFLOW_LEGACY_VOCABULARY_MAP.md` are complete and reviewed.**
+Status: Steps 1–7 complete and accepted on 2026-07-22. Steps 8–11 remain pending a new review and are not authorized by this tranche.
 
 ## 1. Migration strategy
 
@@ -363,3 +363,34 @@ This approval authorizes implementation of **Steps 1 through 7 as one autonomous
 
 Completion of an individual step does not require another review. Implementation must continue until the Step 7 exit criterion is satisfied, a true evidence-dependent blocker is encountered, or an environmental limitation prevents a required acceptance test from running.
 
+## 8. Steps 1–7 completion ledger
+
+| Step | Status | Implemented evidence | Gate result |
+|---|---|---|---|
+| 1. Vocabulary | COMPLETE | `virusflow/ontology/`; canonical aliases and validated kind/scope/unit/coordinate contracts | passed |
+| 2. Core contracts | COMPLETE | first-class `Validity`, configuration references, revisions/checksums/relations, QA fact/rule/status/usability types | passed |
+| 3. ArtifactService | COMPLETE | service-owned multi-component persist/load, immutable paths, checksums, normalized lineage, additive SQLite tables | passed |
+| 4. Configuration | COMPLETE for amplifier tranche | versioned orientation, exact `2063`, unknown-evidence gain/read-noise fallbacks, provisional policies, trace-reference resolver | passed; unavailable epochs remain explicit unknown evidence |
+| 5. Characterization | COMPLETE for Steps 1–7 | all AMP orientations, overscan/gain/variance, exact Bias MAD, masks, trace reference/exception/samples, arc recovery/rejection/residuals, sum aperture | passed |
+| 6. Bias slice | COMPLETE | array-only raw/detector/Bias path, both components, validity/configuration/QA/usability, immutable revisions, stability analytic | passed synthetically and on 20260609 |
+| 7. One amplifier | COMPLETE | canonical Bias/Dark/LDLS/Arc/Twilight/Trace/Wavelength graph, full components, corrected dependencies and raw cmp planning | passed synthetically and on 20260609 |
+
+Commits comprising the tranche:
+
+- `5b469d1` — canonical ontology and core contracts;
+- `85ba08c` — immutable multi-component ArtifactService persistence;
+- `ff98864` — array-only scientific characterization baseline;
+- `e1f348c` — canonical amplifier Task and graph implementation;
+- `b05102a` — mask, Trace, and Wavelength characterization gates;
+- `3a2e426` — canonical QA facts/status/usability persistence;
+- `9c0503a` — legacy calibration public-entry adapters.
+
+The full suite increased from the frozen `30 passed` baseline to `55 passed`. Real acceptance used an isolated temporary SQLite registry and observing-night window `20260609..20260610` for ZipCode `060+003+206+LL+S/N 0039`. It produced all seven canonical Products, complete components, normalized lineage, immutable revisions/checksums, configuration evidence, and usable/pass QA decisions. Detailed inventory and numerical results are recorded in `VIRUSFLOW_REPOSITORY_RECONCILIATION.md`.
+
+The 20260604 secondary dataset is incomplete because it contains no twilight frames. It was used only for a real cross-date Bias validity/revision selection check; no full-graph claim is made.
+
+All Step 1–7 exit criteria are satisfied. The documented rollback remains additive: historical rows/files are untouched, legacy read aliases and public entry points remain, and canonical revisions can be selected independently. No Step 8–11 code was added.
+
+## 9. Next review gate
+
+Do not begin Step 8 until this implementation record and its acceptance evidence are reviewed. The recommended next task is the narrow Step 8 physical-CCD characterization/contract slice: test `upper_y = 2063 - y` endpoints, invertibility, row coverage, and LL/LU plus RU/RL ordering; then introduce paired-amplifier assembly and separate scatter-model/scatter-subtracted Products. Do not expand to full exposures in that task.

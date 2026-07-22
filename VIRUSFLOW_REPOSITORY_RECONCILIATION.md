@@ -1,6 +1,6 @@
 # VIRUSFlow Repository Reconciliation
 
-Status: audit and migration-design deliverable. This document does not authorize implementation. All three reconciliation deliverables must be reviewed before any migration task begins.
+Status: authoritative reconciliation; Migration Plan Steps 1–7 implemented and accepted on 2026-07-22. Steps 8–11 remain unstarted.
 
 ## 1. Evidence and decision rules
 
@@ -456,3 +456,61 @@ Completeness of the second date must be verified rather than assumed.
 Ontology work, additive schema changes, ArtifactService changes, graph corrections, characterization tests, the Bias slice, and the one-amplifier calibration graph are now authorized as parts of one implementation tranche.
 
 The implementation agent must stop before physical-CCD scatter implementation, full exposure processing, observation or dither processing, and legacy-path retirement.
+
+## Steps 1–7 implementation record
+
+Verified — source and test on 2026-07-22:
+
+- `virusflow/ontology/` now registers canonical kinds, scopes, relations, units, coordinates, assumptions, and read aliases. `UPPER_AMPLIFIER_REFLECTION_INDEX` is exactly `2063`; no `2064-y` implementation alternative exists.
+- `ArtifactService.persist_request` and `load_component` own immutable, collision-safe, named multi-component persistence and loading. Additive tables retain revisions, checksums, units, coordinates, configuration references, normalized relations, QA facts/status/usability, and the first-class validity policy. Historical `artifacts`, `provenance`, and `dependencies` remain readable.
+- `RawFrameLoader` is the Task-side FITS/tar boundary. `reduce_amplifier_array`, Bias, Dark, LDLS, Arc, Twilight, Trace, and Wavelength canonical algorithms receive arrays only. `TraceTask` and `WaveTask` contain no direct serializer calls.
+- `BiasTask` preserves `master` and `per_pixel_bias_scatter`; hard QA failure propagates after the failed Product is recorded as unusable. `BiasStabilityStudy` loads both named components through ArtifactService and writes normalized source lineage.
+- `default_calibration_graph` contains `master_bias`, `master_dark`, `master_ldls`, `master_arc`, `master_twilight`, `trace_map`, and `wavelength_map`. `master_arc.inputs_raw == ["cmp"]`; the graph contains `master_ldls -> trace_map`, `master_arc -> wavelength_map`, and the formerly missing `trace_map -> wavelength_map` edge.
+- Trace publication retains the map, sample columns, sampled positions, and per-fiber residual RMS. Wavelength publication retains the map, per-fiber residual RMS, and arc-identification table.
+- Legacy kind aliases, Task class names, explicit `v1` Task selectors, Task output aliases, `reduce_raw_amplifier_frame`, and the array-only legacy call shape of `fit_fiber_traces(raw_inputs, params)` remain available. Historical rows and files were not rewritten.
+
+The pre-implementation baseline was `30 passed`. The completed suite is `55 passed`; focused contract, persistence, characterization, QA, planner, and one-amplifier integration gates also passed.
+
+### 20260609 acceptance evidence
+
+The isolated registry `/tmp/virusflow-acceptance-20260609.n7Kukw/registry.sqlite3` was created for acceptance; the workspace `virusflow.sqlite3` was not modified. Scanning 25 tar files registered 14,100 FITS members across 300 ZipCodes:
+
+| Frame type | Files |
+|---|---:|
+| `zro` | 4,200 |
+| `drk` | 900 |
+| `flt` | 900 |
+| `cmp` | 2,400 |
+| `twi` | 1,500 |
+| `sci` | 4,200 |
+
+The accepted amplifier was `060+003+206+LL+S/N 0039`, selected only after verifying a matching `Fiber_Locations/20210531/fiber_loc_206_060_003_LL.txt` reference and raw counts of 14 zro, 3 dark, 3 LDLS, 8 comparison, and 5 twilight frames. Two darks have civil date 20260610, so the observing-night execution window was `20260609..20260610`.
+
+The real graph completed all seven Products. Latest acceptance revisions were artifact IDs 16–22; each had a checksum, explicit validity policy, configuration references, separated QA status/usability, and one or more QA facts. Every status was `pass` and usability was `usable`. `trace_map` was `(112, 1032)` with median residual RMS `0.0441934 pixel`. `wavelength_map` was `(112, 1032)`, with nine matched lines and best RMS `0.0484820 Angstrom`. Normalized lineage was exactly `master_ldls -> trace_map` and `master_arc + trace_map -> wavelength_map`.
+
+Compatibility-path recomputation agreed after FITS serialization rounding:
+
+| Product | Maximum absolute difference | `np.allclose` |
+|---|---:|---|
+| Master Bias | `2.17e-7` | yes |
+| Master Dark | `1.66e-5` | yes |
+| Master LDLS | `1.22e-4` | yes |
+| Master Arc | `6.10e-5` | yes |
+| Master Twilight | `9.77e-4` | yes |
+| Trace map | `3.05e-5 pixel` | yes |
+| Wavelength map, with Task mask policy | `2.44e-4 Angstrom` | yes |
+
+An unmasked Wavelength recomputation differed by up to `0.1634 Angstrom`. This is an intentional reviewed difference: canonical `WaveTask` can now load and apply the persisted LDLS/dark masks that the former single-component publication path dropped. Recomputing with that declared Task policy is numerically equivalent.
+
+The secondary 20260604 inventory had 12 tar files and no twilight data: 3,744 zro, 2,496 dark, 1,872 flat, and 4,368 cmp files. It was therefore not represented as a complete graph. For the accepted amplifier it supplied 12 zro, 8 dark, 6 flat, and 14 cmp frames. A separate real 20260604 Bias revision was produced, and `latest_valid` selected the 20260604 revision at that date and the 20260609 revision at the primary date.
+
+### Remaining evidence limits
+
+No Step 1–7 exit criterion remains unsatisfied. These evidence gaps remain explicit and do not invalidate the amplifier graph:
+
+- unlabeled `cmp` rows do not establish Hg, Cd, or combined Hg+Cd lamp composition;
+- authoritative gain/read-noise/controller history and configuration epochs remain unavailable, so fallback configuration references are recorded with `evidence_state="unknown"`;
+- historical `AMPNAME=LR/UL` semantics remain characterized behavior rather than proven hardware history;
+- final numerical QA thresholds remain versioned policy.
+
+Steps 8–11 are still prohibited by this tranche. The next reviewed task should be Step 8's one-physical-CCD slice: characterize the approved `upper_y = 2063 - y` transform at boundaries and round trip, then add paired-amplifier assembly and explicit scatter-model/scatter-subtracted Products without changing amplifier Products.
