@@ -1,6 +1,6 @@
 # VIRUSFlow Legacy Vocabulary Map
 
-Status: authoritative compatibility map; Steps 1–7 aliases and adapters implemented on 2026-07-22. No legacy term has been retired.
+Status: authoritative compatibility map; Steps 1–7 are implemented and accepted, Steps 8–10 are authorized as one autonomous tranche, and Step 11 remains unauthorized. No legacy term has been retired.
 
 ## Mapping rules
 
@@ -79,4 +79,4 @@ The review gate was satisfied and the following additive compatibility mechanism
 
 New writes use the canonical kinds and complete component contracts. `ArtifactService.describe` exposes the historical stored kind and `canonical_kind`; it does not rewrite old rows. The repository's historical database and files were not migrated, deleted, or renamed. Optional `master_hg`, `master_cd`, and `master_hgcd` remain unresolved because neither 20260609 nor 20260604 inventory adds usable lamp-state identity.
 
-Compatibility duration remains as specified in the table. Step 11 retirement has not begun, and no alias or public entry point may be removed as a consequence of Steps 1–7 acceptance.
+Compatibility duration remains as specified in the table. Step 11 retirement has not begun and is not authorized; no legacy reader, Task, alias, database row, file, or public entry point may be removed during the Steps 8–10 tranche.

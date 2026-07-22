@@ -1,6 +1,6 @@
 # VIRUSFlow Repository Reconciliation
 
-Status: authoritative reconciliation; Migration Plan Steps 1–7 implemented and accepted on 2026-07-22. Steps 8–11 remain unstarted.
+Status: authoritative reconciliation; Migration Plan Steps 1–7 implemented and accepted on 2026-07-22. Steps 8–10 are authorized as one autonomous tranche. Step 11 remains unauthorized and unstarted.
 
 ## 1. Evidence and decision rules
 
@@ -429,9 +429,9 @@ Update all blocker, missing-knowledge, Product-map, and test-coverage sections a
 
 The repository audit, vocabulary map, Product map, comparison-lamp decision, migration order, compatibility strategy, and provisional policies have been reviewed and approved.
 
-The authorized implementation scope is **Migration Plan Steps 1 through 7, inclusive**.
+The initial authorized implementation scope was **Migration Plan Steps 1 through 7, inclusive**; those steps are implemented and accepted.
 
-The agent must execute those steps autonomously and sequentially without requesting approval after each step. Steps 8 through 11 remain outside the approved tranche.
+The succeeding authorized scope is **Migration Plan Steps 8 through 10, inclusive**, as one autonomous tranche without approval pauses between steps. Step 11 remains outside the approved scope.
 
 The target implementation depth is the complete canonical one-amplifier calibration graph, not only the Bias proof of concept.
 
@@ -453,9 +453,9 @@ Completeness of the second date must be verified rather than assumed.
 
 ## Revised implementation gate
 
-Ontology work, additive schema changes, ArtifactService changes, graph corrections, characterization tests, the Bias slice, and the one-amplifier calibration graph are now authorized as parts of one implementation tranche.
+Ontology work, additive schema changes, ArtifactService changes, graph corrections, characterization tests, the Bias slice, and the one-amplifier calibration graph were completed and accepted in Steps 1–7.
 
-The implementation agent must stop before physical-CCD scatter implementation, full exposure processing, observation or dither processing, and legacy-path retirement.
+Physical-CCD scatter implementation, full exposure processing, and observation/dither processing are now authorized through Step 10. The implementation agent must stop before Step 11 and legacy-path retirement.
 
 ## Steps 1–7 implementation record
 
@@ -513,4 +513,4 @@ No Step 1–7 exit criterion remains unsatisfied. These evidence gaps remain exp
 - historical `AMPNAME=LR/UL` semantics remain characterized behavior rather than proven hardware history;
 - final numerical QA thresholds remain versioned policy.
 
-Steps 8–11 are still prohibited by this tranche. The next reviewed task should be Step 8's one-physical-CCD slice: characterize the approved `upper_y = 2063 - y` transform at boundaries and round trip, then add paired-amplifier assembly and explicit scatter-model/scatter-subtracted Products without changing amplifier Products.
+Steps 8–10 are authorized as one autonomous tranche; Step 11 remains prohibited. The canonical zero-indexed upper-amplifier transform is exactly `upper_y = 2063 - y`; `2064 - y` is not an alternative convention. Pre-refactor numerical behavior is characterization evidence, not scientific truth. Intentional differences are acceptable when justified by retained comparisons, quantified differences, QA, analytics, algorithm/configuration versions, and documented scientific reasoning. No legacy reader, Task, alias, database row, or file may be retired in Steps 8–10.

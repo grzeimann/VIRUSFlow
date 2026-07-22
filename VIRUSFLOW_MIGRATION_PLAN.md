@@ -1,6 +1,6 @@
 # VIRUSFlow Migration Plan
 
-Status: Steps 1–7 complete and accepted on 2026-07-22. Steps 8–11 remain pending a new review and are not authorized by this tranche.
+Status: Steps 1–7 complete and accepted on 2026-07-22. Steps 8–10 are authorized on 2026-07-22 as one autonomous implementation tranche. Step 11 remains unauthorized.
 
 ## 1. Migration strategy
 
@@ -153,7 +153,7 @@ Known physical pairing is not open:
 - left CCD: LL lower, LU upper reflected in y;
 - right CCD: RU lower, RL upper reflected in y.
 
-The blocking characterization is indexed seam materialization: distinguish continuous `upper_y = 2064 - y` from a possible zero-indexed array transform `2063 - y`. The transform and its configuration version must be tested before joint scatter fitting.
+The canonical indexed seam materialization is exactly `upper_y = 2063 - y`. `2064 - y` is not an alternative convention. The transform and its configuration version must be tested before joint scatter fitting.
 
 Produce separate `ccd_scattered_light_model` and `scatter_subtracted_image` Products. Never hide scatter inside an overwritten amplifier array.
 
@@ -273,7 +273,7 @@ This plan is inert until all three Markdown deliverables have been reviewed toge
 
 Completion of documentation is not authorization to begin implementation.
 
-## Approved implementation tranche
+## Approved Steps 1–7 implementation tranche
 
 The three reconciliation documents have been reviewed together and approved.
 
@@ -281,7 +281,7 @@ Implementation is authorized for **Steps 1 through 7, inclusive**, as one contin
 
 Each step's tests and exit criteria remain mandatory internal gates. A failed exit criterion must be corrected before proceeding, but successful completion of a step does not require a new human authorization.
 
-Do not begin Steps 8 through 11 during this tranche.
+This historical tranche ended after Step 7 acceptance and is superseded for Steps 8–10 by the authorization below. It never authorized Step 11.
 
 The intended result is a full-width, moderately deep migration:
 
@@ -355,11 +355,11 @@ This decision removes the indexed seam convention from the unresolved-science an
 
 The indexed physical-CCD seam convention is no longer unresolved.
 
-## Revised review gate
+## Revised Steps 1–7 review gate
 
 Review of the three reconciliation documents is complete.
 
-This approval authorizes implementation of **Steps 1 through 7 as one autonomous tranche**. It does not authorize Steps 8 through 11.
+This approval authorized implementation of **Steps 1 through 7 as one autonomous tranche**. Those steps are now implemented and accepted. The Steps 8–10 authorization below supersedes its former stop-before-Step-8 language; Step 11 remains unauthorized.
 
 Completion of an individual step does not require another review. Implementation must continue until the Step 7 exit criterion is satisfied, a true evidence-dependent blocker is encountered, or an environmental limitation prevents a required acceptance test from running.
 
@@ -391,9 +391,23 @@ The 20260604 secondary dataset is incomplete because it contains no twilight fra
 
 All Step 1–7 exit criteria are satisfied. The documented rollback remains additive: historical rows/files are untouched, legacy read aliases and public entry points remain, and canonical revisions can be selected independently. No Step 8–11 code was added.
 
-## 9. Next review gate
+## 9. Steps 8–10 authorization and scientific acceptance policy
 
-Do not begin Step 8 until this implementation record and its acceptance evidence are reviewed. The recommended next task is the narrow Step 8 physical-CCD characterization/contract slice: test `upper_y = 2063 - y` endpoints, invertibility, row coverage, and LL/LU plus RU/RL ordering; then introduce paired-amplifier assembly and separate scatter-model/scatter-subtracted Products. Do not expand to full exposures in that task.
+The Steps 1–7 implementation record and acceptance evidence have been reviewed and accepted.
+
+Implementation of **Steps 8 through 10, inclusive, is authorized as one autonomous tranche**. Each documented test set and exit criterion is an internal gate: implement, verify scientifically, correct failures, commit the cohesive milestone, and continue without another approval between steps. **Do not begin Step 11.** Do not retire legacy readers, Tasks, aliases, database rows, or files.
+
+The canonical zero-indexed upper-amplifier transform is exactly:
+
+```python
+upper_y = 2063 - y
+```
+
+`2064 - y` is not an alternative convention.
+
+Pre-refactor numerical behavior is characterization evidence, not scientific truth. Intentional differences are acceptable when justified by retained old/new comparisons where practical, quantitative evidence, QA, analytics, and documented scientific reasoning. Every intentional difference must identify its changed assumption, mask, model, or policy; expose relevant QA facts; retain sufficient intermediate evidence; and record algorithm and configuration versions. Uncertain non-blocking scientific choices must be implemented as versioned, configurable policies rather than silent hard-coded assumptions.
+
+The tranche must use isolated registries and artifact directories for acceptance and must not modify the historical workspace registry. Completion of Step 10 does not authorize Step 11.
 
 ## 10. Committed Steps 1–7 verification command
 
