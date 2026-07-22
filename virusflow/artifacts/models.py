@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 from ..core.identity import ZipCode
+from ..ontology.relations import RelationKind
+from ..ontology.scopes import PhysicalScope
 
 
 @dataclass(frozen=True)
@@ -13,6 +15,24 @@ class Scope:
     exposure_id: Optional[str] = None
     start_time: Optional[datetime] = None
     end_time: Optional[datetime] = None
+    physical_scope: PhysicalScope = PhysicalScope.AMPLIFIER
+    observation_id: Optional[str] = None
+    dither_set_id: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class Validity:
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
+    policy: str = "explicit"
+
+
+@dataclass(frozen=True)
+class ConfigurationReference:
+    kind: str
+    version: str
+    identity: Optional[str] = None
+    evidence_state: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -42,8 +62,8 @@ class DiagnosticRecord:
 @dataclass(frozen=True)
 class ArtifactRelation:
     parent_id: int
-    child_id: int
-    relation: str = "derived"
+    child_id: Optional[int] = None
+    relation: str = RelationKind.DERIVED_FROM.value
 
 
 @dataclass
@@ -57,6 +77,13 @@ class Artifact:
     scope: Scope
     metadata: Dict[str, Any] = field(default_factory=dict)
     provenance: Optional[Provenance] = None
+    validity: Validity = field(default_factory=Validity)
+    units: Dict[str, str] = field(default_factory=dict)
+    coordinates: Dict[str, str] = field(default_factory=dict)
+    configuration_refs: List[ConfigurationReference] = field(default_factory=list)
+    relations: List[ArtifactRelation] = field(default_factory=list)
+    revision: Optional[str] = None
+    checksum: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -72,3 +99,10 @@ class ArtifactDescription:
     provenance: Optional[Provenance]
     diagnostics: Optional[DiagnosticRecord]
     model_type: Optional[str] = None  # array2d | array1d | image | table | text | scalar | collection | unknown
+    validity: Optional[Validity] = None
+    units: Dict[str, str] = field(default_factory=dict)
+    coordinates: Dict[str, str] = field(default_factory=dict)
+    configuration_refs: List[ConfigurationReference] = field(default_factory=list)
+    relations: List[ArtifactRelation] = field(default_factory=list)
+    revision: Optional[str] = None
+    checksum: Optional[str] = None

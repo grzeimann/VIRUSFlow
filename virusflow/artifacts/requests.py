@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
-from .models import Scope
+from .models import ArtifactRelation, ConfigurationReference, Scope, Validity
 
 
 @dataclass(frozen=True)
@@ -16,6 +16,9 @@ class LogicalComponent:
     name: str
     model_type: str  # array2d | array1d | image | table | model | scalar | collection
     value: Any
+    units: Optional[str] = None
+    coordinates: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,11 @@ class ArtifactRequest:
     scope: Optional[Scope] = None
     parents: List[int] = field(default_factory=list)
     labels: List[str] = field(default_factory=list)
+    validity: Validity = field(default_factory=Validity)
+    configuration_refs: List[ConfigurationReference] = field(default_factory=list)
+    relations: List[ArtifactRelation] = field(default_factory=list)
+    assumptions: List[str] = field(default_factory=list)
+    revision: Optional[str] = None
 
     def component_names(self) -> List[str]:
         return list((self.components or {}).keys())
