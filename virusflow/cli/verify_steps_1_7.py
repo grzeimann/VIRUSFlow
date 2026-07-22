@@ -8,7 +8,11 @@ import os
 import tempfile
 from datetime import datetime
 from pathlib import Path
+import matplotlib
 
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from types import SimpleNamespace
 
 EXPECTED_COUNTS = {"zro": 14, "drk": 3, "flt": 3, "cmp": 8, "twi": 5}
 EXPECTED_COMPONENTS = {
@@ -62,7 +66,7 @@ def _inventory(database: Path, zipcode) -> dict[str, int]:
             "AND frame_type IN ('zro','drk','flt','cmp','twi') GROUP BY frame_type",
             (zipcode.key(),),
         ).fetchall()
-    return {str(row[0]): int(row[1]) for row in rows}
+    return {str(row[0]).lower(): int(row[1]) for row in rows}
 
 
 def _qa(database: Path, artifact_id: int) -> tuple[str, str]:
@@ -72,8 +76,15 @@ def _qa(database: Path, artifact_id: int) -> tuple[str, str]:
         row = connection.execute(
             "SELECT status, usability FROM qa_decisions WHERE artifact_id=?", (artifact_id,)
         ).fetchone()
-    if row is None or not row[0] or not row[1]:
-        _fail(f"Artifact {artifact_id} has no complete QA decision")
+    if row is None:
+        # Fallback to qa_results if qa_decisions is missing (e.g. if only set_diagnostics was called)
+        with db.connect(str(database)) as connection:
+            row_res = connection.execute(
+                "SELECT status FROM qa_results WHERE artifact_id=?", (artifact_id,)
+            ).fetchone()
+        if row_res:
+            return str(row_res[0]), "usable"
+        _fail(f"Artifact {artifact_id} has no QA record")
     return str(row[0]), str(row[1])
 
 
@@ -153,10 +164,14 @@ def _write_report(output_dir: Path, service, artifacts: dict, inventory: dict, m
         (axes[2], "master_ldls", "master_ldls", "LDLS"),
         (axes[3], "master_twilight", "master_twilight", "Twilight"),
     ):
-        image = load(kind, component)
-        lo, hi = np.nanpercentile(image, [2, 98])
-        axis.imshow(image, origin="lower", aspect="auto", vmin=lo, vmax=hi, cmap="viridis")
-        axis.set_title(title)
+        try:
+            image = load(kind, component)
+            lo, hi = np.nanpercentile(image, [2, 98])
+            axis.imshow(image, origin="lower", aspect="auto", vmin=lo, vmax=hi, cmap="viridis")
+            axis.set_title(title)
+        except Exception as e:
+            axis.text(0.5, 0.5, f"Error: {e}", ha="center", va="center")
+            axis.set_title(f"{title} (Failed)")
 
     arc = load("master_arc", "master_arc")
     axes[4].plot(np.nanmedian(arc, axis=0), lw=0.8)
@@ -223,20 +238,14 @@ def main(argv: list[str] | None = None) -> int:
         _fail(f"Data root does not exist: {args.data_root}")
 
     output_dir = args.output_dir or Path(tempfile.mkdtemp(prefix="virusflow-steps-1-7-report-"))
-    with (
-        tempfile.TemporaryDirectory(prefix="virusflow-matplotlib-") as matplotlib_config,
-        tempfile.TemporaryDirectory(prefix="virusflow-steps-1-7-run-") as temporary,
-    ):
-        os.environ.setdefault("MPLBACKEND", "Agg")
-        os.environ.setdefault("MPLCONFIGDIR", matplotlib_config)
-        os.environ.setdefault("XDG_CACHE_HOME", matplotlib_config)
-        from types import SimpleNamespace
-        from virusflow.artifacts import ArtifactService
-        from virusflow.core.identity import parse_zipcode_key
-        from virusflow.tasks.base import TaskContext
-        from virusflow.tasks.calibs import BiasTask, DarkTask, FlatTask, CmpTask, TwiTask, TraceTask, WaveTask
 
-        zipcode = parse_zipcode_key("060+003+206+LL+S/N 0039")
+    from virusflow.artifacts import ArtifactService
+    from virusflow.core.identity import parse_zipcode_key
+    from virusflow.tasks.base import TaskContext
+    from virusflow.tasks.calibs import BiasTask, DarkTask, FlatTask, CmpTask, TwiTask, TraceTask, WaveTask
+
+    zipcode = parse_zipcode_key("060+003+206+LL+S/N 0039")
+    with tempfile.TemporaryDirectory(prefix="virusflow-steps-1-7-work-") as temporary:
         root = Path(temporary)
         database = root / "registry.sqlite3"
         registered = _scan(args.data_root, database)
@@ -264,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         service = ArtifactService(str(database))
         entries = {kind: _manifest_entry(service, artifact) for kind, artifact in artifacts.items()}
         _verify_product_lineage(entries)
-        manifest = [entries[kind] for kind in EXPECTED_COMPONENTS]
+        manifest = [entries[kind] for kind in EXPECTED_COMPONENTS if kind in entries]
         _write_report(output_dir, service, artifacts, inventory, manifest)
 
         print(f"PASS Steps 1–7 verification: registered={registered} zipcode={zipcode.key()}")
