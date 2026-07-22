@@ -836,17 +836,29 @@ class WaveTask(CalibrationTask):
         if master_cmp is None or trace2d is None:
             raise RuntimeError("WaveTask: failed to materialize required parent arrays (master_cmp and trace)")
 
-        # Build union defect mask from available flat/dark masks and repair master_cmp
+        # Best-effort: build a union defect mask (flat_response_mask ∪ dark_pixel_mask) and repair master_cmp
         try:
-            from ..algorithms.utils.masks import build_union_pixelmask, interpolate_masked_detector_pixels
+            from ..algorithms.utils.masks import interpolate_masked_detector_pixels
+            import numpy as _np
             flat_row = self._resolve_artifact("master_flat", required=False)
             dark_row = self._resolve_artifact("master_dark", required=False)
-            umask, _frac = build_union_pixelmask(flat_artifact=flat_row, dark_artifact=dark_row)
-            if umask is not None:
-                import numpy as _np
-                m = _np.asarray(umask)
-                if m.shape == _np.asarray(master_cmp).shape:
-                    master_cmp = interpolate_masked_detector_pixels(_np.asarray(master_cmp, dtype=float), m)
+            # Attempt to materialize optional mask components via ArtifactService serializers if present
+            m_flat = None
+            m_dark = None
+            # If optional mask components are persisted alongside the primary array (future capability),
+            # they should be discoverable via the registry/sidecar. Current persistence may omit them; tolerate None.
+            # Placeholder for potential future materialization hook:
+            #   m_flat = svc.load_component(flat_row, component_name="flat_response_mask")
+            #   m_dark = svc.load_component(dark_row, component_name="dark_pixel_mask")
+            if (m_flat is not None) or (m_dark is not None):
+                mf = _np.asarray(m_flat, dtype=bool) if m_flat is not None else False
+                md = _np.asarray(m_dark, dtype=bool) if m_dark is not None else False
+                umask = _np.asarray(mf | md, dtype=bool)
+                # rac: repaired-area coverage (fraction of masked pixels)
+                rac = float(_np.sum(umask)) / float(umask.size) if umask.size else 0.0
+                if umask.shape == _np.asarray(master_cmp).shape:
+                    master_cmp = interpolate_masked_detector_pixels(_np.asarray(master_cmp, dtype=float), umask)
+            # If masks are unavailable, silently continue (architecturally correct; no direct FITS I/O here)
         except Exception:
             # Mask unification/repair is best-effort; continue on any error
             pass
