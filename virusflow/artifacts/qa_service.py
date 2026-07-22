@@ -42,10 +42,38 @@ class QADiagnosticsService:
             component["data"] = np.asarray(data, dtype=float)
             values["component"] = component
         decision = engine.evaluate(kind=kind, meta=values)
+        unit_by_name = {
+            "read_noise": "electron",
+            "bad_fraction": "1",
+            "n_inputs": "1",
+            "trace_len": "pixel",
+            "best_nmatch": "1",
+            "best_rms": "Angstrom",
+        }
         facts = {
+            name: {"value": value, "units": unit_by_name.get(name), "component": None}
+            for name, value in (result.scalars or {}).items()
+            if np.isscalar(value) and not isinstance(value, (str, bytes))
+        }
+        facts.update({
             name: {"value": value, "units": None, "component": None}
             for name, value in (decision.metrics or {}).items()
-        }
+        })
+        for component_name, units in (
+            ("per_pixel_bias_scatter", "electron"),
+            ("per_fiber_trace_residual_rms", "pixel"),
+            ("per_fiber_wavelength_residual_rms", "Angstrom"),
+        ):
+            array = result.get_array(component_name)
+            if array is not None:
+                with np.errstate(all="ignore"):
+                    median = float(np.nanmedian(np.asarray(array, dtype=float)))
+                if np.isfinite(median):
+                    facts[f"{component_name}_median"] = {
+                        "value": median,
+                        "units": units,
+                        "component": component_name,
+                    }
         usability = "unusable" if decision.should_block else (
             "degraded" if decision.status in {"warn", "fail"} else "usable"
         )

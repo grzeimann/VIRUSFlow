@@ -9,7 +9,7 @@ from virusflow.analytics.studies.bias import BiasStabilityParams, BiasStabilityS
 from virusflow.artifacts import ArtifactService
 from virusflow.core.identity import ZipCode
 from virusflow.io import RawFrameData
-from virusflow.registry.database import init_db
+from virusflow.registry.database import connect, init_db
 from virusflow.tasks.base import TaskContext
 from virusflow.tasks.calibs import BiasTask, SciTask
 
@@ -56,6 +56,20 @@ def test_bias_task_persists_complete_contract_validity_configuration_and_qa(tmp_
     assert full.configuration_refs
     assert all(ref.evidence_state in {"verified", "unknown"} for ref in full.configuration_refs)
     assert service.adapter.get_diagnostics(artifact.id)["status"] == "pass"
+    with connect(service.db_path) as connection:
+        facts = {
+            row[0]: (row[1], row[2], row[3])
+            for row in connection.execute(
+                "SELECT name, value_json, units, component FROM qa_facts WHERE artifact_id=?",
+                (artifact.id,),
+            )
+        }
+        decision = connection.execute(
+            "SELECT status, usability FROM qa_decisions WHERE artifact_id=?", (artifact.id,)
+        ).fetchone()
+    assert facts["read_noise"][1] == "electron"
+    assert facts["per_pixel_bias_scatter_median"][2] == "per_pixel_bias_scatter"
+    assert tuple(decision) == ("pass", "usable")
 
 
 def test_configured_hard_qa_failure_is_not_swallowed(tmp_path, monkeypatch):
