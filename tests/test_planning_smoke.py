@@ -76,20 +76,19 @@ def test_planning_scheduler_executor_smoke(tmp_path: Path, monkeypatch):
     # We expect at least one planned target (bias and/or dark)
     assert len(report.planned) >= 1
 
-    # Monkeypatch CCD reader to avoid real FITS I/O during algorithms
+    # Inject the approved raw-I/O boundary to avoid real FITS I/O.
     import numpy as _np
-    import virusflow.algorithms.ccd as _ccd
+    from virusflow.io import RawFrameData
 
-    def _synth_reader(path, tar_member, return_header=False):  # noqa: ARG001
-        img = _np.zeros((16, 16), dtype=float)
-        # algorithms expect a tuple (img, header_or_err)
-        return (img, None)
+    class _SyntheticRawLoader:
+        def load(self, path, tar_member=None):
+            img = _np.zeros((16, 16), dtype=float)
+            return RawFrameData(img, {"GAIN": 1.0, "RDNOISE": 3.0, "CCDPOS": "L", "CCDHALF": "L"}, path, tar_member)
 
-    monkeypatch.setattr(_ccd, "reduce_raw_amplifier_frame", _synth_reader, raising=True)
 
     # Schedule only the planned targets and execute
     kind_map = default_kind_to_task()
-    ctx = TaskContext(db_path=db_path, workdir=str(tmp_path / "work"), config={"debug_timing": False})
+    ctx = TaskContext(db_path=db_path, workdir=str(tmp_path / "work"), config={"raw_frame_loader": _SyntheticRawLoader()})
 
     def _ctx_factory():
         return ctx

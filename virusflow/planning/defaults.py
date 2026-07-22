@@ -25,13 +25,14 @@ class _TaskPlaceholder:
 def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[List[TaskSpec], List[Edge]]:
     """Build default calibration TaskSpec nodes and Edge list, optionally apply overrides.
 
-    Kinds and cadences (initial recommendations):
+    Canonical kinds and cadences:
     - master_bias: TimeCadence(every_days=30, min_n_inputs=25), inputs_raw=["zro"]
     - master_dark: ExposureCountCadence(min_n=20, max_span_days=45), inputs_raw=["drk"]
-    - master_flat: ExposureCountCadence(min_n=30, max_span_days=30), inputs_raw=["flt"]
-    - master_cmp: TimeCadence(every_days=90, min_n_inputs=1), inputs_artifacts=["master_flat"]
-    - trace: derived, inputs_artifacts=["master_flat"], no cadence
-    - wave: derived, inputs_artifacts=["master_cmp", "trace"], no cadence
+    - master_ldls: ExposureCountCadence(min_n=30, max_span_days=30), inputs_raw=["flt"]
+    - master_arc: TimeCadence(every_days=90, min_n_inputs=1), inputs_raw=["cmp"]
+    - master_twilight: ExposureCountCadence(min_n=1, max_span_days=30), inputs_raw=["twi"]
+    - trace_map: derived from master_ldls
+    - wavelength_map: derived from master_arc + trace_map
 
     Config surface:
     - To declare preprocessing prerequisites for master_flat (e.g., master_bias/master_dark),
@@ -56,7 +57,7 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         cadence=ExposureCountCadence(min_n=20, max_span_days=45),
     )
     flat = TaskSpec(
-        kind="master_flat",
+        kind="master_ldls",
         task_cls=_TaskPlaceholder,
         inputs_raw=["flt"],
         inputs_artifacts=None,
@@ -64,36 +65,45 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         cadence=ExposureCountCadence(min_n=30, max_span_days=30),
     )
     cmpn = TaskSpec(
-        kind="master_cmp",
+        kind="master_arc",
         task_cls=_TaskPlaceholder,
-        inputs_raw=None,
-        inputs_artifacts=["master_flat"],
+        inputs_raw=["cmp"],
+        inputs_artifacts=None,
         scope_mode="per_zipcode",
         cadence=TimeCadence(every_days=90, min_n_inputs=1),
     )
+    twilight = TaskSpec(
+        kind="master_twilight",
+        task_cls=_TaskPlaceholder,
+        inputs_raw=["twi"],
+        inputs_artifacts=None,
+        scope_mode="per_zipcode",
+        cadence=ExposureCountCadence(min_n=1, max_span_days=30),
+    )
     trace = TaskSpec(
-        kind="trace",
+        kind="trace_map",
         task_cls=_TaskPlaceholder,
         inputs_raw=None,
-        inputs_artifacts=["master_flat"],
+        inputs_artifacts=["master_ldls"],
         scope_mode="per_zipcode",
         cadence=None,
     )
     wave = TaskSpec(
-        kind="wave",
+        kind="wavelength_map",
         task_cls=_TaskPlaceholder,
         inputs_raw=None,
-        inputs_artifacts=["master_cmp", "trace"],
+        inputs_artifacts=["master_arc", "trace_map"],
         scope_mode="per_zipcode",
         cadence=None,
     )
 
-    nodes = [bias, dark, flat, cmpn, trace, wave]
+    nodes = [bias, dark, flat, cmpn, twilight, trace, wave]
 
     # Edges (base)
     edges: List[Edge] = [
         Edge(src=flat, dst=trace, policy="latest_valid", tolerance_days=90),
         Edge(src=cmpn, dst=wave, policy="latest_valid", tolerance_days=90),
+        Edge(src=trace, dst=wave, policy="latest_valid", tolerance_days=90),
     ]
 
     # Optional preprocessing dependencies for master_flat via config params

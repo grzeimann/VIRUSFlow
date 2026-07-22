@@ -253,14 +253,21 @@ def get_trace_reference(specid: str, ifuslot: str, ifuid: str, amp: str, obsdate
         ) from e
 
 
-def _get_trace(twilight: np.ndarray, specid: str, ifuslot: str, ifuid: str, amp: str, obsdate: str, tr_folder: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _get_trace(
+    twilight: np.ndarray,
+    specid: str,
+    ifuslot: str,
+    ifuid: str,
+    amp: str,
+    reference: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute 2D fiber traces from a flat (twilight) image using reference locations.
 
     Returns (trace_2d, ref_table, xchunks, Trace_samples), where trace_2d has
     shape (nfiber, nx) and Trace_samples are the per-chunk sampled positions.
     """
     try:
-        ref = get_trace_reference(specid, ifuslot, ifuid, amp, obsdate, virusconfig=tr_folder)
+        ref = np.asarray(reference, dtype=float)
         # Number of not dead fibers (aka, good fibers)
         N1 = int((ref[:, 1] == 0.0).sum())
         good = np.where(ref[:, 1] == 0.0)[0]
@@ -327,92 +334,27 @@ def _get_trace(twilight: np.ndarray, specid: str, ifuslot: str, ifuid: str, amp:
 from ..core.algo_result import AlgoResult
 
 def fit_fiber_traces(
-    raw_inputs: Optional[Iterable[TraceInput]] = None,
-    params: Optional[Dict[str, Any]] = None,
+    *,
+    master_ldls_array: np.ndarray,
+    trace_reference: np.ndarray,
+    zipcode,
 ) -> AlgoResult:
-    """Build a trace solution using the existing master flat artifact.
-
-    Contract:
-    - Inputs: none strictly required, but accepted for future use.
-    - params must include one of:
-        - 'master_flat_path': direct filesystem path to a master_flat FITS
-        - 'master_flat_artifact': dict-like with key 'path' to the artifact
-    - Output: returns a storage-neutral AlgoResult; no file I/O or persistence here.
-
-    Note: This is a minimal scaffolding that migrates the get_trace concept into
-    the standard step_* algorithm form used by VIRUSFlow. A full trace solution
-    requires instrument-identifying parameters; if any are missing, this
-    function will fail fast with a clear error rather than falling back.
-    """
-    params = dict(params or {})
-
-    # Resolve master flat strictly via explicit path or provided artifact row.
-    master = None
-    hdr = {}
-    nx = None
-
-    # Prefer a materialized array provided by the Task; fall back to path-based load
-    master = None
-    hdr = {}
-    nx = None
-    try:
-        if isinstance(params.get("master_flat_array"), (list, tuple, np.ndarray)):
-            master = np.asarray(params.get("master_flat_array"))
-            nx = master.shape[1] if master is not None else None
-    except Exception:
-        master = None
-    if master is None:
-        mf_path: Optional[str] = params.get("master_flat_path")
-        if not mf_path:
-            mf_art = params.get("master_flat_artifact") or {}
-            try:
-                mf_path = mf_art.get("path") if isinstance(mf_art, dict) else None
-            except Exception:
-                mf_path = None
-        if not mf_path:
-            raise ValueError("fit_fiber_traces requires a 'master_flat_array' or ('master_flat_path'|'master_flat_artifact') with a 'path'")
-        payload = read_array_fits(str(mf_path))
-        master = payload.get("data")
-        hdr = payload.get("header", {})
-        nx = master.shape[1] if master is not None else None
-        if master is None or nx is None:
-            raise RuntimeError("Failed to load master flat for fit_fiber_traces from path: %s" % str(mf_path))
-
-    # Gather and validate required parameters
-    specid = str(params.get("specid")) if params.get("specid") is not None else None
-    ifuslot = str(params.get("ifuslot")) if params.get("ifuslot") is not None else None
-    ifuid = str(params.get("ifuid")) if params.get("ifuid") is not None else None
-    amp = str(params.get("amp")) if params.get("amp") is not None else None
-    obsdate = str(params.get("obsdate")) if params.get("obsdate") is not None else None
-    tr_folder = (
-        str(params.get("virusconfig") or params.get("trace_config") or params.get("tr_folder"))
-        if (params.get("virusconfig") or params.get("trace_config") or params.get("tr_folder")) is not None
-        else None
-    )
-
-    missing: List[str] = []
-    if specid is None or specid == "None":
-        missing.append("specid")
-    if ifuslot is None or ifuslot == "None":
-        missing.append("ifuslot")
-    if ifuid is None or ifuid == "None":
-        missing.append("ifuid")
-    if amp is None or amp == "None":
-        missing.append("amp")
-    if obsdate is None or obsdate == "None":
-        missing.append("obsdate")
-    if tr_folder is None or tr_folder == "None":
-        missing.append("virusconfig/tr_folder")
-
-    if missing:
-        raise ValueError(
-            "fit_fiber_traces missing required parameters: " + ", ".join(missing) +
-            ". Provide specid, ifuslot, ifuid, amp, obsdate (YYYYMMDD), and virusconfig/tr_folder."
-        )
+    """Build a trace solution from arrays supplied by Task/configuration boundaries."""
+    master = np.asarray(master_ldls_array, dtype=float)
+    reference = np.asarray(trace_reference, dtype=float)
+    if master.ndim != 2 or reference.ndim != 2 or reference.shape[1] < 2:
+        raise ValueError("fit_fiber_traces requires a 2D master_ldls_array and Nx2 trace_reference")
+    nx = master.shape[1]
+    specid = str(zipcode.specid).zfill(3)
+    ifuslot = str(zipcode.ifuslot).zfill(3)
+    ifuid = str(zipcode.ifuid).zfill(3)
+    amp = str(zipcode.amp)
 
     # Compute full trace using updated algorithm; no fallback
     try:
-        trace_2d, ref, xchunks, Trace_samples = _get_trace(master, specid, ifuslot, ifuid, amp, obsdate, tr_folder)
+        trace_2d, ref, xchunks, Trace_samples = _get_trace(
+            master, specid, ifuslot, ifuid, amp, reference
+        )
     except Exception as e:
         raise RuntimeError(f"fit_fiber_traces failed to compute trace via _get_trace: {e}") from e
 

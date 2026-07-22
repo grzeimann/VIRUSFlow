@@ -171,6 +171,7 @@ CREATE TABLE IF NOT EXISTS artifact_records (
     coordinates_json TEXT,
     configuration_refs_json TEXT,
     metadata_json TEXT,
+    validity_policy TEXT,
     created_at TEXT,
     FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
 );
@@ -235,6 +236,10 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        # Additive canonical migrations for registries created by earlier releases.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(artifact_records)").fetchall()}
+        if "validity_policy" not in columns:
+            conn.execute("ALTER TABLE artifact_records ADD COLUMN validity_policy TEXT")
 
 
 def _parse_filename_meta(path: str) -> Tuple[str, str, Optional[str]]:
@@ -722,8 +727,8 @@ def save_artifact_details(
                 artifact_id, canonical_kind, role, payload_type, storage_format,
                 physical_scope, exposure_id, observation_id, dither_set_id,
                 revision, checksum, units_json, coordinates_json,
-                configuration_refs_json, metadata_json, created_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                configuration_refs_json, metadata_json, validity_policy, created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(artifact_id) DO UPDATE SET
                 canonical_kind=excluded.canonical_kind,
                 role=excluded.role,
@@ -738,7 +743,8 @@ def save_artifact_details(
                 units_json=excluded.units_json,
                 coordinates_json=excluded.coordinates_json,
                 configuration_refs_json=excluded.configuration_refs_json,
-                metadata_json=excluded.metadata_json
+                metadata_json=excluded.metadata_json,
+                validity_policy=excluded.validity_policy
             """,
             (
                 int(artifact_id),
@@ -756,6 +762,7 @@ def save_artifact_details(
                 json.dumps(record.get("coordinates") or {}, sort_keys=True),
                 json.dumps(record.get("configuration_refs") or [], sort_keys=True),
                 json.dumps(record.get("metadata") or {}, sort_keys=True, default=str),
+                record.get("validity_policy"),
                 record.get("created_at") or datetime.utcnow().isoformat(),
             ),
         )

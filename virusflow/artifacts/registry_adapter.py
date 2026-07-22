@@ -92,6 +92,7 @@ class RegistryAdapter:
                 "coordinates": dict(getattr(art, "coordinates", {}) or {}),
                 "configuration_refs": [asdict(x) for x in (getattr(art, "configuration_refs", []) or [])],
                 "metadata": dict(art.metadata or {}),
+                "validity_policy": getattr(getattr(art, "validity", None), "policy", None),
                 "created_at": getattr(getattr(art, "provenance", None), "created_at", datetime.utcnow()).isoformat(),
             },
             components=list(components or []),

@@ -64,11 +64,11 @@ class FlatResultContract(_BaseSimpleContract):
 
 
 class TraceResultContract(_BaseSimpleContract):
-    pass
+    required_arrays = ["fiber_trace_map", "trace_sample_columns", "sampled_trace_positions", "per_fiber_trace_residual_rms"]
 
 
 class WaveResultContract(_BaseSimpleContract):
-    pass
+    required_arrays = ["wavelength_map", "per_fiber_wavelength_residual_rms"]
 
 class CmpResultContract(_BaseSimpleContract):
     required_arrays = ["master_comparison_lamp"]

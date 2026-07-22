@@ -507,6 +507,17 @@ def fit_wavelength_solution(*,
     except Exception:
         pass
 
+    arc_identification = None
+    try:
+        matches = ((qa_bundle or {}).get("best") or {}).get("matches") or []
+        if matches:
+            arc_identification = np.asarray(
+                [[m.get("x_obs"), m.get("wave_ref"), m.get("wave_fit"), m.get("wave_resid"), m.get("x_resid"), m.get("peak_index")] for m in matches],
+                dtype=float,
+            )
+    except Exception:
+        arc_identification = None
+
     return AlgoResult(
         kind="wave",
         version=ALGO_VERSION,
@@ -515,5 +526,6 @@ def fit_wavelength_solution(*,
         arrays={
             "wavelength_map": wave,
             "per_fiber_wavelength_residual_rms": rms_rows,
+            "arc_identification": arc_identification,
         },
     )

@@ -47,7 +47,9 @@ class MasterBiasContract:
         return ArtifactContractSpec(
             kind="master_bias",
             components=[LogicalComponentSpec(name="master", model_type="array2d", required=True)],
-            optional_components=[],
+            # Compatibility publication may still read historical single-component Bias;
+            # canonical BiasTask enforces the ontology's two required components.
+            optional_components=[LogicalComponentSpec(name="per_pixel_bias_scatter", model_type="array2d", required=False)],
             summaries=["read_noise"],
             required_metadata=[],
             applicability="Bias calibration products",
@@ -88,7 +90,12 @@ class TraceContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
             kind="trace",
-            components=[LogicalComponentSpec(name="fiber_trace_map", model_type="array2d", required=True)],
+            components=[
+                LogicalComponentSpec(name="fiber_trace_map", model_type="array2d", required=True),
+                LogicalComponentSpec(name="trace_sample_columns", model_type="array1d", required=True),
+                LogicalComponentSpec(name="sampled_trace_positions", model_type="array2d", required=True),
+                LogicalComponentSpec(name="per_fiber_trace_residual_rms", model_type="array1d", required=True),
+            ],
             optional_components=[],
             summaries=["per_fiber_trace_residual_rms_ds", "trace_len"],
             required_metadata=[],
@@ -102,8 +109,11 @@ class WaveContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
             kind="wave",
-            components=[LogicalComponentSpec(name="wavelength_map", model_type="array2d", required=True)],
-            optional_components=[],
+            components=[
+                LogicalComponentSpec(name="wavelength_map", model_type="array2d", required=True),
+                LogicalComponentSpec(name="per_fiber_wavelength_residual_rms", model_type="array1d", required=True),
+            ],
+            optional_components=[LogicalComponentSpec(name="arc_identification", model_type="array2d", required=False)],
             summaries=["per_fiber_wavelength_residual_rms_ds", "best_nmatch", "best_rms"],
             required_metadata=[],
             applicability="Wavelength calibration",

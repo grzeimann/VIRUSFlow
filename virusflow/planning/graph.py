@@ -179,9 +179,24 @@ class ReductionGraph:
                 if not has_up:
                     continue
                 for scope in scopes:
-                    key_src = (node.inputs_artifacts[0], _scope_key(scope)) if node.inputs_artifacts else None
-                    src_wins = planned_windows.get(key_src, []) if key_src else []
-                    for win in src_wins:
+                    # A derived Product is schedulable only where every declared
+                    # upstream has a planned or already-valid Product window.
+                    upstream_windows = []
+                    for upstream in node.inputs_artifacts or []:
+                        key_src = (upstream, _scope_key(scope))
+                        wins = list(planned_windows.get(key_src, []))
+                        if not wins:
+                            existing = svc.select_best(
+                                kind=upstream, scope=scope, at_time=None, policy="latest"
+                            )
+                            if existing is not None:
+                                wins = [TemporalWindow(start=None, end=None)]
+                        upstream_windows.append(wins)
+                    if not upstream_windows or any(not wins for wins in upstream_windows):
+                        continue
+                    # Use the first input's windows as target validity; mapping policy
+                    # resolves the other parents at execution time.
+                    for win in upstream_windows[0]:
                         _emit(node.kind, scope, win)
                 continue
 

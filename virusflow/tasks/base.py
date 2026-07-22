@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 # Legacy artifact dataclasses are no longer used in the new artifacts subsystem
 from ..registry import database as db
@@ -231,3 +231,46 @@ class CalibrationTask(Task):
                 pass
         return raw_inputs, parent_ids
 
+    def load_reduced_inputs(self, raw_inputs):
+        """Load raw frames through the I/O boundary and return detector arrays only."""
+        from ..algorithms.ccd import reduce_amplifier_array
+        from ..io import RawFrameLoader
+
+        loader = self.ctx.config.get("raw_frame_loader") if isinstance(self.ctx.config, dict) else None
+        loader = loader or RawFrameLoader()
+        reduced = []
+        for item in raw_inputs:
+            frame = loader.load(str(item["path"]), item.get("tar_member"))
+            detector = reduce_amplifier_array(frame.data, frame.header)
+            reduced.append(
+                {
+                    "data": detector.get_array("oriented_detector_image"),
+                    "error": detector.get_array("detector_error"),
+                    "variance": detector.get_array("detector_variance"),
+                    "header": dict(frame.header),
+                    "source": {"path": frame.path, "tar_member": frame.tar_member},
+                }
+            )
+        return reduced
+
+    def target_validity(self):
+        from ..artifacts.models import Validity
+
+        start = getattr(self.target, "start_dt", None) or self._parse_date(getattr(self.target, "start_date", None))
+        end = getattr(self.target, "end_dt", None) or self._parse_date(getattr(self.target, "end_date", None))
+        return Validity(start=start, end=end, policy="target_window")
+
+    def configuration_references(self):
+        from ..config import ConfigurationService
+
+        root = self.ctx.config.get("configuration_root") if isinstance(self.ctx.config, dict) else None
+        return ConfigurationService(root=root).amplifier_references(self.target.zipcode)
+
+    def evaluate_qa(self, service, artifact, result) -> str:
+        """Persist canonical QA and propagate configured hard blocking failures."""
+        status = service.diagnostics.evaluate_and_save(
+            artifact_id=int(artifact.id), kind=str(artifact.kind), meta=result
+        )
+        if service.diagnostics.should_block(kind=str(artifact.kind), status=status):
+            raise RuntimeError(f"QA hard-fail for {artifact.kind} (artifact_id={artifact.id})")
+        return status

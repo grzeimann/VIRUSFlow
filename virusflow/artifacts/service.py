@@ -371,7 +371,11 @@ class ArtifactService:
             provenance=provenance,
             diagnostics=DiagnosticRecord(**self.adapter.get_diagnostics(int(row["id"]))) if False else None,
             model_type=(components[0].get("model_type") if components else self._infer_model_type(summary)),
-            validity=Validity(_dt(row.get("validity_start")), _dt(row.get("validity_end"))),
+            validity=Validity(
+                _dt(row.get("validity_start")),
+                _dt(row.get("validity_end")),
+                row.get("validity_policy") or "explicit",
+            ),
             units=dict(row.get("units") or {}),
             coordinates=dict(row.get("coordinates") or {}),
             configuration_refs=config_refs,

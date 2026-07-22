@@ -27,13 +27,22 @@ def default_kind_to_task() -> Dict[str, Type[Task]]:
     Notes:
     - twilight flat (twi) is not a planned kind here; mapping provided for completeness.
     """
-    return {
+    canonical = {
         "master_bias": BiasTask,
         "master_dark": DarkTask,
+        "master_ldls": FlatTask,
+        "master_arc": CmpTask,
+        "master_twilight": TwiTask,
+        "trace_map": TraceTask,
+        "wavelength_map": WaveTask,
+    }
+    # Public legacy planner names remain accepted as read/run aliases.
+    canonical.update({
         "master_flat": FlatTask,
         "master_cmp": CmpTask,
+        "master_twi": TwiTask,
         "trace": TraceTask,
         "wave": WaveTask,
-        # Non-standard/planned kinds that may appear in legacy flows
         "twi": TwiTask,
-    }
+    })
+    return canonical
