@@ -17,7 +17,7 @@ import numpy as np
 from astropy.stats import biweight_location
 from scipy.signal import medfilt
 
-from .ccd import reduce_raw_amplifier_frame
+from .inputs import array_frames
 # persistence removed per architecture
 
 __all__ = ["step_flt"]
@@ -81,38 +81,7 @@ def step_flt(
         Algorithm tuning parameters (reserved; none currently used).
     """
     params = params or {}
-    inputs: List[FlatInput] = list(raw_inputs or [])
-    if len(inputs) == 0:
-        raise ValueError("step_flt requires at least one raw flat input in raw_inputs")
-
-    def _reduce_one(idx_item):
-        i, it = idx_item
-        p = it.get("path")
-        tm = it.get("tar_member")
-        if not p:
-            return None, i, "no-path"
-        try:
-            img, _err = reduce_raw_amplifier_frame(p, tm, return_header=False)
-            return img, i, None
-        except Exception as e:
-            return None, i, str(e)
-
-    frames: List[np.ndarray] = []
-    errors: List[str] = []
-
-    for i, it in enumerate(inputs):
-        img, idx, err = _reduce_one((i, it))
-        if img is not None:
-            frames.append(img)
-        elif err:
-            errors.append(f"[{idx}] {err}")
-
-    if not frames:
-        raise RuntimeError("No readable flat frames provided to step_flt")
-
-    shapes = {f.shape for f in frames}
-    if len(shapes) != 1:
-        raise ValueError(f"Input flat frames have differing shapes: {sorted(shapes)}")
+    frames = array_frames(raw_inputs or [])
 
     stack = np.stack(frames, axis=0)
     master = biweight_location(stack, axis=0, ignore_nan=True)

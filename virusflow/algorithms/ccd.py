@@ -22,7 +22,7 @@ from scipy.ndimage import gaussian_filter1d
 
 from .io import read_fits
 
-__all__ = ["orient_amplifier_image", "reduce_raw_amplifier_frame", "repair_masked_columns"]
+__all__ = ["orient_amplifier_image", "reduce_amplifier_array", "reduce_raw_amplifier_frame", "repair_masked_columns"]
 logger = logging.getLogger(__name__)
 
 
@@ -46,12 +46,8 @@ def orient_amplifier_image(image: np.ndarray, amp: str, ampname: Optional[str]) 
     return img
 
 
-def reduce_raw_amplifier_frame(
-    path: str,
-    tar_member: Optional[str] = None,
-    return_header: bool = False,
-) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, dict]:
-    """Basic CCD reduction for a single amplifier image.
+def reduce_amplifier_array(data: np.ndarray, header: dict) -> "AlgoResult":
+    """Reduce one already-loaded amplifier array and return all detector evidence.
 
     Steps (following reference fiber_utils.reduce_raw_amplifier_frame):
       1) Overscan subtraction (robust per-row estimate)
@@ -62,23 +58,19 @@ def reduce_raw_amplifier_frame(
 
     Parameters
     ----------
-    path : str
-        Path to a FITS file or .tar archive containing the FITS as tar_member.
-    tar_member : Optional[str]
-        Member path inside tar archive.
-    return_header : bool
-        If True, also return the FITS primary header (as a copy/dict).
+    data : np.ndarray
+        Already-loaded raw amplifier pixels.
+    header : dict
+        FITS metadata needed for orientation, gain, and read noise.
 
     Returns
     -------
-    image : np.ndarray
-        Reduced, oriented, and gain-multiplied image (float32).
-    error : np.ndarray
-        Propagated error image (float32).
-    header : dict (optional)
-        Primary header (for metadata propagation), returned if return_header=True.
+    AlgoResult
+        Named overscan, reduced-image, error, and variance evidence.
     """
-    data, hdr = read_fits(path, tar_member)
+    from ..core.algo_result import AlgoResult
+
+    hdr = dict(header or {})
 
     # Defensive copies and dtype
     img = np.asarray(data, dtype=float).copy()
@@ -88,17 +80,19 @@ def reduce_raw_amplifier_frame(
     nx = img.shape[1]
     overscan_length = int(32 * (nx / 1064.0))
     overscan_length = max(0, min(nx // 4, overscan_length))  # reasonable bounds
+    overscan_model = np.zeros(img.shape[0], dtype=float)
     if overscan_length > 0:
         # robust per-row estimate: use biweight_location to reduce digitization bias
         # Use all but the last 2 columns in the overscan, like reference code
         osc_region = img[:, -(overscan_length - 2) :] if overscan_length >= 3 else img[:, -overscan_length:]
         # biweight location per row (robust central tendency)
-        O = biweight_location(osc_region, axis=1, ignore_nan=True)
-        img -= O[:, np.newaxis]
+        overscan_model = np.asarray(biweight_location(osc_region, axis=1, ignore_nan=True), dtype=float)
+        img -= overscan_model[:, np.newaxis]
 
     # 2) Trim image (drop overscan columns)
     if overscan_length > 0:
         img = img[:, : nx - overscan_length]
+    overscan_corrected = img.copy()
 
     # 3) Orientation and 4) Gain multiplication
     # Extract metadata with safe defaults
@@ -122,8 +116,32 @@ def reduce_raw_amplifier_frame(
     pos = np.where(image > 0.0, image, 0.0)
     error = np.sqrt(rdnoise ** 2 + pos).astype(np.float32, copy=False)
 
+    return AlgoResult(
+        kind="detector_reduction",
+        version="detector-2.0",
+        meta={"header": hdr, "amp": amp, "ampname": ampname},
+        scalars={"gain": gain, "read_noise": rdnoise, "overscan_columns": overscan_length},
+        arrays={
+            "overscan_model": overscan_model,
+            "overscan_corrected_image": overscan_corrected,
+            "oriented_detector_image": image,
+            "detector_error": error,
+            "detector_variance": np.square(error, dtype=np.float32),
+        },
+    )
+
+
+def reduce_raw_amplifier_frame(
+    path: str,
+    tar_member: Optional[str] = None,
+    return_header: bool = False,
+) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, dict]:
+    """Compatibility wrapper. Canonical Tasks use RawFrameLoader + reduce_amplifier_array."""
+    data, hdr = read_fits(path, tar_member)
+    result = reduce_amplifier_array(data, dict(hdr))
+    image = result.get_array("oriented_detector_image")
+    error = result.get_array("detector_error")
     if return_header:
-        # Return a plain dict to avoid astropy object mutation surprises
         return image, error, dict(hdr)
     return image, error
 

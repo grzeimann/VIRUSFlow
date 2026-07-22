@@ -16,7 +16,7 @@ def get_spectra(array_flt: np.ndarray, array_trace: np.ndarray, npix: int = 5) -
     """Extract per-fiber spectra from a flat (twilight) image using a 2D trace map.
 
     This routine integrates a small, symmetric window of rows around each fiber's trace
-    center for every detector column and averages the weighted samples to build a
+    center for every detector column and sums the weighted samples to build a
     2D spectrum array of shape (n_fibers, n_x).
 
     Parameters
@@ -40,8 +40,8 @@ def get_spectra(array_flt: np.ndarray, array_trace: np.ndarray, npix: int = 5) -
     -----
     - The implementation mirrors legacy behavior: it computes linear weights on the
       first and last rows of the aperture to approximate sub-pixel integration
-      (parallelogram rule); interior rows get unit weight. The final value is divided
-      by ``npix`` to form an average.
+      (parallelogram rule); interior rows get unit weight. The aperture weights sum
+      to ``npix`` for a trace that remains within detector bounds.
     - Fibers whose rounded trace path would sample outside the detector bounds are
       skipped (left as zeros).
     """
@@ -86,7 +86,7 @@ def get_spectra(array_flt: np.ndarray, array_trace: np.ndarray, npix: int = 5) -
                 # Safe gather within bounds (guaranteed by checks above)
                 spec[fiber] += img[indv + j, x] * w
 
-        return spec / float(npix)
+        return spec
     except Exception as e:
         # Convert unexpected issues into a clear runtime error for callers
         raise RuntimeError(f"get_spectra failed: {e}") from e

@@ -4,7 +4,6 @@ import numpy as np
 import pytest
 
 from virusflow.algorithms import sci as alg_sci
-from virusflow.algorithms import ccd as alg_ccd
 from virusflow.core.algo_result import ensure_algo_result, AlgoResult
 from virusflow.contracts.result import SciResultContract
 from virusflow.contracts.artifact import MasterSciContract
@@ -18,19 +17,11 @@ from virusflow.registry.database import init_db
 
 
 def _mk_inputs(n: int):
-    return [{"path": f"/dev/null/{i}", "tar_member": None} for i in range(n)]
+    yy, xx = np.indices((6, 8))
+    return [{"data": (xx + 0.5 * i).astype(float)} for i in range(n)]
 
 
-def test_build_master_science_basic(monkeypatch):
-    # Patch CCD reduction used inside algorithms.sci
-    def fake_reduce(path, tar_member, return_header=False):
-        i = int(str(path).split("/")[-1]) if str(path).split("/")[-1].isdigit() else 0
-        yy, xx = np.indices((6, 8))
-        arr = (xx + 0.5 * i).astype(float)
-        return (arr, {}) if return_header else (arr, {})
-
-    monkeypatch.setattr(alg_ccd, "reduce_raw_amplifier_frame", fake_reduce)
-
+def test_build_master_science_basic():
     ar = alg_sci.build_master_science(raw_inputs=_mk_inputs(3), params={})
     ar2 = ensure_algo_result(ar, kind="sci")
     assert isinstance(ar2, AlgoResult)
@@ -44,28 +35,18 @@ def test_build_master_science_basic(monkeypatch):
     assert rep.ok, f"Unexpected contract errors: {rep.errors}"
 
 
-def test_build_master_science_errors(monkeypatch):
+def test_build_master_science_errors():
     # 1) No inputs
     with pytest.raises(ValueError):
         alg_sci.build_master_science(raw_inputs=[], params={})
 
-    # 2) All inputs unreadable
-    def bad_reduce(path, tar_member, return_header=False):
-        raise IOError("cannot read")
-
-    monkeypatch.setattr(alg_ccd, "reduce_raw_amplifier_frame", bad_reduce)
-    with pytest.raises(RuntimeError):
-        alg_sci.build_master_science(raw_inputs=_mk_inputs(2), params={})
+    # 2) File references are rejected at the array-only boundary.
+    with pytest.raises(TypeError):
+        alg_sci.build_master_science(raw_inputs=[{"path": "/not/loaded.fits"}], params={})
 
     # 3) Inconsistent shapes
-    def varying_reduce(path, tar_member, return_header=False):
-        i = int(str(path).split("/")[-1]) if str(path).split("/")[-1].isdigit() else 0
-        arr = np.zeros((5 + i, 7), dtype=float)
-        return (arr, {}) if return_header else (arr, {})
-
-    monkeypatch.setattr(alg_ccd, "reduce_raw_amplifier_frame", varying_reduce)
     with pytest.raises(ValueError):
-        alg_sci.build_master_science(raw_inputs=_mk_inputs(2), params={})
+        alg_sci.build_master_science(raw_inputs=[np.zeros((5, 7)), np.zeros((6, 7))], params={})
 
 
 def test_master_sci_publication_and_qa_from_component(tmp_path, monkeypatch):

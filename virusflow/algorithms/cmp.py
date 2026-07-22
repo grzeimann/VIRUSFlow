@@ -19,7 +19,7 @@ import logging
 import numpy as np
 from astropy.stats import biweight_location
 
-from . import ccd as _ccd
+from .inputs import array_frames
 # persistence and storage-coupled mask logic removed per architecture
 
 __all__ = ["step_cmp"]
@@ -50,47 +50,13 @@ def step_cmp(
         Algorithm tuning parameters (reserved; none currently used).
     """
     params = params or {}
-    inputs: List[CmpInput] = list(raw_inputs or [])
-    if len(inputs) == 0:
-        raise ValueError("step_cmp requires at least one raw comparison input in raw_inputs")
-
-    def _reduce_one(idx_item):
-        i, it = idx_item
-        p = it.get("path")
-        tm = it.get("tar_member")
-        if not p:
-            return None, i, "no-path"
-        try:
-            img, _err = _ccd.reduce_raw_amplifier_frame(p, tm, return_header=False)
-            return img, i, None
-        except Exception as e:
-            return None, i, str(e)
-
-    frames: List[np.ndarray] = []
-    errors: List[str] = []
-
-    for i, it in enumerate(inputs):
-        img, idx, err = _reduce_one((i, it))
-        if img is not None:
-            frames.append(img)
-        elif err:
-            errors.append(f"[{idx}] {err}")
-
-    if not frames:
-        raise RuntimeError("No readable comparison frames provided to step_cmp")
-
-    shapes = {f.shape for f in frames}
-    if len(shapes) != 1:
-        raise ValueError(f"Input comparison frames have differing shapes: {sorted(shapes)}")
+    frames = array_frames(raw_inputs or [])
 
     stack = np.stack(frames, axis=0)
     master = biweight_location(stack, axis=0, ignore_nan=True)
 
     # Per architecture, do not read other artifacts or construct masks here.
     # Any masking/repair decisions belong to tasks/persistence policies.
-
-    if errors:
-        logger.warning("step_cmp encountered %d reduction errors; proceeding with %d good frames", len(errors), len(frames))
 
     return AlgoResult(
         kind="cmp",
