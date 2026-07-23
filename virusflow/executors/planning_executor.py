@@ -1,19 +1,14 @@
 from __future__ import annotations
 
-"""
-Planning-native executor that runs ScheduledTask instances without relying on the
-legacy core.graph.TaskGraph. Intended for use with virusflow.planning.scheduler.schedule().
+"""Dependency-aware execution for planned VIRUSFlow task graphs."""
 
-Features:
-- Executes tasks in batches when their depends_on are satisfied.
-- Optional threading with a max_workers parameter (similar to LocalExecutor).
-- Captures exceptions per task and continues advancing the graph where possible.
-- Prints a compact per-kind progress line when debug is enabled.
-
-This module intentionally avoids importing legacy core.graph to help retire TaskGraph.
-"""
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
-from typing import Dict, List, Sequence, Tuple, Optional
+import traceback
+from typing import Dict, List, Optional, Tuple
+
+from .progress import GraphProgress, ProgressReporter
 
 
 @dataclass
@@ -22,292 +17,267 @@ class _Node:
     kind: str
     task: object
     deps: List[str]
+    target: str
+
+
+class WorkflowExecutionError(RuntimeError):
+    """Raised after graph state and dependents have been finalized."""
+
+    def __init__(self, failures: list[dict], blocked: list[dict]) -> None:
+        self.failures = failures
+        self.blocked = blocked
+        sample = failures[0] if failures else {"id": "unknown", "reason": "unknown"}
+        super().__init__(
+            f"workflow failed: {len(failures)} failed, {len(blocked)} blocked; "
+            f"first failure {sample['id']}: {sample['reason']}"
+        )
 
 
 class PlanningExecutor:
-    def __init__(self, max_workers: int | None = None, debug: bool = False) -> None:
+    """Execute each unique graph node once when all prerequisites are ready."""
+
+    def __init__(
+        self,
+        max_workers: int | None = None,
+        debug: bool = False,
+        *,
+        progress: bool = True,
+        progress_mode: str = "auto",
+        progress_interval: float = 30.0,
+        progress_stream=None,
+        progress_path: str | None = None,
+        max_retries: int = 0,
+        raise_on_failure: bool = True,
+    ) -> None:
         from .execution_context import in_task_worker
 
         requested = 4 if max_workers is None else max(1, int(max_workers))
         self.max_workers = 1 if in_task_worker() else requested
         self.debug = bool(debug)
+        self.max_retries = max(0, int(max_retries))
+        self.raise_on_failure = bool(raise_on_failure)
         self._nodes: Dict[str, _Node] = {}
-        # Execution statistics populated after run()
-        # Shape: {
-        #   'total': int, 'succeeded': int, 'failed': int,
-        #   'per_kind': {kind: {'total': int, 'ok': int, 'fail': int}},
-        #   'failures': [{'id': node_id, 'kind': kind, 'reason': str}]
-        # }
         self.execution_stats: Dict[str, object] = {}
-        # Live table control (enabled by default when stdout is a TTY and not in debug line mode)
-        try:
-            import sys as _sys
-            self._live_enabled_default = bool(getattr(_sys.stdout, "isatty", lambda: False)())
-        except Exception:
-            self._live_enabled_default = False
+        self.progress = GraphProgress(self.max_workers)
+        self.reporter = ProgressReporter(
+            self.progress,
+            enabled=progress,
+            mode=progress_mode,
+            interval_seconds=progress_interval,
+            stream=progress_stream,
+            structured_path=progress_path,
+        )
 
-    def add_task(self, node_id: str, task: object, kind: Optional[str] = None, depends_on: List[str] | None = None) -> None:
+    @staticmethod
+    def _target_label(node_id: str, task: object) -> str:
+        target = getattr(task, "target", None)
+        if target is None:
+            return str(node_id)
+        for name in ("observation_id", "exposure_id", "dither_set_id"):
+            value = getattr(target, name, None)
+            if value:
+                return f"{name}={value}"
+        zipcode = getattr(target, "zipcode", None)
+        if zipcode is not None and hasattr(zipcode, "key"):
+            return f"zipcode={zipcode.key()}"
+        return str(node_id)
+
+    def add_task(
+        self,
+        node_id: str,
+        task: object,
+        kind: Optional[str] = None,
+        depends_on: List[str] | None = None,
+        *,
+        target: str | None = None,
+    ) -> None:
         if node_id in self._nodes:
             raise ValueError(f"task node is already registered: {node_id}")
-        k = kind or getattr(task, "kind", "task")
-        self._nodes[node_id] = _Node(id=node_id, kind=str(k), task=task, deps=list(depends_on or []))
+        task_kind = str(kind or getattr(task, "kind", "task"))
+        label = str(target or self._target_label(node_id, task))
+        self._nodes[node_id] = _Node(
+            id=node_id,
+            kind=task_kind,
+            task=task,
+            deps=list(depends_on or []),
+            target=label,
+        )
+        self.progress.add_node(node_id, kind=task_kind, target=label)
+
+    def add_observed(
+        self,
+        node_id: str,
+        *,
+        kind: str,
+        state: str,
+        target: str | None = None,
+        message: str | None = None,
+    ) -> None:
+        """Include a planner-cached or deliberately skipped unit in progress."""
+
+        if state not in {"cached", "skipped"}:
+            raise ValueError("observed graph work must be cached or skipped")
+        if node_id in self._nodes:
+            raise ValueError(f"task node is already registered: {node_id}")
+        self.progress.add_node(
+            node_id, kind=str(kind), target=target or node_id, state=state, message=message
+        )
 
     def _indeg_and_dependents(self) -> Tuple[Dict[str, int], Dict[str, List[str]]]:
-        indeg: Dict[str, int] = {k: 0 for k in self._nodes}
-        dependents: Dict[str, List[str]] = {k: [] for k in self._nodes}
-        for nid, n in self._nodes.items():
-            for d in n.deps:
-                indeg[nid] = indeg.get(nid, 0) + 1
-                dependents.setdefault(d, []).append(nid)
+        indeg: Dict[str, int] = {key: 0 for key in self._nodes}
+        dependents: Dict[str, List[str]] = {key: [] for key in self._nodes}
+        for node_id, node in self._nodes.items():
+            for dependency in node.deps:
+                if dependency not in self._nodes:
+                    raise ValueError(f"task {node_id} has unknown dependency {dependency}")
+                indeg[node_id] += 1
+                dependents[dependency].append(node_id)
+        # Validate acyclicity before progress starts so final state is never a
+        # misleading partial completion caused by malformed graph structure.
+        check = dict(indeg)
+        ready = deque(key for key, value in check.items() if value == 0)
+        visited = 0
+        while ready:
+            current = ready.popleft()
+            visited += 1
+            for dependent in dependents[current]:
+                check[dependent] -= 1
+                if check[dependent] == 0:
+                    ready.append(dependent)
+        if visited != len(self._nodes):
+            raise ValueError("task graph contains a cycle")
         return indeg, dependents
 
     def run(self) -> Dict[str, object]:
-        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
         from .execution_context import enter_worker, leave_worker
-        import time as _time
 
         indeg, dependents = self._indeg_and_dependents()
-        ready = [k for k, v in indeg.items() if v == 0]
-        done: Dict[str, bool] = {}
-        failed: Dict[str, str] = {}
+        ready = deque(node_id for node_id, value in indeg.items() if value == 0)
         results: Dict[str, object] = {}
-        _start_ts = _time.perf_counter()
+        attempts = {node_id: 0 for node_id in self._nodes}
+        unsuccessful: set[str] = set()
+        failures: dict[str, dict] = {}
+        blocked: dict[str, dict] = {}
+        per_kind: dict[str, dict[str, int]] = {}
+        for node in self._nodes.values():
+            bucket = per_kind.setdefault(
+                node.kind,
+                {"total": 0, "succeeded": 0, "failed": 0, "blocked": 0, "retried": 0},
+            )
+            bucket["total"] += 1
 
-        def _has_failed_dep(nid: str) -> bool:
-            return any((d in failed) for d in self._nodes[nid].deps)
+        def release(node_id: str) -> None:
+            for dependent in dependents[node_id]:
+                indeg[dependent] -= 1
+                if indeg[dependent] == 0:
+                    ready.append(dependent)
 
-        def _run_one(nid: str):
-            token = enter_worker(f"worker-{nid}")
+        def run_one(node_id: str):
+            worker_id = f"worker-{node_id}"
+            token = enter_worker(worker_id)
             try:
-                dependency_outputs = {
+                inputs = {
                     dependency: results[dependency]
-                    for dependency in self._nodes[nid].deps
+                    for dependency in self._nodes[node_id].deps
                     if dependency in results
                 }
-                return nid, self._nodes[nid].task.run(dependency_outputs), None
-            except Exception as e:  # pragma: no cover - behavior mirrored from LocalExecutor
-                return nid, None, str(e)
+                return self._nodes[node_id].task.run(inputs), None, None
+            except Exception as exc:  # task failure is finalized by the graph owner
+                return None, exc, traceback.format_exc()
             finally:
                 leave_worker(token)
 
-        # Simple progress counters by kind
-        totals: Dict[str, int] = {}
-        for n in self._nodes.values():
-            totals[n.kind] = totals.get(n.kind, 0) + 1
-        ok: Dict[str, int] = {k: 0 for k in totals}
-        fl: Dict[str, int] = {k: 0 for k in totals}
-        running: Dict[str, int] = {k: 0 for k in totals}
+        self.reporter.start()
+        first_exception: Exception | None = None
+        with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="virusflow") as pool:
+            in_flight: dict[Future, str] = {}
+            while ready or in_flight:
+                while ready and len(in_flight) < self.max_workers:
+                    node_id = ready.popleft()
+                    failed_dependencies = [dep for dep in self._nodes[node_id].deps if dep in unsuccessful]
+                    if failed_dependencies:
+                        reason = f"blocked by prerequisite(s): {', '.join(failed_dependencies)}"
+                        unsuccessful.add(node_id)
+                        blocked[node_id] = {
+                            "id": node_id,
+                            "kind": self._nodes[node_id].kind,
+                            "reason": reason,
+                        }
+                        per_kind[self._nodes[node_id].kind]["blocked"] += 1
+                        event = self.progress.transition(node_id, "blocked", message=reason)
+                        self.reporter.emit(event, force=True)
+                        release(node_id)
+                        continue
+                    attempts[node_id] += 1
+                    worker_id = f"worker-{node_id}"
+                    event = self.progress.transition(node_id, "running", worker_id=worker_id)
+                    self.reporter.emit(event)
+                    in_flight[pool.submit(run_one, node_id)] = node_id
 
-        # Live table renderer (enabled in default mode when stdout is a TTY)
-        use_live = (not self.debug) and getattr(self, "_live_enabled_default", False)
-        _printed_lines = 0
-
-        def _render_live():
-            nonlocal _printed_lines
-            if not use_live:
-                return
-            import sys as _sys
-            # Move cursor up and clear previous lines
-            if _printed_lines > 0:
-                _sys.stdout.write("\x1b[" + str(_printed_lines) + "A")  # move up
-                for _ in range(_printed_lines):
-                    _sys.stdout.write("\x1b[2K\n")  # clear line and move down
-                _sys.stdout.write("\x1b[" + str(_printed_lines) + "A")  # move back up
-            # Compose table
-            rows = []
-            # Pull a snapshot of QA tallies to render per-kind columns
-            try:
-                from ..artifacts.diagnostics import qa_tallies_snapshot as _qa_snap  # type: ignore
-                q = _qa_snap() or {}
-            except Exception:
-                q = {}
-            header = "Task Kind                    | total | running | ok | fail | qa_pass | qa_warn | qa_fail"
-            sep = "-" * len(header)
-            rows.append(header)
-            rows.append(sep)
-            for k in sorted(totals.keys()):
-                qk = q.get(str(k).lower(), {}) or {}
-                qp = int(qk.get("pass", 0))
-                qw = int(qk.get("warn", 0))
-                qf = int(qk.get("fail", 0))
-                rows.append(f"{k:<28} | {totals.get(k,0):>5} | {running.get(k,0):>7} | {ok.get(k,0):>2} | {fl.get(k,0):>4} | {qp:>7} | {qw:>7} | {qf:>7}")
-            # Overall summary
-            rows.append(sep)
-            all_total = sum(totals.values())
-            all_running = sum(running.values())
-            all_ok = sum(ok.values())
-            all_fail = sum(fl.values())
-            rows.append(f"Overall                      | {all_total:>5} | {all_running:>7} | {all_ok:>2} | {all_fail:>4}")
-            # Optional QA footer with warn/fail tallies
-            try:
-                qt = q.get("__all__", {}) or {}
-                q_pass = int(qt.get("pass", 0))
-                q_warn = int(qt.get("warn", 0))
-                q_fail = int(qt.get("fail", 0))
-                rows.append(f"QA totals                    |  pass={q_pass}  warn={q_warn}  fail={q_fail}")
-            except Exception:
-                pass
-            # Elapsed time footer
-            try:
-                elapsed = max(0.0, _time.perf_counter() - _start_ts)
-                esec = int(elapsed)
-                hh = esec // 3600
-                mm = (esec % 3600) // 60
-                ss = esec % 60
-                rows.append(f"Elapsed time                 |  {hh:02d}:{mm:02d}:{ss:02d}")
-            except Exception:
-                pass
-            text = "\n".join(rows) + "\n"
-            _sys.stdout.write(text)
-            _sys.stdout.flush()
-            _printed_lines = len(rows)
-
-        def _bump(kind: str, success: bool):
-            if success:
-                ok[kind] = ok.get(kind, 0) + 1
-            else:
-                fl[kind] = fl.get(kind, 0) + 1
-            _render_live()
-            if self.debug:
-                parts = [f"{k}: {ok.get(k,0)}/{totals.get(k,0)} ok, {fl.get(k,0)} fail" for k in sorted(totals.keys())]
-                print("\r[Progress] " + " | ".join(parts), end="", flush=True)
-
-        # Initial render
-        _render_live()
-        while ready:
-            batch = ready[:]
-            ready.clear()
-            # Filter out nodes whose deps have failed
-            runnable = [nid for nid in batch if not _has_failed_dep(nid)]
-            skipped = [nid for nid in batch if _has_failed_dep(nid)]
-            for nid in skipped:
-                failed[nid] = "blocked-dependency"
-                done[nid] = True
-                _bump(self._nodes[nid].kind, False)
-                for dep in dependents.get(nid, []):
-                    indeg[dep] -= 1
-                    if indeg[dep] == 0:
-                        ready.append(dep)
-
-            if not runnable:
-                continue
-
-            if self.max_workers <= 1 or len(runnable) == 1:
-                for nid in runnable:
-                    # mark running
-                    k = self._nodes[nid].kind
-                    running[k] = running.get(k, 0) + 1
-                    _render_live()
-                    _, _res, err = _run_one(nid)
-                    # done running
-                    running[k] = max(0, running.get(k, 0) - 1)
-                    if err is not None:
-                        failed[nid] = err
-                        _bump(k, False)
+                if not in_flight:
+                    continue
+                completed, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
+                for future in completed:
+                    node_id = in_flight.pop(future)
+                    result, error, trace = future.result()
+                    node = self._nodes[node_id]
+                    if error is not None and attempts[node_id] <= self.max_retries:
+                        per_kind[node.kind]["retried"] += 1
+                        event = self.progress.transition(
+                            node_id,
+                            "pending",
+                            message=f"retry {attempts[node_id]}/{self.max_retries}: {error}",
+                        )
+                        self.reporter.emit(event, force=True)
+                        ready.append(node_id)
+                        continue
+                    if error is not None:
+                        first_exception = first_exception or error
+                        reason = f"{type(error).__name__}: {error}"
+                        failures[node_id] = {
+                            "id": node_id,
+                            "kind": node.kind,
+                            "reason": reason,
+                            "exception_type": type(error).__name__,
+                            "traceback": trace,
+                            "attempts": attempts[node_id],
+                        }
+                        unsuccessful.add(node_id)
+                        per_kind[node.kind]["failed"] += 1
+                        event = self.progress.transition(node_id, "failed", message=reason)
+                        self.reporter.emit(event, force=True)
                     else:
-                        results[nid] = _res
-                        _bump(k, True)
-                    done[nid] = True
-                    for dep in dependents.get(nid, []):
-                        indeg[dep] -= 1
-                        if indeg[dep] == 0:
-                            ready.append(dep)
-            else:
-                with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
-                    # submit initial batch up to max_workers
-                    in_flight = {}
-                    q = runnable[:]
-                    # Fill initial slots
-                    while q and len(in_flight) < self.max_workers:
-                        nid0 = q.pop(0)
-                        k0 = self._nodes[nid0].kind
-                        running[k0] = running.get(k0, 0) + 1
-                        fut0 = ex.submit(_run_one, nid0)
-                        in_flight[fut0] = nid0
-                    _render_live()
-                    while in_flight:
-                        done_futs, _ = wait(list(in_flight.keys()), return_when=FIRST_COMPLETED)
-                        for fut in done_futs:
-                            nid = in_flight.pop(fut)
-                            k = self._nodes[nid].kind
-                            _nid, _res, err = fut.result()
-                            # decrement running for this kind
-                            running[k] = max(0, running.get(k, 0) - 1)
-                            if err is not None:
-                                failed[nid] = err
-                                _bump(k, False)
-                            else:
-                                results[nid] = _res
-                                _bump(k, True)
-                            done[nid] = True
-                            for dep in dependents.get(nid, []):
-                                indeg[dep] -= 1
-                                if indeg[dep] == 0:
-                                    ready.insert(0, dep)  # prioritize newly-unlocked
-                        # Top up
-                        while q and len(in_flight) < self.max_workers:
-                            nid2 = q.pop(0)
-                            k2 = self._nodes[nid2].kind
-                            running[k2] = running.get(k2, 0) + 1
-                            in_flight[ex.submit(_run_one, nid2)] = nid2
-                        _render_live()
+                        results[node_id] = result
+                        per_kind[node.kind]["succeeded"] += 1
+                        event = self.progress.transition(node_id, "succeeded")
+                        self.reporter.emit(event)
+                    release(node_id)
 
-        # Final snapshot/newline for progress print
-        if self.debug:
-            print()
-        elif use_live:
-            _render_live()
-            try:
-                import sys as _sys
-                _sys.stdout.write("\n")
-                _sys.stdout.flush()
-            except Exception:
-                pass
-
-        # If any nodes remain not done, raise to indicate a likely cycle
-        if len(done) != len(self._nodes):
-            raise ValueError("Not all tasks executed; possible cycle or unresolved dependencies")
-
-        # Prepare execution statistics (always available after run)
-        total_nodes = len(self._nodes)
-        succeeded = sum(ok.values())
-        failed_total = sum(fl.values())
-        per_kind: Dict[str, Dict[str, int]] = {}
-        for k, tot in totals.items():
-            per_kind[k] = {"total": int(tot), "ok": int(ok.get(k, 0)), "fail": int(fl.get(k, 0))}
-        failures_list: List[Dict[str, str]] = []
-        for nid, reason in failed.items():
-            try:
-                k = self._nodes[nid].kind
-            except Exception:
-                k = "unknown"
-            failures_list.append({"id": nid, "kind": k, "reason": str(reason)})
+        final_event = self.progress.finalize()
+        snapshot = self.progress.snapshot()
+        self.reporter.finish(final_event)
         self.execution_stats = {
-            "total": int(total_nodes),
-            "succeeded": int(succeeded),
-            "failed": int(failed_total),
+            "total": snapshot.total,
+            "executed": len(self._nodes),
+            "succeeded": snapshot.succeeded,
+            "failed": snapshot.failed,
+            "blocked": snapshot.blocked,
+            "cached": snapshot.cached,
+            "skipped": snapshot.skipped,
+            "retried": snapshot.retried,
+            "elapsed_seconds": snapshot.elapsed_seconds,
+            "workers": self.max_workers,
             "per_kind": per_kind,
-            "failures": failures_list,
+            "failures": list(failures.values()),
+            "blocked_tasks": list(blocked.values()),
+            "progress": snapshot.as_dict(),
         }
-
-        # If there were failures, surface a concise error summary without stopping the whole run (only in debug show details)
-        if failed and self.debug:
-            kinds: Dict[str, int] = {}
-            for nid, reason in failed.items():
-                k = self._nodes[nid].kind
-                kinds[k] = kinds.get(k, 0) + 1
-                print(f"[Error] {k} {nid}: {reason}")
-
-        # Always print a one-line execution summary for user feedback
-        try:
-            print(f"Execution summary: total={total_nodes}, ok={succeeded}, failed={failed_total}")
-            if failed_total > 0:
-                # Print a few failure reasons for visibility even when not in debug mode
-                try:
-                    for f in (failures_list[:3] if isinstance(failures_list, list) else []):
-                        print(f"[Failure] {f.get('kind','?')} {f.get('id','?')}: {f.get('reason','')}")
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        if failures and self.raise_on_failure:
+            error = WorkflowExecutionError(list(failures.values()), list(blocked.values()))
+            if first_exception is not None:
+                raise error from first_exception
+            raise error
         return results
+
+
+__all__ = ["PlanningExecutor", "WorkflowExecutionError"]

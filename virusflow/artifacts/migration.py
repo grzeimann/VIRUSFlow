@@ -35,6 +35,20 @@ class MigrationResult:
     delete_payloads: bool
 
 
+def find_legacy_dense_artifacts(service: ArtifactService) -> list[dict]:
+    """Return active superseded dense records without mutating the registry."""
+
+    superseded = set(SUPERSEDED_STAGE_8_10_KINDS)
+    return [
+        row for row in service.adapter.list_all()
+        if str(row.get("state") or "active") == "active"
+        and (
+            (row.get("canonical_kind") or row.get("kind")) in superseded
+            or _is_legacy_dense_scatter(service, row)
+        )
+    ]
+
+
 def migrate_stages_8_10_storage(
     db_path: str,
     *,

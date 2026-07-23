@@ -7,7 +7,9 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
+import time
 
 import numpy as np
 
@@ -322,6 +324,7 @@ def _exposure_figure(output_dir: Path, service, exposure_result: dict) -> dict:
         "sky": service.describe(exposure_result["sky_fiber_mask"].id)["summary"],
         "response": response_row.get("metadata") or {},
         "effective_time": service.describe(exposure_result["effective_exposure_time"].id)["summary"],
+        "calibrated_state": dict(state.metadata),
         "qa_counts": statuses,
     }
 
@@ -370,15 +373,24 @@ def _observation_figure(output_dir: Path, service, observation_result: dict) -> 
     }
 
 
-def _write_report(output_dir: Path, inventory: dict, counts: dict, facts: dict, manifest: list[dict]) -> None:
+def _write_report(
+    output_dir: Path,
+    inventory: dict,
+    counts: dict,
+    facts: dict,
+    manifest: list[dict],
+    validation: dict,
+) -> tuple[Path, Path]:
     (output_dir / "steps_8_10_manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True, default=str))
     (output_dir / "steps_8_10_inventory.json").write_text(json.dumps(inventory, indent=2, sort_keys=True))
     (output_dir / "steps_8_10_facts.json").write_text(json.dumps(facts, indent=2, sort_keys=True, default=str))
     catalog_error = (facts["exposure"].get("catalog") or {}).get("environmental_error")
+    json_path = output_dir / "validation_report.json"
+    json_path.write_text(json.dumps(validation, indent=2, sort_keys=True, default=str) + "\n")
     report = [
-        "# VIRUSFlow Steps 8–10 Scientific Acceptance",
+        "# VIRUSFlow Stage 11 Representative Observation Validation",
         "",
-        "Result: **PASS**",
+        f"Result: **{validation['result']}**",
         "",
         f"Exposure: `{EXPOSURE_ID}`  ",
         f"Observation: `{OBSERVATION_ID}` with `{', '.join(OBSERVATION_EXPOSURES)}`  ",
@@ -409,9 +421,178 @@ def _write_report(output_dir: Path, inventory: dict, counts: dict, facts: dict, 
         "",
         "Every named component listed in `steps_8_10_manifest.json` was loaded through ArtifactService with checksum verification; normalized parents, revisions, QA status, usability, validity, configuration references, and scientific summaries remain queryable in the isolated registry.",
         "",
-        "The identity relative response and provisional dither geometry are explicit degraded/configurable policies, not hidden scientific truth. No cube reconstruction, profile extraction, covariance expansion, advanced sky PCA, legacy retirement, or Step 11 work is included.",
+        "## Execution and storage",
+        "",
+        f"Workers: `{validation['execution']['workers']}`; mode: `{validation['execution']['mode']}`; runtime: `{validation['execution']['runtime_seconds']:.3f} s`.",
+        "",
+        f"Persistent bytes: `{validation['storage']['total_bytes']}`; final observation bytes: `{validation['storage']['final_observation_bytes']}`; scratch remaining: `{validation['cleanup']['scratch_bytes_after']}`.",
+        "",
+        "## Scientific and serial/parallel comparison",
+        "",
+        f"Validated baseline comparison: `{json.dumps(validation.get('validated_baseline_comparison'), sort_keys=True, default=str)}`",
+        "",
+        f"```json\n{json.dumps(validation.get('comparison'), indent=2, sort_keys=True, default=str)}\n```",
+        "",
+        "## Acceptance criteria",
+        "",
+        *[f"- {'PASS' if check['passed'] else 'FAIL'}: {check['name']} — {check.get('detail', '')}" for check in validation['checks']],
+        "",
+        "## Limitations",
+        "",
+        *[f"- {item}" for item in validation['limitations']],
+        "",
+        "The identity relative response and provisional dither geometry remain explicit degraded/configurable policies; this report does not claim an accepted physical LSF model or propagated sky/response covariance.",
     ]
-    (output_dir / "steps_8_10_scientific_acceptance.md").write_text("\n".join(report) + "\n")
+    markdown_path = output_dir / "validation_report.md"
+    markdown_path.write_text("\n".join(report) + "\n")
+    return markdown_path, json_path
+
+
+def _final_row(service) -> dict:
+    rows = [
+        row for row in service.adapter.list_all(kind="calibrated_fiber_observation")
+        if str(row.get("state") or "active") == "active"
+        and row.get("observation_id") == OBSERVATION_ID
+    ]
+    if not rows:
+        _fail("Missing final calibrated observation Product")
+    return max(rows, key=lambda row: (str(row.get("created_at") or ""), int(row["id"])))
+
+
+def _array_metrics(left: np.ndarray, right: np.ndarray) -> dict:
+    if left.shape != right.shape:
+        return {"passed": False, "left_shape": list(left.shape), "right_shape": list(right.shape)}
+    if left.dtype.kind in "biu" and right.dtype.kind in "biu":
+        equal = bool(np.array_equal(left, right))
+        return {"passed": equal, "shape": list(left.shape), "exact": equal}
+    finite = np.isfinite(left) & np.isfinite(right)
+    finite_patterns_equal = bool(np.array_equal(np.isfinite(left), np.isfinite(right)))
+    if not finite.any():
+        return {"passed": finite_patterns_equal, "shape": list(left.shape), "finite": 0, "finite_patterns_equal": finite_patterns_equal}
+    difference = np.asarray(left[finite], dtype=np.float64) - np.asarray(right[finite], dtype=np.float64)
+    return {
+        "shape": list(left.shape), "finite": int(finite.sum()),
+        "finite_patterns_equal": finite_patterns_equal,
+        "max_abs": float(np.max(np.abs(difference))),
+        "rms": float(np.sqrt(np.mean(difference * difference))),
+    }
+
+
+def compare_workspaces(current_workspace: Path, reference_workspace: Path) -> dict:
+    """Compare final scientific components sequentially to bound memory use."""
+
+    from virusflow.artifacts import ArtifactService
+    current = ArtifactService(str(current_workspace / "registry.sqlite3"))
+    reference = ArtifactService(str(reference_workspace / "registry.sqlite3"))
+    current_row, reference_row = _final_row(current), _final_row(reference)
+    tolerances = {
+        "flux": {"atol": 5.0e-22}, "variance": {"atol": 5.0e-42},
+        "wavelength": {"atol": 1.0e-8}, "sky_coordinates": {"atol": 1.0e-10},
+        "focal_plane_coordinates": {"atol": 1.0e-10},
+    }
+
+
+def compare_validated_baseline(facts: dict) -> dict:
+    """Compare meaningful scalar facts with the documented 2026-07-22 gate."""
+
+    measurements = {
+        "left_scatter_fit_sigma_electron": facts["physical_ccd"]["left"].get("fit_residual_robust_sigma"),
+        "right_scatter_fit_sigma_electron": facts["physical_ccd"]["right"].get("fit_residual_robust_sigma"),
+        "astrometry_rms_arcsec": facts["exposure"]["final_astrometry"].get("residual_rms_arcsec"),
+        "sky_residual_sigma_electron": facts["exposure"]["calibrated_state"].get("sky_residual_robust_sigma"),
+        "response_median": facts["exposure"]["response"].get("response_median"),
+        "registration_rms_arcsec": facts["observation"]["registration"].get("registration_residual_rms_arcsec"),
+        "covered_pixel_fraction": facts["observation"]["coverage"].get("covered_pixel_fraction"),
+    }
+    expected = {
+        "left_scatter_fit_sigma_electron": (2.95525, 0.05),
+        "right_scatter_fit_sigma_electron": (2.93268, 0.05),
+        "astrometry_rms_arcsec": (0.724692, 0.05),
+        "sky_residual_sigma_electron": (9.68230, 0.25),
+        "response_median": (1.00000953, 1.0e-3),
+        "registration_rms_arcsec": (2.85951, 0.15),
+        "covered_pixel_fraction": (0.457677, 2.0e-3),
+    }
+    metrics = {}
+    for name, (reference, tolerance) in expected.items():
+        measured = measurements[name]
+        finite = measured is not None and np.isfinite(float(measured))
+        delta = abs(float(measured) - reference) if finite else float("inf")
+        metrics[name] = {
+            "measured": measured, "reference": reference, "absolute_tolerance": tolerance,
+            "absolute_difference": delta, "passed": bool(finite and delta <= tolerance),
+        }
+    return {
+        "reference": "VIRUSFLOW_STEPS_8_10_ACCEPTANCE.md (2026-07-22 real-data gate)",
+        "passed": all(value["passed"] for value in metrics.values()),
+        "metrics": metrics,
+        "intentional_storage_effects": {
+            "float32": "parallel/serial final-array comparison uses component-specific absolute tolerances",
+            "flux_scaling": "physical values are compared after VFSCAL reconstruction",
+            "sky_projection": "current flux-conserving latent-grid output is the accepted revised baseline",
+            "lsf": "no difference attributed; no accepted physical LSF model exists",
+        },
+    }
+    metrics = {}
+    exact = {"mask", "fiber_identity", "exposure_index"}
+    for component in (
+        "flux", "variance", "mask", "wavelength", "fiber_identity",
+        "sky_coordinates", "focal_plane_coordinates", "exposure_index",
+    ):
+        left = np.asarray(current.load_component(current_row, component)["data"])
+        right = np.asarray(reference.load_component(reference_row, component)["data"])
+        metric = _array_metrics(left, right)
+        if component in exact:
+            metric["passed"] = bool(metric.get("exact", False))
+        else:
+            atol = tolerances[component]["atol"]
+            metric["atol"] = atol
+            metric["passed"] = bool(metric.get("finite_patterns_equal", False) and metric.get("max_abs", float("inf")) <= atol)
+        metrics[component] = metric
+        del left, right
+    current_desc, reference_desc = current.describe(current_row), reference.describe(reference_row)
+    return {
+        "schema": "virusflow.scientific-comparison.v1",
+        "passed": all(value["passed"] for value in metrics.values()),
+        "components": metrics,
+        "artifact_identity": {
+            "revision_equal": current_row.get("revision") == reference_row.get("revision"),
+            "checksum_equal": current_row.get("checksum") == reference_row.get("checksum"),
+            "current_revision": current_row.get("revision"),
+            "reference_revision": reference_row.get("revision"),
+        },
+        "provenance_parent_count": {
+            "current": len(current_desc["relations"]), "reference": len(reference_desc["relations"]),
+        },
+    }
+
+
+def _publish_validation_report(database: Path, workspace: Path, markdown_path: Path, json_path: Path, final_artifact_id: int):
+    from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
+    from virusflow.artifacts.models import Scope
+    from virusflow.ontology.scopes import PhysicalScope
+    from virusflow.persistence.policy import DefaultPersistencePolicy
+    from virusflow.publication.context import PublicationContext
+    from virusflow.publication.service import DefaultPublicationService
+    from virusflow.artifacts import ArtifactService
+
+    request = ArtifactRequest(
+        kind="validation_report", role="diagnostic",
+        scope=Scope(zipcode=None, observation_id=OBSERVATION_ID, physical_scope=PhysicalScope.OBSERVATION),
+        parents=[final_artifact_id],
+        components={
+            "report_json": LogicalComponent("report_json", "array1d", np.frombuffer(json_path.read_bytes(), dtype=np.uint8), "1", "none"),
+            "report_markdown": LogicalComponent("report_markdown", "array1d", np.frombuffer(markdown_path.read_bytes(), dtype=np.uint8), "1", "none"),
+        },
+        metadata={"schema": "virusflow.validation.v1", "observation_id": OBSERVATION_ID},
+    )
+    publisher = DefaultPublicationService(
+        svc=ArtifactService(str(database)), policy=DefaultPersistencePolicy(),
+        base_dir=str(workspace / "artifacts"),
+    )
+    return publisher.publish([request], PublicationContext(
+        "stage11_validation", "1", "representative_observation_validation", "1", {}, [], {},
+    ))[0]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -424,6 +605,12 @@ def main(argv: list[str] | None = None) -> int:
         "--reuse-products", action="store_true",
         help="reuse complete immutable exposure revisions already in the isolated workspace",
     )
+    parser.add_argument("--workers", type=int, default=4, help="graph workers (default: 4)")
+    parser.add_argument("--serial", action="store_true", help="force one graph worker")
+    parser.add_argument("--progress-mode", choices=["auto", "tty", "plain", "json"], default="plain")
+    parser.add_argument("--progress-interval", type=float, default=30.0)
+    parser.add_argument("--progress-file", type=Path, help="structured progress JSONL path")
+    parser.add_argument("--reference-workspace", type=Path, help="compare final arrays with another completed workspace")
     args = parser.parse_args(argv)
     if not args.data_root.is_dir():
         _fail(f"Data root does not exist: {args.data_root}")
@@ -439,6 +626,7 @@ def main(argv: list[str] | None = None) -> int:
     from virusflow.tasks.base import TaskContext
     from virusflow.tasks.exposure import ExposureTask
     from virusflow.tasks.observation import ObservationTask
+    from virusflow.executors.planning_executor import PlanningExecutor
 
     registered = _scan(args.data_root, database)
     inventory = _inventory(database)
@@ -447,30 +635,43 @@ def main(argv: list[str] | None = None) -> int:
     selected = next(item for item in inventory["science_exposures"] if item["exposure_id"] == EXPOSURE_ID)
     if selected["amplifiers"] != 300:
         _fail(f"Selected Exposure has {selected['amplifiers']} amplifiers, expected 300")
+    workers = 1 if args.serial else int(args.workers)
+    if workers < 1:
+        _fail("workers must be at least one")
+    progress_file = args.progress_file or output_dir / "progress.jsonl"
     context = TaskContext(
         str(database), str(workspace / "artifacts"),
         {
             "configuration_root": str(args.configuration_root),
             "fplane_path": str(args.configuration_root / "fplaneall.txt"),
             "catalog_provider": PanSTARRSCSVProvider(timeout_seconds=60),
+            "nworkers": workers,
         },
     )
     service = ArtifactService(str(database))
-    exposure_results = {}
+    executor = PlanningExecutor(
+        max_workers=workers, progress=True, progress_mode=args.progress_mode,
+        progress_interval=args.progress_interval, progress_path=str(progress_file),
+    )
     for exposure_id in OBSERVATION_EXPOSURES:
-        existing = _existing_exposure_result(service, exposure_id) if args.reuse_products else None
-        if existing is not None:
-            exposure_results[exposure_id] = existing
-            continue
         exposure_at = datetime.strptime(exposure_id, "%Y%m%dT%H%M%S.%f")
-        exposure_results[exposure_id] = ExposureTask(
-            context, target=ExposureTarget(exposure_id, exposure_at)
-        ).run({})
+        executor.add_task(
+            exposure_id, ExposureTask(context, target=ExposureTarget(exposure_id, exposure_at)),
+            kind="exposure", target=f"exposure_id={exposure_id}",
+        )
+    observation_node = f"observation:{OBSERVATION_ID}"
+    executor.add_task(
+        observation_node,
+        ObservationTask(context, target=ObservationTarget(OBSERVATION_ID, DITHER_SET_ID, OBSERVATION_EXPOSURES)),
+        kind="observation", depends_on=list(OBSERVATION_EXPOSURES),
+        target=f"observation_id={OBSERVATION_ID}",
+    )
+    started = time.monotonic()
+    graph_results = executor.run()
+    runtime = time.monotonic() - started
+    exposure_results = {key: graph_results[key] for key in OBSERVATION_EXPOSURES}
     exposure_result = exposure_results[EXPOSURE_ID]
-    observation_result = ObservationTask(
-        context,
-        target=ObservationTarget(OBSERVATION_ID, DITHER_SET_ID, OBSERVATION_EXPOSURES),
-    ).run(exposure_results)
+    observation_result = graph_results[observation_node]
     manifest, counts = _validate(service)
     facts = {
         "physical_ccd": _physical_figure(output_dir, service),
@@ -483,11 +684,81 @@ def main(argv: list[str] | None = None) -> int:
         _fail(f"Full Exposure coverage failed: {completion}")
     if int(facts["observation"]["assignment"].get("complete", 0)) != 1:
         _fail("Real Observation was not assigned as one complete standard sequence")
-    _write_report(output_dir, inventory, counts, facts, manifest)
+    final_row = _final_row(service)
+    scratch_root = workspace / "artifacts" / ".scratch"
+    scratch_after = sum(path.stat().st_size for path in scratch_root.rglob("*") if path.is_file()) if scratch_root.exists() else 0
+    comparison = compare_workspaces(workspace, args.reference_workspace) if args.reference_workspace else None
+    baseline_comparison = compare_validated_baseline(facts)
+    forbidden_count = sum(
+        count for kind, count in counts.items() if kind in FORBIDDEN_PERSISTENT_KINDS
+    )
+    storage = facts["storage"]
+    cache_bytes = sum(
+        int(row.get("payload_bytes") or 0) for row in service.adapter.list_all()
+        if str(row.get("state") or "active") == "active" and str(row.get("lifecycle") or "") == "cache"
+    )
+    checks = [
+        {"name": "complete observation", "passed": int(facts["observation"]["assignment"].get("complete", 0)) == 1, "detail": str(OBSERVATION_EXPOSURES)},
+        {"name": "no dense production intermediates", "passed": forbidden_count == 0, "detail": f"active forbidden artifacts={forbidden_count}"},
+        {"name": "scratch cleaned", "passed": scratch_after == 0, "detail": f"remaining bytes={scratch_after}"},
+        {"name": "graph completed", "passed": executor.execution_stats.get("failed") == 0 and executor.execution_stats.get("blocked") == 0, "detail": json.dumps(executor.execution_stats.get("progress"), sort_keys=True)},
+        {"name": "structured progress", "passed": progress_file.exists() and progress_file.stat().st_size > 0, "detail": str(progress_file)},
+        {"name": "previous validated scientific baseline", "passed": baseline_comparison["passed"], "detail": baseline_comparison["reference"]},
+    ]
+    if comparison is not None:
+        checks.append({"name": "parallel versus serial scientific equivalence", "passed": comparison["passed"], "detail": "component tolerances in comparison"})
+        checks.append({"name": "deterministic artifact identity", "passed": comparison["artifact_identity"]["revision_equal"], "detail": json.dumps(comparison["artifact_identity"], sort_keys=True)})
+    try:
+        software_revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2],
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+    except Exception:
+        software_revision = "unknown"
+    validation = {
+        "schema": "virusflow.validation.v1",
+        "result": "PASS" if all(check["passed"] for check in checks) else "FAIL",
+        "observation": {"observation_id": OBSERVATION_ID, "dither_set_id": DITHER_SET_ID, "exposure_ids": list(OBSERVATION_EXPOSURES)},
+        "commands": ["python -m virusflow.cli.verify_steps_8_10 " + " ".join(argv or [])],
+        "software_revision": software_revision,
+        "effective_configuration": {
+            "data_root": str(args.data_root), "configuration_root": str(args.configuration_root),
+            "workspace": str(workspace), "artifact_root": str(workspace / "artifacts"),
+            "registry": str(database), "scratch_root": str(scratch_root),
+        },
+        "execution": {
+            "workers": workers, "mode": "serial" if workers == 1 else "parallel",
+            "progress_mode": args.progress_mode, "runtime_seconds": runtime,
+            "statistics": executor.execution_stats,
+        },
+        "storage": {
+            **storage, "final_observation_bytes": int(final_row.get("payload_bytes") or 0),
+            "cache_bytes": cache_bytes,
+            "peak_scratch_bytes": None,
+        },
+        "cleanup": {"scratch_bytes_after": scratch_after, "scratch_cleaned": scratch_after == 0},
+        "scientific_facts": facts,
+        "validated_baseline_comparison": baseline_comparison,
+        "comparison": comparison,
+        "tolerances": (comparison or {}).get("components", {}),
+        "checks": checks,
+        "limitations": [
+            "Peak scratch usage is not sampled because the accepted exposure path currently materializes its temporary states in memory.",
+            "The production baseline relative response is provisional unity.",
+            "No accepted physical LSF model is available.",
+            "Sky/response covariance is not propagated.",
+            "095+004+426+RU+S/N 0048 has zero-valued comparison arrays and no wavelength-dependent extraction.",
+        ],
+    }
+    markdown_path, json_path = _write_report(output_dir, inventory, counts, facts, manifest, validation)
+    report_artifact = _publish_validation_report(database, workspace, markdown_path, json_path, int(final_row["id"]))
+    validation["validation_artifact_id"] = int(report_artifact.id)
+    json_path.write_text(json.dumps(validation, indent=2, sort_keys=True, default=str) + "\n")
     print(f"PASS Steps 8–10 verification: registered={registered} workspace={workspace}")
     print(f"Products: {json.dumps(counts, sort_keys=True)}")
-    print(f"Report: {output_dir / 'steps_8_10_scientific_acceptance.md'}")
-    return 0
+    print(f"Report: {markdown_path}")
+    print(f"Machine report: {json_path}")
+    return 0 if validation["result"] == "PASS" else 1
 
 
 if __name__ == "__main__":

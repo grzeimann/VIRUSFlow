@@ -125,6 +125,11 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
         ("flux", "variance", "mask", "wavelength", "fiber_identity", "sky_coordinates", "focal_plane_coordinates", "exposure_index"),
         lifecycle=ArtifactLifecycle.CANONICAL,
     ),
+    "validation_report": _spec(
+        "validation_report", PhysicalScope.OBSERVATION, Unit.DIMENSIONLESS.value,
+        CoordinateConvention.NONE, ("report_json", "report_markdown"),
+        lifecycle=ArtifactLifecycle.CANONICAL,
+    ),
     "analysis_materialization": _spec(
         "analysis_materialization", PhysicalScope.OBSERVATION, None,
         CoordinateConvention.NONE, ("data",), lifecycle=ArtifactLifecycle.ANALYSIS,

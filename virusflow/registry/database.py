@@ -618,6 +618,29 @@ def list_exposures(db_path: str = DEFAULT_DB_PATH) -> List[str]:
         return [r[0] for r in rows]
 
 
+def observation_exposure_ids(
+    observation_id: str,
+    *,
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[str]:
+    """Resolve science-exposure membership from scanned observation metadata."""
+
+    import re
+
+    match = re.fullmatch(r"(\d{8})-OBSID(\d+)", str(observation_id), re.IGNORECASE)
+    if match is None:
+        raise ValueError("observation id must use YYYYMMDD-OBSID<number>")
+    date_token, expnum = match.group(1), int(match.group(2))
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT e.id FROM exposures e JOIN exposure_details d ON d.exposure_id=e.id "
+            "WHERE d.expnum=? AND e.id LIKE ? AND lower(e.frame_type)='sci' "
+            "ORDER BY e.when_utc,e.id",
+            (expnum, f"{date_token}%"),
+        ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
 def list_raw_files(exposure_id: Optional[str] = None, db_path: str = DEFAULT_DB_PATH) -> List[RawFileId]:
     with connect(db_path) as conn:
         if exposure_id:

@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Optional, List
+from typing import Any, Optional, List
 
 import yaml
 
@@ -412,6 +412,29 @@ def resolve_nworkers(*, cli_value=None, serial: bool = False, configured_value=N
         raise ValueError("nworkers must be at least one; use --serial for serial execution")
     return value
 
+
+def resolve_progress_config(args: argparse.Namespace, configured=None) -> dict[str, Any]:
+    """Resolve CLI overrides over planning configuration and built-in defaults."""
+
+    enabled = getattr(args, "progress", None)
+    if enabled is None:
+        enabled = getattr(configured, "progress", True)
+    mode = getattr(args, "progress_mode", None) or getattr(configured, "progress_mode", "auto")
+    interval = getattr(args, "progress_interval", None)
+    if interval is None:
+        interval = getattr(configured, "progress_interval", 30.0)
+    path = getattr(args, "progress_file", None) or getattr(configured, "progress_path", None)
+    retries = getattr(args, "max_retries", None)
+    if retries is None:
+        retries = getattr(configured, "max_retries", 0)
+    return {
+        "progress": bool(enabled),
+        "progress_mode": str(mode),
+        "progress_interval": float(interval),
+        "progress_path": str(path) if path else None,
+        "max_retries": int(retries),
+    }
+
 def _run_planned(args: argparse.Namespace) -> None:
     from ..core.pathutils import ensure_dir
     from ..planning import (
@@ -570,10 +593,23 @@ def _run_planned(args: argparse.Namespace) -> None:
     )
     # Submit to PlanningExecutor (planning-native; no TaskGraph dependency)
     from ..executors.planning_executor import PlanningExecutor as _PlanningExecutor
-    execp = _PlanningExecutor(max_workers=nworkers, debug=bool(args.debug_timing))
+    progress_cfg = resolve_progress_config(args, cfg_obj)
+    execp = _PlanningExecutor(
+        max_workers=nworkers, debug=bool(args.debug_timing), **progress_cfg
+    )
     # Add tasks preserving dependencies
     for st in scheduled:
         execp.add_task(st.id, st.task, kind=st.kind, depends_on=st.depends_on)
+    for index, target in enumerate(report.existing):
+        execp.add_observed(
+            f"cached:{index}:{getattr(target, 'kind', 'target')}",
+            kind=getattr(target, "kind", "target"), state="cached", target=repr(target),
+        )
+    for index, target in enumerate(report.skipped):
+        execp.add_observed(
+            f"skipped:{index}:{getattr(target, 'kind', 'target')}",
+            kind=getattr(target, "kind", "target"), state="skipped", target=repr(target),
+        )
     ensure_dir(args.workdir)
     execp.run()
     # Print executor summary if available
@@ -606,190 +642,311 @@ def cmd_run(args: argparse.Namespace) -> None:
     _run_planned(args)
 
 
-def main(argv: Optional[list[str]] = None) -> None:
-    p = argparse.ArgumentParser(prog="virusflow", description="VIRUSFlow CLI")
+def _json_arg(value: str) -> dict:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("value must be a JSON object")
+    return parsed
 
-    # Define a global/parent parser so --db can appear before or after subcommands
-    global_opts = argparse.ArgumentParser(add_help=False)
-    global_opts.add_argument("--db", default=str(Path.cwd() / "virusflow.sqlite3"), help="Path to registry DB")
 
+def _science_context(args: argparse.Namespace):
+    from ..tasks.base import TaskContext
+
+    root = Path(getattr(args, "configuration_root", None) or Path.cwd()).resolve()
+    cfg = {
+        "configuration_root": str(root),
+        "fplane_path": str(root / "fplaneall.txt"),
+        "preserve_failed_scratch": bool(getattr(args, "preserve_failed_scratch", False)),
+    }
+    return TaskContext(str(args.db), str(Path(args.workdir).resolve()), cfg)
+
+
+def _science_executor(args: argparse.Namespace):
+    from ..executors.planning_executor import PlanningExecutor
+
+    workers = resolve_nworkers(
+        cli_value=getattr(args, "nworkers", None), serial=bool(getattr(args, "serial", False))
+    )
+    return PlanningExecutor(max_workers=workers, **resolve_progress_config(args)), workers
+
+
+def _result_manifest(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _result_manifest(child) for key, child in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_result_manifest(child) for child in value]
+    if hasattr(value, "id"):
+        return {"artifact_id": int(value.id), "kind": getattr(value, "kind", None)}
+    if hasattr(value, "exposure_id"):
+        return {"run_local_state": type(value).__name__, "exposure_id": value.exposure_id}
+    return str(value)
+
+
+def cmd_run_exposure(args: argparse.Namespace) -> None:
+    from datetime import datetime
+    from ..planning.targets import ExposureTarget
+    from ..tasks.exposure import ExposureTask
+
+    if not Path(args.db).exists():
+        raise SystemExit(f"Registry DB not found: {args.db}; run 'virusflow init' and 'virusflow scan' first")
+    try:
+        at = datetime.strptime(args.exposure_id, "%Y%m%dT%H%M%S.%f")
+    except ValueError as exc:
+        raise SystemExit("--exposure-id must use YYYYMMDDTHHMMSS.s") from exc
+    executor, workers = _science_executor(args)
+    executor.add_task(
+        args.exposure_id, ExposureTask(_science_context(args), target=ExposureTarget(args.exposure_id, at)),
+        kind="exposure", target=f"exposure_id={args.exposure_id}",
+    )
+    result = executor.run()[args.exposure_id]
+    print(yaml.safe_dump({"workers": workers, "result": _result_manifest(result)}, sort_keys=False))
+
+
+def cmd_run_observation(args: argparse.Namespace) -> None:
+    from datetime import datetime
+    from ..planning.targets import ExposureTarget, ObservationTarget
+    from ..registry.database import observation_exposure_ids
+    from ..tasks.exposure import ExposureTask
+    from ..tasks.observation import ObservationTask
+
+    explicit = tuple(args.exposure_id or ())
+    exposure_ids = explicit or tuple(observation_exposure_ids(args.observation_id, db_path=args.db))
+    if not exposure_ids:
+        raise SystemExit(f"No scanned science exposures found for {args.observation_id}")
+    dither_set_id = args.dither_set_id or f"{args.observation_id}-DITHER"
+    context = _science_context(args)
+    executor, workers = _science_executor(args)
+    for exposure_id in exposure_ids:
+        try:
+            at = datetime.strptime(exposure_id, "%Y%m%dT%H%M%S.%f")
+        except ValueError as exc:
+            raise SystemExit(f"invalid exposure identity: {exposure_id}") from exc
+        executor.add_task(
+            exposure_id, ExposureTask(context, target=ExposureTarget(exposure_id, at)),
+            kind="exposure", target=f"exposure_id={exposure_id}",
+        )
+    node_id = f"observation:{args.observation_id}"
+    executor.add_task(
+        node_id,
+        ObservationTask(context, target=ObservationTarget(args.observation_id, dither_set_id, tuple(exposure_ids))),
+        kind="observation", depends_on=list(exposure_ids), target=f"observation_id={args.observation_id}",
+    )
+    result = executor.run()[node_id]
+    print(yaml.safe_dump({
+        "workers": workers, "observation_id": args.observation_id,
+        "exposure_ids": list(exposure_ids), "result": _result_manifest(result),
+    }, sort_keys=False))
+
+
+def cmd_artifact_show(args: argparse.Namespace) -> None:
+    from ..artifacts import ArtifactService
+    print(yaml.safe_dump(ArtifactService(args.db).describe(args.artifact_id), sort_keys=False))
+
+
+def cmd_models(args: argparse.Namespace) -> None:
+    from ..artifacts import ArtifactService
+    from ..ontology.lifecycle import ArtifactLifecycle
+    service = ArtifactService(args.db)
+    rows = [
+        row for row in service.adapter.list_all(kind=args.kind)
+        if str(row.get("lifecycle") or "") == ArtifactLifecycle.MODEL.value
+        or str(row.get("canonical_kind") or row.get("kind") or "").startswith("candidate_")
+    ]
+    if args.state:
+        rows = [row for row in rows if str(row.get("state") or "active") == args.state]
+    print(yaml.safe_dump([service.describe(row) for row in rows[: args.limit]], sort_keys=False))
+
+
+def cmd_study_list(args: argparse.Namespace) -> None:
+    from ..registry import database as _db
+    with _db.connect(args.db) as connection:
+        rows = [dict(row) for row in connection.execute(
+            "SELECT study_id,scientific_question,retention_policy,expected_bytes,materialized_bytes,state,created_at,completed_at FROM analysis_studies ORDER BY created_at"
+        ).fetchall()]
+    print(yaml.safe_dump(rows, sort_keys=False))
+
+
+def cmd_study_show(args: argparse.Namespace) -> None:
+    from ..analytics.materialization import AnalysisStudyService
+    print(yaml.safe_dump(AnalysisStudyService(args.db, args.output_dir).get(args.study_id).__dict__, sort_keys=False))
+
+
+def cmd_study_create(args: argparse.Namespace) -> None:
+    from ..analytics.materialization import AnalysisStudyService
+    record = AnalysisStudyService(args.db, args.output_dir).create(
+        scientific_question=args.question, selection=args.selection,
+        selected_observations=args.observation, model_versions=args.model_versions,
+        calibration_versions=args.calibration_versions, software_version=args.software_version,
+        algorithm_versions=args.algorithm_versions, intermediate_kinds=args.intermediate_kind,
+        retention_policy=args.retention, expected_bytes=args.expected_bytes, study_id=args.study_id,
+    )
+    print(yaml.safe_dump(record.__dict__, sort_keys=False))
+
+
+def cmd_study_complete(args: argparse.Namespace) -> None:
+    from ..analytics.materialization import AnalysisStudyService
+    AnalysisStudyService(args.db, args.output_dir).complete(args.study_id, summary=args.summary)
+    print(f"Completed analysis study {args.study_id}")
+
+
+def cmd_study_validate(args: argparse.Namespace) -> None:
+    from ..analytics.materialization import AnalysisStudyService
+    AnalysisStudyService(args.db, args.output_dir).record_validation(
+        args.study_id, candidate_artifact_id=args.candidate_artifact_id,
+        metrics=args.metrics, comparison=args.comparison, decision=args.decision,
+    )
+    print(f"Recorded validation for candidate {args.candidate_artifact_id}; no promotion was performed")
+
+
+def cmd_cleanup(args: argparse.Namespace) -> None:
+    from ..storage.cleanup import cleanup_cache, cleanup_legacy, cleanup_scratch
+    if args.cleanup_cmd == "scratch":
+        report = cleanup_scratch(args.workdir, execute=args.execute)
+    elif args.cleanup_cmd == "cache":
+        report = cleanup_cache(args.db, execute=args.execute)
+    else:
+        report = cleanup_legacy(
+            args.db, deactivate=args.deactivate, delete_payloads=args.delete_payloads,
+            validation_succeeded=args.validation_succeeded,
+        )
+    print(yaml.safe_dump(report.as_dict(), sort_keys=False))
+
+
+def cmd_config_show(args: argparse.Namespace) -> None:
+    from ..planning import load_planning_config
+    configured = load_planning_config(args.planning_yaml) if args.planning_yaml else None
+    payload = {
+        "db": str(Path(args.db).resolve()),
+        "workdir": str(Path(args.workdir).resolve()),
+        "workers": resolve_nworkers(cli_value=args.nworkers, serial=args.serial, configured_value=getattr(configured, "nworkers", None)),
+        **resolve_progress_config(args, configured),
+    }
+    print(yaml.safe_dump(payload, sort_keys=False))
+
+
+def cmd_validate_observation(args: argparse.Namespace) -> None:
+    from .verify_steps_8_10 import main as verify_main
+    workers = resolve_nworkers(cli_value=args.nworkers, serial=args.serial)
+    mode = args.progress_mode or "plain"
+    forwarded = [
+        "--data-root", args.data_root, "--workspace", args.workspace,
+        "--output-dir", args.output_dir, "--workers", str(workers),
+        "--progress-mode", mode,
+    ]
+    if args.serial:
+        forwarded.append("--serial")
+    if args.progress_file:
+        forwarded.extend(["--progress-file", args.progress_file])
+    if args.progress_interval is not None:
+        forwarded.extend(["--progress-interval", str(args.progress_interval)])
+    if args.reference_workspace:
+        forwarded.extend(["--reference-workspace", args.reference_workspace])
+    raise SystemExit(verify_main(forwarded))
+
+
+def _add_db(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--db", default=os.environ.get("VIRUSFLOW_DB", str(Path.cwd() / "virusflow.sqlite3")),
+        help="Registry SQLite path (default: VIRUSFLOW_DB or ./virusflow.sqlite3)",
+    )
+
+
+def _add_progress(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--nworkers", "--workers", dest="nworkers", type=int, help="Task workers (default: 4)")
+    parser.add_argument("--serial", action="store_true", help="Force one worker")
+    toggle = parser.add_mutually_exclusive_group()
+    toggle.add_argument("--progress", dest="progress", action="store_true", default=None)
+    toggle.add_argument("--no-progress", dest="progress", action="store_false")
+    parser.add_argument("--progress-mode", choices=["auto", "tty", "plain", "json"], default=None)
+    parser.add_argument("--progress-interval", type=float, default=None, help="Batch heartbeat seconds")
+    parser.add_argument("--progress-file", help="Append structured JSONL progress")
+    parser.add_argument("--max-retries", type=int, default=None)
+
+
+def _add_science_run(parser: argparse.ArgumentParser) -> None:
+    _add_db(parser)
+    _add_progress(parser)
+    parser.add_argument("--workdir", default=os.environ.get("VIRUSFLOW_WORKDIR", str(Path.cwd() / "work")))
+    parser.add_argument("--configuration-root", default=os.environ.get("VIRUSFLOW_CONFIG_ROOT", str(Path.cwd())))
+    parser.add_argument("--preserve-failed-scratch", action="store_true")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="virusflow", description="Artifact-driven VIRUS reduction and validation")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sp = sub.add_parser("init", help="Initialize registry database", parents=[global_opts])
-    sp.set_defaults(func=cmd_init)
+    sp = sub.add_parser("init", help="Initialize a registry")
+    _add_db(sp); sp.set_defaults(func=cmd_init)
+    sp = sub.add_parser("scan", help="Register raw FITS inputs")
+    _add_db(sp); sp.add_argument("root"); sp.set_defaults(func=cmd_scan)
+    sp = sub.add_parser("exposures", help="List scanned exposures")
+    _add_db(sp); sp.add_argument("--start-date"); sp.add_argument("--end-date"); sp.add_argument("--limit", type=int); sp.add_argument("--csv", action="store_true"); sp.set_defaults(func=cmd_exposures)
+    sp = sub.add_parser("tasks", help="List registered task implementations"); sp.set_defaults(func=cmd_tasks)
 
-    sp = sub.add_parser("scan", help="Scan a root directory for raw FITS files", parents=[global_opts])
-    sp.add_argument("root", help="Root path to scan")
-    sp.set_defaults(func=cmd_scan)
+    run = sub.add_parser("run", help="Execute the task graph").add_subparsers(dest="run_cmd", required=True)
+    cal = run.add_parser("calibrations", help="Plan and execute calibration products")
+    _add_science_run(cal)
+    cal.add_argument("--planning-yaml"); cal.add_argument("--plan-only", action="store_true")
+    cal.add_argument("--start-date", dest="plan_start_date"); cal.add_argument("--end-date", dest="plan_end_date")
+    cal.add_argument("--only-zipcodes"); cal.add_argument("--force-replan", action="store_true")
+    cal.add_argument("--qa-out-dir"); cal.add_argument("--qa-yaml"); cal.add_argument("--debug-timing", action="store_true"); cal.add_argument("--debug-inputs", action="store_true")
+    cal.add_argument("--use-mapping-helper", action="store_true"); cal.add_argument("--mapping-tolerance-days", type=int)
+    cal.set_defaults(func=cmd_run)
+    exp = run.add_parser("exposure", help="Reduce one atomic science exposure")
+    _add_science_run(exp); exp.add_argument("--exposure-id", required=True); exp.set_defaults(func=cmd_run_exposure)
+    obs = run.add_parser("observation", help="Reduce registry-derived observation membership")
+    _add_science_run(obs); obs.add_argument("--observation-id", required=True); obs.add_argument("--dither-set-id"); obs.add_argument("--exposure-id", action="append", help="Explicit member override (repeatable)"); obs.set_defaults(func=cmd_run_observation)
 
-    sp = sub.add_parser("tasks", help="List available tasks and versions")
-    sp.set_defaults(func=cmd_tasks)
+    artifact = sub.add_parser("artifact", help="Inspect artifacts and provenance").add_subparsers(dest="artifact_cmd", required=True)
+    al = artifact.add_parser("list"); _add_db(al)
+    al.add_argument("--kind"); al.add_argument("--zipcode"); al.add_argument("--at"); al.add_argument("--limit", type=int); al.add_argument("--csv", action="store_true"); al.add_argument("--summary", action="store_true"); al.add_argument("--best", action="store_true"); al.add_argument("--policy", choices=["latest_valid", "latest"]); al.add_argument("--status"); al.set_defaults(func=cmd_artifacts)
+    ash = artifact.add_parser("show"); _add_db(ash); ash.add_argument("artifact_id", type=int); ash.set_defaults(func=cmd_artifact_show)
 
-    # artifacts listing
-    sp = sub.add_parser("artifacts", help="List or select artifacts in the registry", parents=[global_opts])
-    sp.add_argument("--kind", help="Artifact kind to filter (e.g., master_bias, master_dark)")
-    sp.add_argument("--zipcode", help="ZipCode key to filter (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
-    sp.add_argument("--at", help="Only artifacts valid at this time (YYYYMMDD or ISO datetime)")
-    sp.add_argument("--limit", type=int, help="Limit number of rows")
-    sp.add_argument("--csv", action="store_true", help="Output as CSV instead of a fixed-width table")
-    sp.add_argument("--summary", action="store_true", help="Include sidecar JSON summary if available (no FITS I/O)")
-    sp.add_argument("--best", action="store_true", help="Select best artifact per policy instead of listing (requires --kind and --zipcode)")
-    sp.add_argument("--policy", choices=["latest_valid", "latest"], help="Selection policy for --best (default: latest_valid)")
-    sp.add_argument("--status", help="Filter by QA status (e.g., pass, fail)")
-    sp.set_defaults(func=cmd_artifacts)
+    model = sub.add_parser("model", help="Inspect accepted and candidate models").add_subparsers(dest="model_cmd", required=True)
+    ml = model.add_parser("list"); _add_db(ml); ml.add_argument("--kind"); ml.add_argument("--state"); ml.add_argument("--limit", type=int, default=100); ml.set_defaults(func=cmd_models)
+    ms = model.add_parser("show"); _add_db(ms); ms.add_argument("artifact_id", type=int); ms.set_defaults(func=cmd_artifact_show)
 
-    storage_p = sub.add_parser("storage", help="Report or migrate artifact storage", parents=[global_opts])
-    storage_sub = storage_p.add_subparsers(dest="storage_cmd", required=True)
-    storage_report = storage_sub.add_parser("report", parents=[global_opts])
-    storage_report.add_argument("--largest", type=int, default=10)
-    storage_report.set_defaults(func=cmd_storage_report)
-    storage_migrate = storage_sub.add_parser("migrate-stages-8-10", parents=[global_opts])
-    storage_migrate.add_argument(
-        "--delete-payloads", action="store_true",
-        help="Delete invalidated dense payloads after replacement validation",
-    )
-    storage_migrate.set_defaults(func=cmd_storage_migrate)
-    storage_cleanup = storage_sub.add_parser("cleanup-scratch", parents=[global_opts])
-    storage_cleanup.add_argument("--workdir", required=True)
-    storage_cleanup.set_defaults(func=cmd_scratch_cleanup)
+    storage = sub.add_parser("storage", help="Report persistent storage").add_subparsers(dest="storage_cmd", required=True)
+    sr = storage.add_parser("report"); _add_db(sr); sr.add_argument("--largest", type=int, default=10); sr.set_defaults(func=cmd_storage_report)
+    cleanup = sub.add_parser("cleanup", help="Inventory by default; mutate only with explicit flags").add_subparsers(dest="cleanup_cmd", required=True)
+    cs = cleanup.add_parser("scratch"); cs.add_argument("--workdir", required=True); cs.add_argument("--execute", action="store_true"); cs.set_defaults(func=cmd_cleanup)
+    cc = cleanup.add_parser("cache"); _add_db(cc); cc.add_argument("--execute", action="store_true"); cc.set_defaults(func=cmd_cleanup)
+    cl = cleanup.add_parser("legacy"); _add_db(cl); cl.add_argument("--deactivate", action="store_true"); cl.add_argument("--delete-payloads", action="store_true"); cl.add_argument("--validation-succeeded", action="store_true"); cl.set_defaults(func=cmd_cleanup)
 
-    # exposures table
-    sp = sub.add_parser("exposures", help="Show a quick readable table from exposures in the registry", parents=[global_opts])
-    sp.add_argument("--start-date", help="Filter start date YYYYMMDD")
-    sp.add_argument("--end-date", help="Filter end date YYYYMMDD")
-    sp.add_argument("--limit", type=int, help="Limit number of rows")
-    sp.add_argument("--csv", action="store_true", help="Output as CSV instead of a fixed-width table")
-    sp.set_defaults(func=cmd_exposures)
+    qa = sub.add_parser("qa", help="Inspect and evaluate QA").add_subparsers(dest="qa_cmd", required=True)
+    ql = qa.add_parser("list"); _add_db(ql); ql.add_argument("--kind"); ql.add_argument("--zipcode"); ql.add_argument("--status"); ql.add_argument("--limit", type=int); ql.add_argument("--csv", action="store_true"); ql.set_defaults(func=cmd_qa_list)
+    qs = qa.add_parser("show"); _add_db(qs); qs.add_argument("--artifact-id", required=True); qs.set_defaults(func=cmd_qa_show)
+    qe = qa.add_parser("evaluate"); _add_db(qe); qe.add_argument("--artifact-id", required=True); qe.add_argument("--kind", required=True); qe.add_argument("--meta"); qe.add_argument("--from-summary", action="store_true"); qe.set_defaults(func=cmd_qa_eval)
 
-    # QA group with subcommands
-    qa_p = sub.add_parser("qa", help="Manage/view artifact QA", parents=[global_opts])
-    qa_sub = qa_p.add_subparsers(dest="qa_cmd", required=True)
-    qas = qa_sub.add_parser("set", help="Set QA status/metrics", parents=[global_opts])
-    qas.add_argument("--artifact-id", required=True, help="Artifact id")
-    qas.add_argument("--status", required=True, help="QA status (e.g., pass, fail)")
-    qas.add_argument("--metrics", help="JSON dict of QA metrics")
-    qas.set_defaults(func=cmd_qa_set)
-    qash = qa_sub.add_parser("show", help="Show QA for an artifact", parents=[global_opts])
-    qash.add_argument("--artifact-id", required=True, help="Artifact id")
-    qash.set_defaults(func=cmd_qa_show)
-    qal = qa_sub.add_parser("list", help="List artifacts with optional QA filter", parents=[global_opts])
-    qal.add_argument("--kind", help="Filter by artifact kind")
-    qal.add_argument("--zipcode", help="Filter by zipcode key")
-    qal.add_argument("--status", help="Filter by QA status (e.g., pass, fail)")
-    qal.add_argument("--limit", type=int, help="Limit number of rows")
-    qal.add_argument("--csv", action="store_true", help="Output as CSV")
-    qal.set_defaults(func=cmd_qa_list)
-    qae = qa_sub.add_parser("eval", help="Evaluate QA for a specific artifact", parents=[global_opts])
-    qae.add_argument("--artifact-id", required=True, help="Artifact id")
-    qae.add_argument("--kind", required=True, help="Artifact kind (e.g., trace, wave)")
-    qae.add_argument("--meta", help="JSON dict of algo meta or summary to feed QA engine")
-    qae.add_argument("--from-summary", action="store_true", help="Use ArtifactService.describe(summary) as meta if --meta not provided")
-    qae.set_defaults(func=cmd_qa_eval)
-    qab = qa_sub.add_parser("backfill", help="Re-evaluate QA for many artifacts", parents=[global_opts])
-    qab.add_argument("--kind", help="Only re-evaluate this kind (optional)")
-    qab.add_argument("--since", help="Only artifacts created since YYYYMMDD (optional)")
-    qab.add_argument("--limit", type=int, help="Limit number of artifacts (optional)")
-    qab.add_argument("--from-summary", action="store_true", help="Use ArtifactService.describe(summary) as meta for each artifact")
-    qab.add_argument("--dry-run", action="store_true", help="Do not write results, just show planned actions")
-    qab.set_defaults(func=cmd_qa_backfill)
+    study = sub.add_parser("study", help="Manage bounded analysis studies").add_subparsers(dest="study_cmd", required=True)
+    sl = study.add_parser("list"); _add_db(sl); sl.set_defaults(func=cmd_study_list)
+    ss = study.add_parser("show"); _add_db(ss); ss.add_argument("study_id"); ss.add_argument("--output-dir", default="analysis"); ss.set_defaults(func=cmd_study_show)
+    sc = study.add_parser("create"); _add_db(sc); sc.add_argument("--study-id"); sc.add_argument("--question", required=True); sc.add_argument("--selection", type=_json_arg, required=True); sc.add_argument("--observation", action="append", default=[]); sc.add_argument("--model-versions", type=_json_arg, default={}); sc.add_argument("--calibration-versions", type=_json_arg, default={}); sc.add_argument("--software-version", default="unknown"); sc.add_argument("--algorithm-versions", type=_json_arg, default={}); sc.add_argument("--intermediate-kind", action="append", required=True); sc.add_argument("--retention", choices=["none", "selected", "outliers", "all", "until_study_completion", "permanent"], default="selected"); sc.add_argument("--expected-bytes", type=int, required=True); sc.add_argument("--output-dir", default="analysis"); sc.set_defaults(func=cmd_study_create)
+    sx = study.add_parser("complete"); _add_db(sx); sx.add_argument("study_id"); sx.add_argument("--summary", type=_json_arg, required=True); sx.add_argument("--output-dir", default="analysis"); sx.set_defaults(func=cmd_study_complete)
+    sv = study.add_parser("validate"); _add_db(sv); sv.add_argument("study_id"); sv.add_argument("--candidate-artifact-id", type=int, required=True); sv.add_argument("--metrics", type=_json_arg, required=True); sv.add_argument("--comparison", type=_json_arg, required=True); sv.add_argument("--decision", required=True); sv.add_argument("--output-dir", default="analysis"); sv.set_defaults(func=cmd_study_validate)
 
-    # analyze (analytics)
-    sp_an = sub.add_parser("analyze", help="Run analytics studies on existing artifacts", parents=[global_opts])
-    sp_an.add_argument("--study", required=True, choices=["trace", "wavelength", "calibration", "instrument_health", "trending", "reports"], help="Analytics study to run")
-    sp_an.add_argument("--zipcode", help="ZipCode key filter (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
-    sp_an.add_argument("--limit", type=int, help="Limit number of source artifacts")
-    sp_an.add_argument("--out", required=True, help="Output root directory for generated files")
-    # Common toggles used by specific studies
-    sp_an.add_argument("--no-preview", action="store_true", help="Do not generate preview image (trace/wavelength)")
-    sp_an.add_argument("--no-row-dispersion", action="store_true", help="Do not generate per-row dispersion plot (trace study)")
-    sp_an.add_argument("--no-value-hist", action="store_true", help="Do not generate wavelength value histogram (wavelength study)")
-    # Calibration study toggles
-    sp_an.add_argument("--kinds", help="Calibration kinds to analyze (comma-separated: master_flat,master_cmp)")
-    sp_an.add_argument("--no-p95-hist", action="store_true", help="Do not generate per-artifact p95 histogram (calibration study)")
-    sp_an.add_argument("--no-badfrac-trend", action="store_true", help="Do not generate BADFRAC trend (master_flat only)")
-    sp_an.add_argument("--no-zero-map", action="store_true", help="Do not generate zero-map thumbnail (master_cmp only)")
-    # Instrument health toggles
-    sp_an.add_argument("--no-throughput-trend", action="store_true", help="Do not generate fiber throughput trend (instrument_health study)")
-    sp_an.add_argument("--no-bad-fiber-map", action="store_true", help="Do not generate bad fiber heuristic map (instrument_health study)")
-    # Trending study parameters
-    sp_an.add_argument("--kind", dest="trend_kind", help="Artifact kind to trend QA metrics for (e.g., trace, wave)")
-    sp_an.add_argument("--metric", help="QA metric name to trend (e.g., rms_median)")
-    sp_an.add_argument("--since", help="Only include artifacts created since YYYYMMDD (optional)")
-    sp_an.add_argument("--until", help="Only include artifacts created until YYYYMMDD (optional)")
-    # Reports study parameters
-    sp_an.add_argument("--report-kind", choices=["daily_calib", "weekly_health"], help="Report kind for 'reports' study")
-    sp_an.set_defaults(func=cmd_analyze)
+    analyze = sub.add_parser("analyze", help="Run read-only production analytics"); _add_db(analyze)
+    analyze.add_argument("--study", required=True, choices=["trace", "wavelength", "calibration", "instrument_health", "trending", "reports"]); analyze.add_argument("--zipcode"); analyze.add_argument("--limit", type=int); analyze.add_argument("--out", required=True)
+    for flag in ("no-preview", "no-row-dispersion", "no-value-hist", "no-p95-hist", "no-badfrac-trend", "no-zero-map", "no-throughput-trend", "no-bad-fiber-map"): analyze.add_argument(f"--{flag}", action="store_true")
+    analyze.add_argument("--kinds"); analyze.add_argument("--kind", dest="trend_kind"); analyze.add_argument("--metric"); analyze.add_argument("--since"); analyze.add_argument("--until"); analyze.add_argument("--report-kind", choices=["daily_calib", "weekly_health"]); analyze.set_defaults(func=cmd_analyze)
 
-    # debug-raw helper
-    sp_dbg = sub.add_parser("debug-raw", help="Probe raw inputs for a zipcode and frame type", parents=[global_opts])
-    sp_dbg.add_argument("--zipcode", required=True, help="ZipCode key (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
-    sp_dbg.add_argument("--frame-type", required=True, help="Frame type (e.g., zro, drk, flt)")
-    sp_dbg.add_argument("--start-date", help="Filter start date YYYYMMDD")
-    sp_dbg.add_argument("--end-date", help="Filter end date YYYYMMDD")
-    sp_dbg.add_argument("--limit", type=int, help="Show up to N sample rows (default 10)")
-    sp_dbg.add_argument("--verify", action="store_true", help="For tar members, verify FITS header readability via tarfile+astropy")
-    sp_dbg.add_argument("--probe", action="store_true", help="Attempt a single algorithms.ccd.reduce_raw_amplifier_frame on the first candidate and report")
-    sp_dbg.set_defaults(func=cmd_debug_raw)
+    config = sub.add_parser("config", help="Show effective execution configuration").add_subparsers(dest="config_cmd", required=True)
+    show = config.add_parser("show"); _add_science_run(show); show.add_argument("--planning-yaml"); show.set_defaults(func=cmd_config_show)
+    validate = sub.add_parser("validate", help="Run representative scientific validation").add_subparsers(dest="validate_cmd", required=True)
+    vo = validate.add_parser("observation"); vo.add_argument("--data-root", required=True); vo.add_argument("--workspace", required=True); vo.add_argument("--output-dir", required=True); vo.add_argument("--reference-workspace"); _add_progress(vo); vo.set_defaults(func=cmd_validate_observation)
+    return p
 
-    # plan group with subcommands
-    plan_p = sub.add_parser("plan", help="Create a YAML plan from scientific intent")
-    plan_sub = plan_p.add_subparsers(dest="plan_cmd", required=True)
 
-    # plan calibrations
-    spc = plan_sub.add_parser("calibrations", help="Plan calibration tasks for a date window", parents=[global_opts])
-    spc.add_argument("--start-date", required=True, help="Start date YYYYMMDD")
-    spc.add_argument("--end-date", required=True, help="End date YYYYMMDD")
-    spc.add_argument("--bias-version", default=None, help="Bias task version, default=latest")
-    spc.add_argument("--dark-version", default=None, help="Dark task version, default=latest")
-    spc.add_argument("--flat-version", default=None, help="Flat task version, default=latest")
-    spc.add_argument("--cmp-version", default=None, help="Cmp task version, default=latest")
-    spc.add_argument("--twi-version", default=None, help="Twi task version, default=latest")
-    spc.add_argument("--trace-version", default=None, help="Trace task version, default=latest")
-    spc.add_argument("--wave-version", default=None, help="Wave task version, default=latest")
-    spc.add_argument("--only-zipcode", help="Developer filter: comma-separated ZipCode keys (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
-    spc.add_argument("--limit", type=int, help="Developer filter: limit number of zipcodes")
-    spc.set_defaults(func=cmd_plan_calibrations)
-
-    # plan night (stub)
-    spn = plan_sub.add_parser("night", help="Plan a nightly reduction run", parents=[global_opts])
-    spn.add_argument("--date", required=True, help="Night date YYYYMMDD")
-    spn.set_defaults(func=cmd_plan_night)
-
-    # plan exposure (stub)
-    spe = plan_sub.add_parser("exposure", help="Plan reduction of a single exposure", parents=[global_opts])
-    spe.add_argument("--exposure-id", required=True, help="Exposure identifier (e.g., 20260511T035810.4)")
-    spe.set_defaults(func=cmd_plan_exposure)
-
-    # plan observation-set (stub)
-    spo = plan_sub.add_parser("observation-set", help="Plan higher-level products from multiple exposures", parents=[global_opts])
-    spo.add_argument("--name", required=True, help="Observation set name")
-    spo.set_defaults(func=cmd_plan_observation_set)
-
-    # run
-    sp = sub.add_parser("run", help="Plan and execute calibrations (planning-first)", parents=[global_opts])
-    sp.add_argument("--workdir", default=str(Path.cwd() / "work"), help="Working directory")
-    sp.add_argument("--nworkers", "--workers", dest="nworkers", type=int, default=None, help="Task workers (default 4; overrides configuration)")
-    sp.add_argument("--serial", action="store_true", help="Run serially (equivalent to --nworkers 1)")
-    sp.add_argument("--qa-out-dir", help="Directory to write QA outputs (plots and JSON packets)")
-    sp.add_argument("--qa-yaml", help="Path to QA rules YAML (overrides VF_QA_YAML and default docs/qa_default.yml)")
-    sp.add_argument("--debug-timing", action="store_true", help="Print timing diagnostics during run")
-    sp.add_argument("--debug-inputs", action="store_true", help="Print a few resolved raw inputs per task (paths/tar_members)")
-    # Planning options
-    sp.add_argument("--planning-yaml", help="Path to planning rules YAML to override defaults (see docs/planning_config.md)")
-    sp.add_argument("--plan-only", action="store_true", help="Only perform planning and write planning_report.yml to --workdir, do not execute tasks")
-    sp.add_argument("--plan-start-date", help="Planning date window start (YYYYMMDD)")
-    sp.add_argument("--plan-end-date", help="Planning date window end (YYYYMMDD)")
-    sp.add_argument("--only-zipcodes", help="Comma-separated ZipCode keys to limit planning (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
-    # Mapping helper controls (science→calib selection centralization)
-    sp.add_argument("--use-mapping-helper", action="store_true", help="Use planning.mapping.select_for_edge for artifact selection inside tasks (experimental)")
-    sp.add_argument("--mapping-tolerance-days", type=int, help="Optional tolerance window (days) for mapping helper when selecting parent calibrations")
-    # Force planning controls
-    sp.add_argument("--force-replan", action="store_true", help="Force planning even if an existing artifact is registered (rebuild calibrations)")
-    sp.set_defaults(func=cmd_run)
-
-    args = p.parse_args(argv)
-    # Delegate to the chosen function
-    args.func(args)
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.func(args)
+    except ValueError as exc:
+        parser.error(str(exc))
 
 
 if __name__ == "__main__":

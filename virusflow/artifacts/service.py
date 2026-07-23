@@ -143,8 +143,9 @@ class ArtifactService:
             raise OSError(
                 f"projected {kind} payload ({projected_bytes} bytes) exceeds the safe available-disk budget ({available_bytes} bytes free)"
             )
+        stable_parents = [self._stable_parent_identity(parent_id) for parent_id in parents]
         revision = request.revision or self._logical_revision(
-            kind, scope, validity, normalized_components, parents, context
+            kind, scope, validity, normalized_components, stable_parents, context
         )
         existing = self.adapter.find_by_revision(revision)
         if existing is not None and str(existing.get("state") or "active") == "active":
@@ -374,6 +375,13 @@ class ArtifactService:
             "payload_type": desc.payload_type,
             "storage_format": desc.storage_format,
             "path": desc.storage.uri if desc.storage else None,
+            "scope": {
+                "physical_scope": desc.scope.physical_scope.value,
+                "zipcode": desc.scope.zipcode.key() if desc.scope.zipcode is not None else None,
+                "exposure_id": desc.scope.exposure_id,
+                "observation_id": desc.scope.observation_id,
+                "dither_set_id": desc.scope.dither_set_id,
+            },
             "summary": desc.metadata,
             "qa": self.adapter.get_qa_bundle(int(desc.id)),
             "model_type": desc.model_type,
@@ -385,6 +393,18 @@ class ArtifactService:
             "state": desc.state,
             "payload_bytes": desc.payload_bytes,
             "relations": [asdict(x) for x in desc.relations],
+            "provenance": {
+                "producer": desc.provenance.algorithm,
+                "parents": list(desc.provenance.parents),
+                "created_at": desc.provenance.created_at.isoformat(),
+                "configuration_references": [asdict(value) for value in desc.configuration_refs],
+            },
+            "analysis": {
+                "study_id": desc.metadata.get("study_id"),
+                "accepted_model_id": desc.metadata.get("accepted_model_id"),
+                "promotion_decision": desc.metadata.get("promotion_decision"),
+                "candidate": str(row.get("canonical_kind") or desc.kind).startswith("candidate_"),
+            },
         }
 
     def load_component(self, artifact_id_or_row, component_name: Optional[str] = None, *, verify_checksum: bool = True) -> Dict[str, Any]:
@@ -464,6 +484,17 @@ class ArtifactService:
                 except OSError:
                     pass
 
+    def _stable_parent_identity(self, parent_id: int) -> str:
+        row = self.adapter.get_row(int(parent_id))
+        if row is not None and row.get("revision"):
+            return (
+                f"artifact:{row.get('canonical_kind') or canonical_kind(row.get('kind') or 'unknown')}:"
+                f"{row['revision']}"
+            )
+        # Raw-frame identities use stable scan row IDs in the current schema.
+        # Their future replacement should be a typed raw-frame checksum identity.
+        return f"registry-row:{int(parent_id)}"
+
     @staticmethod
     def _logical_revision(kind, scope, validity, components, parents, context) -> str:
         digest = hashlib.sha256()
@@ -471,7 +502,7 @@ class ArtifactService:
             "kind": kind,
             "scope": asdict(scope),
             "validity": asdict(validity),
-            "parents": [int(value) for value in parents],
+            "parents": list(parents),
             "task": [getattr(context, "task_name", None), getattr(context, "task_version", None)],
             "algorithm": [getattr(context, "algorithm_name", None), getattr(context, "algorithm_version", None)],
             "parameters": dict(getattr(context, "parameters", {}) or {}),

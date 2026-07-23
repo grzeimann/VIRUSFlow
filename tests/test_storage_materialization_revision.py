@@ -269,12 +269,13 @@ def test_worker_precedence_parallel_failures_nested_budget_and_scratch(tmp_path:
         def run(self, inputs):
             events.append("ran")
 
-    failed = PlanningExecutor(max_workers=2)
+    failed = PlanningExecutor(max_workers=2, raise_on_failure=False)
     failed.add_task("prerequisite", Fails())
     failed.add_task("dependent", MustNotRun(), depends_on=["prerequisite"])
     assert failed.run() == {}
     assert not events
-    assert failed.execution_stats["failed"] == 2
+    assert failed.execution_stats["failed"] == 1
+    assert failed.execution_stats["blocked"] == 1
 
     token = enter_worker("outer")
     try:

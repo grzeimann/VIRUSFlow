@@ -62,6 +62,11 @@ class NodeConfig:
 class PlanningConfig:
     version: int = 1
     nworkers: Optional[int] = None
+    progress: bool = True
+    progress_mode: str = "auto"
+    progress_interval: float = 30.0
+    progress_path: Optional[str] = None
+    max_retries: int = 0
     nodes: Dict[str, NodeConfig] = field(default_factory=dict)
     edges: List[Edge] = field(default_factory=list)
 
@@ -188,7 +193,28 @@ def load_planning_config_from_dict(cfg: Mapping[str, Any]) -> PlanningConfig:
     nworkers = None if configured_workers is None else int(configured_workers)
     if nworkers is not None and nworkers < 1:
         raise ValueError("nworkers must be at least one")
-    return PlanningConfig(version=version, nworkers=nworkers, nodes=nodes, edges=edges)
+    progress = execution.get("progress", True) if isinstance(execution, Mapping) else True
+    progress_mode = str(execution.get("progress_mode", "auto")) if isinstance(execution, Mapping) else "auto"
+    if progress_mode not in {"auto", "tty", "plain", "json"}:
+        raise ValueError("execution.progress_mode must be auto, tty, plain, or json")
+    progress_interval = float(execution.get("progress_interval", 30.0)) if isinstance(execution, Mapping) else 30.0
+    if progress_interval <= 0:
+        raise ValueError("execution.progress_interval must be positive")
+    progress_path = execution.get("progress_path") if isinstance(execution, Mapping) else None
+    max_retries = int(execution.get("max_retries", 0)) if isinstance(execution, Mapping) else 0
+    if max_retries < 0:
+        raise ValueError("execution.max_retries cannot be negative")
+    return PlanningConfig(
+        version=version,
+        nworkers=nworkers,
+        progress=bool(progress),
+        progress_mode=progress_mode,
+        progress_interval=progress_interval,
+        progress_path=(str(progress_path) if progress_path else None),
+        max_retries=max_retries,
+        nodes=nodes,
+        edges=edges,
+    )
 
 
 def load_planning_config(path: str) -> PlanningConfig:
