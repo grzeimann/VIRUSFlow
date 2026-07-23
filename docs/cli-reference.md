@@ -17,7 +17,7 @@ Run `virusflow COMMAND --help` or `virusflow COMMAND SUBCOMMAND --help` for auth
 | `analyze` | Run existing read-only post-run studies. |
 | `storage report` | Summarize active artifact count/bytes by kind and largest products. |
 | `cleanup scratch/cache/legacy` | Inventory or explicitly clean lifecycle-specific storage. |
-| `config show` | Show resolved worker/progress and path configuration. |
+| `config show` | Show resolved worker/progress, registry, artifact, scratch, and configuration-root values. |
 | `validate observation` | Run the representative real-observation acceptance workflow. |
 | `performance show` | Summarize a saved timing report. |
 | `performance compare` | Compare timing reports and optionally verify exact Product equivalence between two registries. |
@@ -29,10 +29,12 @@ Run `virusflow COMMAND --help` or `virusflow COMMAND SUBCOMMAND --help` for auth
 
 Planning configuration supports the same values under `execution`: `nworkers`, `progress`, `progress_mode`, `progress_interval`, `progress_path`, and `max_retries`. CLI values override YAML.
 
+Planning YAML node and edge names must be canonical: `master_bias`, `master_dark`, `master_ldls`, `master_arc`, `master_twilight`, `trace_map`, and `wavelength_map`. The CLI does not expose task-class or task-version selection.
+
 See [performance.md](performance.md) for timing fields, controlled-comparison commands, measured regression findings, and current database boundaries.
 
 ## Exit and safety behavior
 
 Malformed targets/options produce exit status 2. Graph failures produce a nonzero status with failed and blocked nodes separated. Cleanup is non-destructive unless `--execute` or `--deactivate` is present. Canonical/model artifacts are never cache eviction candidates. Legacy payload deletion requires all three flags: `--deactivate --delete-payloads --validation-succeeded`.
 
-Removed public interfaces are not emulated: the nonfunctional `plan` command family, `debug-raw`, plural `artifacts`, and immediate `storage cleanup-scratch` path are retired. Use `run calibrations --plan-only`, `artifact`, and `cleanup`.
+Removed public interfaces are not emulated: the nonfunctional `plan` command family, `tasks`, `debug-raw`, plural `artifacts`, and immediate `storage cleanup-scratch` path are retired. Use `run calibrations --plan-only`, `artifact`, and `cleanup`. Deprecated Artifact names remain lookup/migration vocabulary only and are rejected for publication.

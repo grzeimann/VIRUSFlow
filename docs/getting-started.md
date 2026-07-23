@@ -26,6 +26,8 @@ virusflow exposures --db ./run/registry.sqlite3 --limit 20
 virusflow config show --db ./run/registry.sqlite3 --workdir ./run/artifacts
 ```
 
+Planning YAML may override only the seven canonical calibration nodes and their explicit edges. Historical names (`master_flat`, `master_cmp`, `trace`, and `wave`) remain readable in old registries but cannot be used to create new plans or Products.
+
 ## Run work
 
 Calibration planning and execution use scanned dates and ZipCodes:

@@ -4,7 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Any, Optional, List
+from typing import Any, Optional
 
 import yaml
 
@@ -14,9 +14,7 @@ _os_mplcfg.environ.setdefault("MPLBACKEND", "Agg")
 
 from ..registry import database as db
 from ..storage.filesystem import FileSystemStorage
-from ..tasks import available_tasks, get_task_class
-from ..tasks.base import TaskContext
-from ..core.identity import ZipCode, parse_zipcode_key
+from ..core.identity import parse_zipcode_key
 from .formatting import format_artifacts_table, format_exposures_table
 
 
@@ -60,11 +58,6 @@ def cmd_scan(args: argparse.Namespace) -> None:
     # Report how many tar files were indexed during this scan (DB mode only)
     if indexed_tars:
         print(f"Indexed {len(indexed_tars)} tar files into registry (DB mode)")
-
-
-def cmd_tasks(args: argparse.Namespace) -> None:
-    av = available_tasks()
-    print(yaml.safe_dump(av, sort_keys=False))
 
 
 def cmd_exposures(args: argparse.Namespace) -> None:
@@ -138,38 +131,7 @@ def cmd_storage_report(args: argparse.Namespace) -> None:
     print(yaml.safe_dump(report, sort_keys=False))
 
 
-def cmd_storage_migrate(args: argparse.Namespace) -> None:
-    from ..artifacts.migration import migrate_stages_8_10_storage
-
-    result = migrate_stages_8_10_storage(
-        args.db, delete_payloads=bool(args.delete_payloads)
-    )
-    print(yaml.safe_dump(result.__dict__, sort_keys=False))
-
-
-def cmd_scratch_cleanup(args: argparse.Namespace) -> None:
-    from ..storage.scratch import cleanup_abandoned_scratch
-
-    removed = cleanup_abandoned_scratch(args.workdir)
-    print(f"Removed {removed} abandoned scratch files from {args.workdir}")
-
-
 # ------------------ QA subcommands ------------------
-
-def cmd_qa_set(args: argparse.Namespace) -> None:
-    from ..registry import database as _db
-    import json as _json
-    metrics = None
-    if args.metrics:
-        try:
-            metrics = _json.loads(args.metrics)
-        except Exception as e:
-            raise SystemExit(f"Invalid JSON for --metrics: {e}")
-    from ..artifacts import ArtifactService
-    svc = ArtifactService(args.db)
-    svc.set_diagnostics(int(args.artifact_id), status=args.status, metrics=metrics)
-    print(f"Saved QA for artifact {args.artifact_id}: status={args.status}")
-
 
 def cmd_qa_show(args: argparse.Namespace) -> None:
     from ..registry import database as _db
@@ -221,59 +183,6 @@ def cmd_qa_eval(args: argparse.Namespace) -> None:
     print(f"QA evaluate: artifact_id={art_id} kind={kind} status={status}")
 
 
-essential_kinds = {"master_bias", "master_dark", "master_flat", "master_cmp", "trace", "wave"}
-
-
-def cmd_qa_backfill(args: argparse.Namespace) -> None:
-    """Re-evaluate QA for many artifacts, optionally filtered by kind and date.
-
-    By default uses summary-derived meta when --from-summary is set; otherwise passes an empty meta.
-    """
-    import datetime as _dt
-    from ..artifacts import ArtifactService
-    svc = ArtifactService(args.db)
-    rows = db.list_artifacts(kind=args.kind, zipcode=None, db_path=args.db, limit=args.limit)
-    # Optional since filter based on created_at when present
-    if args.since:
-        try:
-            since_dt = _dt.datetime.strptime(str(args.since), "%Y%m%d")
-        except Exception:
-            raise SystemExit("--since must be YYYYMMDD")
-        def _ok(r):
-            ca = r.get("created_at")
-            if not ca:
-                return True
-            try:
-                return _dt.datetime.fromisoformat(str(ca)) >= since_dt
-            except Exception:
-                return True
-        rows = [r for r in rows if _ok(r)]
-    n = 0
-    n_fail = 0
-    for r in rows:
-        try:
-            art_id = int(r.get("id"))
-            kind = args.kind or str(r.get("kind"))
-            meta = None
-            if args.from_summary:
-                try:
-                    desc = svc.describe(r)
-                    meta = desc.get("summary") if isinstance(desc, dict) else None
-                except Exception:
-                    meta = None
-            if args.dry_run:
-                print(f"[dry-run] would evaluate artifact_id={art_id} kind={kind}")
-                continue
-            status = svc.diagnostics.evaluate_and_save(artifact_id=art_id, kind=kind, meta=meta or {})
-            print(f"artifact_id={art_id} kind={kind} status={status}")
-            n += 1
-            if str(status).lower() == "fail":
-                n_fail += 1
-        except Exception as e:
-            print(f"error evaluating artifact id={r.get('id')}: {e}")
-    if not args.dry_run:
-        print(f"Backfill complete: evaluated={n}, failures={n_fail}")
-
 # ------------------ Analytics subcommands ------------------
 
 def cmd_analyze(args: argparse.Namespace) -> None:
@@ -311,92 +220,6 @@ def cmd_analyze(args: argparse.Namespace) -> None:
         print(yaml.safe_dump(res, sort_keys=False))
     except Exception:
         print(res)
-
-# ------------------ Debugging helpers ------------------
-
-def cmd_debug_raw(args: argparse.Namespace) -> None:
-    """Probe raw inputs for a zipcode and frame type without running algorithms.
-
-    Prints a concise table and optionally attempts a single CCD base reduction on the first item.
-    """
-    from ..registry import database as _db
-    import os as _os
-    import tarfile as _tarfile
-    from astropy.io import fits as _fits
-    # Ensure algorithms I/O knows which registry DB to use for tar member reads
-    try:
-        from ..algorithms.io import set_registry_db_path as _set_registry_db_path
-        _set_registry_db_path(args.db)
-    except Exception:
-        pass
-
-    zc = parse_zipcode_key(args.zipcode) if getattr(args, "zipcode", None) else None
-    if zc is None:
-        print("--zipcode is required (IFUSLOT+IFUID+SPECID+AMP+CONTROLLER)")
-        return
-    sd = args.start_date or "19000101"
-    ed = args.end_date or "21000101"
-    rows = _db.list_raw_files_scoped(frame_type=args.frame_type, start_date=sd, end_date=ed, zipcode=zc, db_path=args.db)
-    if not rows:
-        print("No raw files found for the given filters.")
-        return
-    print(f"Found {len(rows)} raw files for frame_type={args.frame_type} zipcode={zc.key()} {sd}..{ed}")
-    # Show up to N samples
-    N = int(args.limit or 10)
-    for (rid, rf) in rows[:N]:
-        exists = _os.path.exists(rf.path)
-        info = f"id={rid} path={rf.path} member={rf.tar_member} backend={rf.storage_backend} exists={exists}"
-        print(" - " + info)
-        # For tar members, optionally verify readability
-        if args.verify and rf.storage_backend == "tar" and rf.tar_member and exists:
-            try:
-                with _tarfile.open(rf.path, mode="r:") as tf:
-                    m = tf.getmember(rf.tar_member)
-                    ef = tf.extractfile(m) if m is not None else None
-                    if ef is None:
-                        print("   [verify] cannot extract member (None)")
-                    else:
-                        with _fits.open(ef, memmap=False):
-                            print("   [verify] FITS header read OK")
-            except Exception as e:
-                print(f"   [verify] error: {e}")
-    # Optional single reduce_raw_amplifier_frame probe
-    if args.probe:
-        try:
-            import virusflow.algorithms.ccd as _ccd
-        except Exception as e:  # pragma: no cover
-            print(f"Probe unavailable (import error): {e}")
-            return
-        (rid0, rf0) = rows[0]
-        try:
-            img, _hdr = _ccd.reduce_raw_amplifier_frame(rf0.path, rf0.tar_member, return_header=False)
-            print(f"Probe success: shape={getattr(img, 'shape', None)} from path={rf0.path} member={rf0.tar_member}")
-        except Exception as e:
-            print(f"Probe failed: {e}")
-
-# ------------------ Planner subcommands ------------------
-
-
-def cmd_plan_calibrations(args: argparse.Namespace) -> None:
-    # Legacy plan-file generation has been removed. Use the planning-first run path instead.
-    raise SystemExit("'virusflow plan calibrations' is removed. Use 'virusflow run --plan-start-date YYYYMMDD --plan-end-date YYYYMMDD' for planning-first execution.")
-
-
-def cmd_plan_night(args: argparse.Namespace) -> None:
-    # Stub: produce an empty plan with a note for now
-    plan = {"tasks": [], "note": f"night planning for date {args.date} not yet implemented"}
-    print(yaml.safe_dump(plan, sort_keys=False))
-
-
-def cmd_plan_exposure(args: argparse.Namespace) -> None:
-    plan = {"tasks": [], "note": f"exposure planning for {args.exposure_id} not yet implemented"}
-    print(yaml.safe_dump(plan, sort_keys=False))
-
-
-def cmd_plan_observation_set(args: argparse.Namespace) -> None:
-    plan = {"tasks": [], "note": f"observation-set planning for {args.name} not yet implemented"}
-    print(yaml.safe_dump(plan, sort_keys=False))
-
 
 # ------------------ Runner ------------------
 
@@ -566,17 +389,15 @@ def _run_planned(args: argparse.Namespace) -> None:
     from ..planning import schedule as _schedule, adapt_target as _adapt_target
     from ..tasks.mapping import default_kind_to_task as _default_kind_to_task
     from ..tasks.base import TaskContext as _TaskContext
-    if _schedule is None:
-        raise RuntimeError("planning.schedule is unavailable")
     # Build context and mapping
-    cfg = {"nworkers": nworkers, "workers": nworkers, "inside_task_worker": False, "debug_timing": bool(args.debug_timing), "debug_inputs": bool(getattr(args, "debug_inputs", False))}
-    if getattr(args, "qa_out_dir", None):
-        cfg["qa_out_dir"] = args.qa_out_dir
-    # Experimental mapping helper controls
-    if getattr(args, "use_mapping_helper", False):
-        cfg["use_mapping_helper"] = True
-    if getattr(args, "mapping_tolerance_days", None) is not None:
-        cfg["mapping_tolerance_days"] = int(args.mapping_tolerance_days)
+    cfg = {
+        "nworkers": nworkers,
+        "workers": nworkers,
+        "inside_task_worker": False,
+        "debug_timing": bool(args.debug_timing),
+        "debug_inputs": bool(getattr(args, "debug_inputs", False)),
+        "configuration_root": str(Path(args.configuration_root).resolve()),
+    }
     ctx = _TaskContext(db_path=args.db, workdir=args.workdir, config=cfg)
 
     def _ctx_factory():
@@ -825,6 +646,8 @@ def cmd_config_show(args: argparse.Namespace) -> None:
     payload = {
         "db": str(Path(args.db).resolve()),
         "workdir": str(Path(args.workdir).resolve()),
+        "scratch_root": str((Path(args.workdir).resolve() / ".scratch")),
+        "configuration_root": str(Path(args.configuration_root).resolve()),
         "workers": resolve_nworkers(cli_value=args.nworkers, serial=args.serial, configured_value=getattr(configured, "nworkers", None)),
         **resolve_progress_config(args, configured),
     }
@@ -942,16 +765,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_db(sp); sp.add_argument("root"); sp.set_defaults(func=cmd_scan)
     sp = sub.add_parser("exposures", help="List scanned exposures")
     _add_db(sp); sp.add_argument("--start-date"); sp.add_argument("--end-date"); sp.add_argument("--limit", type=int); sp.add_argument("--csv", action="store_true"); sp.set_defaults(func=cmd_exposures)
-    sp = sub.add_parser("tasks", help="List registered task implementations"); sp.set_defaults(func=cmd_tasks)
-
     run = sub.add_parser("run", help="Execute the task graph").add_subparsers(dest="run_cmd", required=True)
     cal = run.add_parser("calibrations", help="Plan and execute calibration products")
     _add_science_run(cal)
-    cal.add_argument("--planning-yaml"); cal.add_argument("--plan-only", action="store_true")
+    cal.add_argument(
+        "--planning-yaml",
+        help="Canonical calibration node/edge overrides and execution defaults",
+    ); cal.add_argument("--plan-only", action="store_true")
     cal.add_argument("--start-date", dest="plan_start_date"); cal.add_argument("--end-date", dest="plan_end_date")
     cal.add_argument("--only-zipcodes"); cal.add_argument("--force-replan", action="store_true")
-    cal.add_argument("--qa-out-dir"); cal.add_argument("--qa-yaml"); cal.add_argument("--debug-timing", action="store_true"); cal.add_argument("--debug-inputs", action="store_true")
-    cal.add_argument("--use-mapping-helper", action="store_true"); cal.add_argument("--mapping-tolerance-days", type=int)
+    cal.add_argument("--qa-yaml"); cal.add_argument("--debug-timing", action="store_true"); cal.add_argument("--debug-inputs", action="store_true")
     cal.set_defaults(func=cmd_run)
     exp = run.add_parser("exposure", help="Reduce one atomic science exposure")
     _add_science_run(exp); exp.add_argument("--exposure-id", required=True); exp.set_defaults(func=cmd_run_exposure)
@@ -960,7 +783,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     artifact = sub.add_parser("artifact", help="Inspect artifacts and provenance").add_subparsers(dest="artifact_cmd", required=True)
     al = artifact.add_parser("list"); _add_db(al)
-    al.add_argument("--kind"); al.add_argument("--zipcode"); al.add_argument("--at"); al.add_argument("--limit", type=int); al.add_argument("--csv", action="store_true"); al.add_argument("--summary", action="store_true"); al.add_argument("--best", action="store_true"); al.add_argument("--policy", choices=["latest_valid", "latest"]); al.add_argument("--status"); al.set_defaults(func=cmd_artifacts)
+    al.add_argument("--kind", help="Canonical kind; deprecated names are read-only lookup aliases"); al.add_argument("--zipcode"); al.add_argument("--at"); al.add_argument("--limit", type=int); al.add_argument("--csv", action="store_true"); al.add_argument("--summary", action="store_true"); al.add_argument("--best", action="store_true"); al.add_argument("--policy", choices=["latest_valid", "latest"]); al.add_argument("--status"); al.set_defaults(func=cmd_artifacts)
     ash = artifact.add_parser("show"); _add_db(ash); ash.add_argument("artifact_id", type=int); ash.set_defaults(func=cmd_artifact_show)
 
     model = sub.add_parser("model", help="Inspect accepted and candidate models").add_subparsers(dest="model_cmd", required=True)
@@ -972,7 +795,7 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup = sub.add_parser("cleanup", help="Inventory by default; mutate only with explicit flags").add_subparsers(dest="cleanup_cmd", required=True)
     cs = cleanup.add_parser("scratch"); cs.add_argument("--workdir", required=True); cs.add_argument("--execute", action="store_true"); cs.set_defaults(func=cmd_cleanup)
     cc = cleanup.add_parser("cache"); _add_db(cc); cc.add_argument("--execute", action="store_true"); cc.set_defaults(func=cmd_cleanup)
-    cl = cleanup.add_parser("legacy"); _add_db(cl); cl.add_argument("--deactivate", action="store_true"); cl.add_argument("--delete-payloads", action="store_true"); cl.add_argument("--validation-succeeded", action="store_true"); cl.set_defaults(func=cmd_cleanup)
+    cl = cleanup.add_parser("legacy", help="Inventory or explicitly retire superseded records"); _add_db(cl); cl.add_argument("--deactivate", action="store_true", help="Mark registry records obsolete but retain payloads"); cl.add_argument("--delete-payloads", action="store_true", help="Delete payloads (requires deactivation and validation gate)"); cl.add_argument("--validation-succeeded", action="store_true", help="Confirm representative validation before payload deletion"); cl.set_defaults(func=cmd_cleanup)
 
     qa = sub.add_parser("qa", help="Inspect and evaluate QA").add_subparsers(dest="qa_cmd", required=True)
     ql = qa.add_parser("list"); _add_db(ql); ql.add_argument("--kind"); ql.add_argument("--zipcode"); ql.add_argument("--status"); ql.add_argument("--limit", type=int); ql.add_argument("--csv", action="store_true"); ql.set_defaults(func=cmd_qa_list)

@@ -24,12 +24,12 @@ nodes:
       min_n: 20
       max_span_days: 45
 edges:
-  - src: master_flat
-    dst: trace
+  - src: master_ldls
+    dst: trace_map
     policy: latest_valid
     tolerance_days: 90
-  - src: master_cmp
-    dst: wave
+  - src: master_arc
+    dst: wavelength_map
     policy: latest_valid
     tolerance_days: 90
 
@@ -46,6 +46,17 @@ except Exception:  # pragma: no cover - yaml is an optional runtime dep but pres
 
 from .targets import TimeCadence, ExposureCountCadence, CadencePolicy
 from .graph import TaskSpec, Edge
+
+
+SUPPORTED_CALIBRATION_KINDS = frozenset({
+    "master_bias",
+    "master_dark",
+    "master_ldls",
+    "master_arc",
+    "master_twilight",
+    "trace_map",
+    "wavelength_map",
+})
 
 
 @dataclass(frozen=True)
@@ -101,15 +112,6 @@ class PlanningConfig:
             if nc.cadence is not None:
                 new_n = replace(new_n, cadence=nc.cadence)
             out_nodes.append(new_n)
-        # If config introduces entirely new nodes, append them (task_cls=None placeholder)
-        for kind, nc in self.nodes.items():
-            if kind not in base_by_kind and nc.enabled:
-                out_nodes.append(TaskSpec(kind=kind, task_cls=object,  # placeholder
-                                          inputs_raw=list(nc.inputs_raw or []),
-                                          inputs_artifacts=list(nc.inputs_artifacts or []),
-                                          scope_mode=str(nc.scope_mode or "per_zipcode"),
-                                          cadence=nc.cadence,
-                                          params_schema=dict(nc.params or {})))
         # Edges: replace if any provided, else keep base
         out_edges: List[Edge]
         if self.edges:
@@ -182,10 +184,20 @@ def load_planning_config_from_dict(cfg: Mapping[str, Any]) -> PlanningConfig:
         raise ValueError("config.nodes must be a mapping")
     nodes: Dict[str, NodeConfig] = {}
     for kind, nd in nodes_cfg.items():
+        if str(kind) not in SUPPORTED_CALIBRATION_KINDS:
+            raise ValueError(
+                f"unsupported planning node {kind!r}; use a canonical calibration kind"
+            )
         if not isinstance(nd, Mapping):
             raise ValueError(f"nodes.{kind} must be a mapping")
         nodes[kind] = _parse_node(kind, nd)
     edges = _parse_edges(cfg.get("edges"))
+    for edge in edges:
+        for endpoint in (edge.src.kind, edge.dst.kind):
+            if endpoint not in SUPPORTED_CALIBRATION_KINDS:
+                raise ValueError(
+                    f"unsupported planning edge kind {endpoint!r}; use a canonical calibration kind"
+                )
     execution = cfg.get("execution") or {}
     configured_workers = execution.get("nworkers") if isinstance(execution, Mapping) else None
     if configured_workers is None:

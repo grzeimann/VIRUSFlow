@@ -10,24 +10,16 @@ import this to obtain a baseline kind→task mapping.
 from typing import Dict, Type
 
 from .base import Task
-from .calibs import BiasTask, DarkTask, FlatTask, CmpTask, TraceTask, WaveTask, TwiTask, SciTask
+from .calibs import BiasTask, DarkTask, FlatTask, CmpTask, TraceTask, WaveTask, TwiTask
 
 
 def default_kind_to_task() -> Dict[str, Type[Task]]:
     """Return mapping from planning kinds to Task classes.
 
-    Kinds covered:
-    - master_bias → BiasTask
-    - master_dark → DarkTask
-    - master_flat → FlatTask
-    - master_cmp → CmpTask
-    - trace → TraceTask
-    - wave → WaveTask
-
-    Notes:
-    - twilight flat (twi) is not a planned kind here; mapping provided for completeness.
+    Only canonical planning kinds are accepted. Historical Artifact aliases are
+    resolved when old registry rows are read, never when a new graph is built.
     """
-    canonical = {
+    return {
         "master_bias": BiasTask,
         "master_dark": DarkTask,
         "master_ldls": FlatTask,
@@ -36,13 +28,3 @@ def default_kind_to_task() -> Dict[str, Type[Task]]:
         "trace_map": TraceTask,
         "wavelength_map": WaveTask,
     }
-    # Public legacy planner names remain accepted as read/run aliases.
-    canonical.update({
-        "master_flat": FlatTask,
-        "master_cmp": CmpTask,
-        "master_twi": TwiTask,
-        "trace": TraceTask,
-        "wave": WaveTask,
-        "twi": TwiTask,
-    })
-    return canonical

@@ -75,8 +75,3 @@ class CmpResultContract(_BaseSimpleContract):
 
 class TwiResultContract(_BaseSimpleContract):
     required_arrays = ["master_twilight"]
-
-
-class SciResultContract(_BaseSimpleContract):
-    required_arrays = ["master_science"]
-    required_scalars = ["n_inputs"]

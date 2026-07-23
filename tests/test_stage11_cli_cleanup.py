@@ -28,6 +28,8 @@ def test_planning_progress_configuration_and_cli_precedence():
         "progress": True, "progress_mode": "plain", "progress_interval": 1.0,
         "progress_path": "cli.jsonl", "max_retries": 3,
     }
+    with pytest.raises(ValueError, match="canonical calibration kind"):
+        load_planning_config_from_dict({"nodes": {"master_flat": {"enabled": True}}})
 
 
 def test_clean_cli_exposes_real_commands_and_retires_plan_stubs(tmp_path: Path):
@@ -38,11 +40,63 @@ def test_clean_cli_exposes_real_commands_and_retires_plan_stubs(tmp_path: Path):
     assert args.nworkers is None
     with pytest.raises(SystemExit):
         parser.parse_args(["plan", "night", "--date", "20260609"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["tasks"])
     for command in (
         ["artifact", "show", "1"], ["model", "list"], ["storage", "report"],
         ["cleanup", "cache"], ["config", "show"],
     ):
         parser.parse_args(command)
+
+
+def test_retired_modules_and_hidden_handlers_are_absent():
+    import virusflow.cli.virusflow as cli
+
+    root = Path(__file__).resolve().parents[1]
+    for relative in (
+        "virusflow/algorithms/sci.py",
+        "virusflow/artifacts/materialize.py",
+        "virusflow/cli/verify_steps_1_7.py",
+        "virusflow/planning/mapping.py",
+    ):
+        assert not (root / relative).exists()
+    for name in (
+        "cmd_storage_migrate", "cmd_scratch_cleanup", "cmd_debug_raw",
+        "cmd_plan_calibrations", "cmd_plan_night", "cmd_plan_exposure",
+        "cmd_plan_observation_set", "cmd_qa_set", "cmd_qa_backfill",
+    ):
+        assert not hasattr(cli, name)
+
+
+def test_legacy_artifact_names_are_read_only_not_publication_aliases(tmp_path: Path):
+    import numpy as np
+
+    from virusflow.artifacts import ArtifactService
+    from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
+    from virusflow.ontology.artifact_kinds import canonical_kind, kind_spec
+    from virusflow.persistence.policy import DefaultPersistencePolicy
+    from virusflow.publication.context import PublicationContext
+    from virusflow.publication.service import DefaultPublicationService
+
+    assert canonical_kind("master_flat") == "master_ldls"
+    with pytest.raises(KeyError, match="Unregistered"):
+        kind_spec("master_sci")
+
+    service = ArtifactService(str(tmp_path / "registry.sqlite3"))
+    publisher = DefaultPublicationService(
+        svc=service,
+        policy=DefaultPersistencePolicy(),
+        base_dir=str(tmp_path / "artifacts"),
+    )
+    request = ArtifactRequest(
+        kind="master_flat",
+        components={
+            "master_flat": LogicalComponent("master_flat", "array2d", np.ones((2, 2)))
+        },
+    )
+    context = PublicationContext("test", "1", "test", "1", {}, [], {})
+    with pytest.raises(ValueError, match="read-only.*master_ldls"):
+        publisher.publish([request], context)
 
 
 def test_registry_derived_observation_membership(tmp_path: Path):

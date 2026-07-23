@@ -5,18 +5,7 @@ defaults:
   policy: soft
 
 kinds:
-  master_sci:
-    policy: hard
-    metrics:
-      p95:
-        from: "reduce.percentile(meta.component.data,95)"
-        default: 0.0
-    checks:
-      - id: "science_signal_present"
-        where: "p95 > 0.0"
-        severity: fail_if_false
-
-  master_flat:
+  master_ldls:
     policy: soft
     metrics:
       p95:

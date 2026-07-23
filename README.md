@@ -38,7 +38,9 @@ Execution uses four graph workers by default. Add `--serial` to a `run` command 
 
 ## Architecture and data boundaries
 
-Targets describe requested calibration, exposure, or observation work. Tasks resolve inputs and call deterministic algorithms. The dependency-aware `PlanningExecutor` runs each graph node once and reports succeeded, failed, blocked, cached, skipped, and retried work. `ArtifactService` is the only production persistence boundary and records components, checksums, dtype, shape, units, validity, producer, parents, QA, lifecycle, and state.
+Targets describe requested calibration, exposure, or observation work. Calibration execution has one path: `ReductionGraph.plan` builds Targets, `planning.schedule` creates dependencies, and `PlanningExecutor` runs each graph node once. Tasks load published inputs with `ArtifactService.load_component`, call deterministic algorithms, and publish through `DefaultPublicationService` to `ArtifactService.persist_request`. The service records components, checksums, dtype, shape, units, validity, producer, parents, QA, lifecycle, and state.
+
+New calibration plans and publications use only `master_bias`, `master_dark`, `master_ldls`, `master_arc`, `master_twilight`, `trace_map`, and `wavelength_map`. Deprecated names such as `master_flat`, `master_cmp`, `trace`, and `wave` are accepted only while reading or retiring old registry records; publication rejects them.
 
 Storage has five deliberately distinct classes:
 
@@ -78,6 +80,7 @@ Cleanup commands inventory candidates by default. Scratch/cache deletion require
 - [Troubleshooting](docs/troubleshooting.md)
 - [Stage 11 migration](docs/migration/stage-11.md)
 - [Target architecture](docs/architecture/VIRUSFlow_Target_Architecture.md)
+- [Current implementation flow](docs/architecture/current-system.md)
 - [Stages 8–10 storage specification](docs/tasks/VIRUSFlow_Stages_8_10_Storage_Materialization_Sky_Parallel_Revision.md)
 
 ## Testing and development

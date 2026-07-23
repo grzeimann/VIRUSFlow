@@ -10,8 +10,20 @@ Stage 11 consolidates execution around the dependency-aware planning executor an
 | `virusflow storage cleanup-scratch` | `virusflow cleanup scratch [--execute]` |
 | `virusflow storage migrate-stages-8-10` | `virusflow cleanup legacy` with separate deactivation/deletion flags |
 | `virusflow debug-raw` | Registry/task diagnostics and focused developer tests |
+| `virusflow tasks` and `v1` task selectors | Canonical planning-kind mapping used internally by `run` |
+
+The retired `ArtifactMaterializer`, task-level direct registration helper, optional planning mapping helper, stages 8–10 mutation function, and old steps 1–7 validator were removed. The supported flow is:
+
+```text
+run → ReductionGraph.plan → planning.schedule → PlanningExecutor
+    → Task → algorithm → DefaultPublicationService → ArtifactService.persist_request
+```
+
+Tasks and diagnostics load components through `ArtifactService.load_component`. The old `master_sci` stack was removed; science continues through the per-exposure reduction and complete-observation publication path. The only retained Artifact-name compatibility is `LEGACY_KIND_ALIASES`, explicitly limited to reading existing registries and locating migration candidates. It cannot publish new records.
 
 Execution defaults to four workers and progress enabled. Planning YAML execution fields are `nworkers`, `progress`, `progress_mode`, `progress_interval`, `progress_path`, and `max_retries`. Explicit CLI values override them; `--serial` forces one.
+
+Planning node and edge names must use the seven canonical calibration kinds. Dependencies have one configuration representation: explicit edges. The removed `preprocess_requires` and mapping-helper flags are not interpreted.
 
 The stages 8–10 migration identifies active superseded dense kinds and old dense scattered-light representations. Dry-run inventory is the default:
 

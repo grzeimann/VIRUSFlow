@@ -2,6 +2,8 @@
 
 All examples assume a scanned `./run/registry.sqlite3` and configuration files in the repository root.
 
+The examples use canonical Product names. Legacy names may be queried when inspecting an old registry, but new planning configuration and publication reject them.
+
 ## Calibration
 
 ```bash

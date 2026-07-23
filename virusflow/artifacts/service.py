@@ -12,7 +12,12 @@ from typing import Any, Dict, Iterable, Optional
 
 import numpy as np
 
-from ..ontology.artifact_kinds import canonical_kind, kind_candidates, kind_spec
+from ..ontology.artifact_kinds import (
+    LEGACY_KIND_ALIASES,
+    canonical_kind,
+    kind_candidates,
+    kind_spec,
+)
 from ..ontology.lifecycle import ArtifactLifecycle
 from ..ontology.relations import RelationKind
 from ..registry import database as db
@@ -80,13 +85,30 @@ class ArtifactService:
             raise ValueError("Artifact.storage_format is required")
         if not artifact.storage or not artifact.storage.uri:
             raise ValueError("Artifact.storage.uri is required")
+        requested_kind = str(artifact.kind).strip().lower()
+        if requested_kind in LEGACY_KIND_ALIASES:
+            raise ValueError(
+                f"legacy Artifact kind {artifact.kind!r} is read-only; publish "
+                f"{LEGACY_KIND_ALIASES[requested_kind]!r} instead"
+            )
+        spec = None
         try:
-            lifecycle = kind_spec(artifact.kind).lifecycle
+            spec = kind_spec(artifact.kind)
+            lifecycle = spec.lifecycle
         except KeyError:
+            if str(artifact.role).lower() not in {"analysis", "analytic", "diagnostic"}:
+                raise ValueError(f"unregistered production Artifact kind: {artifact.kind!r}")
             lifecycle = artifact.lifecycle
         if lifecycle == ArtifactLifecycle.SCRATCH:
             raise ValueError(f"scratch-only kind cannot be registered permanently: {artifact.kind}")
         components = list(getattr(artifact, "_component_records", []) or [])
+        if spec is not None:
+            names = {str(component.get("name")) for component in components}
+            missing = set(spec.required_components) - names
+            if missing:
+                raise ValueError(
+                    f"canonical Artifact registration requires persisted components: {sorted(missing)}"
+                )
         from ..performance import phase
         with phase("artifact_publish"):
             return self.adapter.register(artifact, components=components)
@@ -94,6 +116,12 @@ class ArtifactService:
     def persist_request(self, request: ArtifactRequest, *, context: Any, policy: Any, base_dir: str) -> Artifact:
         if not request.components:
             raise ValueError("ArtifactRequest has no components")
+        requested_kind = str(request.kind).strip().lower()
+        if requested_kind in LEGACY_KIND_ALIASES:
+            raise ValueError(
+                f"legacy Artifact kind {request.kind!r} is read-only; publish "
+                f"{LEGACY_KIND_ALIASES[requested_kind]!r} instead"
+            )
         kind = canonical_kind(request.kind)
         spec = kind_spec(kind)
         if spec.lifecycle == ArtifactLifecycle.SCRATCH:
@@ -134,6 +162,11 @@ class ArtifactService:
             name: normalize_component(kind, component)
             for name, component in request.components.items()
         }
+        missing_components = set(spec.required_components) - set(normalized_components)
+        if missing_components:
+            raise ValueError(
+                f"missing required components for {kind}: {sorted(missing_components)}"
+            )
         storage_root = Path(base_dir)
         storage_root.mkdir(parents=True, exist_ok=True)
         projected_bytes = int(sum(
@@ -615,8 +648,12 @@ class ArtifactService:
         if require_cache and lifecycle != ArtifactLifecycle.CACHE.value:
             raise ValueError(f"only cache payloads may be evicted without migration approval: {artifact_id}")
         removed = 0
-        for component in self.adapter.list_components(int(artifact_id)):
-            path = Path(str(component.get("path") or ""))
+        components = self.adapter.list_components(int(artifact_id))
+        paths = [component.get("path") for component in components]
+        if not paths:
+            paths = [row.get("path")]
+        for value in dict.fromkeys(paths):
+            path = Path(str(value or ""))
             if not path.name:
                 continue
             for target in (path, path.with_suffix(path.suffix + ".json")):

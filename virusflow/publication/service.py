@@ -1,25 +1,22 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Protocol, Dict, Any
-from pathlib import Path
+from typing import Iterable, List, Protocol, Dict
 
-from ..artifacts.models import Artifact, StorageRef, Scope, Provenance
-from ..artifacts.requests import ArtifactRequest, LogicalComponent
+from ..artifacts.models import Artifact
+from ..artifacts.requests import ArtifactRequest
 from ..artifacts.service import ArtifactService
 from ..contracts.artifact import (
     ArtifactContract,
     ArtifactContractSpec,
     MasterBiasContract,
     MasterDarkContract,
-    MasterFlatContract,
-    MasterCmpContract,
-    MasterTwiContract,
-    TraceContract,
-    WaveContract,
+    MasterLDLSContract,
+    MasterArcContract,
+    MasterTwilightContract,
+    TraceMapContract,
+    WavelengthMapContract,
 )
-from ..persistence.policy import PersistencePolicy, RepresentationDecision
-from ..artifacts.serializers import Serializer
-from ..artifacts.io_fits import write_array_fits
+from ..persistence.policy import PersistencePolicy
 from .context import PublicationContext
 
 
@@ -44,11 +41,11 @@ class PublicationService(Protocol):
 _KIND_TO_CONTRACT: Dict[str, ArtifactContract] = {
     "master_bias": MasterBiasContract(),
     "master_dark": MasterDarkContract(),
-    "master_flat": MasterFlatContract(),
-    "master_cmp": MasterCmpContract(),
-    "master_twi": MasterTwiContract(),
-    "trace": TraceContract(),
-    "wave": WaveContract(),
+    "master_ldls": MasterLDLSContract(),
+    "master_arc": MasterArcContract(),
+    "master_twilight": MasterTwilightContract(),
+    "trace_map": TraceMapContract(),
+    "wavelength_map": WavelengthMapContract(),
 }
 
 
@@ -90,32 +87,6 @@ class DefaultPublicationService:
         self._validate_against_contract(req, spec)
         return self.svc.persist_request(req, context=ctx, policy=self.policy, base_dir=self.base_dir)
 
-    def _payload_type_for(self, model_type: str) -> str:
-        mt = (model_type or "").strip().lower()
-        if mt in ("array2d", "array1d"):
-            return "array"
-        if mt == "image":
-            return "image"
-        if mt == "table":
-            return "table"
-        if mt == "scalar":
-            return "scalar"
-        return "collection"
-
-    def _select_primary_component(self, req: ArtifactRequest, spec: ArtifactContractSpec) -> tuple[str, LogicalComponent]:
-        # Prefer the first required component in the contract
-        names_req = [c.name for c in (spec.components or []) if c.required]
-        for nm in names_req:
-            comp = req.get_component(nm)
-            if comp is not None:
-                return nm, comp
-        # Fallback: first component provided
-        for nm in req.component_names():
-            comp = req.get_component(nm)
-            if comp is not None:
-                return nm, comp
-        raise ValueError("ArtifactRequest has no components to persist")
-
     def _validate_against_contract(self, req: ArtifactRequest, spec: ArtifactContractSpec) -> None:
         # Ensure required components exist and model_types match when provided
         missing = []
@@ -129,12 +100,3 @@ class DefaultPublicationService:
             rc = req.get_component(c.name)
             if rc is not None and c.model_type and str(rc.model_type).lower() != str(c.model_type).lower():
                 raise ValueError(f"Component '{c.name}' has model_type={rc.model_type}, expected {c.model_type}")
-
-    def _filename_tokens(self, *, req: ArtifactRequest, ctx: PublicationContext) -> Dict[str, str]:
-        # Minimal tokens; tasks may pass more later (zipcode, dates)
-        toks: Dict[str, str] = {
-            "kind": (req.kind or "artifact"),
-            "task": (ctx.task_name or "task"),
-            "tver": (ctx.task_version or "v1"),
-        }
-        return toks

@@ -84,8 +84,17 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
         _publish(service, tmp_path, "master_ldls", zipcode, {"master_ldls": twilight, "flat_response_mask": zero.astype(np.uint8)}, at)
         _publish(service, tmp_path, "master_arc", zipcode, {"master_arc": one}, at)
         _publish(service, tmp_path, "master_twilight", zipcode, {"master_twilight": twilight}, at)
-        _publish(service, tmp_path, "trace_map", zipcode, {"fiber_trace_map": trace}, at)
-        _publish(service, tmp_path, "wavelength_map", zipcode, {"wavelength_map": wavelength}, at)
+        sample_columns = np.asarray([0, nx - 1], dtype=float)
+        _publish(service, tmp_path, "trace_map", zipcode, {
+            "fiber_trace_map": trace,
+            "trace_sample_columns": sample_columns,
+            "sampled_trace_positions": trace[:, [0, nx - 1]],
+            "per_fiber_trace_residual_rms": np.zeros(trace.shape[0]),
+        }, at)
+        _publish(service, tmp_path, "wavelength_map", zipcode, {
+            "wavelength_map": wavelength,
+            "per_fiber_wavelength_residual_rms": np.zeros(trace.shape[0]),
+        }, at)
 
     config = ConfigurationService(root=Path.cwd())
     fplane, _ = config.resolve_fplane(Path.cwd() / "fplaneall.txt")

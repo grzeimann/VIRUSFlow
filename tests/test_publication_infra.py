@@ -23,10 +23,14 @@ def test_publication_roundtrip_master_bias(tmp_path: Path):
 
     # Build a simple array component
     arr = np.ones((5, 7), dtype=float)
-    comp = LogicalComponent(name="master", model_type="array2d", value=arr)
     req = ArtifactRequest(
         kind="master_bias",
-        components={"master": comp},
+        components={
+            "master": LogicalComponent("master", "array2d", arr),
+            "per_pixel_bias_scatter": LogicalComponent(
+                "per_pixel_bias_scatter", "array2d", np.zeros_like(arr)
+            ),
+        },
         summaries={"read_noise": 1.23},
         metadata={"n_inputs": 3, "algo_version": "bias-1.0"},
         scope=Scope(zipcode=None),
@@ -34,7 +38,7 @@ def test_publication_roundtrip_master_bias(tmp_path: Path):
     )
 
     ctx = PublicationContext(
-        task_name="bias", task_version="v1",
+        task_name="bias", task_version="v2",
         algorithm_name="bias", algorithm_version="bias-1.0",
         parameters={"foo": "bar"}, parent_ids=[], timings={}
     )

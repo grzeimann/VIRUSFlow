@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from typing import Dict, Iterable, Type
 
 import numpy as np
@@ -10,7 +9,6 @@ from ..algorithms.bias import step_bias
 from ..algorithms.cmp import step_cmp
 from ..algorithms.dark import step_dark
 from ..algorithms.flat import step_flt
-from ..algorithms.sci import build_master_science
 from ..algorithms.trace import fit_fiber_traces
 from ..algorithms.twi import step_twi
 from ..algorithms.wave import fit_wavelength_solution
@@ -23,7 +21,6 @@ from ..contracts.result import (
     CmpResultContract,
     DarkResultContract,
     FlatResultContract,
-    SciResultContract,
     TraceResultContract,
     TwiResultContract,
     WaveResultContract,
@@ -164,8 +161,6 @@ class DarkTask(_RawCalibrationTask):
 
 
 class FlatTask(_RawCalibrationTask):
-    """Legacy public class name producing the canonical LDLS Product."""
-
     name = "flat"
     version = "v2"
     frame_type = "flt"
@@ -177,15 +172,7 @@ class FlatTask(_RawCalibrationTask):
     component_map = {"master_flat": "master_ldls", "flat_response_mask": "flat_response_mask"}
     combine_method = "chunked fixed-center biweight_location"
 
-    def run(self, inputs):
-        result = super().run(inputs)
-        result["master_flat"] = result[self.artifact_name]
-        return result
-
-
 class CmpTask(_RawCalibrationTask):
-    """Legacy public class name producing aggregate Master Arc from raw cmp."""
-
     name = "cmp"
     version = "v2"
     frame_type = "cmp"
@@ -196,12 +183,6 @@ class CmpTask(_RawCalibrationTask):
     result_contract = CmpResultContract
     component_map = {"master_comparison_lamp": "master_arc"}
     combine_method = "chunked fixed-center biweight_location"
-
-    def run(self, inputs):
-        result = super().run(inputs)
-        result["master_cmp"] = result[self.artifact_name]
-        return result
-
 
 class TwiTask(_RawCalibrationTask):
     name = "twi"
@@ -214,29 +195,6 @@ class TwiTask(_RawCalibrationTask):
     result_contract = TwiResultContract
     component_map = {"master_twilight": "master_twilight"}
     combine_method = "chunked fixed-center biweight_location"
-
-    def run(self, inputs):
-        result = super().run(inputs)
-        result["master_twi"] = result[self.artifact_name]
-        return result
-
-
-class SciTask(_RawCalibrationTask):
-    name = "sci"
-    version = "v2"
-    frame_type = "sci"
-    artifact_name = "master_sci"
-    algorithm = staticmethod(build_master_science)
-    algorithm_name = "virusflow.algorithms.sci.build_master_science"
-    result_kind = "sci"
-    result_contract = SciResultContract
-    # master_sci is outside the Step 1 canonical Product registry; retain legacy behavior.
-    component_map = {"master_science": "master_science"}
-
-    def _components(self, result):
-        value = result.get_array("master_science")
-        return {"master_science": LogicalComponent("master_science", "array2d", value, "electron", "oriented_amplifier_blue_to_red")}
-
 
 class TraceTask(_CanonicalTask):
     name = "trace"
@@ -277,7 +235,7 @@ class TraceTask(_CanonicalTask):
             raise ValueError("TraceTask result contract: " + "; ".join(report.errors))
         refs = self.configuration_references() + [trace_ref]
         artifact = self._publish(result, [int(parent["id"])], configuration_refs=refs)
-        return {self.artifact_name: artifact, "trace": artifact}
+        return {self.artifact_name: artifact}
 
 
 class WaveTask(_CanonicalTask):
@@ -354,4 +312,4 @@ class WaveTask(_CanonicalTask):
         artifact = self._publish(
             result, [int(arc_row["id"]), int(trace_row["id"])], configuration_refs=refs
         )
-        return {self.artifact_name: artifact, "wave": artifact}
+        return {self.artifact_name: artifact}

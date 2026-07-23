@@ -127,9 +127,20 @@ def test_physical_ccd_task_publishes_compact_model_and_keeps_evaluation_in_memor
         ))
         trace_ids.append(_publish(service, tmp_path, ArtifactRequest(
             kind="trace_map", scope=Scope(zipcode=zipcode), validity=Validity(at, at, "fixture"),
-            components={"fiber_trace_map": LogicalComponent(
-                "fiber_trace_map", "array2d", trace, "pixel", "fiber_by_dispersion_pixel"
-            )},
+            components={
+                "fiber_trace_map": LogicalComponent(
+                    "fiber_trace_map", "array2d", trace, "pixel", "fiber_by_dispersion_pixel"
+                ),
+                "trace_sample_columns": LogicalComponent(
+                    "trace_sample_columns", "array1d", np.asarray([0.0, 23.0])
+                ),
+                "sampled_trace_positions": LogicalComponent(
+                    "sampled_trace_positions", "array2d", trace[:, [0, -1]]
+                ),
+                "per_fiber_trace_residual_rms": LogicalComponent(
+                    "per_fiber_trace_residual_rms", "array1d", np.zeros(trace.shape[0])
+                ),
+            },
         )).id)
 
     target = PhysicalCCDTarget(exposure_id, "206", "left", lower, upper, at)

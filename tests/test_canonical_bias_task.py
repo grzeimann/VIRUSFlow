@@ -3,15 +3,13 @@ from __future__ import annotations
 from datetime import datetime
 
 import numpy as np
-import pytest
-
 from virusflow.analytics.studies.bias import BiasStabilityParams, BiasStabilityStudy
 from virusflow.artifacts import ArtifactService
 from virusflow.core.identity import ZipCode
 from virusflow.io import RawFrameData
 from virusflow.registry.database import connect, init_db
 from virusflow.tasks.base import TaskContext
-from virusflow.tasks.calibs import BiasTask, SciTask
+from virusflow.tasks.calibs import BiasTask
 
 
 class _Target:
@@ -70,22 +68,6 @@ def test_bias_task_persists_complete_contract_validity_configuration_and_qa(tmp_
     assert facts["read_noise"][1] == "electron"
     assert facts["per_pixel_bias_scatter_median"][2] == "per_pixel_bias_scatter"
     assert tuple(decision) == ("pass", "usable")
-
-
-def test_configured_hard_qa_failure_is_not_swallowed(tmp_path, monkeypatch):
-    yaml_path = tmp_path / "qa.yml"
-    yaml_path.write_text(
-        "version: 1\ndefaults: {policy: soft}\nkinds:\n  master_sci:\n    policy: hard\n"
-        "    metrics: {p95: {from: 'reduce.percentile(meta.component.data,95)', default: 0.0}}\n"
-        "    checks: [{id: signal, where: 'p95 > 0.0', severity: fail_if_false}]\n"
-    )
-    monkeypatch.setenv("VF_QA_YAML", str(yaml_path))
-    task, service = _task(tmp_path, SciTask, value=0.0)
-    with pytest.raises(RuntimeError, match="QA hard-fail"):
-        task.run({})
-    rows = service.adapter.find(kind="master_sci", zipcode=_Target.zipcode, at_time=None, limit=None)
-    assert len(rows) == 1
-    assert service.adapter.get_diagnostics(int(rows[0]["id"]))["status"] == "fail"
 
 
 def test_bias_stability_uses_named_components_and_records_all_source_lineage(tmp_path):

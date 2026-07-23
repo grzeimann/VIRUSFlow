@@ -3,9 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-# Legacy artifact dataclasses are no longer used in the new artifacts subsystem
-from ..registry import database as db
-from ..artifacts import Artifact as NewArtifact, ArtifactService, Scope, StorageRef, Provenance
+from ..artifacts import Artifact as NewArtifact, ArtifactService, Scope
 
 
 @dataclass
@@ -41,76 +39,6 @@ class Task:
 
     def run(self, inputs: Dict[str, NewArtifact]) -> Dict[str, NewArtifact]:
         raise NotImplementedError
-
-    def save_artifact(self, art: NewArtifact, parent_ids: List[int] | None = None) -> int:
-        """Register an artifact via ArtifactService.register (full delegation).
-
-        This centralizes provenance and registry behavior in the service.
-        """
-        # Build provenance params (include serialized target for traceability)
-        params = dict(self.params)
-        if getattr(self, "target", None) is not None:
-            try:
-                t = self.target
-                if hasattr(t, "to_dict"):
-                    params["target"] = t.to_dict()
-                else:
-                    params["target"] = str(t)
-            except Exception:
-                params["target"] = str(self.target)
-            # Also thread validity_start/end (as datetimes) derived from target window when available
-            try:
-                from datetime import datetime as _dt
-                sd = getattr(self.target, "start_date", None)
-                ed = getattr(self.target, "end_date", None)
-                def _parse_ymd(s):
-                    if not s:
-                        return None
-                    s = str(s)
-                    if len(s) >= 8:
-                        return _dt.strptime(s[:8], "%Y%m%d")
-                    return None
-                vstart = _parse_ymd(sd)
-                vend = _parse_ymd(ed)
-                if vstart is not None:
-                    params.setdefault("validity_start", vstart)
-                if vend is not None:
-                    params.setdefault("validity_end", vend)
-            except Exception:
-                pass
-
-        # Construct service scope
-        from ..artifacts import ArtifactService, Scope, Artifact as NewArtifact, StorageRef, Provenance
-        zc = getattr(art, "zipcode", None) or getattr(getattr(self, "target", None), "zipcode", None)
-        scope = Scope(zipcode=zc)
-
-        # Build new-model Artifact and register
-        svc = ArtifactService(self.ctx.db_path)
-        # Prefer the existing storage reference from the provided artifact (has correct URI)
-        _existing_storage = getattr(art, "storage", None)
-        _sfmt = getattr(_existing_storage, "storage_format", "fits") if _existing_storage else "fits"
-        _suri = getattr(_existing_storage, "uri", None)
-        if not _suri:
-            # Fallback to legacy `.path` attribute if present
-            _suri = str(getattr(art, "path", None) or "")
-        storage_ref = StorageRef(uri=str(_suri), storage_format=_sfmt, backend=getattr(_existing_storage, "backend", "fs"))
-        new_art = NewArtifact(
-            id=None,
-            kind=str(getattr(art, "kind", self.name)),
-            role=getattr(art, "role", "calibration"),
-            payload_type=getattr(art, "payload_type", "array"),
-            storage_format=_sfmt,  # current savers use FITS primary HDU
-            storage=storage_ref,
-            scope=scope,
-            metadata=dict(getattr(art, "metadata", {}) or {}),
-            provenance=Provenance(
-                algorithm=f"{self.name}:{self.version}",
-                params=params,
-                parents=[int(x) for x in (parent_ids or [])],
-            ),
-        )
-        return svc.register(new_art)
-
 
 # Generic calibration task template used by BiasTask and future calibs
 class CalibrationTask(Task):
@@ -152,40 +80,15 @@ class CalibrationTask(Task):
         midpoint of the target window via ArtifactService.select_best. Falls back
         to the latest by zipcode if a time-qualified match is not found.
 
-        When the feature flag is enabled (ctx.config.use_mapping_helper or
-        environment VF_MAP_HELPER=1), consult the planning.mapping.select_for_edge
-        helper to centralize policy+tolerance handling. Optional tolerance can be
-        configured via ctx.config.mapping_tolerance_days.
+        Selection is always performed through ArtifactService. Planning edges
+        determine execution order; task loading resolves the published Product.
         """
-        import os as _os
         self._require_target()
         zipcode = getattr(self.target, "zipcode", None)
         at_time = self._target_mid_time()
         svc = ArtifactService(self.ctx.db_path)
         scope = Scope(zipcode=zipcode)
-        use_helper = False
-        try:
-            use_helper = bool(getattr(self.ctx, "config", {}).get("use_mapping_helper", False))
-        except Exception:
-            use_helper = False
-        if not use_helper:
-            use_helper = (_os.environ.get("VF_MAP_HELPER", "0") == "1")
-        if use_helper:
-            try:
-                from ..planning import select_for_edge as _select_for_edge  # type: ignore
-            except Exception:
-                _select_for_edge = None  # type: ignore
-            tol = None
-            try:
-                tol = getattr(self.ctx, "config", {}).get("mapping_tolerance_days")
-            except Exception:
-                tol = None
-            if _select_for_edge is not None:
-                row = _select_for_edge(kind=kind, scope=scope, at_time=at_time, policy="latest_valid", tolerance_days=tol, service=svc)
-            else:
-                row = svc.select_best(kind=kind, scope=scope, at_time=at_time, policy="latest_valid")
-        else:
-            row = svc.select_best(kind=kind, scope=scope, at_time=at_time, policy="latest_valid")
+        row = svc.select_best(kind=kind, scope=scope, at_time=at_time, policy="latest_valid")
         if not row:
             row = svc.select_best(kind=kind, scope=scope, at_time=None, policy="latest")
         if not row:

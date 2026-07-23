@@ -19,6 +19,7 @@ from virusflow.algorithms.physical_ccd import (
     fit_gap_scattered_light,
 )
 from virusflow.artifacts import ArtifactService, Scope
+from virusflow.artifacts.models import Artifact, Provenance, StorageRef
 from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
 from virusflow.artifacts.sparse_mask import decode_mask, encode_mask
 from virusflow.analytics.materialization import AnalysisStudyService, RetentionPolicy
@@ -36,6 +37,24 @@ def _publisher(tmp_path: Path):
     )
     context = PublicationContext("test", "1", "test", "1", {}, [], {})
     return service, publisher, context
+
+
+def _register_legacy_dense_scatter(service: ArtifactService, root: Path) -> tuple[int, Path]:
+    payload = root / "legacy-dense-scatter.bin"
+    payload.write_bytes(b"legacy dense scatter payload")
+    artifact = Artifact(
+        id=None,
+        kind="ccd_scattered_light_model",
+        role="calibration",
+        payload_type="array",
+        storage_format="fits",
+        storage=StorageRef(str(payload), "fits"),
+        scope=Scope(zipcode=None),
+        metadata={"payload_bytes": payload.stat().st_size},
+        provenance=Provenance("legacy", {}, []),
+        payload_bytes=payload.stat().st_size,
+    )
+    return service.adapter.register(artifact, components=[]), payload
 
 
 def test_sparse_mask_all_encodings_roundtrip_bit_flags_and_service_is_transparent(tmp_path: Path):
@@ -68,10 +87,18 @@ def test_sparse_mask_all_encodings_roundtrip_bit_flags_and_service_is_transparen
 
 def test_scratch_only_publication_is_rejected_and_worker_scratch_is_cleaned(tmp_path: Path):
     _, publisher, context = _publisher(tmp_path)
-    with pytest.raises(ValueError, match="scratch-only"):
+    from virusflow.artifacts.migration import SUPERSEDED_STAGE_8_10_KINDS
+
+    for kind in SUPERSEDED_STAGE_8_10_KINDS:
+        with pytest.raises(ValueError, match="scratch-only"):
+            publisher.publish([ArtifactRequest(
+                kind=kind,
+                components={"data": LogicalComponent("data", "array2d", np.ones((3, 3)))},
+            )], context)
+    with pytest.raises(ValueError, match="missing required components"):
         publisher.publish([ArtifactRequest(
-            kind="reduced_science_image",
-            components={"image": LogicalComponent("image", "array2d", np.ones((3, 3)))},
+            kind="ccd_scattered_light_model",
+            components={"model": LogicalComponent("model", "array2d", np.ones((3, 3)))},
         )], context)
     with ScratchSpace(tmp_path, run_id="run", worker_id="worker-1") as scratch:
         path = scratch.child("detector")
@@ -301,14 +328,11 @@ def test_worker_precedence_parallel_failures_nested_budget_and_scratch(tmp_path:
     retained_space.cleanup()
 
 
-def test_migration_invalidates_only_legacy_dense_scatter_and_preserves_compact(tmp_path: Path):
-    from virusflow.artifacts.migration import migrate_stages_8_10_storage
+def test_legacy_cleanup_separates_deactivation_from_payload_deletion(tmp_path: Path):
+    from virusflow.storage.cleanup import cleanup_legacy
 
     service, publisher, context = _publisher(tmp_path)
-    dense = publisher.publish([ArtifactRequest(
-        kind="ccd_scattered_light_model",
-        components={"model": LogicalComponent("model", "array2d", np.ones((8, 8)))},
-    )], context)[0]
+    dense_id, payload = _register_legacy_dense_scatter(service, tmp_path)
     compact_components = {
         "model_parameters": LogicalComponent("model_parameters", "array1d", np.arange(6)),
         "detector_shape": LogicalComponent("detector_shape", "array1d", np.asarray([8, 8])),
@@ -321,11 +345,35 @@ def test_migration_invalidates_only_legacy_dense_scatter_and_preserves_compact(t
     compact = publisher.publish([ArtifactRequest(
         kind="ccd_scattered_light_model", components=compact_components,
     )], context)[0]
-    result = migrate_stages_8_10_storage(service.db_path)
-    assert result.invalidated == 1
-    assert service.adapter.get_row(dense.id)["state"] == "obsolete"
+    preview = cleanup_legacy(service.db_path)
+    assert preview.dry_run and preview.candidates == 1
+    assert service.adapter.get_row(dense_id)["state"] == "active"
+    assert payload.exists()
+
+    result = cleanup_legacy(service.db_path, deactivate=True)
+    assert result.affected == 1 and result.removed_bytes == 0
+    assert service.adapter.get_row(dense_id)["state"] == "obsolete"
+    assert payload.exists()
     assert service.adapter.get_row(compact.id)["state"] == "active"
     assert service.select_best(kind="ccd_scattered_light_model", scope=Scope(zipcode=None))['id'] == compact.id
+
+    delete_root = tmp_path / "delete"
+    delete_root.mkdir()
+    service2, _, _ = _publisher(delete_root)
+    dense2_id, payload2 = _register_legacy_dense_scatter(service2, delete_root)
+    with pytest.raises(ValueError, match="deactivate"):
+        cleanup_legacy(service2.db_path, delete_payloads=True, validation_succeeded=True)
+    with pytest.raises(ValueError, match="validation-succeeded"):
+        cleanup_legacy(service2.db_path, deactivate=True, delete_payloads=True)
+    deleted = cleanup_legacy(
+        service2.db_path,
+        deactivate=True,
+        delete_payloads=True,
+        validation_succeeded=True,
+    )
+    assert deleted.affected == 1 and deleted.removed_bytes > 0
+    assert service2.adapter.get_row(dense2_id)["state"] == "obsolete"
+    assert not payload2.exists()
 
 
 def test_analysis_policies_budget_candidates_and_validation_provenance(tmp_path: Path):

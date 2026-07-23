@@ -5,9 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import shutil
-from typing import Iterable
-
-from ..artifacts.migration import SUPERSEDED_STAGE_8_10_KINDS, find_legacy_dense_artifacts
+from ..artifacts.migration import find_legacy_dense_artifacts
 from ..artifacts.service import ArtifactService
 from ..ontology.lifecycle import ArtifactLifecycle
 

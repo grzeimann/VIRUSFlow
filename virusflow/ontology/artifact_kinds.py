@@ -49,7 +49,6 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
     "master_ldls": _spec("master_ldls", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_ldls", "flat_response_mask")),
     "master_arc": _spec("master_arc", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_arc",)),
     "master_twilight": _spec("master_twilight", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_twilight",)),
-    "master_sci": _spec("master_sci", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_science",)),
     "trace_map": _spec("trace_map", PhysicalScope.AMPLIFIER, Unit.PIXEL.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("fiber_trace_map", "trace_sample_columns", "sampled_trace_positions", "per_fiber_trace_residual_rms")),
     "wavelength_map": _spec("wavelength_map", PhysicalScope.AMPLIFIER, Unit.ANGSTROM.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("wavelength_map", "per_fiber_wavelength_residual_rms"), ("arc_identification",)),
     "read_noise": _spec("read_noise", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.NONE, ("read_noise",)),
@@ -192,6 +191,11 @@ LEGACY_KIND_ALIASES: Dict[str, str] = {
 
 
 def canonical_kind(name: str) -> str:
+    """Resolve deprecated names while reading old registries and migration input.
+
+    Publication rejects these aliases so they cannot create new records.
+    """
+
     key = str(name or "").strip().lower()
     return LEGACY_KIND_ALIASES.get(key, key)
 

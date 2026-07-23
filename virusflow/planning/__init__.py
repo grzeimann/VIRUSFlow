@@ -12,13 +12,7 @@ from .config import (
 )
 from .adapter import PlanningTargetAdapter, adapt_target
 from .validate import validate_edges, validate_graph, PlanningValidationError
-from .mapping import select_for_edge
-# Optional thin scheduler (planning-first execution assembly)
-try:
-    from .scheduler import schedule, ScheduledTask  # type: ignore
-except Exception:  # pragma: no cover - scheduler is optional for now
-    schedule = None  # type: ignore
-    ScheduledTask = None  # type: ignore
+from .scheduler import schedule, ScheduledTask
 
 __all__ = [
     # targets
@@ -41,9 +35,10 @@ __all__ = [
     "PlanningConfig",
     "load_planning_config",
     "load_planning_config_from_dict",
-    # mapping helper
-    "select_for_edge",
-    # scheduler (optional)
+    "validate_edges",
+    "validate_graph",
+    "PlanningValidationError",
+    # scheduler
     "schedule",
     "ScheduledTask",
 ]

@@ -20,12 +20,16 @@ def test_publication_records_publication_context_in_provenance(tmp_path: Path, m
     policy = DefaultPersistencePolicy()
     pub = DefaultPublicationService(svc=svc, policy=policy, base_dir=str(tmp_path))
 
-    # Build a simple multi-component-capable request (single array component used here)
+    # Build the complete canonical Bias request.
     arr = np.zeros((3, 5), dtype=float)
-    comp = LogicalComponent(name="master", model_type="array2d", value=arr)
     req = ArtifactRequest(
         kind="master_bias",
-        components={"master": comp},
+        components={
+            "master": LogicalComponent("master", "array2d", arr),
+            "per_pixel_bias_scatter": LogicalComponent(
+                "per_pixel_bias_scatter", "array2d", np.zeros_like(arr)
+            ),
+        },
         summaries={"read_noise": 2.5},
         metadata={"n_inputs": 3, "algo_version": "bias-1.0"},
         scope=Scope(zipcode=None),
@@ -35,7 +39,7 @@ def test_publication_records_publication_context_in_provenance(tmp_path: Path, m
 
     ctx = PublicationContext(
         task_name="bias",
-        task_version="v1",
+        task_version="v2",
         algorithm_name="algorithms.bias.step_bias",
         algorithm_version="bias-1.0",
         parameters={"foo": "bar"},

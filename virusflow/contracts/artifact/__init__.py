@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Protocol
+from typing import List, Optional, Protocol
 
 
 @dataclass(frozen=True)
@@ -46,10 +46,11 @@ class MasterBiasContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
             kind="master_bias",
-            components=[LogicalComponentSpec(name="master", model_type="array2d", required=True)],
-            # Compatibility publication may still read historical single-component Bias;
-            # canonical BiasTask enforces the ontology's two required components.
-            optional_components=[LogicalComponentSpec(name="per_pixel_bias_scatter", model_type="array2d", required=False)],
+            components=[
+                LogicalComponentSpec(name="master", model_type="array2d", required=True),
+                LogicalComponentSpec(name="per_pixel_bias_scatter", model_type="array2d", required=True),
+            ],
+            optional_components=[],
             summaries=["read_noise"],
             required_metadata=[],
             applicability="Bias calibration products",
@@ -62,8 +63,11 @@ class MasterDarkContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
             kind="master_dark",
-            components=[LogicalComponentSpec(name="master_dark", model_type="array2d", required=True)],
-            optional_components=[LogicalComponentSpec(name="dark_pixel_mask", model_type="array2d", required=False)],
+            components=[
+                LogicalComponentSpec(name="master_dark", model_type="array2d", required=True),
+                LogicalComponentSpec(name="dark_pixel_mask", model_type="array2d", required=True),
+            ],
+            optional_components=[],
             summaries=["bad_fraction"],
             required_metadata=[],
             applicability="Dark calibration products",
@@ -72,12 +76,15 @@ class MasterDarkContract:
         )
 
 
-class MasterFlatContract:
+class MasterLDLSContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
-            kind="master_flat",
-            components=[LogicalComponentSpec(name="master_flat", model_type="array2d", required=True)],
-            optional_components=[LogicalComponentSpec(name="flat_response_mask", model_type="array2d", required=False)],
+            kind="master_ldls",
+            components=[
+                LogicalComponentSpec(name="master_ldls", model_type="array2d", required=True),
+                LogicalComponentSpec(name="flat_response_mask", model_type="array2d", required=True),
+            ],
+            optional_components=[],
             summaries=["bad_fraction"],
             required_metadata=[],
             applicability="Flat calibration products",
@@ -86,10 +93,10 @@ class MasterFlatContract:
         )
 
 
-class TraceContract:
+class TraceMapContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
-            kind="trace",
+            kind="trace_map",
             components=[
                 LogicalComponentSpec(name="fiber_trace_map", model_type="array2d", required=True),
                 LogicalComponentSpec(name="trace_sample_columns", model_type="array1d", required=True),
@@ -100,15 +107,15 @@ class TraceContract:
             summaries=["per_fiber_trace_residual_rms_ds", "trace_len"],
             required_metadata=[],
             applicability="Trace solution for fiber extraction",
-            validity_semantics="Valid with master_flat parent",
-            provenance_expectations=["master_flat"],
+            validity_semantics="Valid with master_ldls parent",
+            provenance_expectations=["master_ldls"],
         )
 
 
-class WaveContract:
+class WavelengthMapContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
-            kind="wave",
+            kind="wavelength_map",
             components=[
                 LogicalComponentSpec(name="wavelength_map", model_type="array2d", required=True),
                 LogicalComponentSpec(name="per_fiber_wavelength_residual_rms", model_type="array1d", required=True),
@@ -117,16 +124,16 @@ class WaveContract:
             summaries=["per_fiber_wavelength_residual_rms_ds", "best_nmatch", "best_rms"],
             required_metadata=[],
             applicability="Wavelength calibration",
-            validity_semantics="Valid with master_cmp and trace parents",
-            provenance_expectations=["master_cmp", "trace"],
+            validity_semantics="Valid with master_arc and trace_map parents",
+            provenance_expectations=["master_arc", "trace_map"],
         )
 
 
-class MasterCmpContract:
+class MasterArcContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
-            kind="master_cmp",
-            components=[LogicalComponentSpec(name="master_comparison_lamp", model_type="array2d", required=True)],
+            kind="master_arc",
+            components=[LogicalComponentSpec(name="master_arc", model_type="array2d", required=True)],
             optional_components=[],
             summaries=[],
             required_metadata=[],
@@ -136,29 +143,15 @@ class MasterCmpContract:
         )
 
 
-class MasterTwiContract:
+class MasterTwilightContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
-            kind="master_twi",
+            kind="master_twilight",
             components=[LogicalComponentSpec(name="master_twilight", model_type="array2d", required=True)],
             optional_components=[],
             summaries=[],
             required_metadata=[],
             applicability="Twilight calibration products",
             validity_semantics="Valid for instrument zipcode and date window",
-            provenance_expectations=[],
-        )
-
-
-class MasterSciContract:
-    def spec(self) -> ArtifactContractSpec:
-        return ArtifactContractSpec(
-            kind="master_sci",
-            components=[LogicalComponentSpec(name="master_science", model_type="array2d", required=True)],
-            optional_components=[],
-            summaries=["n_inputs"],
-            required_metadata=[],
-            applicability="Science exposure stack for detector/fiber diagnostics",
-            validity_semantics="Valid for instrument zipcode and date window (diagnostic)",
             provenance_expectations=[],
         )

@@ -8,16 +8,13 @@ Responsibilities:
 - Extract metrics from inputs (v1: algorithm meta only)
 - Evaluate boolean checks with a safe expression evaluator
 - Determine per-kind status with policy (hard|soft|off)
-- Return decision and allow persistence via DiagnosticsFacade
+- Return a decision for persistence through ArtifactService diagnostics
 """
 
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-import math
-import operator
 
 try:
     import yaml  # type: ignore

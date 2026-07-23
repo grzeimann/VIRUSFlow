@@ -1,10 +1,4 @@
-import os
 from pathlib import Path
-
-import math
-import json
-
-import pytest
 
 from virusflow.qa.engine import QAEngine
 
@@ -68,11 +62,11 @@ def test_metric_defaults_applied_when_missing(tmp_path):
 
 
 def test_reducers_and_status_priority_warn_over_pass_fail_over_warn(tmp_path):
-    # Configure wave-like rules: fail if median >= 1.0; warn if p95 >= 1.8
+    # Configure wavelength-map rules: fail if median >= 1.0; warn if p95 >= 1.8
     yaml_text = (
         "version: 1\n"
         "kinds:\n"
-        "  wave:\n"
+        "  wavelength_map:\n"
         "    policy: hard\n"
         "    metrics:\n"
         "      rms_median: { from: reduce.median(meta.per_fiber_wavelength_residual_rms) }\n"
@@ -90,13 +84,13 @@ def test_reducers_and_status_priority_warn_over_pass_fail_over_warn(tmp_path):
 
     # Case 1: median passes (<1.0), but p95 >= 1.8 → status warn
     meta_warn = {"per_fiber_wavelength_residual_rms": [0.4, 0.8, 2.1, float("nan")]}  # p95 ~ 2.1
-    d_warn = eng.evaluate(kind="wave", meta=meta_warn)
+    d_warn = eng.evaluate(kind="wavelength_map", meta=meta_warn)
     assert d_warn.metrics["rms_median"] < 1.0
     assert d_warn.status == "warn"
 
     # Case 2: median fails (>=1.0) → status fail regardless of warn check
     meta_fail = {"per_fiber_wavelength_residual_rms": [1.2, 1.1, 0.9]}
-    d_fail = eng.evaluate(kind="wave", meta=meta_fail)
+    d_fail = eng.evaluate(kind="wavelength_map", meta=meta_fail)
     assert d_fail.metrics["rms_median"] >= 1.0
     assert d_fail.status == "fail"
 
@@ -149,12 +143,12 @@ def test_master_bias_like_rule_passes_for_readnoise_near_three(tmp_path):
     assert d_none.status == "fail"
 
 
-def test_master_cmp_not_all_zero_rule(tmp_path):
-    # New QA: fail master_cmp if all values are zero (p95 == 0)
+def test_master_arc_not_all_zero_rule(tmp_path):
+    # Fail master_arc if all values are zero (p95 == 0)
     yaml_text = (
         "version: 1\n"
         "kinds:\n"
-        "  master_cmp:\n"
+        "  master_arc:\n"
         "    policy: soft\n"
         "    metrics:\n"
         "      p95: { from: meta.p95 }\n"
@@ -167,9 +161,9 @@ def test_master_cmp_not_all_zero_rule(tmp_path):
     eng = QAEngine(ypath)
 
     # p95 == 0 -> should fail
-    d_fail = eng.evaluate(kind="master_cmp", meta={"p95": 0.0})
+    d_fail = eng.evaluate(kind="master_arc", meta={"p95": 0.0})
     assert d_fail.status == "fail"
 
     # p95 > 0 -> should pass
-    d_ok = eng.evaluate(kind="master_cmp", meta={"p95": 123.4})
+    d_ok = eng.evaluate(kind="master_arc", meta={"p95": 123.4})
     assert d_ok.status == "pass"

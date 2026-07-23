@@ -68,12 +68,3 @@ class ScratchSpace:
         if exc is None or not self.preserve_failed:
             self.cleanup()
         return False
-
-
-def cleanup_abandoned_scratch(workdir: str | Path) -> int:
-    root = Path(workdir).resolve() / ".scratch"
-    if not root.exists():
-        return 0
-    removed = sum(1 for path in root.rglob("*") if path.is_file())
-    shutil.rmtree(root)
-    return removed
