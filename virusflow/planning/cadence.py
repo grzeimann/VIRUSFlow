@@ -19,6 +19,20 @@ from ..registry import database as db
 from .targets import TemporalWindow
 
 
+def _parse_exposure_id(eid: str) -> datetime | None:
+    value = str(eid)
+    for fmt, candidate in (
+        ("%Y%m%dT%H%M%S.%f", value),
+        ("%Y%m%dT%H%M%S", value.split(".", 1)[0]),
+        ("%Y%m%d", value[:8]),
+    ):
+        try:
+            return datetime.strptime(candidate, fmt)
+        except ValueError:
+            pass
+    return None
+
+
 def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_days: int, min_n_inputs: int = 1, start_date: str | None = None, end_date: str | None = None) -> List[TemporalWindow]:
     """Enumerate periodic windows for a zipcode.
 
@@ -50,17 +64,6 @@ def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_d
     if len(rows) < int(min_n_inputs):
         if start_date or end_date:
             # derive bounds and emit a single window if any timestamps are parsable
-            def _parse_exposure_id(eid: str):
-                from datetime import datetime as _dt
-                s = str(eid)
-                base = s.split(".")[0]
-                try:
-                    return _dt.strptime(base, "%Y%m%dT%H%M%S")
-                except Exception:
-                    try:
-                        return _dt.strptime(base[:8], "%Y%m%d")
-                    except Exception:
-                        return None
             times: List[datetime] = []
             for (_rid, rf) in rows:
                 t = _parse_exposure_id(getattr(rf, "exposure_id", None))
@@ -70,17 +73,6 @@ def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_d
                 return [TemporalWindow(start=min(times), end=max(times))]
         return []
     # Derive concrete window bounds from exposure_id timestamps
-    def _parse_exposure_id(eid: str):
-        from datetime import datetime as _dt
-        s = str(eid)
-        base = s.split(".")[0]
-        try:
-            return _dt.strptime(base, "%Y%m%dT%H%M%S")
-        except Exception:
-            try:
-                return _dt.strptime(base[:8], "%Y%m%d")
-            except Exception:
-                return None
     times: List[datetime] = []
     for (_rid, rf) in rows:
         t = _parse_exposure_id(getattr(rf, "exposure_id", None))
@@ -129,19 +121,6 @@ def exposure_count_windows(*, db_path: str, scope: Scope, frame_type: str, min_n
     if not rows:
         return []
     # Parse exposure_id → datetime and sort
-    def _parse_exposure_id(eid: str):
-        from datetime import datetime as _dt
-        s = str(eid)
-        # Expect formats like 20260511T035810.4 or 20260511T035810
-        base = s.split(".")[0]
-        try:
-            return _dt.strptime(base, "%Y%m%dT%H%M%S")
-        except Exception:
-            # As a fallback, try YYYYMMDD only
-            try:
-                return _dt.strptime(base[:8], "%Y%m%d")
-            except Exception:
-                return None
     items = []
     for (_rid, rf) in rows:
         t = _parse_exposure_id(getattr(rf, "exposure_id", None))

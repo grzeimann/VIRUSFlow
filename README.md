@@ -87,7 +87,7 @@ python -m pytest -q
 python -m virusflow.cli.verify_steps_8_10 --help
 ```
 
-The repository separates `algorithms`, `tasks`, `planning`, `executors`, `artifacts`, `analytics`, `registry`, and `storage`. See [CODING_STYLE.md](CODING_STYLE.md) and [docs/AGENTS.md](docs/AGENTS.md) before changing scientific or persistence contracts. Scientific changes require characterization and acceptance tests; direct task filesystem writes are migration debt.
+The repository separates `algorithms`, `tasks`, `planning`, `executors`, `artifacts`, `analytics`, `registry`, and `storage`. See [docs/AGENTS.md](docs/AGENTS.md) before changing scientific or persistence contracts. Scientific changes require characterization and acceptance tests; direct task filesystem writes are migration debt.
 
 ## Troubleshooting, contribution, license, and citation
 

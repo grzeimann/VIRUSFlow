@@ -87,7 +87,9 @@ class ArtifactService:
         if lifecycle == ArtifactLifecycle.SCRATCH:
             raise ValueError(f"scratch-only kind cannot be registered permanently: {artifact.kind}")
         components = list(getattr(artifact, "_component_records", []) or [])
-        return self.adapter.register(artifact, components=components)
+        from ..performance import phase
+        with phase("artifact_publish"):
+            return self.adapter.register(artifact, components=components)
 
     def persist_request(self, request: ArtifactRequest, *, context: Any, policy: Any, base_dir: str) -> Artifact:
         if not request.components:
@@ -145,9 +147,12 @@ class ArtifactService:
             )
         stable_parents = [self._stable_parent_identity(parent_id) for parent_id in parents]
         revision = request.revision or self._logical_revision(
-            kind, scope, validity, normalized_components, stable_parents, context
+            kind, scope, normalized_components, stable_parents, context,
+            request.configuration_refs,
         )
-        existing = self.adapter.find_by_revision(revision)
+        from ..performance import current_task_timing, phase
+        with phase("artifact_lookup"):
+            existing = self.adapter.find_by_revision(revision)
         if existing is not None and str(existing.get("state") or "active") == "active":
             return self._artifact_from_row(existing)
         tokens["revision"] = revision
@@ -191,9 +196,11 @@ class ArtifactService:
                 metadata["shape"] = list(component.value.shape)
             except Exception:
                 pass
-            serializer.save(path, component.value, metadata=metadata)
+            with phase("serialization"):
+                serializer.save(path, component.value, metadata=metadata)
             written_paths.append(Path(path))
-            checksum = _sha256(path)
+            with phase("content_hash"):
+                checksum = _sha256(path)
             checksums.append(f"{name}:{checksum}")
             if primary_path is None:
                 primary_path = path
@@ -298,6 +305,15 @@ class ArtifactService:
                 raise
             return self._artifact_from_row(concurrent)
         artifact.id = int(artifact_id)
+        timing = current_task_timing()
+        if timing is not None:
+            timing.increment("artifacts_written")
+            timing.increment("artifact_bytes_written", total_payload_bytes)
+            timing.identity("artifacts_written", f"{kind}:{artifact.id}")
+            timing.artifact_events.append({
+                "operation": "write", "artifact_id": artifact.id,
+                "kind": kind, "bytes": total_payload_bytes,
+            })
         return artifact
 
     def select_best(
@@ -408,11 +424,14 @@ class ArtifactService:
         }
 
     def load_component(self, artifact_id_or_row, component_name: Optional[str] = None, *, verify_checksum: bool = True) -> Dict[str, Any]:
-        row = artifact_id_or_row if isinstance(artifact_id_or_row, dict) else self.adapter.get_row(int(artifact_id_or_row))
+        from ..performance import current_task_timing, phase
+        with phase("artifact_lookup"):
+            row = artifact_id_or_row if isinstance(artifact_id_or_row, dict) else self.adapter.get_row(int(artifact_id_or_row))
         if not row:
             raise FileNotFoundError("Artifact row not found")
         artifact_id = int(row["id"])
-        components = self.adapter.list_components(artifact_id)
+        with phase("artifact_lookup"):
+            components = self.adapter.list_components(artifact_id)
         component = None
         if components:
             if component_name is None:
@@ -438,13 +457,30 @@ class ArtifactService:
         if serializer is None:
             raise ArtifactLoadError(f"No serializer for artifact {artifact_id} component {component.get('name')}")
         try:
-            payload = serializer.load(str(path))
+            with phase("artifact_load"):
+                payload = serializer.load(str(path))
         except Exception as exc:
             raise ArtifactLoadError(f"Failed loading artifact {artifact_id} component {component.get('name')}: {exc}") from exc
         if verify_checksum and component.get("checksum"):
-            actual = _sha256(path)
+            with phase("content_hash"):
+                actual = _sha256(path)
             if actual != component["checksum"]:
                 raise ArtifactLoadError(f"Checksum mismatch for artifact {artifact_id} component {component.get('name')}")
+        timing = current_task_timing()
+        if timing is not None:
+            try:
+                payload_bytes = int(component.get("payload_bytes") or Path(path).stat().st_size)
+            except OSError:
+                payload_bytes = int(getattr(payload.get("data"), "nbytes", 0))
+            timing.increment("artifacts_loaded")
+            timing.increment("artifact_bytes_loaded", payload_bytes)
+            timing.identity("artifacts_loaded", f"{artifact_id}:{component.get('name')}")
+            timing.artifact_events.append({
+                "operation": "load", "artifact_id": artifact_id,
+                "component": component.get("name"), "bytes": payload_bytes,
+                "kind": row.get("canonical_kind") or row.get("kind"),
+                "lifecycle": row.get("lifecycle"),
+            })
         return {**payload, "component": component}
 
     def load_payload(self, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -496,16 +532,21 @@ class ArtifactService:
         return f"registry-row:{int(parent_id)}"
 
     @staticmethod
-    def _logical_revision(kind, scope, validity, components, parents, context) -> str:
+    def _logical_revision(
+        kind, scope, components, parents, context, configuration_refs=()
+    ) -> str:
         digest = hashlib.sha256()
         identity = {
             "kind": kind,
             "scope": asdict(scope),
-            "validity": asdict(validity),
             "parents": list(parents),
             "task": [getattr(context, "task_name", None), getattr(context, "task_version", None)],
             "algorithm": [getattr(context, "algorithm_name", None), getattr(context, "algorithm_version", None)],
             "parameters": dict(getattr(context, "parameters", {}) or {}),
+            "configuration_refs": sorted(
+                (asdict(value) for value in (configuration_refs or [])),
+                key=lambda value: json.dumps(value, sort_keys=True, default=str),
+            ),
         }
         digest.update(json.dumps(identity, sort_keys=True, default=str).encode("utf-8"))
         for name, component in sorted(components.items()):

@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..artifacts.models import Scope
 from ..artifacts.service import ArtifactService
+from ..registry import database as db
 
 from .targets import Target, TemporalWindow, CadencePolicy
 
@@ -115,6 +116,7 @@ class ReductionGraph:
         # Track which windows were planned per kind and scope to enable
         # planning of artifact-driven nodes without raw inputs (e.g., trace, wave).
         planned_windows: Dict[Tuple[str, str], List[TemporalWindow]] = {}
+        effective_raw_inputs: set[Tuple[str, str, Tuple[int, ...]]] = set()
 
         def _scope_key(scope: Scope) -> str:
             try:
@@ -236,6 +238,25 @@ class ReductionGraph:
                     windows = []
 
                 for win in windows:
+                    if has_raw:
+                        rows = db.list_raw_files_scoped(
+                            frame_type=frame_type,
+                            start_date=(win.start.strftime("%Y%m%d") if win.start else "19000101"),
+                            end_date=(win.end.strftime("%Y%m%d") if win.end else "21000101"),
+                            zipcode=scope.zipcode,
+                            db_path=db_path,
+                            start_time=win.start,
+                            end_time=win.end,
+                        )
+                        raw_ids = tuple(sorted(int(row_id) for row_id, _ in rows))
+                        effective_key = (node.kind, _scope_key(scope), raw_ids)
+                        if raw_ids and effective_key in effective_raw_inputs:
+                            duplicate = Target(kind=node.kind, scope=scope, window=win)
+                            report.skipped.append(duplicate)
+                            report.reasons[_tkey(duplicate)] = "duplicate_effective_raw_inputs"
+                            continue
+                        if raw_ids:
+                            effective_raw_inputs.add(effective_key)
                     _emit(node.kind, scope, win)
 
         report.planned = planned

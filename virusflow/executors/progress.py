@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 from threading import Event, Lock, Thread
 import time
+import statistics
 from typing import IO, Any, Mapping
 
 
@@ -24,6 +25,8 @@ class ProgressNode:
     attempts: int = 0
     worker_id: str | None = None
     message: str | None = None
+    timing: dict[str, Any] | None = None
+    dependencies: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,9 @@ class ProgressSnapshot:
     workers_active: int
     workers_configured: int
     finalized: bool
+    task_kind_timing: Mapping[str, Any]
+    timing_summary: Mapping[str, Any]
+    eta_confidence: str
 
     @property
     def fraction(self) -> float:
@@ -84,6 +90,7 @@ class GraphProgress:
         target: str | None = None,
         state: str = "pending",
         message: str | None = None,
+        dependencies: tuple[str, ...] = (),
     ) -> None:
         if state not in VALID_STATES:
             raise ValueError(f"invalid progress state: {state}")
@@ -91,7 +98,8 @@ class GraphProgress:
             if node_id in self._nodes:
                 raise ValueError(f"progress node already registered: {node_id}")
             self._nodes[node_id] = ProgressNode(
-                str(node_id), str(kind), str(target or node_id), state=state, message=message
+                str(node_id), str(kind), str(target or node_id), state=state, message=message,
+                dependencies=tuple(str(value) for value in dependencies),
             )
             self._sequence += 1
             if state in TERMINAL_STATES:
@@ -135,6 +143,11 @@ class GraphProgress:
                 "message": message,
             }
 
+    def record_timing(self, node_id: str, timing: Mapping[str, Any]) -> None:
+        with self._lock:
+            self._nodes[node_id].timing = dict(timing)
+            self._sequence += 1
+
     def finalize(self) -> dict[str, Any]:
         with self._lock:
             nonterminal = [node.node_id for node in self._nodes.values() if node.state not in TERMINAL_STATES]
@@ -163,7 +176,85 @@ class GraphProgress:
                 span = max(recent[-1] - recent[0], 1.0e-9)
                 rate = (len(recent) - 1) / span
             remaining = total - completed
-            eta = None if rate is None or rate <= 0 else remaining / rate
+            kind_timings: dict[str, Any] = {}
+            estimated_work = 0.0
+            observed_kinds = 0
+            medians_by_kind: dict[str, float] = {}
+            all_measured: list[float] = []
+            for kind in sorted({node.kind for node in self._nodes.values()}):
+                matching = [node for node in self._nodes.values() if node.kind == kind]
+                measured = [float(node.timing.get("wall_seconds", 0.0)) for node in matching if node.timing]
+                running_kind = sum(node.state == "running" for node in matching)
+                completed_kind = sum(node.state in TERMINAL_STATES for node in matching)
+                remaining_kind = len(matching) - completed_kind
+                if measured:
+                    observed_kinds += 1
+                    median = statistics.median(measured)
+                    medians_by_kind[kind] = median
+                    all_measured.extend(measured)
+                    estimated_work += remaining_kind * median
+                else:
+                    median = None
+                kind_timings[kind] = {
+                    "total": len(matching), "completed": completed_kind,
+                    "running": running_kind, "waiting": max(0, remaining_kind - running_kind),
+                    "mean_seconds": statistics.fmean(measured) if measured else None,
+                    "median_seconds": median,
+                    "p95_seconds": self._percentile(measured, 0.95) if measured else None,
+                }
+            fallback = statistics.median(all_measured) if all_measured else 0.0
+            if fallback:
+                for kind, item in kind_timings.items():
+                    if kind not in medians_by_kind:
+                        estimated_work += int(item["waiting"]) * fallback
+
+            path_cache: dict[str, tuple[float, list[str]]] = {}
+            visiting: set[str] = set()
+
+            def remaining_path(node_id: str) -> tuple[float, list[str]]:
+                if node_id in path_cache:
+                    return path_cache[node_id]
+                if node_id in visiting:
+                    return 0.0, []
+                visiting.add(node_id)
+                node = self._nodes[node_id]
+                prefixes = [remaining_path(dep) for dep in node.dependencies if dep in self._nodes]
+                prefix = max(prefixes, default=(0.0, []), key=lambda item: item[0])
+                duration = 0.0
+                if node.state not in TERMINAL_STATES:
+                    duration = medians_by_kind.get(node.kind, fallback)
+                result = (prefix[0] + duration, [*prefix[1], node_id] if duration else prefix[1])
+                visiting.remove(node_id)
+                path_cache[node_id] = result
+                return result
+
+            critical_remaining = max(
+                (remaining_path(node_id) for node_id in self._nodes),
+                default=(0.0, []), key=lambda item: item[0],
+            )
+            work_eta = estimated_work / self.workers if observed_kinds and estimated_work else 0.0
+            eta = max(work_eta, critical_remaining[0]) if observed_kinds and remaining else None
+            confidence = "none" if not observed_kinds else ("low" if observed_kinds < len(kind_timings) else "medium")
+            timing_records = [node.timing for node in self._nodes.values() if node.timing]
+            raw_durations = [
+                float(event.get("seconds", 0.0)) for timing in timing_records
+                for event in timing.get("raw_reads", [])
+            ]
+            task_wall = sum(float(timing.get("wall_seconds", 0.0)) for timing in timing_records)
+            phase_total = lambda name: sum(
+                float((timing.get("phases", {}).get(name) or {}).get("exclusive_seconds", 0.0))
+                for timing in timing_records
+            )
+            timing_summary = {
+                "raw_access_mean_seconds": statistics.fmean(raw_durations) if raw_durations else None,
+                "raw_access_median_seconds": statistics.median(raw_durations) if raw_durations else None,
+                "raw_access_p95_seconds": self._percentile(raw_durations, 0.95) if raw_durations else None,
+                "database_share": (phase_total("database_query") / task_wall) if task_wall else 0.0,
+                "publication_share": (phase_total("artifact_publish") / task_wall) if task_wall else 0.0,
+                "compute_share": (phase_total("compute") / task_wall) if task_wall else 0.0,
+                "estimated_remaining_critical_path_seconds": critical_remaining[0],
+                "estimated_remaining_critical_path": critical_remaining[1],
+            }
             return ProgressSnapshot(
                 sequence=self._sequence,
                 total=total,
@@ -183,7 +274,20 @@ class GraphProgress:
                 workers_active=counts["running"],
                 workers_configured=self.workers,
                 finalized=self._finalized,
+                task_kind_timing=kind_timings,
+                timing_summary=timing_summary,
+                eta_confidence=confidence,
             )
+
+    @staticmethod
+    def _percentile(values: list[float], q: float) -> float:
+        ordered = sorted(values)
+        if not ordered:
+            return 0.0
+        position = (len(ordered) - 1) * q
+        lower, upper = int(position), min(len(ordered) - 1, int(position) + 1)
+        fraction = position - lower
+        return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
 
 
 class ProgressReporter:
@@ -272,8 +376,19 @@ class ProgressReporter:
                         f"cached={snapshot.cached} skipped={snapshot.skipped} "
                         f"workers={snapshot.workers_active}/{snapshot.workers_configured} "
                         f"elapsed={self._duration(snapshot.elapsed_seconds)} "
-                        f"rate={rate} eta={self._duration(snapshot.eta_seconds)} active={active}"
+                        f"rate={rate} eta={self._duration(snapshot.eta_seconds)}({snapshot.eta_confidence}) active={active}"
                     )
+                    if snapshot.task_kind_timing:
+                        kinds = []
+                        for kind, item in list(snapshot.task_kind_timing.items())[:4]:
+                            median = item.get("median_seconds")
+                            p95 = item.get("p95_seconds")
+                            kinds.append(
+                                f"{kind}={item['completed']}/{item['total']} r{item['running']} "
+                                f"med={'--' if median is None else f'{median:.2f}s'} "
+                                f"p95={'--' if p95 is None else f'{p95:.2f}s'}"
+                            )
+                        text += " kinds=[" + "; ".join(kinds) + "]"
                 if self.mode == "tty":
                     self.stream.write("\r\x1b[2K" + text)
                 else:

@@ -13,13 +13,13 @@ Exports: step_twi
 from typing import Iterable, Optional, Dict, Any, List
 
 import numpy as np
-from astropy.stats import biweight_location
 
 from .inputs import array_frames
+from .robust import chunked_biweight_location
 # persistence removed per architecture
 
 # Algorithm version string for this module
-ALGO_VERSION = "twi-1.0"
+ALGO_VERSION = "twi-1.1"
 
 # Input item type accepted by step_twi (same structure as bias/dark/flat)
 TwiInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
@@ -46,7 +46,7 @@ def step_twi(
     frames = array_frames(raw_inputs or [])
 
     stack = np.stack(frames, axis=0)
-    master = biweight_location(stack, axis=0, ignore_nan=True)
+    master = chunked_biweight_location(stack, axis=0)
 
     return AlgoResult(
         kind="twi",

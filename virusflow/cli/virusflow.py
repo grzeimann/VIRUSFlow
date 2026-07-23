@@ -591,11 +591,12 @@ def _run_planned(args: argparse.Namespace) -> None:
         task_context_factory=_ctx_factory,
         target_adapter=_adapt_target,
     )
-    # Submit to PlanningExecutor (planning-native; no TaskGraph dependency)
+    # Submit to the planning-native executor without the deprecated graph shim.
     from ..executors.planning_executor import PlanningExecutor as _PlanningExecutor
     progress_cfg = resolve_progress_config(args, cfg_obj)
     execp = _PlanningExecutor(
-        max_workers=nworkers, debug=bool(args.debug_timing), **progress_cfg
+        max_workers=nworkers, debug=bool(args.debug_timing), **progress_cfg,
+        performance_path=getattr(args, "performance_report", None),
     )
     # Add tasks preserving dependencies
     for st in scheduled:
@@ -670,7 +671,10 @@ def _science_executor(args: argparse.Namespace):
     workers = resolve_nworkers(
         cli_value=getattr(args, "nworkers", None), serial=bool(getattr(args, "serial", False))
     )
-    return PlanningExecutor(max_workers=workers, **resolve_progress_config(args)), workers
+    return PlanningExecutor(
+        max_workers=workers, **resolve_progress_config(args),
+        performance_path=getattr(args, "performance_report", None),
+    ), workers
 
 
 def _result_manifest(value: Any) -> Any:
@@ -827,6 +831,59 @@ def cmd_config_show(args: argparse.Namespace) -> None:
     print(yaml.safe_dump(payload, sort_keys=False))
 
 
+def cmd_performance_show(args: argparse.Namespace) -> None:
+    report = json.loads(Path(args.report).read_text())
+    summary = {
+        "run_id": report.get("run_id"), "status": report.get("status"),
+        "wall_seconds": report.get("wall_seconds"),
+        "workers_configured": report.get("workers_configured"),
+        "worker_utilization": report.get("worker_utilization"),
+        "critical_path": report.get("critical_path"),
+        "task_kind_summary": report.get("task_kind_summary"),
+        "raw_io": report.get("raw_io"), "database": report.get("database"),
+    }
+    print(yaml.safe_dump(summary, sort_keys=False))
+
+
+def cmd_performance_compare(args: argparse.Namespace) -> None:
+    from ..performance import compare_artifact_registries, compare_performance_reports
+
+    comparison = compare_performance_reports(
+        json.loads(Path(args.before).read_text()), json.loads(Path(args.after).read_text())
+    )
+    if bool(args.before_db) != bool(args.after_db):
+        raise SystemExit("--before-db and --after-db must be supplied together")
+    if args.before_db:
+        scientific = compare_artifact_registries(args.before_db, args.after_db)
+        comparison["scientific_equivalence"] = scientific
+        if args.scientific_output:
+            Path(args.scientific_output).write_text(
+                json.dumps(scientific, indent=2, sort_keys=True) + "\n"
+            )
+    text = json.dumps(comparison, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        Path(args.output).write_text(text)
+        print(json.dumps({
+            "output": str(Path(args.output).resolve()),
+            "wall_seconds": comparison["wall_seconds"],
+            "scientific_equivalence_passed": (
+                comparison.get("scientific_equivalence") or {}
+            ).get("passed"),
+        }, indent=2, sort_keys=True))
+    else:
+        print(text, end="")
+
+
+def cmd_performance_overhead(args: argparse.Namespace) -> None:
+    from ..performance import measure_instrumentation_overhead
+
+    result = measure_instrumentation_overhead(args.iterations)
+    text = json.dumps(result, indent=2, sort_keys=True) + "\n"
+    if args.output:
+        Path(args.output).write_text(text)
+    print(text, end="")
+
+
 def cmd_validate_observation(args: argparse.Namespace) -> None:
     from .verify_steps_8_10 import main as verify_main
     workers = resolve_nworkers(cli_value=args.nworkers, serial=args.serial)
@@ -864,6 +921,7 @@ def _add_progress(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--progress-interval", type=float, default=None, help="Batch heartbeat seconds")
     parser.add_argument("--progress-file", help="Append structured JSONL progress")
     parser.add_argument("--max-retries", type=int, default=None)
+    parser.add_argument("--performance-report", help="Write performance JSON and Markdown")
 
 
 def _add_science_run(parser: argparse.ArgumentParser) -> None:
@@ -935,6 +993,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     config = sub.add_parser("config", help="Show effective execution configuration").add_subparsers(dest="config_cmd", required=True)
     show = config.add_parser("show"); _add_science_run(show); show.add_argument("--planning-yaml"); show.set_defaults(func=cmd_config_show)
+    performance = sub.add_parser("performance", help="Inspect or compare performance reports").add_subparsers(dest="performance_cmd", required=True)
+    ps = performance.add_parser("show"); ps.add_argument("report"); ps.set_defaults(func=cmd_performance_show)
+    pc = performance.add_parser("compare"); pc.add_argument("before"); pc.add_argument("after"); pc.add_argument("--output"); pc.add_argument("--before-db"); pc.add_argument("--after-db"); pc.add_argument("--scientific-output"); pc.set_defaults(func=cmd_performance_compare)
+    po = performance.add_parser("overhead"); po.add_argument("--iterations", type=int, default=100000); po.add_argument("--output"); po.set_defaults(func=cmd_performance_overhead)
     validate = sub.add_parser("validate", help="Run representative scientific validation").add_subparsers(dest="validate_cmd", required=True)
     vo = validate.add_parser("observation"); vo.add_argument("--data-root", required=True); vo.add_argument("--workspace", required=True); vo.add_argument("--output-dir", required=True); vo.add_argument("--reference-workspace"); _add_progress(vo); vo.set_defaults(func=cmd_validate_observation)
     return p

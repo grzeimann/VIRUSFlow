@@ -39,11 +39,20 @@ class ScratchSpace:
         return path
 
     def cleanup(self) -> None:
+        from ..performance import current_task_timing, phase
         resolved = self.path.resolve()
         root = self._root.resolve()
         if root not in resolved.parents or resolved == root:
             raise RuntimeError(f"refusing unsafe scratch cleanup: {resolved}")
-        shutil.rmtree(resolved)
+        try:
+            scratch_bytes = sum(path.stat().st_size for path in resolved.rglob("*") if path.is_file())
+        except OSError:
+            scratch_bytes = 0
+        with phase("scratch_cleanup"):
+            shutil.rmtree(resolved)
+        timing = current_task_timing()
+        if timing is not None:
+            timing.increment("scratch_bytes_written", scratch_bytes)
         parent = resolved.parent
         while parent != root and root in parent.parents:
             try:

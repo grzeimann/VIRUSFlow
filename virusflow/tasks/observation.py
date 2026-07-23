@@ -122,7 +122,7 @@ class ObservationTask(_SciencePublisher):
             raw_rows = [row for row in db.list_raw_file_rows(exposure_id, self.ctx.db_path) if row[1].frame_type == "sci"]
             if not raw_rows:
                 raise RuntimeError(f"Observation member has no real science input: {exposure_id}")
-            representative = (loader or RawFrameLoader()).load(raw_rows[0][1].path, raw_rows[0][1].tar_member)
+            representative = (loader or RawFrameLoader()).load_ref(raw_rows[0][1])
             header = representative.header
             when = _instant(exposure_id)
             sequence.append((when - start).total_seconds())

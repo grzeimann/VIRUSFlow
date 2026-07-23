@@ -101,7 +101,7 @@ class ReducedScienceAmplifierTask(_SciencePublisher):
             raise RuntimeError(f"Expected one science amplifier input for {exposure_id}/{zipcode.key()}, found {len(rows)}")
         row_id, raw = rows[0]
         loader = self.ctx.config.get("raw_frame_loader") if isinstance(self.ctx.config, dict) else None
-        frame = (loader or RawFrameLoader()).load(raw.path, raw.tar_member)
+        frame = (loader or RawFrameLoader()).load_ref(raw)
         reduced = reduce_amplifier_array(frame.data, frame.header)
         image = np.asarray(reduced.get_array("oriented_detector_image"), dtype=np.float32)
         variance = np.asarray(reduced.get_array("detector_variance"), dtype=np.float32)
@@ -132,7 +132,7 @@ class ReducedScienceAmplifierTask(_SciencePublisher):
             dark_exptime = None
             if dark_rows:
                 dark_raw = dark_rows[0][1]
-                dark_frame = (loader or RawFrameLoader()).load(dark_raw.path, dark_raw.tar_member)
+                dark_frame = (loader or RawFrameLoader()).load_ref(dark_raw)
                 dark_exptime = float(dark_frame.header.get("EXPTIME") or 0.0)
             dark_scale = science_exptime / dark_exptime if science_exptime > 0 and dark_exptime and dark_exptime > 0 else 1.0
             dark_residual = dark - bias

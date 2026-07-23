@@ -19,12 +19,17 @@ Run `virusflow COMMAND --help` or `virusflow COMMAND SUBCOMMAND --help` for auth
 | `cleanup scratch/cache/legacy` | Inventory or explicitly clean lifecycle-specific storage. |
 | `config show` | Show resolved worker/progress and path configuration. |
 | `validate observation` | Run the representative real-observation acceptance workflow. |
+| `performance show` | Summarize a saved timing report. |
+| `performance compare` | Compare timing reports and optionally verify exact Product equivalence between two registries. |
+| `performance overhead` | Measure context-local instrumentation overhead. |
 
 ## Execution options
 
-`run` subcommands accept `--nworkers`/`--workers`, `--serial`, `--progress`/`--no-progress`, `--progress-mode auto|tty|plain|json`, `--progress-interval`, `--progress-file`, and `--max-retries`. Defaults are progress enabled, automatic rendering, 30-second noninteractive heartbeat, zero retries, and four workers. `--serial` always forces one worker.
+`run` subcommands accept `--nworkers`/`--workers`, `--serial`, `--progress`/`--no-progress`, `--progress-mode auto|tty|plain|json`, `--progress-interval`, `--progress-file`, `--max-retries`, and `--performance-report`. Defaults are progress enabled, automatic rendering, 30-second noninteractive heartbeat, zero retries, and four workers. `--serial` always forces one worker. A performance report path writes both JSON and a same-stem Markdown report.
 
 Planning configuration supports the same values under `execution`: `nworkers`, `progress`, `progress_mode`, `progress_interval`, `progress_path`, and `max_retries`. CLI values override YAML.
+
+See [performance.md](performance.md) for timing fields, controlled-comparison commands, measured regression findings, and current database boundaries.
 
 ## Exit and safety behavior
 

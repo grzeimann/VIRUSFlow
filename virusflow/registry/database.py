@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import tarfile
+import time
+from threading import Lock
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, date
@@ -15,6 +18,77 @@ from ..core.identity import RawFileId, ZipCode
 
 
 DEFAULT_DB_PATH = os.environ.get("VIRUSFLOW_DB", str(Path.cwd() / "virusflow.sqlite3"))
+_INITIALIZED_DATABASES: Dict[str, Tuple[int, int]] = {}
+_INITIALIZE_LOCK = Lock()
+
+
+def _record_sql(sql: str, elapsed: float) -> None:
+    from ..performance import current_task_timing
+
+    timing = current_task_timing()
+    if timing is None:
+        return
+    normalized = " ".join(str(sql).strip().split())
+    verb = normalized.split(" ", 1)[0].upper() if normalized else ""
+    lower = normalized.lower()
+    schema_operation = any(
+        marker in lower
+        for marker in ("create table", "create index", "alter table", "pragma table_info")
+    )
+    raw_catalog = not schema_operation and any(
+        name in normalized.lower()
+        for name in ("raw_files", "tar_members", "tar_files", "exposures", "exposure_details", "amplifiers")
+    )
+    known_tables = (
+        "exposures", "exposure_details", "amplifiers", "raw_files", "tar_files",
+        "tar_members", "artifacts", "artifact_records", "artifact_components",
+        "artifact_relations", "provenance", "qa_facts", "qa_records",
+        "analysis_studies", "analysis_materializations", "performance_runs",
+        "performance_tasks",
+    )
+    tables = [
+        name for name in known_tables
+        if re.search(rf"(?<![a-z0-9_]){re.escape(name)}(?![a-z0-9_])", lower)
+    ]
+    event = {
+        "seconds": max(0.0, float(elapsed)), "operation": verb,
+        "sql": normalized[:500], "raw_catalog": raw_catalog,
+        "write": verb in {"INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "DROP", "ALTER"},
+        "tables": tables,
+    }
+    timing.database_queries.append(event)
+    timing.increment("database_queries")
+    if raw_catalog:
+        timing.increment("raw_catalog_queries")
+
+
+class _TimingConnection(sqlite3.Connection):
+    def execute(self, sql, parameters=(), /):
+        from ..performance import phase
+        started = time.perf_counter()
+        try:
+            with phase("database_query"):
+                return super().execute(sql, parameters)
+        finally:
+            _record_sql(str(sql), time.perf_counter() - started)
+
+    def executemany(self, sql, seq_of_parameters, /):
+        from ..performance import phase
+        started = time.perf_counter()
+        try:
+            with phase("database_query"):
+                return super().executemany(sql, seq_of_parameters)
+        finally:
+            _record_sql(str(sql), time.perf_counter() - started)
+
+    def executescript(self, sql_script, /):
+        from ..performance import phase
+        started = time.perf_counter()
+        try:
+            with phase("database_query"):
+                return super().executescript(sql_script)
+        finally:
+            _record_sql(str(sql_script), time.perf_counter() - started)
 
 # ---- Small internal helpers to keep SQL paths concise and consistent ----
 def _as_iso(dt: Optional[datetime]) -> Optional[str]:
@@ -42,12 +116,21 @@ def _connect(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     # concurrent writer scenarios common in tests and planner runs.
     # - isolation_level=None enables autocommit (each statement is its own transaction),
     #   avoiding long-lived write transactions held open by context managers.
-    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None)
+    conn = sqlite3.connect(db_path, timeout=30, isolation_level=None, factory=_TimingConnection)
+    try:
+        from ..performance import current_task_timing
+        timing = current_task_timing()
+        if timing is not None:
+            timing.increment("database_connections")
+            timing.identity("database_paths", str(Path(db_path).resolve()))
+    except Exception:
+        pass
     try:
         # Busy timeout applies per-connection; keep it generous.
         conn.execute("PRAGMA busy_timeout=5000")
-        # Prefer WAL; if already configured, this is a no-op.
-        conn.execute("PRAGMA journal_mode=WAL")
+        from ..performance import legacy_baseline_enabled
+        if legacy_baseline_enabled():
+            conn.execute("PRAGMA journal_mode=WAL")
         # In WAL mode, NORMAL synchronous is generally safe and reduces writer stalls.
         conn.execute("PRAGMA synchronous=NORMAL")
     except Exception:
@@ -62,7 +145,9 @@ def connect(db_path: str = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
     try:
         yield conn
     finally:
-        conn.commit()
+        from ..performance import phase
+        with phase("database_transaction"):
+            conn.commit()
         conn.close()
 
 
@@ -260,6 +345,32 @@ CREATE TABLE IF NOT EXISTS analysis_materializations (
     FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
 );
 
+CREATE TABLE IF NOT EXISTS performance_runs (
+    run_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at TEXT,
+    completed_at TEXT,
+    workers INTEGER,
+    wall_seconds REAL,
+    summary_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS performance_tasks (
+    run_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    task_kind TEXT NOT NULL,
+    target TEXT,
+    worker_id TEXT,
+    status TEXT,
+    wall_seconds REAL,
+    timing_json TEXT NOT NULL,
+    PRIMARY KEY(run_id, task_id, attempt),
+    FOREIGN KEY(run_id) REFERENCES performance_runs(run_id)
+);
+CREATE INDEX IF NOT EXISTS performance_tasks_kind_idx ON performance_tasks(task_kind, run_id);
+
 -- Helpful indexes (safe no-ops if already present)
 CREATE INDEX IF NOT EXISTS artifacts_kind_amp ON artifacts(kind, amp_key);
 CREATE INDEX IF NOT EXISTS provenance_created_at ON provenance(created_at);
@@ -269,30 +380,43 @@ CREATE INDEX IF NOT EXISTS artifact_relations_child ON artifact_relations(child_
 
 
 def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    with connect(db_path) as conn:
-        conn.executescript(SCHEMA)
-        # Additive canonical migrations for registries created by earlier releases.
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(artifact_records)").fetchall()}
-        if "validity_policy" not in columns:
-            conn.execute("ALTER TABLE artifact_records ADD COLUMN validity_policy TEXT")
-        for name, definition in (
-            ("lifecycle", "TEXT NOT NULL DEFAULT 'canonical'"),
-            ("state", "TEXT NOT NULL DEFAULT 'active'"),
-            ("payload_bytes", "INTEGER NOT NULL DEFAULT 0"),
-        ):
-            if name not in columns:
-                conn.execute(f"ALTER TABLE artifact_records ADD COLUMN {name} {definition}")
-        component_columns = {
-            row[1] for row in conn.execute("PRAGMA table_info(artifact_components)").fetchall()
-        }
-        for name, definition in (
-            ("payload_bytes", "INTEGER NOT NULL DEFAULT 0"),
-            ("dtype", "TEXT"),
-            ("shape_json", "TEXT"),
-        ):
-            if name not in component_columns:
-                conn.execute(f"ALTER TABLE artifact_components ADD COLUMN {name} {definition}")
+    from ..performance import legacy_baseline_enabled
+
+    resolved = str(Path(db_path).resolve())
+    with _INITIALIZE_LOCK:
+        path = Path(resolved)
+        if path.exists() and not legacy_baseline_enabled():
+            stat = path.stat()
+            signature = (int(stat.st_dev), int(stat.st_ino))
+            if _INITIALIZED_DATABASES.get(resolved) == signature:
+                return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with connect(resolved) as conn:
+            conn.executescript(SCHEMA)
+            # Additive canonical migrations for registries created by earlier releases.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(artifact_records)").fetchall()}
+            if "validity_policy" not in columns:
+                conn.execute("ALTER TABLE artifact_records ADD COLUMN validity_policy TEXT")
+            for name, definition in (
+                ("lifecycle", "TEXT NOT NULL DEFAULT 'canonical'"),
+                ("state", "TEXT NOT NULL DEFAULT 'active'"),
+                ("payload_bytes", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE artifact_records ADD COLUMN {name} {definition}")
+            component_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(artifact_components)").fetchall()
+            }
+            for name, definition in (
+                ("payload_bytes", "INTEGER NOT NULL DEFAULT 0"),
+                ("dtype", "TEXT"),
+                ("shape_json", "TEXT"),
+            ):
+                if name not in component_columns:
+                    conn.execute(f"ALTER TABLE artifact_components ADD COLUMN {name} {definition}")
+        stat = path.stat()
+        if not legacy_baseline_enabled():
+            _INITIALIZED_DATABASES[resolved] = (int(stat.st_dev), int(stat.st_ino))
 
 
 def _parse_filename_meta(path: str) -> Tuple[str, str, Optional[str]]:
@@ -699,6 +823,8 @@ def list_raw_files_scoped(
     end_date: str,
     zipcode: Optional[ZipCode] = None,
     db_path: str = DEFAULT_DB_PATH,
+    start_time: Optional[datetime] = None,
+    end_time: Optional[datetime] = None,
 ) -> List[Tuple[int, RawFileId]]:
     """List raw files filtered by frame_type and exposure date window, optionally by zipcode.
 
@@ -709,9 +835,10 @@ def list_raw_files_scoped(
     with connect(db_path) as conn:
         base = (
             "SELECT rf.id, rf.exposure_id, rf.frame_type, rf.path, rf.tar_member, rf.storage_backend, "
-            "rf.amp_key, a.ifuslot, a.ifuid, a.specid, a.amp, a.controller "
+            "rf.amp_key, a.ifuslot, a.ifuid, a.specid, a.amp, a.controller, tm.offset, tm.size "
             "FROM raw_files rf JOIN exposures e ON rf.exposure_id = e.id "
             "LEFT JOIN amplifiers a ON rf.amp_key = a.key "
+            "LEFT JOIN tar_members tm ON tm.tar_path=rf.path AND tm.member=rf.tar_member "
             "WHERE LOWER(rf.frame_type)=LOWER(?) AND e.when_utc IS NOT NULL AND substr(replace(e.when_utc,'-',''),1,8) BETWEEN ? AND ?"
         )
         params: List[str] = [frame_type, sd, ed]
@@ -719,6 +846,21 @@ def list_raw_files_scoped(
             base += " AND rf.amp_key=?"
             params.append(zipcode.key())
         rows = conn.execute(base, tuple(params)).fetchall()
+        if start_time is not None or end_time is not None:
+            def _instant(value: str) -> Optional[datetime]:
+                try:
+                    return datetime.strptime(str(value), "%Y%m%dT%H%M%S.%f")
+                except ValueError:
+                    try:
+                        return datetime.strptime(str(value).split(".", 1)[0], "%Y%m%dT%H%M%S")
+                    except ValueError:
+                        return None
+            rows = [
+                row for row in rows
+                if (instant := _instant(row[1])) is None
+                or ((start_time is None or instant >= start_time)
+                    and (end_time is None or instant <= end_time))
+            ]
         out: List[Tuple[int, RawFileId]] = []
         for r in rows:
             zc: Optional[ZipCode] = None
@@ -732,7 +874,8 @@ def list_raw_files_scoped(
                 except (SystemExit, ValueError):
                     zc = None
             rf = RawFileId(
-                exposure_id=r[1], frame_type=r[2], path=r[3], tar_member=r[4], storage_backend=r[5], zipcode=zc
+                exposure_id=r[1], frame_type=r[2], path=r[3], tar_member=r[4],
+                storage_backend=r[5], zipcode=zc, archive_offset=r[12], archive_size=r[13],
             )
             out.append((int(r[0]), rf))
         return out
@@ -812,7 +955,9 @@ def save_artifact(artifact, prov, db_path: str = DEFAULT_DB_PATH) -> int:
             msg = str(e).lower()
             if "database is locked" in msg or "database locked" in msg or "busy" in msg:
                 last_err = e
-                _time.sleep(0.1 * (attempt + 1))
+                from ..performance import phase
+                with phase("database_lock_wait"):
+                    _time.sleep(0.1 * (attempt + 1))
                 continue
             raise
     # If retries exhausted, re-raise the last locking error

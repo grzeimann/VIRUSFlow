@@ -3,7 +3,7 @@ from pathlib import Path
 
 import numpy as np
 
-from virusflow.artifacts import Scope, Validity
+from virusflow.artifacts import ConfigurationReference, Scope, Validity
 from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
 from virusflow.artifacts.service import ArtifactLoadError, ArtifactService
 from virusflow.config import CCD_TRANSFORM_CONFIGURATION, ConfigurationService, EFFECTIVE_EXPOSURE_POLICY
@@ -24,7 +24,7 @@ def _context(parents=()):
     )
 
 
-def _request(zc, parents=()):
+def _request(zc, parents=(), validity=None, configuration_refs=()):
     return ArtifactRequest(
         kind="master_bias",
         components={
@@ -36,8 +36,9 @@ def _request(zc, parents=()):
         summaries={"read_noise": 2.0, "n_inputs": 4},
         metadata={"n_inputs": 4},
         scope=Scope(zc),
-        validity=Validity(datetime(2026, 6, 9), datetime(2026, 6, 10)),
+        validity=validity or Validity(datetime(2026, 6, 9), datetime(2026, 6, 10)),
         parents=list(parents),
+        configuration_refs=list(configuration_refs),
     )
 
 
@@ -67,6 +68,44 @@ def test_multicomponent_roundtrip_validity_revision_checksum_and_lineage(tmp_pat
     with db.connect(str(database)) as conn:
         assert conn.execute("SELECT COUNT(*) FROM dependencies").fetchone()[0] == 1
         assert conn.execute("SELECT COUNT(*) FROM artifact_relations").fetchone()[0] == 1
+
+
+def test_revision_uses_effective_inputs_and_configuration_not_nominal_validity(tmp_path: Path):
+    database = tmp_path / "registry.sqlite"
+    db.init_db(str(database))
+    svc = ArtifactService(str(database))
+    pub = DefaultPublicationService(
+        svc=svc, policy=DefaultPersistencePolicy(), base_dir=str(tmp_path / "products")
+    )
+    zc = ZipCode("013", "043", "412", "LL", "S_N_0021")
+    config = ConfigurationReference("gain", "1", zc.key(), "measured")
+
+    first = pub.publish([
+        _request(
+            zc,
+            validity=Validity(datetime(2026, 6, 9), datetime(2026, 6, 10)),
+            configuration_refs=[config],
+        )
+    ], _context())[0]
+    same_computation = pub.publish([
+        _request(
+            zc,
+            validity=Validity(datetime(2026, 6, 8), datetime(2026, 6, 11)),
+            configuration_refs=[config],
+        )
+    ], _context())[0]
+    changed_config = pub.publish([
+        _request(
+            zc,
+            validity=Validity(datetime(2026, 6, 8), datetime(2026, 6, 11)),
+            configuration_refs=[ConfigurationReference("gain", "2", zc.key(), "measured")],
+        )
+    ], _context())[0]
+
+    assert same_computation.id == first.id
+    assert same_computation.revision == first.revision
+    assert changed_config.id != first.id
+    assert changed_config.revision != first.revision
 
 
 def test_configuration_baselines_preserve_unknown_and_provisional_evidence():

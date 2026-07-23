@@ -6,6 +6,7 @@ from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import traceback
+from threading import current_thread
 from typing import Dict, List, Optional, Tuple
 
 from .progress import GraphProgress, ProgressReporter
@@ -48,6 +49,8 @@ class PlanningExecutor:
         progress_path: str | None = None,
         max_retries: int = 0,
         raise_on_failure: bool = True,
+        performance: bool = True,
+        performance_path: str | None = None,
     ) -> None:
         from .execution_context import in_task_worker
 
@@ -56,7 +59,11 @@ class PlanningExecutor:
         self.debug = bool(debug)
         self.max_retries = max(0, int(max_retries))
         self.raise_on_failure = bool(raise_on_failure)
+        self.performance_enabled = bool(performance)
+        self.performance_path = performance_path
+        self.performance_report: Dict[str, object] = {}
         self._nodes: Dict[str, _Node] = {}
+        self._observed: list[dict[str, str]] = []
         self.execution_stats: Dict[str, object] = {}
         self.progress = GraphProgress(self.max_workers)
         self.reporter = ProgressReporter(
@@ -82,6 +89,23 @@ class PlanningExecutor:
             return f"zipcode={zipcode.key()}"
         return str(node_id)
 
+    @staticmethod
+    def _target_identity(task: object) -> dict[str, str]:
+        target = getattr(task, "target", None)
+        if target is None:
+            return {}
+        identity = {}
+        for name in (
+            "observation_id", "dither_set_id", "exposure_id", "start_date", "end_date",
+        ):
+            value = getattr(target, name, None)
+            if value is not None:
+                identity[name] = str(value)
+        zipcode = getattr(target, "zipcode", None)
+        if zipcode is not None:
+            identity["zipcode"] = str(zipcode.key() if hasattr(zipcode, "key") else zipcode)
+        return identity
+
     def add_task(
         self,
         node_id: str,
@@ -102,7 +126,10 @@ class PlanningExecutor:
             deps=list(depends_on or []),
             target=label,
         )
-        self.progress.add_node(node_id, kind=task_kind, target=label)
+        self.progress.add_node(
+            node_id, kind=task_kind, target=label,
+            dependencies=tuple(depends_on or ()),
+        )
 
     def add_observed(
         self,
@@ -122,6 +149,10 @@ class PlanningExecutor:
         self.progress.add_node(
             node_id, kind=str(kind), target=target or node_id, state=state, message=message
         )
+        self._observed.append({
+            "id": str(node_id), "kind": str(kind), "target": str(target or node_id),
+            "state": state, "message": str(message or ""),
+        })
 
     def _indeg_and_dependents(self) -> Tuple[Dict[str, int], Dict[str, List[str]]]:
         indeg: Dict[str, int] = {key: 0 for key in self._nodes}
@@ -150,9 +181,35 @@ class PlanningExecutor:
 
     def run(self) -> Dict[str, object]:
         from .execution_context import enter_worker, leave_worker
+        from ..performance import PerformanceRun
 
         indeg, dependents = self._indeg_and_dependents()
         ready = deque(node_id for node_id, value in indeg.items() if value == 0)
+        database_paths = sorted({
+            str(getattr(getattr(node.task, "ctx", None), "db_path"))
+            for node in self._nodes.values()
+            if getattr(getattr(node.task, "ctx", None), "db_path", None)
+        })
+        workdirs = sorted({
+            str(getattr(getattr(node.task, "ctx", None), "workdir"))
+            for node in self._nodes.values()
+            if getattr(getattr(node.task, "ctx", None), "workdir", None)
+        })
+        performance = PerformanceRun(
+            workers=self.max_workers,
+            configuration={
+                "max_retries": self.max_retries, "executor": "PlanningExecutor",
+                "executor_backend": "thread_pool", "artifact_roots": workdirs,
+            },
+            database_paths=database_paths,
+        )
+        performance.dependencies = {key: list(node.deps) for key, node in self._nodes.items()}
+        for node_id in ready:
+            performance.mark_queued(node_id)
+        for item in self._observed:
+            performance.record_terminal(
+                item["id"], item["kind"], item["target"], item["state"], item["message"] or None
+            )
         results: Dict[str, object] = {}
         attempts = {node_id: 0 for node_id in self._nodes}
         unsuccessful: set[str] = set()
@@ -171,24 +228,34 @@ class PlanningExecutor:
                 indeg[dependent] -= 1
                 if indeg[dependent] == 0:
                     ready.append(dependent)
+                    performance.mark_queued(dependent)
 
         def run_one(node_id: str):
-            worker_id = f"worker-{node_id}"
+            worker_id = current_thread().name
             token = enter_worker(worker_id)
+            node = self._nodes[node_id]
+            task_timing, timing_token = performance.begin_task(
+                node_id, node.kind, node.target, worker_id, attempts[node_id],
+                self._target_identity(node.task),
+            )
             try:
                 inputs = {
                     dependency: results[dependency]
                     for dependency in self._nodes[node_id].deps
                     if dependency in results
                 }
-                return self._nodes[node_id].task.run(inputs), None, None
-            except Exception as exc:  # task failure is finalized by the graph owner
-                return None, exc, traceback.format_exc()
+                result = self._nodes[node_id].task.run(inputs)
+                performance.end_task(task_timing, timing_token, "succeeded")
+                return result, None, None, task_timing
+            except BaseException as exc:  # retain timing for failures and worker interruption
+                performance.end_task(task_timing, timing_token, "failed", exc)
+                return None, exc, traceback.format_exc(), task_timing
             finally:
                 leave_worker(token)
 
         self.reporter.start()
-        first_exception: Exception | None = None
+        first_exception: BaseException | None = None
+        interrupted = False
         with ThreadPoolExecutor(max_workers=self.max_workers, thread_name_prefix="virusflow") as pool:
             in_flight: dict[Future, str] = {}
             while ready or in_flight:
@@ -204,6 +271,11 @@ class PlanningExecutor:
                             "reason": reason,
                         }
                         per_kind[self._nodes[node_id].kind]["blocked"] += 1
+                        terminal_timing = performance.record_terminal(
+                            node_id, self._nodes[node_id].kind, self._nodes[node_id].target,
+                            "blocked", reason,
+                        )
+                        self.progress.record_timing(node_id, terminal_timing.as_dict())
                         event = self.progress.transition(node_id, "blocked", message=reason)
                         self.reporter.emit(event, force=True)
                         release(node_id)
@@ -219,8 +291,9 @@ class PlanningExecutor:
                 completed, _ = wait(tuple(in_flight), return_when=FIRST_COMPLETED)
                 for future in completed:
                     node_id = in_flight.pop(future)
-                    result, error, trace = future.result()
+                    result, error, trace, task_timing = future.result()
                     node = self._nodes[node_id]
+                    self.progress.record_timing(node_id, task_timing.as_dict())
                     if error is not None and attempts[node_id] <= self.max_retries:
                         per_kind[node.kind]["retried"] += 1
                         event = self.progress.transition(
@@ -230,8 +303,11 @@ class PlanningExecutor:
                         )
                         self.reporter.emit(event, force=True)
                         ready.append(node_id)
+                        performance.mark_queued(node_id)
                         continue
                     if error is not None:
+                        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                            interrupted = True
                         first_exception = first_exception or error
                         reason = f"{type(error).__name__}: {error}"
                         failures[node_id] = {
@@ -272,6 +348,21 @@ class PlanningExecutor:
             "blocked_tasks": list(blocked.values()),
             "progress": snapshot.as_dict(),
         }
+        performance.finish("interrupted" if interrupted else ("failed" if failures else "succeeded"))
+        self.performance_report = performance.report()
+        self.execution_stats["performance"] = self.performance_report
+        if self.performance_path:
+            markdown_path, json_path = performance.write(self.performance_path)
+            self.execution_stats["performance_files"] = {
+                "markdown": str(markdown_path), "json": str(json_path),
+            }
+        if database_paths:
+            performance.persist(database_paths[0])
+        try:
+            from ..io.raw import RawFrameLoader
+            RawFrameLoader.clear_run_cache(performance.run_id)
+        except Exception:
+            pass
         if failures and self.raise_on_failure:
             error = WorkflowExecutionError(list(failures.values()), list(blocked.values()))
             if first_exception is not None:

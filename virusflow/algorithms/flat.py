@@ -14,17 +14,17 @@ from typing import Iterable, Optional, Dict, Any, List
 
 import logging
 import numpy as np
-from astropy.stats import biweight_location
 from scipy.signal import medfilt
 
 from .inputs import array_frames
+from .robust import chunked_biweight_location
 # persistence removed per architecture
 
 __all__ = ["step_flt"]
 logger = logging.getLogger(__name__)
 
 # Algorithm version string for this module
-ALGO_VERSION = "flat-1.0"
+ALGO_VERSION = "flat-1.1"
 
 # Input item type accepted by step_flt (same structure as bias/dark)
 FlatInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
@@ -84,7 +84,7 @@ def step_flt(
     frames = array_frames(raw_inputs or [])
 
     stack = np.stack(frames, axis=0)
-    master = biweight_location(stack, axis=0, ignore_nan=True)
+    master = chunked_biweight_location(stack, axis=0)
 
     flat_mask = detect_flat_response_outliers(master)
     n_bad = int(flat_mask.sum())

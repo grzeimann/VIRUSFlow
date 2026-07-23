@@ -197,17 +197,24 @@ class CalibrationTask(Task):
 
     def query_inputs(self):
         from ..registry import database as _db
+        from ..performance import phase
         self._require_target()
         if not self.frame_type:
             raise ValueError(f"{self.__class__.__name__}.frame_type is not set")
-        scoped = _db.list_raw_files_scoped(
-            frame_type=self.frame_type,
-            start_date=self.target.start_date,
-            end_date=self.target.end_date,
-            zipcode=getattr(self.target, "zipcode", None),
-            db_path=self.ctx.db_path,
-        )
-        raw_inputs = [{"path": r.path, "tar_member": r.tar_member, "storage_backend": r.storage_backend} for (_id, r) in scoped]
+        with phase("raw_lookup"):
+            scoped = _db.list_raw_files_scoped(
+                frame_type=self.frame_type,
+                start_date=self.target.start_date,
+                end_date=self.target.end_date,
+                zipcode=getattr(self.target, "zipcode", None),
+                db_path=self.ctx.db_path,
+                start_time=getattr(self.target, "start_dt", None),
+                end_time=getattr(self.target, "end_dt", None),
+            )
+        raw_inputs = [{
+            "path": r.path, "tar_member": r.tar_member, "storage_backend": r.storage_backend,
+            "archive_offset": r.archive_offset, "archive_size": r.archive_size,
+        } for (_id, r) in scoped]
         parent_ids = [pid for (pid, _r) in scoped if pid is not None]
         if not raw_inputs:
             zkey = getattr(self.target, "zipcode", None)
@@ -235,13 +242,26 @@ class CalibrationTask(Task):
         """Load raw frames through the I/O boundary and return detector arrays only."""
         from ..algorithms.ccd import reduce_amplifier_array
         from ..io import RawFrameLoader
+        from ..performance import current_task_timing, phase
 
         loader = self.ctx.config.get("raw_frame_loader") if isinstance(self.ctx.config, dict) else None
         loader = loader or RawFrameLoader()
         reduced = []
         for item in raw_inputs:
-            frame = loader.load(str(item["path"]), item.get("tar_member"))
-            detector = reduce_amplifier_array(frame.data, frame.header)
+            with phase("load_raw_frames"):
+                if item.get("archive_offset") is None:
+                    frame = loader.load(str(item["path"]), item.get("tar_member"))
+                else:
+                    frame = loader.load(
+                        str(item["path"]), item.get("tar_member"),
+                        archive_offset=item.get("archive_offset"),
+                        archive_size=item.get("archive_size"),
+                    )
+            with phase("base_reduction"):
+                detector = reduce_amplifier_array(frame.data, frame.header)
+            timing = current_task_timing()
+            if timing is not None:
+                timing.increment("base_reduction_calls")
             reduced.append(
                 {
                     "data": detector.get_array("oriented_detector_image"),

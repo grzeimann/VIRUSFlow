@@ -125,6 +125,21 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
         executor.add_task(item.id, item.task, kind=item.kind, depends_on=item.depends_on)
     executor.run()
 
+    master_timing = next(
+        item for item in executor.performance_report["tasks"]
+        if item["task_kind"] == "master_bias"
+    )
+    assert master_timing["phases"]["load_raw_frames"]["count"] == 25
+    assert master_timing["phases"]["base_reduction"]["count"] == 25
+    assert master_timing["phases"]["combine_frames"]["count"] == 1
+    assert master_timing["counters"]["frame_count"] == 25
+    assert master_timing["identities"]["array_shape"] == ["24x32"]
+    assert master_timing["identities"]["combine_method"] == [
+        "chunked fixed-center biweight_location + MAD"
+    ]
+    assert master_timing["counters"]["base_reduction_calls"] == 25
+    assert master_timing["counters"]["combine_calls"] == 1
+
     service = ArtifactService(database)
     rows = {
         kind: service.select_best(kind=kind, scope=Scope(zipcode=zipcode), policy="latest")

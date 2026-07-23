@@ -7,6 +7,7 @@ from threading import Barrier
 import pytest
 
 from virusflow.executors.planning_executor import PlanningExecutor, WorkflowExecutionError
+from virusflow.executors.progress import GraphProgress
 
 
 class _TTY(StringIO):
@@ -123,3 +124,22 @@ def test_progress_does_not_change_task_results_or_identity():
         return executor.run(), tuple(executor._nodes)
 
     assert execute(False) == execute(True)
+
+
+def test_kind_timing_and_eta_are_bounded_by_remaining_dependency_path():
+    progress = GraphProgress(2)
+    progress.add_node("a", kind="bias")
+    progress.add_node("b", kind="bias", dependencies=("a",))
+    progress.add_node("c", kind="wave", dependencies=("b",))
+    progress.transition("a", "running", worker_id="worker")
+    progress.record_timing("a", {
+        "wall_seconds": 2.0, "raw_reads": [], "phases": {},
+    })
+    progress.transition("a", "succeeded")
+    snapshot = progress.snapshot()
+    assert snapshot.task_kind_timing["bias"]["mean_seconds"] == 2.0
+    assert snapshot.task_kind_timing["bias"]["median_seconds"] == 2.0
+    assert snapshot.task_kind_timing["bias"]["p95_seconds"] == 2.0
+    assert snapshot.eta_confidence == "low"
+    assert snapshot.eta_seconds == 4.0
+    assert snapshot.timing_summary["estimated_remaining_critical_path"] == ["b", "c"]

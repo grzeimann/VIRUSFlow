@@ -15,14 +15,14 @@ from typing import Iterable, Optional, Dict, Any, List
 
 import logging
 import numpy as np
-from astropy.stats import biweight_location
 from .inputs import array_frames
+from .robust import chunked_biweight_location
 
 __all__ = ["step_bias"]
 logger = logging.getLogger(__name__)
 
 # Algorithm version string for this module
-ALGO_VERSION = "bias-1.0"
+ALGO_VERSION = "bias-1.1"
 
 # Input item type accepted by step_bias
 BiasInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
@@ -55,7 +55,7 @@ def step_bias(
 
     stack = np.stack(frames, axis=0)
     # Use biweight location for stack combination to avoid digitization bias
-    master = biweight_location(stack, axis=0, ignore_nan=True)
+    master = chunked_biweight_location(stack, axis=0)
     # Robust per-pixel scatter via MAD (kept as median-of-abs-dev for now)
     mad = np.median(np.abs(stack - master[None, :, :]), axis=0) * 1.4826
     # Scalar read-noise estimate

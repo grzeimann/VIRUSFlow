@@ -17,16 +17,16 @@ from typing import Iterable, Optional, Dict, Any, List
 
 import logging
 import numpy as np
-from astropy.stats import biweight_location
 
 from .inputs import array_frames
+from .robust import chunked_biweight_location
 # persistence and storage-coupled mask logic removed per architecture
 
 __all__ = ["step_cmp"]
 logger = logging.getLogger(__name__)
 
 # Algorithm version string for this module
-ALGO_VERSION = "cmp-1.0"
+ALGO_VERSION = "cmp-1.1"
 
 # Input item type accepted by step_cmp (same structure as bias/dark/flat)
 CmpInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
@@ -53,7 +53,7 @@ def step_cmp(
     frames = array_frames(raw_inputs or [])
 
     stack = np.stack(frames, axis=0)
-    master = biweight_location(stack, axis=0, ignore_nan=True)
+    master = chunked_biweight_location(stack, axis=0)
 
     # Per architecture, do not read other artifacts or construct masks here.
     # Any masking/repair decisions belong to tasks/persistence policies.

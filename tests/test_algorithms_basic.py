@@ -4,14 +4,31 @@ from pathlib import Path
 import types
 import numpy as np
 import json
+from astropy.stats import biweight_location
 
 from virusflow.algorithms import bias as alg_bias
 from virusflow.algorithms import dark as alg_dark
 from virusflow.algorithms import flat as alg_flat
 from virusflow.algorithms import cmp as alg_cmp
+from virusflow.algorithms.robust import chunked_biweight_location
+
+
 def _mk_inputs(n: int, shape=(6, 8)):
     yy, xx = np.indices(shape)
     return [{"data": (xx + yy + i).astype(float)} for i in range(n)]
+
+
+def test_chunked_biweight_matches_astropy_fixed_center_estimator():
+    rng = np.random.default_rng(8675309)
+    stack = rng.normal(size=(14, 37, 43)).astype(np.float32)
+    stack[0, ::5, ::7] = np.nan
+    stack[1, ::11, ::13] += 10_000.0
+    stack[:, 0, 0] = 7.0
+
+    expected = biweight_location(stack, axis=0, ignore_nan=True)
+    actual = chunked_biweight_location(stack, axis=0, chunk_pixels=101)
+
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_step_bias_returns_algo_result():

@@ -48,3 +48,5 @@ class RawFileId:
     tar_member: Optional[str] = None
     storage_backend: str = "filesystem"
     zipcode: Optional[ZipCode] = None
+    archive_offset: Optional[int] = None
+    archive_size: Optional[int] = None

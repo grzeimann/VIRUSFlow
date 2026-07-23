@@ -108,13 +108,28 @@ class _CanonicalTask(CalibrationTask):
 
 
 class _RawCalibrationTask(_CanonicalTask):
+    combine_method = "unspecified"
+
     def run(self, inputs):
+        from ..performance import current_task_timing, phase
+
         self._require_target()
         raw_inputs, parent_ids = self.query_inputs()
         arrays = self.load_reduced_inputs(raw_inputs)
-        result = ensure_algo_result(
-            self.algorithm(raw_inputs=arrays, params=self._params()), kind=self.result_kind
-        )
+        timing = current_task_timing()
+        if timing is not None:
+            timing.increment("frame_count", len(arrays))
+            if arrays:
+                sample = np.asarray(arrays[0]["data"])
+                timing.identity("array_shape", "x".join(str(value) for value in sample.shape))
+                timing.identity("array_dtype", str(sample.dtype))
+            timing.identity("combine_method", self.combine_method)
+        with phase("combine_frames"):
+            if timing is not None:
+                timing.increment("combine_calls")
+            result = ensure_algo_result(
+                self.algorithm(raw_inputs=arrays, params=self._params()), kind=self.result_kind
+            )
         report = self.result_contract().validate(result)
         if not report.ok:
             raise ValueError(f"{self.__class__.__name__} result contract: {'; '.join(report.errors)}")
@@ -132,6 +147,7 @@ class BiasTask(_RawCalibrationTask):
     result_kind = "bias"
     result_contract = BiasResultContract
     component_map = {"master": "master", "per_pixel_bias_scatter": "per_pixel_bias_scatter"}
+    combine_method = "chunked fixed-center biweight_location + MAD"
 
 
 class DarkTask(_RawCalibrationTask):
@@ -144,6 +160,7 @@ class DarkTask(_RawCalibrationTask):
     result_kind = "dark"
     result_contract = DarkResultContract
     component_map = {"master_dark": "master_dark", "dark_pixel_mask": "dark_pixel_mask"}
+    combine_method = "chunked fixed-center biweight_location"
 
 
 class FlatTask(_RawCalibrationTask):
@@ -158,6 +175,7 @@ class FlatTask(_RawCalibrationTask):
     result_kind = "flat"
     result_contract = FlatResultContract
     component_map = {"master_flat": "master_ldls", "flat_response_mask": "flat_response_mask"}
+    combine_method = "chunked fixed-center biweight_location"
 
     def run(self, inputs):
         result = super().run(inputs)
@@ -177,6 +195,7 @@ class CmpTask(_RawCalibrationTask):
     result_kind = "cmp"
     result_contract = CmpResultContract
     component_map = {"master_comparison_lamp": "master_arc"}
+    combine_method = "chunked fixed-center biweight_location"
 
     def run(self, inputs):
         result = super().run(inputs)
@@ -194,6 +213,7 @@ class TwiTask(_RawCalibrationTask):
     result_kind = "twi"
     result_contract = TwiResultContract
     component_map = {"master_twilight": "master_twilight"}
+    combine_method = "chunked fixed-center biweight_location"
 
     def run(self, inputs):
         result = super().run(inputs)

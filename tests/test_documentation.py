@@ -9,7 +9,7 @@ from virusflow.cli.virusflow import build_parser, resolve_nworkers
 ROOT = Path(__file__).resolve().parents[1]
 DOCUMENTS = [
     ROOT / "README.md", ROOT / "docs/getting-started.md", ROOT / "docs/cli-reference.md",
-    ROOT / "docs/examples.md", ROOT / "docs/troubleshooting.md",
+    ROOT / "docs/examples.md", ROOT / "docs/troubleshooting.md", ROOT / "docs/performance.md",
     ROOT / "docs/migration/stage-11.md",
 ]
 
@@ -39,6 +39,9 @@ def test_documented_command_families_exist_and_default_is_four_workers():
         ["study", "list"], ["study", "show", "study"],
         ["storage", "report"], ["cleanup", "scratch", "--workdir", "/work"],
         ["cleanup", "cache"], ["cleanup", "legacy"], ["config", "show"],
+        ["performance", "show", "performance.json"],
+        ["performance", "compare", "before.json", "after.json"],
+        ["performance", "overhead"],
         ["validate", "observation", "--data-root", "/raw", "--workspace", "/work", "--output-dir", "/report"],
     ]
     for invocation in invocations:
