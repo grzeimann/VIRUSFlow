@@ -1,6 +1,6 @@
 # VIRUSFlow Steps 8–10 Scientific Acceptance
 
-Status: Steps 8 and 9 passed their internal implementation and real-data gates on 2026-07-22. Step 10 remains in progress in the authorized autonomous tranche. Step 11 is unauthorized and unstarted.
+Status: Steps 8 through 10 passed their internal implementation and real-data gates on 2026-07-22. Step 11 is unauthorized and unstarted.
 
 ## Selected 20260609 identities
 
@@ -59,6 +59,24 @@ Within-amplifier and exposure-wide twilight factors remain separate and the fina
 
 The first pass found that the LDLS response mask for `028+042+413+RL+S/N 0031` masked 98.4496% of detector samples and destroyed an otherwise valid arc solution. The corrected, versioned bounded-mask policy rejects near-global flat masks while retaining their fraction and decision; the amplifier then has 11 seed rows below the 1 Å criterion and a wavelength Product. In contrast, all eight raw comparison arrays for `095+004+426+RU+S/N 0048` are exactly zero, so its missing wavelength Product is retained as a real input limitation.
 
+## Step 10 real-data evidence
+
+All three OBSID 6 members were run as complete, independent Exposure entities in the same isolated acceptance workspace:
+
+| Exposure | Reduced / physical CCD / extracted | Catalog accepted | Astrometric RMS (arcsec) | Response median | Effective time (s) |
+|---|---:|---:|---:|---:|---:|
+| `20260609T031649.6` | 300 / 150 / 299 | 5 | 0.724692 | 1.00000953 | 67.399394048 |
+| `20260609T031859.3` | 300 / 150 / 299 | 5 | 0.724732 | 0.999958771 | 67.448336384 |
+| `20260609T032112.2` | 300 / 150 / 299 | 7 | 0.849316 | 0.999908529 | 67.899279872 |
+
+Each Exposure retains its own detector state, sky, astrometry, response, effective time, QA, revisions, and lineage. The real headers do not contain usable seeing or transparency fields; the corresponding per-exposure state values are retained as NaN rather than imputed. Every exposure is degraded by the same explicitly unavailable zero-arc RU amplifier, but all 75 IFUSLOTs and all 150 physical CCDs remain represented.
+
+The explicit membership is `20260609T031649.6`, `20260609T031859.3`, and `20260609T032112.2`, ordered by timestamps and consistent OBSID 6 evidence. No exposure is synthesized. The provisional, versioned nominal offsets are `(0.0, 0.0)`, `(1.27, 0.73)`, and `(0.0, 1.46)` arcsec. Catalog-refined relative offsets are `(0.0, 0.0)`, `(-2.01919, 6.72512)`, and `(0.168890, -0.0472918)` arcsec. Their residual RMS is 2.85951 arcsec, above the explicit 1.5 arcsec warning threshold. Registration and observation-summary QA are therefore `warn/degraded`; the nominal configuration was not tuned to force agreement.
+
+The refined-footprint coverage map has covered-grid fraction 0.457677, hole fraction 0.542323, duplicated-covered fraction 0.700551, and maximum multiplicity three. It is explicitly a fiber-footprint diagnostic, not cube reconstruction. The large registration discrepancy and coverage holes are retained as a scientific investigation target.
+
+Focused tests cover incomplete two-exposure sets, an extra fourth exposure, ambiguous sequence evidence, repeated identities, missing amplifier coverage, nominal-versus-refined offsets, checksum loading, normalized lineage, and preservation of all per-exposure state. Canonical `query_observation`, `query_dither_set`, and read-only `query_observation_set` boundaries return the grouping Products without merging Exposure state.
+
 ## Test ledger
 
 - Pre-change baseline: `55 passed`.
@@ -66,3 +84,6 @@ The first pass found that the LDLS response mask for `028+042+413+RL+S/N 0031` m
 - Full suite after Step 8: `61 passed` with one pre-existing flat median-filter warning.
 - Step 9 focused algorithm, catalog-provider, Product-contract, serialization, and Task gate: `17 passed`.
 - Full suite at the Step 9 milestone boundary: `76 passed` with one pre-existing flat median-filter warning.
+- Step 10 focused assignment, registration, coverage, entity, query, and Task gate: `5 passed`.
+- Final complete suite: `76 passed` with the same pre-existing flat median-filter warning.
+- Reproducible `python -m virusflow.cli.verify_steps_8_10 --workspace /tmp/virusflow-step9-acceptance.AsfiSO --output-dir /tmp/virusflow-step9-acceptance.AsfiSO/report --reuse-products` gate: PASS. It re-inventoried 14,100 inputs, loaded every named component through ArtifactService with checksum verification, validated normalized lineage and current logical revisions, and generated `steps_8_10_scientific_acceptance.md` plus three diagnostic figures and JSON inventory, fact, and manifest files.

@@ -29,3 +29,8 @@ class PhysicalCCDIdentity:
 class ObservationIdentity:
     observation_id: str
 
+
+@dataclass(frozen=True)
+class DitherSetIdentity:
+    dither_set_id: str
+    observation_id: str

@@ -65,6 +65,21 @@ class ExposureTarget:
     at_time: Optional[datetime] = None
 
 
+@dataclass(frozen=True)
+class ObservationTarget:
+    """Explicit grouping target; member identities are never synthesized."""
+
+    observation_id: str
+    dither_set_id: str
+    exposure_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.observation_id or not self.dither_set_id:
+            raise ValueError("Observation and DitherSet identities are required")
+        if not self.exposure_ids:
+            raise ValueError("ObservationTarget requires at least one real exposure identity")
+
+
 class CadencePolicy:
     """Protocol for cadence policies used by calibration nodes.
 

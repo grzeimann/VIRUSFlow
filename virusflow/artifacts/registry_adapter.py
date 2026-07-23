@@ -124,9 +124,20 @@ class RegistryAdapter:
                 row.update(details)
         return rows
 
+    def list_all(self, *, kind: Optional[str] = None) -> List[dict]:
+        rows = db.list_artifacts(kind=kind, db_path=self.db_path)
+        for row in rows:
+            details = db.get_artifact_details(int(row["id"]), db_path=self.db_path)
+            if details:
+                row.update(details)
+        return rows
+
     # --- Diagnostics ---
     def get_diagnostics(self, artifact_id: int) -> Optional[dict]:
         return db.get_qa_results(int(artifact_id), db_path=self.db_path)
+
+    def get_qa_bundle(self, artifact_id: int) -> Optional[dict]:
+        return db.get_qa_bundle(int(artifact_id), db_path=self.db_path)
 
     def set_diagnostics(self, artifact_id: int, status: str, metrics: Optional[dict]) -> None:
         db.save_qa_results(int(artifact_id), status=status, metrics=metrics, db_path=self.db_path)

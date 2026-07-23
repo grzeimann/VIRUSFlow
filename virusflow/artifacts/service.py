@@ -239,6 +239,33 @@ class ArtifactService:
         rows.sort(key=lambda row: (str(row.get("created_at") or ""), int(row.get("id") or 0)), reverse=True)
         return self.adapter.get_row(int(rows[0]["id"])) or rows[0]
 
+    def query_observation(self, observation_id: str, *, kind: Optional[str] = None) -> list[dict]:
+        """Canonical read boundary for all Products related to one Observation."""
+
+        return [
+            row for row in self.adapter.list_all(kind=canonical_kind(kind) if kind else None)
+            if row.get("observation_id") == str(observation_id)
+        ]
+
+    def query_dither_set(self, dither_set_id: str, *, kind: Optional[str] = None) -> list[dict]:
+        """Canonical read boundary for one explicit DitherSet relationship."""
+
+        return [
+            row for row in self.adapter.list_all(kind=canonical_kind(kind) if kind else None)
+            if row.get("dither_set_id") == str(dither_set_id)
+        ]
+
+    def query_observation_set(
+        self, observation_ids: Iterable[str], *, kind: Optional[str] = None
+    ) -> list[dict]:
+        """Read-only query-defined ObservationSet; no exposure state is merged."""
+
+        identities = {str(value) for value in observation_ids}
+        return [
+            row for row in self.adapter.list_all(kind=canonical_kind(kind) if kind else None)
+            if row.get("observation_id") in identities
+        ]
+
     def get(self, artifact_id: int, *, include_payload: bool = False) -> Optional[ArtifactDescription]:
         row = self.adapter.get_row(int(artifact_id))
         return self._describe_row(row, include_payload=include_payload) if row else None
@@ -257,7 +284,7 @@ class ArtifactService:
             "storage_format": desc.storage_format,
             "path": desc.storage.uri if desc.storage else None,
             "summary": desc.metadata,
-            "qa": self.adapter.get_diagnostics(int(desc.id)),
+            "qa": self.adapter.get_qa_bundle(int(desc.id)),
             "model_type": desc.model_type,
             "components": self.adapter.list_components(int(desc.id)),
             "validity": asdict(desc.validity) if desc.validity else None,

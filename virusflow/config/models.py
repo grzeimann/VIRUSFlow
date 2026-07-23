@@ -33,3 +33,10 @@ class DitherPolicy:
     version: str = "baseline-1"
     rule: str = "nominal_standard_sequence_then_astrometric_refinement"
     evidence_state: str = "provisional"
+    nominal_pattern_arcsec: tuple[tuple[float, float], ...] = (
+        (0.0, 0.0),
+        (1.27, 0.73),
+        (0.0, 1.46),
+    )
+    registration_warn_rms_arcsec: float = 1.5
+    source: str = "provisional equilateral 1.46-arcsec sequence; authoritative history unresolved"

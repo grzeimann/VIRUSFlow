@@ -633,6 +633,7 @@ class ExposureTask(_SciencePublisher):
                 "classification": _component("classification", np.asarray([1 if mode == "parallel" else 0]), "1", "none"),
                 "source_fields": _component("source_fields", np.asarray([time_evidence["EXPTIME"] or np.nan, time_evidence["PEXPTIME"] or np.nan]), "s", "none"),
             },
+            parents=[int(initial_artifact.id)],
             summaries={"parallel": int(mode == "parallel")}, metadata={"mode": mode, **time_evidence}, refs=exposure_refs,
             algorithm="virusflow.algorithms.exposure.classify_mode", version=EFFECTIVE_EXPOSURE_POLICY.version,
         )

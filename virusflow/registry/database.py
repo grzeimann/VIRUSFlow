@@ -594,6 +594,29 @@ def list_raw_files(exposure_id: Optional[str] = None, db_path: str = DEFAULT_DB_
         return out
 
 
+def list_raw_file_rows(exposure_id: str, db_path: str = DEFAULT_DB_PATH) -> List[Tuple[int, RawFileId]]:
+    """Return raw row identities with canonical amplifier identities for lineage."""
+
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, exposure_id, frame_type, path, tar_member, storage_backend, amp_key "
+            "FROM raw_files WHERE exposure_id=? ORDER BY id",
+            (str(exposure_id),),
+        ).fetchall()
+    out: List[Tuple[int, RawFileId]] = []
+    for row in rows:
+        zipcode = None
+        if row[6]:
+            try:
+                from ..core.identity import parse_zipcode_key
+
+                zipcode = parse_zipcode_key(str(row[6]))
+            except (SystemExit, ValueError):
+                zipcode = None
+        out.append((int(row[0]), RawFileId(row[1], row[2], row[3], row[4], row[5], zipcode)))
+    return out
+
+
 def list_raw_files_scoped(
     frame_type: str,
     start_date: str,
@@ -1055,6 +1078,43 @@ def get_qa_results(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional
         except Exception:
             metrics = {}
         return {"artifact_id": int(row[0]), "status": row[1], "metrics": metrics}
+
+
+def get_qa_bundle(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    """Return normalized facts, decision, status, and usability for one Product."""
+
+    import json as _json
+    with connect(db_path) as conn:
+        decision = conn.execute(
+            "SELECT status, usability, policy_version, rules_json FROM qa_decisions WHERE artifact_id=?",
+            (int(artifact_id),),
+        ).fetchone()
+        facts = conn.execute(
+            "SELECT name, value_json, units, component FROM qa_facts WHERE artifact_id=? ORDER BY name",
+            (int(artifact_id),),
+        ).fetchall()
+    if decision is None and not facts:
+        return get_qa_results(artifact_id, db_path=db_path)
+    fact_values = {}
+    for row in facts:
+        try:
+            value = _json.loads(row[1])
+        except Exception:
+            value = row[1]
+        fact_values[str(row[0])] = {"value": value, "units": row[2], "component": row[3]}
+    try:
+        rules = _json.loads(decision[3] or "[]") if decision is not None else []
+    except Exception:
+        rules = []
+    return {
+        "artifact_id": int(artifact_id),
+        "status": decision[0] if decision is not None else None,
+        "usability": decision[1] if decision is not None else None,
+        "policy_version": decision[2] if decision is not None else None,
+        "rules": rules,
+        "facts": fact_values,
+        "metrics": {name: value["value"] for name, value in fact_values.items()},
+    }
 
 
 def list_zipcodes(

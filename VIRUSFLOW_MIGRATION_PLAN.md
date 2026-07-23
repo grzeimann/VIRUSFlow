@@ -181,6 +181,8 @@ Exposure remains atomic. Observation and DitherSet rows relate exposures but nev
 
 Use versioned nominal dither assignments as the baseline and store astrometric refinements as evidence. Handle incomplete or nonstandard sets without fabricating missing exposures.
 
+Implementation gate passed on 2026-07-22. `ObservationTarget`, `ObservationTask`, and the array-only dither algorithms preserve the three OBSID 6 exposures as independent Product-producing entities and publish explicit membership, assignment, registration, coverage, and observation-summary Products. All three exposures were reduced independently through 300 detector amplifiers, 150 physical CCDs, and 299 extractable amplifiers. Nominal and refined offsets are separate. The real 2.85951 arcsec registration-versus-nominal RMS exceeds the versioned 1.5 arcsec warning threshold, so registration and observation QA are degraded while the grouping remains queryable and usable for investigation. Incomplete, extra, ambiguous, repeated, missing-coverage, and immutable-state cases are tested. Observation, DitherSet, and query-defined ObservationSet reads use the canonical ArtifactService boundary. Detailed evidence is retained in `VIRUSFLOW_STEPS_8_10_ACCEPTANCE.md`.
+
 ### Step 11 — Retirement
 
 No path is removed merely because canonical code exists. Retirement requires:

@@ -529,3 +529,7 @@ Verified — source, focused tests, full suite, and real-data execution on 2026-
 ## Step 9 implementation record
 
 Verified on 2026-07-22 using isolated real exposure `20260609T031649.6`: all 300 raw amplifiers produced detector reductions, all 150 physical CCDs produced scatter Products, and 299 amplifiers across all 75 IFUSLOTs produced exact-weight aperture extraction and the approved exposure Products. The sole unavailable wavelength path is `095+004+426+RU+S/N 0048`, for which all eight real comparison frames are identically zero. Live Pan-STARRS DR2 refinement retained 3,682 catalog rows, 53 candidates, five accepted matches, and 0.724692 arcsec residual RMS. The exposure remains degraded rather than falsely complete; detailed QA, scientific differences, and component evidence are in `VIRUSFLOW_STEPS_8_10_ACCEPTANCE.md`. Step 10 remained uncommitted at this milestone and Step 11 remained unstarted.
+
+## Step 10 implementation record
+
+Verified on 2026-07-22 using the three real OBSID 6 exposures. Each independently produced 300 detector reductions, 150 physical CCDs, 299 extracted-amplifier Products, and its own astrometry, sky, response, time, QA, and lineage. First-class Observation/DitherSet Products retain membership, provisional nominal offsets, measured offsets, rejected/fallback facts, registration residuals, and a coverage map. The 2.85951 arcsec real registration-versus-nominal RMS is intentionally reported as degraded rather than hidden. No exposure state was collapsed, no member was fabricated, and no Step 11 retirement was begun.

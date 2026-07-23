@@ -167,7 +167,12 @@ class PhysicalCCDTask(_SciencePublisher):
     def _components(result, names: Iterable[str], *, units: str, coordinates: str):
         components = {}
         for name in names:
-            value = result.get_array(name)
+            value = np.asarray(result.get_array(name))
+            # Detector-valued surfaces do not require celestial-coordinate
+            # float64 precision; make their storage precision explicit rather
+            # than relying on a serializer-wide coercion.
+            if value.dtype.kind == "f" and value.dtype.itemsize > 4:
+                value = value.astype(np.float32)
             unit = "1" if "mask" in name or name == "source_amplifier_map" else (
                 "pixel" if name == "source_y_coordinate" else units
             )

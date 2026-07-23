@@ -100,6 +100,30 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
     "exposure_mode_classification": _spec("exposure_mode_classification", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.NONE, ("classification", "source_fields")),
     "effective_exposure_time": _spec("effective_exposure_time", PhysicalScope.EXPOSURE, Unit.SECOND.value, CoordinateConvention.NONE, ("effective_seconds", "source_fields")),
     "exposure_completion_manifest": _spec("exposure_completion_manifest", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.NONE, ("coverage", "amplifier_identity")),
+    "observation_exposure_state": _spec(
+        "observation_exposure_state", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value,
+        CoordinateConvention.NONE, ("state", "astrometry_parameters", "coverage_summary"),
+    ),
+    "observation_membership": _spec(
+        "observation_membership", PhysicalScope.OBSERVATION, Unit.DIMENSIONLESS.value,
+        CoordinateConvention.NONE, ("membership", "exposure_state"),
+    ),
+    "dither_assignment": _spec(
+        "dither_assignment", PhysicalScope.DITHER_SET, "arcsec", CoordinateConvention.NONE,
+        ("assignments", "sequence_evidence"),
+    ),
+    "dither_registration": _spec(
+        "dither_registration", PhysicalScope.DITHER_SET, "arcsec", CoordinateConvention.NONE,
+        ("nominal_offsets", "refined_offsets", "registration_residuals", "registration_success", "astrometry_parameters"),
+    ),
+    "dither_coverage_map": _spec(
+        "dither_coverage_map", PhysicalScope.DITHER_SET, Unit.DIMENSIONLESS.value,
+        CoordinateConvention.NONE, ("coverage", "x_coordinate", "y_coordinate"),
+    ),
+    "observation_summary": _spec(
+        "observation_summary", PhysicalScope.OBSERVATION, Unit.DIMENSIONLESS.value,
+        CoordinateConvention.NONE, ("member_state", "qa_usability"),
+    ),
 }
 
 
