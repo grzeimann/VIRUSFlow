@@ -106,8 +106,8 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     result = ExposureTask(context, target=ExposureTarget(exposure_id, at)).run({})
     required = {
         "exposure_completion_manifest", "initial_astrometry", "catalog_match_table", "final_astrometry",
-        "fiber_sky_coordinates", "sky_fiber_mask", "incident_sky_spectrum", "fiber_sky_prediction",
-        "sky_subtracted_spectrum", "final_exposure_response", "effective_exposure_time",
+        "fiber_sky_coordinates", "sky_fiber_mask", "sky_model", "fiber_response_model",
+        "calibrated_fiber_state", "effective_exposure_time",
         "amp_to_amp_normalization",
     }
     assert required <= set(result)
@@ -115,6 +115,15 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     assert manifest["summary"]["raw_amplifier_count"] == 4
     assert manifest["summary"]["extracted_amplifier_count"] == 4
     assert service.describe(result["final_astrometry"].id)["summary"]["refined"] == 1
-    for artifact in result.values():
+    forbidden = {
+        "reduced_science_image", "scatter_subtracted_image", "aperture_extracted_spectrum",
+        "extracted_variance", "fiber_sky_prediction", "sky_subtracted_spectrum",
+        "final_exposure_response",
+    }
+    assert not any(service.adapter.list_all(kind=kind) for kind in forbidden)
+    assert result["calibrated_fiber_state"].flux.dtype == np.float32
+    for name, artifact in result.items():
+        if name == "calibrated_fiber_state":
+            continue
         for component in service.describe(artifact.id)["components"]:
             service.load_component(artifact.id, component["name"], verify_checksum=True)

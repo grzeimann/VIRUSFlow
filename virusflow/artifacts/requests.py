@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
 from .models import ArtifactRelation, ConfigurationReference, Scope, Validity
+from ..ontology.lifecycle import ArtifactLifecycle
 
 
 @dataclass(frozen=True)
@@ -44,6 +45,7 @@ class ArtifactRequest:
     relations: List[ArtifactRelation] = field(default_factory=list)
     assumptions: List[str] = field(default_factory=list)
     revision: Optional[str] = None
+    lifecycle: Optional[ArtifactLifecycle] = None
 
     def component_names(self) -> List[str]:
         return list((self.components or {}).keys())

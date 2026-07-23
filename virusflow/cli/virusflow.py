@@ -131,6 +131,29 @@ def cmd_artifacts(args: argparse.Namespace) -> None:
     print(format_artifacts_table(rows, csv=bool(args.csv), include_summary=bool(args.summary)))
 
 
+def cmd_storage_report(args: argparse.Namespace) -> None:
+    from ..artifacts import ArtifactService
+
+    report = ArtifactService(args.db).storage_summary(largest=args.largest)
+    print(yaml.safe_dump(report, sort_keys=False))
+
+
+def cmd_storage_migrate(args: argparse.Namespace) -> None:
+    from ..artifacts.migration import migrate_stages_8_10_storage
+
+    result = migrate_stages_8_10_storage(
+        args.db, delete_payloads=bool(args.delete_payloads)
+    )
+    print(yaml.safe_dump(result.__dict__, sort_keys=False))
+
+
+def cmd_scratch_cleanup(args: argparse.Namespace) -> None:
+    from ..storage.scratch import cleanup_abandoned_scratch
+
+    removed = cleanup_abandoned_scratch(args.workdir)
+    print(f"Removed {removed} abandoned scratch files from {args.workdir}")
+
+
 # ------------------ QA subcommands ------------------
 
 def cmd_qa_set(args: argparse.Namespace) -> None:
@@ -377,6 +400,18 @@ def cmd_plan_observation_set(args: argparse.Namespace) -> None:
 
 # ------------------ Runner ------------------
 
+
+def resolve_nworkers(*, cli_value=None, serial: bool = False, configured_value=None) -> int:
+    """CLI > configuration > four-worker default, with an explicit serial override."""
+
+    if serial:
+        return 1
+    value = cli_value if cli_value is not None else configured_value
+    value = 4 if value is None else int(value)
+    if value < 1:
+        raise ValueError("nworkers must be at least one; use --serial for serial execution")
+    return value
+
 def _run_planned(args: argparse.Namespace) -> None:
     from ..core.pathutils import ensure_dir
     from ..planning import (
@@ -399,6 +434,11 @@ def _run_planned(args: argparse.Namespace) -> None:
     cfg_obj: PlanningConfig | None = None
     if getattr(args, "planning_yaml", None):
         cfg_obj = load_planning_config(args.planning_yaml)
+    nworkers = resolve_nworkers(
+        cli_value=getattr(args, "nworkers", getattr(args, "workers", None)),
+        serial=bool(getattr(args, "serial", False)),
+        configured_value=getattr(cfg_obj, "nworkers", None),
+    )
     # Build default graph and apply overrides
     nodes, edges = default_calibration_graph(cfg_obj)
     # Preflight: validate planning graph
@@ -506,7 +546,7 @@ def _run_planned(args: argparse.Namespace) -> None:
     if _schedule is None:
         raise RuntimeError("planning.schedule is unavailable")
     # Build context and mapping
-    cfg = {"workers": args.workers, "debug_timing": bool(args.debug_timing), "debug_inputs": bool(getattr(args, "debug_inputs", False))}
+    cfg = {"nworkers": nworkers, "workers": nworkers, "inside_task_worker": False, "debug_timing": bool(args.debug_timing), "debug_inputs": bool(getattr(args, "debug_inputs", False))}
     if getattr(args, "qa_out_dir", None):
         cfg["qa_out_dir"] = args.qa_out_dir
     # Experimental mapping helper controls
@@ -530,7 +570,7 @@ def _run_planned(args: argparse.Namespace) -> None:
     )
     # Submit to PlanningExecutor (planning-native; no TaskGraph dependency)
     from ..executors.planning_executor import PlanningExecutor as _PlanningExecutor
-    execp = _PlanningExecutor(max_workers=(args.workers if args.workers and args.workers > 0 else 1), debug=bool(args.debug_timing))
+    execp = _PlanningExecutor(max_workers=nworkers, debug=bool(args.debug_timing))
     # Add tasks preserving dependencies
     for st in scheduled:
         execp.add_task(st.id, st.task, kind=st.kind, depends_on=st.depends_on)
@@ -597,6 +637,21 @@ def main(argv: Optional[list[str]] = None) -> None:
     sp.add_argument("--policy", choices=["latest_valid", "latest"], help="Selection policy for --best (default: latest_valid)")
     sp.add_argument("--status", help="Filter by QA status (e.g., pass, fail)")
     sp.set_defaults(func=cmd_artifacts)
+
+    storage_p = sub.add_parser("storage", help="Report or migrate artifact storage", parents=[global_opts])
+    storage_sub = storage_p.add_subparsers(dest="storage_cmd", required=True)
+    storage_report = storage_sub.add_parser("report", parents=[global_opts])
+    storage_report.add_argument("--largest", type=int, default=10)
+    storage_report.set_defaults(func=cmd_storage_report)
+    storage_migrate = storage_sub.add_parser("migrate-stages-8-10", parents=[global_opts])
+    storage_migrate.add_argument(
+        "--delete-payloads", action="store_true",
+        help="Delete invalidated dense payloads after replacement validation",
+    )
+    storage_migrate.set_defaults(func=cmd_storage_migrate)
+    storage_cleanup = storage_sub.add_parser("cleanup-scratch", parents=[global_opts])
+    storage_cleanup.add_argument("--workdir", required=True)
+    storage_cleanup.set_defaults(func=cmd_scratch_cleanup)
 
     # exposures table
     sp = sub.add_parser("exposures", help="Show a quick readable table from exposures in the registry", parents=[global_opts])
@@ -713,7 +768,8 @@ def main(argv: Optional[list[str]] = None) -> None:
     # run
     sp = sub.add_parser("run", help="Plan and execute calibrations (planning-first)", parents=[global_opts])
     sp.add_argument("--workdir", default=str(Path.cwd() / "work"), help="Working directory")
-    sp.add_argument("--workers", type=int, default=4, help="Worker threads for algorithms and task batches (set 0 for serial)")
+    sp.add_argument("--nworkers", "--workers", dest="nworkers", type=int, default=None, help="Task workers (default 4; overrides configuration)")
+    sp.add_argument("--serial", action="store_true", help="Run serially (equivalent to --nworkers 1)")
     sp.add_argument("--qa-out-dir", help="Directory to write QA outputs (plots and JSON packets)")
     sp.add_argument("--qa-yaml", help="Path to QA rules YAML (overrides VF_QA_YAML and default docs/qa_default.yml)")
     sp.add_argument("--debug-timing", action="store_true", help="Print timing diagnostics during run")

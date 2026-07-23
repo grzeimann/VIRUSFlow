@@ -35,3 +35,4 @@ __all__ = [
     "UNKNOWN_UNIT",
     "Unit",
 ]
+from .lifecycle import ArtifactLifecycle

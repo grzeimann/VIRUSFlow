@@ -13,3 +13,4 @@ from .models import (
     Validity,
 )
 from .service import ArtifactService
+from ..ontology.lifecycle import ArtifactLifecycle

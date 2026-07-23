@@ -172,6 +172,9 @@ CREATE TABLE IF NOT EXISTS artifact_records (
     configuration_refs_json TEXT,
     metadata_json TEXT,
     validity_policy TEXT,
+    lifecycle TEXT NOT NULL DEFAULT 'canonical',
+    state TEXT NOT NULL DEFAULT 'active',
+    payload_bytes INTEGER NOT NULL DEFAULT 0,
     created_at TEXT,
     FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
 );
@@ -187,6 +190,9 @@ CREATE TABLE IF NOT EXISTS artifact_components (
     units TEXT,
     coordinates TEXT,
     metadata_json TEXT,
+    payload_bytes INTEGER NOT NULL DEFAULT 0,
+    dtype TEXT,
+    shape_json TEXT,
     PRIMARY KEY(artifact_id, name),
     FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
 );
@@ -224,6 +230,36 @@ CREATE TABLE IF NOT EXISTS qa_decisions (
     FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
 );
 
+CREATE TABLE IF NOT EXISTS analysis_studies (
+    study_id TEXT PRIMARY KEY,
+    scientific_question TEXT NOT NULL,
+    selection_json TEXT NOT NULL,
+    selected_observations_json TEXT NOT NULL,
+    model_versions_json TEXT NOT NULL,
+    calibration_versions_json TEXT NOT NULL,
+    software_version TEXT,
+    algorithm_versions_json TEXT NOT NULL,
+    intermediate_kinds_json TEXT NOT NULL,
+    retention_policy TEXT NOT NULL,
+    expected_bytes INTEGER NOT NULL,
+    materialized_bytes INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'active',
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS analysis_materializations (
+    study_id TEXT NOT NULL,
+    artifact_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    retained INTEGER NOT NULL,
+    payload_bytes INTEGER NOT NULL,
+    PRIMARY KEY(study_id, artifact_id),
+    FOREIGN KEY(study_id) REFERENCES analysis_studies(study_id),
+    FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
+);
+
 -- Helpful indexes (safe no-ops if already present)
 CREATE INDEX IF NOT EXISTS artifacts_kind_amp ON artifacts(kind, amp_key);
 CREATE INDEX IF NOT EXISTS provenance_created_at ON provenance(created_at);
@@ -240,6 +276,23 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(artifact_records)").fetchall()}
         if "validity_policy" not in columns:
             conn.execute("ALTER TABLE artifact_records ADD COLUMN validity_policy TEXT")
+        for name, definition in (
+            ("lifecycle", "TEXT NOT NULL DEFAULT 'canonical'"),
+            ("state", "TEXT NOT NULL DEFAULT 'active'"),
+            ("payload_bytes", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE artifact_records ADD COLUMN {name} {definition}")
+        component_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(artifact_components)").fetchall()
+        }
+        for name, definition in (
+            ("payload_bytes", "INTEGER NOT NULL DEFAULT 0"),
+            ("dtype", "TEXT"),
+            ("shape_json", "TEXT"),
+        ):
+            if name not in component_columns:
+                conn.execute(f"ALTER TABLE artifact_components ADD COLUMN {name} {definition}")
 
 
 def _parse_filename_meta(path: str) -> Tuple[str, str, Optional[str]]:
@@ -764,8 +817,9 @@ def save_artifact_details(
                 artifact_id, canonical_kind, role, payload_type, storage_format,
                 physical_scope, exposure_id, observation_id, dither_set_id,
                 revision, checksum, units_json, coordinates_json,
-                configuration_refs_json, metadata_json, validity_policy, created_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                configuration_refs_json, metadata_json, validity_policy,
+                lifecycle, state, payload_bytes, created_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(artifact_id) DO UPDATE SET
                 canonical_kind=excluded.canonical_kind,
                 role=excluded.role,
@@ -781,7 +835,10 @@ def save_artifact_details(
                 coordinates_json=excluded.coordinates_json,
                 configuration_refs_json=excluded.configuration_refs_json,
                 metadata_json=excluded.metadata_json,
-                validity_policy=excluded.validity_policy
+                validity_policy=excluded.validity_policy,
+                lifecycle=excluded.lifecycle,
+                state=excluded.state,
+                payload_bytes=excluded.payload_bytes
             """,
             (
                 int(artifact_id),
@@ -800,6 +857,9 @@ def save_artifact_details(
                 json.dumps(record.get("configuration_refs") or [], sort_keys=True),
                 json.dumps(record.get("metadata") or {}, sort_keys=True, default=str),
                 record.get("validity_policy"),
+                record.get("lifecycle") or "canonical",
+                record.get("state") or "active",
+                int(record.get("payload_bytes") or 0),
                 record.get("created_at") or datetime.utcnow().isoformat(),
             ),
         )
@@ -808,8 +868,9 @@ def save_artifact_details(
                 """
                 INSERT INTO artifact_components(
                     artifact_id, name, model_type, path, payload_type,
-                    storage_format, checksum, units, coordinates, metadata_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                    storage_format, checksum, units, coordinates, metadata_json,
+                    payload_bytes, dtype, shape_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(artifact_id, name) DO UPDATE SET
                     model_type=excluded.model_type,
                     path=excluded.path,
@@ -818,7 +879,10 @@ def save_artifact_details(
                     checksum=excluded.checksum,
                     units=excluded.units,
                     coordinates=excluded.coordinates,
-                    metadata_json=excluded.metadata_json
+                    metadata_json=excluded.metadata_json,
+                    payload_bytes=excluded.payload_bytes,
+                    dtype=excluded.dtype,
+                    shape_json=excluded.shape_json
                 """,
                 (
                     int(artifact_id),
@@ -831,6 +895,9 @@ def save_artifact_details(
                     component.get("units"),
                     component.get("coordinates"),
                     json.dumps(component.get("metadata") or {}, sort_keys=True, default=str),
+                    int(component.get("payload_bytes") or 0),
+                    component.get("dtype"),
+                    json.dumps(component.get("shape") or []),
                 ),
             )
         for relation in relations:
@@ -864,6 +931,26 @@ def get_artifact_details(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Op
         return out
 
 
+def get_artifact_by_revision(revision: str, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT artifact_id FROM artifact_records WHERE revision=?", (str(revision),)
+        ).fetchone()
+    return get_artifact(int(row[0]), db_path=db_path) if row is not None else None
+
+
+def set_artifact_state(artifact_id: int, state: str, db_path: str = DEFAULT_DB_PATH) -> None:
+    if state not in {"active", "obsolete", "evicted"}:
+        raise ValueError(f"invalid artifact state: {state}")
+    init_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE artifact_records SET state=? WHERE artifact_id=?",
+            (state, int(artifact_id)),
+        )
+
+
 def list_artifact_components(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
     import json
 
@@ -878,6 +965,10 @@ def list_artifact_components(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -
                 row["metadata"] = json.loads(row.pop("metadata_json") or "{}")
             except Exception:
                 row["metadata"] = {}
+            try:
+                row["shape"] = json.loads(row.pop("shape_json") or "[]")
+            except Exception:
+                row["shape"] = []
         return out
 
 

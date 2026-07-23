@@ -3,13 +3,20 @@ from __future__ import annotations
 """Canonical science amplifier and physical-CCD orchestration Tasks."""
 
 from datetime import datetime
+from dataclasses import dataclass
 from typing import Iterable
 
 import numpy as np
 
 from .base import Task
 from ..algorithms.ccd import reduce_amplifier_array
-from ..algorithms.physical_ccd import ALGORITHM_VERSION, TRANSFORM_VERSION, assemble_physical_ccd, fit_gap_scattered_light
+from ..algorithms.physical_ccd import (
+    ALGORITHM_VERSION,
+    TRANSFORM_VERSION,
+    assemble_physical_ccd,
+    compact_scattered_light_payload,
+    fit_gap_scattered_light,
+)
 from ..artifacts import ArtifactService, Scope, Validity
 from ..artifacts.models import ConfigurationReference
 from ..artifacts.requests import ArtifactRequest, LogicalComponent
@@ -25,6 +32,25 @@ def _instant(exposure_id: str) -> datetime:
         return datetime.strptime(str(exposure_id), "%Y%m%dT%H%M%S.%f")
     except ValueError:
         return datetime.strptime(str(exposure_id)[:8], "%Y%m%d")
+
+
+@dataclass(frozen=True)
+class ReducedAmplifierState:
+    zipcode: object
+    exposure_id: str
+    image: np.ndarray
+    variance: np.ndarray
+    pixel_mask: np.ndarray
+    header: dict
+    parent_ids: tuple[int, ...]
+    summaries: dict
+
+
+@dataclass(frozen=True)
+class PhysicalCCDState:
+    assembly: object
+    scatter: object
+    model_artifact: object
 
 
 class _SciencePublisher(Task):
@@ -119,44 +145,26 @@ class ReducedScienceAmplifierTask(_SciencePublisher):
                 calibration_parents.append(int(ldls_row["id"]))
             mask |= (~np.isfinite(image) | ~np.isfinite(variance)).astype(np.uint8)
             calibration_policy = "bias_plus_exptime_scaled_dark_residual-1"
-        spec = kind_spec("reduced_science_image")
-        request = ArtifactRequest(
-            kind="reduced_science_image", role="reduction",
-            components={
-                "image": LogicalComponent("image", "array2d", image, spec.units, spec.coordinates.value),
-                "variance": LogicalComponent("variance", "array2d", variance, "electron2", spec.coordinates.value),
-                "pixel_mask": LogicalComponent("pixel_mask", "array2d", mask, "1", spec.coordinates.value),
-            },
-            summaries={
-                "invalid_pixel_fraction": float(mask.mean()),
-                "gain": float(reduced.scalars["gain"]),
-                "read_noise": float(reduced.scalars["read_noise"]),
-                "science_exptime": science_exptime,
-                "dark_exptime": float(dark_exptime or 0.0),
-                "dark_scale": float(dark_scale),
-            },
-            metadata={
-                "exposure_id": exposure_id,
-                "zipcode": zipcode.key(),
-                "reduction_stage": "overscan_orientation_gain_bias_dark_mask",
-                "calibration_policy": calibration_policy,
-                "source_header": {key: frame.header.get(key) for key in ("DATE", "OBJECT", "EXPTIME", "PEXPTIME", "OBSID", "DITHER", "QRA", "QDEC", "PARANGLE")},
-            },
-            scope=Scope(zipcode=zipcode, exposure_id=exposure_id, physical_scope=PhysicalScope.AMPLIFIER),
-            parents=[int(row_id), *calibration_parents],
-            validity=Validity(at, at, "exposure_identity"),
-            configuration_refs=[ConfigurationReference("amplifier_orientation", "legacy-characterized-1", zipcode.key(), "verified")],
-            assumptions=[
-                "Master Dark contains the Master Bias level; only its residual above Master Bias is exposure-time scaled.",
-                "Detector covariance is not propagated in the baseline slice.",
-            ],
+        summaries = {
+            "invalid_pixel_fraction": float(mask.mean()),
+            "gain": float(reduced.scalars["gain"]),
+            "read_noise": float(reduced.scalars["read_noise"]),
+            "science_exptime": science_exptime,
+            "dark_exptime": float(dark_exptime or 0.0),
+            "dark_scale": float(dark_scale),
+            "calibration_policy": calibration_policy,
+        }
+        state = ReducedAmplifierState(
+            zipcode=zipcode,
+            exposure_id=exposure_id,
+            image=np.asarray(image, dtype=np.float32),
+            variance=np.asarray(variance, dtype=np.float32),
+            pixel_mask=np.asarray(mask, dtype=np.uint8),
+            header=dict(frame.header),
+            parent_ids=tuple([int(row_id), *calibration_parents]),
+            summaries=summaries,
         )
-        artifact = self._publish(
-            request, algorithm_name="virusflow.algorithms.ccd.reduce_amplifier_array",
-            algorithm_version=str(reduced.version),
-        )
-        self._qa(artifact, request.summaries)
-        return {"reduced_science_image": artifact}
+        return {"reduced_science_state": state}
 
 
 class PhysicalCCDTask(_SciencePublisher):
@@ -173,8 +181,9 @@ class PhysicalCCDTask(_SciencePublisher):
             # than relying on a serializer-wide coercion.
             if value.dtype.kind == "f" and value.dtype.itemsize > 4:
                 value = value.astype(np.float32)
-            unit = "1" if "mask" in name or name == "source_amplifier_map" else (
-                "pixel" if name == "source_y_coordinate" else units
+            unit = (
+                "1" if name.endswith("indices") or name == "detector_shape"
+                else ("electron" if name in {"model_parameters", "residual_sample_values"} else units)
             )
             components[name] = LogicalComponent(
                 name, "array1d" if np.asarray(value).ndim == 1 else "array2d",
@@ -187,12 +196,16 @@ class PhysicalCCDTask(_SciencePublisher):
         target = self.target
         at = target.at_time or _instant(target.exposure_id)
 
-        def source(zipcode):
-            scope = Scope(zipcode=zipcode, exposure_id=target.exposure_id, physical_scope=PhysicalScope.AMPLIFIER)
-            row = service.select_best(kind="reduced_science_image", scope=scope, at_time=at)
-            if row is None:
-                raise RuntimeError(f"Missing reduced science amplifier Product for {target.exposure_id}/{zipcode.key()}")
-            return row
+        def source(zipcode, label):
+            state = inputs.get(label) if isinstance(inputs, dict) else None
+            if isinstance(state, dict):
+                state = state.get("reduced_science_state")
+            if isinstance(state, ReducedAmplifierState):
+                return state
+            return ReducedScienceAmplifierTask(
+                self.ctx, target=type("Target", (), {"zipcode": zipcode, "exposure_id": target.exposure_id})(),
+                params={"apply_calibrations": True},
+            ).run({})["reduced_science_state"]
 
         def trace(zipcode):
             row = service.select_best(kind="trace_map", scope=Scope(zipcode=zipcode), at_time=at)
@@ -200,19 +213,18 @@ class PhysicalCCDTask(_SciencePublisher):
                 raise RuntimeError(f"Missing trace_map Product for {zipcode.key()}")
             return row
 
-        lower_row, upper_row = source(target.lower_zipcode), source(target.upper_zipcode)
+        lower_state = source(target.lower_zipcode, "lower_state")
+        upper_state = source(target.upper_zipcode, "upper_state")
         lower_trace_row, upper_trace_row = trace(target.lower_zipcode), trace(target.upper_zipcode)
-        lower_image = service.load_component(lower_row, "image")["data"]
-        upper_image = service.load_component(upper_row, "image")["data"]
         assembly = assemble_physical_ccd(
-            lower_image, upper_image,
+            lower_state.image, upper_state.image,
             side=target.side,
             lower_amp=target.lower_zipcode.amp,
             upper_amp=target.upper_zipcode.amp,
-            lower_variance=service.load_component(lower_row, "variance")["data"],
-            upper_variance=service.load_component(upper_row, "variance")["data"],
-            lower_mask=service.load_component(lower_row, "pixel_mask")["data"],
-            upper_mask=service.load_component(upper_row, "pixel_mask")["data"],
+            lower_variance=lower_state.variance,
+            upper_variance=upper_state.variance,
+            lower_mask=lower_state.pixel_mask,
+            upper_mask=upper_state.pixel_mask,
         )
         scatter = fit_gap_scattered_light(
             assembly,
@@ -223,14 +235,10 @@ class PhysicalCCDTask(_SciencePublisher):
             }},
         )
         coordinate = kind_spec("ccd_scattered_light_model").coordinates.value
-        common = {
-            name: assembly.get_array(name) for name in (
-                "seam_mask", "inter_amplifier_gap_mask", "source_amplifier_map", "source_y_coordinate"
-            )
-        }
-        for name, value in common.items():
-            scatter.arrays[name] = value
-        parents = [int(lower_row["id"]), int(upper_row["id"]), int(lower_trace_row["id"]), int(upper_trace_row["id"])]
+        parents = [
+            *lower_state.parent_ids, *upper_state.parent_ids,
+            int(lower_trace_row["id"]), int(upper_trace_row["id"]),
+        ]
         metadata = {
             **dict(assembly.meta or {}), **dict(scatter.meta or {}),
             "exposure_id": target.exposure_id,
@@ -242,35 +250,24 @@ class PhysicalCCDTask(_SciencePublisher):
             zipcode=target.lower_zipcode, exposure_id=target.exposure_id,
             physical_scope=PhysicalScope.PHYSICAL_CCD,
         )
+        compact = compact_scattered_light_payload(scatter)
         model_names = kind_spec("ccd_scattered_light_model").required_components
+        compact_result = type(scatter)(
+            kind=scatter.kind, version=scatter.version, arrays=compact,
+            meta=scatter.meta, scalars=scatter.scalars,
+        )
         model_request = ArtifactRequest(
             kind="ccd_scattered_light_model", role="reduction",
-            components=self._components(scatter, model_names, units="electron", coordinates=coordinate),
+            components=self._components(compact_result, model_names, units="electron", coordinates=coordinate),
             summaries=dict(scatter.scalars or {}), metadata=metadata, scope=scope, parents=parents,
             validity=Validity(at, at, "exposure_identity"), configuration_refs=refs,
             assumptions=["The summed scattered-light field is smooth across the physical CCD."],
         )
         model_artifact = self._publish(model_request, algorithm_name="virusflow.algorithms.physical_ccd.fit_gap_scattered_light", algorithm_version=ALGORITHM_VERSION)
-        scatter_image = np.asarray(scatter.get_array("scatter_subtracted_image"), dtype=np.float32)
-        subtraction_arrays = dict(common)
-        subtraction_arrays.update({
-            "image": scatter_image,
-            "variance": assembly.get_array("variance"),
-            "pixel_mask": assembly.get_array("pixel_mask"),
-        })
-        subtraction_result = type(assembly)(kind="scatter_subtracted_image", version=ALGORITHM_VERSION, arrays=subtraction_arrays)
-        sub_names = kind_spec("scatter_subtracted_image").required_components
-        sub_request = ArtifactRequest(
-            kind="scatter_subtracted_image", role="reduction",
-            components=self._components(subtraction_result, sub_names, units="electron", coordinates=coordinate),
-            summaries={"invalid_pixel_fraction": float(np.asarray(assembly.get_array("pixel_mask"), dtype=bool).mean())},
-            metadata=metadata, scope=scope,
-            parents=[int(lower_row["id"]), int(upper_row["id"]), int(model_artifact.id)],
-            validity=Validity(at, at, "exposure_identity"), configuration_refs=refs,
-        )
-        sub_artifact = self._publish(sub_request, algorithm_name="virusflow.algorithms.physical_ccd.subtract", algorithm_version=ALGORITHM_VERSION)
         status = "pass" if np.isfinite(scatter.scalars.get("holdout_residual_robust_sigma", np.nan)) else "fail"
         usability = "usable" if status == "pass" else "unusable"
         self._qa(model_artifact, dict(scatter.scalars or {}), status=status, usability=usability)
-        self._qa(sub_artifact, sub_request.summaries, status=status, usability=usability)
-        return {"ccd_scattered_light_model": model_artifact, "scatter_subtracted_image": sub_artifact}
+        return {
+            "ccd_scattered_light_model": model_artifact,
+            "physical_ccd_state": PhysicalCCDState(assembly, scatter, model_artifact),
+        }

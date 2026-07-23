@@ -86,7 +86,7 @@ class DiagnosticsFacade:
                         comp.setdefault("data", arr)
                         m["component"] = comp
                         # Backward-compatible enrichment for legacy configs expecting meta.p95 on some kinds
-                        if k in {"master_flat", "master_cmp"} and (m.get("p95") is None):
+                        if k in {"master_flat", "master_cmp", "master_sci"} and (m.get("p95") is None):
                             with _np.errstate(all="ignore"):
                                 val = float(_np.nanpercentile(arr, 95)) if arr.size else None
                             if val is not None and val == val:

@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-import uuid
+import shutil
+import sqlite3
+import warnings
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
-from ..ontology.artifact_kinds import canonical_kind, kind_candidates
+import numpy as np
+
+from ..ontology.artifact_kinds import canonical_kind, kind_candidates, kind_spec
+from ..ontology.lifecycle import ArtifactLifecycle
 from ..ontology.relations import RelationKind
 from ..registry import database as db
 from .qa_service import QADiagnosticsService
@@ -27,6 +32,8 @@ from .registry_adapter import RegistryAdapter
 from .requests import ArtifactRequest
 from .serializers import Serializer, SerializerRegistry
 from .serializers import array_fits as _array_fits
+from .serializers import mask_fits as _mask_fits
+from .storage_conventions import normalize_component
 
 
 class ArtifactLoadError(RuntimeError):
@@ -73,6 +80,12 @@ class ArtifactService:
             raise ValueError("Artifact.storage_format is required")
         if not artifact.storage or not artifact.storage.uri:
             raise ValueError("Artifact.storage.uri is required")
+        try:
+            lifecycle = kind_spec(artifact.kind).lifecycle
+        except KeyError:
+            lifecycle = artifact.lifecycle
+        if lifecycle == ArtifactLifecycle.SCRATCH:
+            raise ValueError(f"scratch-only kind cannot be registered permanently: {artifact.kind}")
         components = list(getattr(artifact, "_component_records", []) or [])
         return self.adapter.register(artifact, components=components)
 
@@ -80,7 +93,12 @@ class ArtifactService:
         if not request.components:
             raise ValueError("ArtifactRequest has no components")
         kind = canonical_kind(request.kind)
-        revision = request.revision or uuid.uuid4().hex
+        spec = kind_spec(kind)
+        if spec.lifecycle == ArtifactLifecycle.SCRATCH:
+            raise ValueError(f"scratch-only kind cannot be persisted: {kind}")
+        lifecycle = request.lifecycle or spec.lifecycle
+        if lifecycle == ArtifactLifecycle.SCRATCH:
+            raise ValueError(f"scratch lifecycle cannot be persisted: {kind}")
         scope = request.scope or Scope(zipcode=None)
         validity = request.validity
         if validity.start is None and scope.start_time is not None:
@@ -101,7 +119,7 @@ class ArtifactService:
             "kind": kind,
             "scope": scope_token.replace("/", "_"),
             "validity": validity_token,
-            "revision": revision,
+            "revision": "pending",
         }
 
         request_parents = [int(x) for x in request.parents]
@@ -110,12 +128,36 @@ class ArtifactService:
             raise ValueError("ArtifactRequest.parents conflicts with deprecated PublicationContext.parent_ids")
         parents = request_parents or context_parents
 
+        normalized_components = {
+            name: normalize_component(kind, component)
+            for name, component in request.components.items()
+        }
+        storage_root = Path(base_dir)
+        storage_root.mkdir(parents=True, exist_ok=True)
+        projected_bytes = int(sum(
+            getattr(component.value, "nbytes", 0) or 0
+            for component in normalized_components.values()
+        ))
+        available_bytes = int(shutil.disk_usage(storage_root).free)
+        if projected_bytes > int(0.9 * available_bytes):
+            raise OSError(
+                f"projected {kind} payload ({projected_bytes} bytes) exceeds the safe available-disk budget ({available_bytes} bytes free)"
+            )
+        revision = request.revision or self._logical_revision(
+            kind, scope, validity, normalized_components, parents, context
+        )
+        existing = self.adapter.find_by_revision(revision)
+        if existing is not None and str(existing.get("state") or "active") == "active":
+            return self._artifact_from_row(existing)
+        tokens["revision"] = revision
+
         component_records = []
         checksums = []
         units: Dict[str, str] = {}
         coordinates: Dict[str, str] = {}
         primary_path: Optional[str] = None
-        for name, component in request.components.items():
+        written_paths: list[Path] = []
+        for name, component in normalized_components.items():
             decision = policy.decide(artifact_kind=kind, component_name=name, model_type=component.model_type)
             payload_type = self._payload_type_for(component.model_type)
             serializer = self.serializers.get(payload_type, decision.storage_format)
@@ -149,6 +191,7 @@ class ArtifactService:
             except Exception:
                 pass
             serializer.save(path, component.value, metadata=metadata)
+            written_paths.append(Path(path))
             checksum = _sha256(path)
             checksums.append(f"{name}:{checksum}")
             if primary_path is None:
@@ -157,6 +200,15 @@ class ArtifactService:
                 units[name] = component.units
             if component.coordinates:
                 coordinates[name] = component.coordinates
+            sidecar = Path(path).with_suffix(Path(path).suffix + ".json")
+            payload_bytes = Path(path).stat().st_size + (sidecar.stat().st_size if sidecar.exists() else 0)
+            value = component.value
+            shape = list(getattr(value, "shape", ()) or ())
+            dtype = str(getattr(value, "dtype", "")) or None
+            described = serializer.describe(path) or {}
+            component_metadata = {**dict(component.metadata or {})}
+            if described.get("mask_encoding"):
+                component_metadata["mask_encoding"] = described["mask_encoding"]
             component_records.append(
                 {
                     "name": name,
@@ -167,11 +219,30 @@ class ArtifactService:
                     "checksum": checksum,
                     "units": component.units,
                     "coordinates": component.coordinates,
-                    "metadata": dict(component.metadata or {}),
+                    "metadata": component_metadata,
+                    "payload_bytes": int(payload_bytes),
+                    "dtype": dtype,
+                    "shape": shape,
                 }
             )
 
         aggregate_checksum = hashlib.sha256("\n".join(sorted(checksums)).encode("utf-8")).hexdigest()
+        total_payload_bytes = int(sum(record["payload_bytes"] for record in component_records))
+        maximum = int((request.metadata or {}).get("maximum_payload_bytes") or self._default_maximum_bytes(kind))
+        if maximum > 0 and total_payload_bytes > maximum:
+            self._remove_written(written_paths)
+            raise ValueError(
+                f"{kind} payload is {total_payload_bytes} bytes, exceeding configured maximum {maximum}"
+            )
+        storage_warnings = []
+        for record in component_records:
+            shape = record.get("shape") or []
+            if lifecycle == ArtifactLifecycle.MODEL and len(shape) == 2 and min(shape) >= 1000:
+                storage_warnings.append(
+                    f"model component {record['name']} has detector-like dimensions {shape}"
+                )
+        for message in storage_warnings:
+            warnings.warn(message, RuntimeWarning, stacklevel=2)
         context_params = dict(getattr(context, "parameters", {}) or {})
         provenance = Provenance(
             algorithm=f"{getattr(context, 'algorithm_name', None) or 'unknown'}:{getattr(context, 'algorithm_version', None) or 'unknown'}",
@@ -197,7 +268,13 @@ class ArtifactService:
             storage_format=component_records[0]["storage_format"],
             storage=StorageRef(primary_path or "", component_records[0]["storage_format"], component_records[0]["storage_format"]),
             scope=scope,
-            metadata={**dict(request.summaries or {}), **dict(request.metadata or {}), "components": [r["name"] for r in component_records]},
+            metadata={
+                **dict(request.summaries or {}), **dict(request.metadata or {}),
+                "components": [r["name"] for r in component_records],
+                "payload_bytes": total_payload_bytes,
+                "storage_warnings": storage_warnings,
+                "projected_payload_bytes": projected_bytes,
+            },
             provenance=provenance,
             validity=validity,
             units=units,
@@ -206,9 +283,19 @@ class ArtifactService:
             relations=relations,
             revision=revision,
             checksum=aggregate_checksum,
+            lifecycle=lifecycle,
+            state="active",
+            payload_bytes=total_payload_bytes,
         )
         setattr(artifact, "_component_records", component_records)
-        artifact_id = self.register(artifact)
+        try:
+            artifact_id = self.register(artifact)
+        except sqlite3.IntegrityError:
+            concurrent = self.adapter.find_by_revision(revision)
+            if concurrent is None:
+                self._remove_written(written_paths)
+                raise
+            return self._artifact_from_row(concurrent)
         artifact.id = int(artifact_id)
         return artifact
 
@@ -232,7 +319,8 @@ class ArtifactService:
             }
             rows = [
                 row for row in rows
-                if all(value is None or row.get(field) == value for field, value in filters.items())
+                if str(row.get("state") or "active") == "active"
+                and all(value is None or row.get(field) == value for field, value in filters.items())
             ]
         if not rows:
             return None
@@ -245,6 +333,7 @@ class ArtifactService:
         return [
             row for row in self.adapter.list_all(kind=canonical_kind(kind) if kind else None)
             if row.get("observation_id") == str(observation_id)
+            and str(row.get("state") or "active") == "active"
         ]
 
     def query_dither_set(self, dither_set_id: str, *, kind: Optional[str] = None) -> list[dict]:
@@ -253,6 +342,7 @@ class ArtifactService:
         return [
             row for row in self.adapter.list_all(kind=canonical_kind(kind) if kind else None)
             if row.get("dither_set_id") == str(dither_set_id)
+            and str(row.get("state") or "active") == "active"
         ]
 
     def query_observation_set(
@@ -264,6 +354,7 @@ class ArtifactService:
         return [
             row for row in self.adapter.list_all(kind=canonical_kind(kind) if kind else None)
             if row.get("observation_id") in identities
+            and str(row.get("state") or "active") == "active"
         ]
 
     def get(self, artifact_id: int, *, include_payload: bool = False) -> Optional[ArtifactDescription]:
@@ -290,6 +381,9 @@ class ArtifactService:
             "validity": asdict(desc.validity) if desc.validity else None,
             "revision": desc.revision,
             "checksum": desc.checksum,
+            "lifecycle": desc.lifecycle.value,
+            "state": desc.state,
+            "payload_bytes": desc.payload_bytes,
             "relations": [asdict(x) for x in desc.relations],
         }
 
@@ -345,11 +439,138 @@ class ArtifactService:
     def _default_serializers(self) -> SerializerRegistry:
         registry = SerializerRegistry()
         registry.register("array", "fits", Serializer(describe=_array_fits.describe, load=_array_fits.load, save=_array_fits.save))
+        registry.register("mask", "fits", Serializer(describe=_mask_fits.describe, load=_mask_fits.load, save=_mask_fits.save))
         return registry
 
     @staticmethod
     def _payload_type_for(model_type: str) -> str:
         return "array" if str(model_type).lower() in {"array1d", "array2d"} else str(model_type).lower()
+
+    @staticmethod
+    def _default_maximum_bytes(kind: str) -> int:
+        return {
+            "ccd_scattered_light_model": 64 * 1024**2,
+            "sky_model": 128 * 1024**2,
+            "fiber_response_model": 256 * 1024**2,
+            "calibrated_fiber_observation": 4 * 1024**3,
+        }.get(kind, 0)
+
+    @staticmethod
+    def _remove_written(paths: Iterable[Path]) -> None:
+        for path in paths:
+            for target in (path, path.with_suffix(path.suffix + ".json")):
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _logical_revision(kind, scope, validity, components, parents, context) -> str:
+        digest = hashlib.sha256()
+        identity = {
+            "kind": kind,
+            "scope": asdict(scope),
+            "validity": asdict(validity),
+            "parents": [int(value) for value in parents],
+            "task": [getattr(context, "task_name", None), getattr(context, "task_version", None)],
+            "algorithm": [getattr(context, "algorithm_name", None), getattr(context, "algorithm_version", None)],
+            "parameters": dict(getattr(context, "parameters", {}) or {}),
+        }
+        digest.update(json.dumps(identity, sort_keys=True, default=str).encode("utf-8"))
+        for name, component in sorted(components.items()):
+            value = component.value
+            array = value.payload if hasattr(value, "payload") else value
+            array = np.ascontiguousarray(array)
+            digest.update(name.encode("utf-8"))
+            digest.update(str(array.dtype).encode("ascii"))
+            digest.update(str(array.shape).encode("ascii"))
+            digest.update(memoryview(array).cast("B"))
+            digest.update(json.dumps(component.metadata, sort_keys=True, default=str).encode("utf-8"))
+        return digest.hexdigest()[:32]
+
+    def _artifact_from_row(self, row: Dict[str, Any]) -> Artifact:
+        desc = self._describe_row(row, include_payload=False)
+        return Artifact(
+            id=desc.id,
+            kind=desc.kind,
+            role=desc.role or "reduction",
+            payload_type=desc.payload_type or "array",
+            storage_format=desc.storage_format or "fits",
+            storage=desc.storage or StorageRef("", "fits", "fs"),
+            scope=desc.scope or Scope(zipcode=None),
+            metadata=dict(desc.metadata),
+            provenance=desc.provenance,
+            validity=desc.validity or Validity(),
+            units=dict(desc.units),
+            coordinates=dict(desc.coordinates),
+            configuration_refs=list(desc.configuration_refs),
+            relations=list(desc.relations),
+            revision=desc.revision,
+            checksum=desc.checksum,
+            lifecycle=desc.lifecycle,
+            state=desc.state,
+            payload_bytes=desc.payload_bytes,
+        )
+
+    def storage_summary(self, *, largest: int = 10) -> Dict[str, Any]:
+        rows = [row for row in self.adapter.list_all() if str(row.get("state") or "active") == "active"]
+        by_kind: Dict[str, Dict[str, int]] = {}
+        for row in rows:
+            kind = str(row.get("canonical_kind") or canonical_kind(row.get("kind") or "unknown"))
+            bucket = by_kind.setdefault(kind, {"count": 0, "total_bytes": 0})
+            bucket["count"] += 1
+            bucket["total_bytes"] += int(row.get("payload_bytes") or (row.get("metadata") or {}).get("payload_bytes") or 0)
+        ordered = sorted(rows, key=lambda row: int(row.get("payload_bytes") or 0), reverse=True)
+        return {
+            "total_count": len(rows),
+            "total_bytes": sum(item["total_bytes"] for item in by_kind.values()),
+            "by_kind": dict(sorted(by_kind.items(), key=lambda item: item[1]["total_bytes"], reverse=True)),
+            "largest": [
+                {
+                    "artifact_id": int(row["id"]),
+                    "kind": row.get("canonical_kind") or row.get("kind"),
+                    "payload_bytes": int(row.get("payload_bytes") or 0),
+                }
+                for row in ordered[: max(0, int(largest))]
+            ],
+        }
+
+    def evict_payload(self, artifact_id: int, *, require_cache: bool = True) -> int:
+        row = self.adapter.get_row(int(artifact_id))
+        if row is None:
+            raise FileNotFoundError(f"artifact not found: {artifact_id}")
+        lifecycle = str(row.get("lifecycle") or "canonical")
+        if require_cache and lifecycle != ArtifactLifecycle.CACHE.value:
+            raise ValueError(f"only cache payloads may be evicted without migration approval: {artifact_id}")
+        removed = 0
+        for component in self.adapter.list_components(int(artifact_id)):
+            path = Path(str(component.get("path") or ""))
+            if not path.name:
+                continue
+            for target in (path, path.with_suffix(path.suffix + ".json")):
+                try:
+                    removed += target.stat().st_size
+                    target.unlink()
+                except FileNotFoundError:
+                    pass
+        self.adapter.set_state(int(artifact_id), "evicted")
+        return removed
+
+    def invalidate_kinds(self, kinds: Iterable[str], *, delete_payloads: bool = False) -> Dict[str, int]:
+        selected = {canonical_kind(kind) for kind in kinds}
+        count = 0
+        removed = 0
+        for row in self.adapter.list_all():
+            if canonical_kind(row.get("canonical_kind") or row.get("kind") or "") not in selected:
+                continue
+            if str(row.get("state") or "active") != "active":
+                continue
+            self.adapter.set_state(int(row["id"]), "obsolete")
+            count += 1
+            if delete_payloads:
+                removed += self.evict_payload(int(row["id"]), require_cache=False)
+                self.adapter.set_state(int(row["id"]), "obsolete")
+        return {"invalidated": count, "removed_bytes": removed}
 
     @staticmethod
     def _infer_model_type(summary: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -425,6 +646,9 @@ class ArtifactService:
             relations=relations,
             revision=row.get("revision"),
             checksum=row.get("checksum"),
+            lifecycle=ArtifactLifecycle(row.get("lifecycle") or "canonical"),
+            state=str(row.get("state") or "active"),
+            payload_bytes=int(row.get("payload_bytes") or summary.get("payload_bytes") or 0),
         )
         if include_payload:
             summary["payload"] = self.load_component(row)

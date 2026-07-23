@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple
 
 from .coordinates import CoordinateConvention
+from .lifecycle import ArtifactLifecycle
 from .scopes import PhysicalScope
 from .units import Unit
 
@@ -18,6 +19,7 @@ class ArtifactKindSpec:
     required_components: Tuple[str, ...] = ()
     optional_components: Tuple[str, ...] = ()
     allowed_roles: Tuple[str, ...] = ("calibration", "reduction", "diagnostic", "analytic")
+    lifecycle: ArtifactLifecycle = ArtifactLifecycle.CANONICAL
 
 
 def _spec(
@@ -27,6 +29,7 @@ def _spec(
     coordinates: CoordinateConvention,
     required: Iterable[str],
     optional: Iterable[str] = (),
+    lifecycle: ArtifactLifecycle = ArtifactLifecycle.CANONICAL,
 ) -> ArtifactKindSpec:
     return ArtifactKindSpec(
         name=name,
@@ -36,6 +39,7 @@ def _spec(
         coordinates=coordinates,
         required_components=tuple(required),
         optional_components=tuple(optional),
+        lifecycle=lifecycle,
     )
 
 
@@ -45,6 +49,7 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
     "master_ldls": _spec("master_ldls", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_ldls", "flat_response_mask")),
     "master_arc": _spec("master_arc", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_arc",)),
     "master_twilight": _spec("master_twilight", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_twilight",)),
+    "master_sci": _spec("master_sci", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_science",)),
     "trace_map": _spec("trace_map", PhysicalScope.AMPLIFIER, Unit.PIXEL.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("fiber_trace_map", "trace_sample_columns", "sampled_trace_positions", "per_fiber_trace_residual_rms")),
     "wavelength_map": _spec("wavelength_map", PhysicalScope.AMPLIFIER, Unit.ANGSTROM.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("wavelength_map", "per_fiber_wavelength_residual_rms"), ("arc_identification",)),
     "read_noise": _spec("read_noise", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.NONE, ("read_noise",)),
@@ -54,23 +59,28 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
     "oriented_detector_image": _spec("oriented_detector_image", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("image",)),
     "overscan_model": _spec("overscan_model", PhysicalScope.AMPLIFIER, Unit.ADU.value, CoordinateConvention.RAW_AMPLIFIER, ("row_model",)),
     "overscan_corrected_image": _spec("overscan_corrected_image", PhysicalScope.AMPLIFIER, Unit.ADU.value, CoordinateConvention.RAW_AMPLIFIER, ("image",)),
-    "reduced_science_image": _spec("reduced_science_image", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("image", "variance", "pixel_mask")),
+    # These scientific values remain named so analysis can request them, but
+    # ArtifactService rejects their publication during production.
+    "reduced_science_image": _spec("reduced_science_image", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("image", "variance", "pixel_mask"), lifecycle=ArtifactLifecycle.SCRATCH),
     "ccd_scattered_light_model": _spec(
         "ccd_scattered_light_model", PhysicalScope.PHYSICAL_CCD, Unit.ELECTRON.value,
         CoordinateConvention.PHYSICAL_CCD_ZERO_INDEXED,
-        ("model", "gap_sample_mask", "fit_sample_mask", "holdout_sample_mask", "fit_residual", "model_parameters", "seam_mask", "inter_amplifier_gap_mask", "source_amplifier_map", "source_y_coordinate"),
+        ("model_parameters", "detector_shape", "gap_sample_indices", "fit_sample_indices", "holdout_sample_indices", "residual_sample_indices", "residual_sample_values"),
+        lifecycle=ArtifactLifecycle.MODEL,
     ),
     "scatter_subtracted_image": _spec(
         "scatter_subtracted_image", PhysicalScope.PHYSICAL_CCD, Unit.ELECTRON.value,
         CoordinateConvention.PHYSICAL_CCD_ZERO_INDEXED,
         ("image", "variance", "pixel_mask", "seam_mask", "inter_amplifier_gap_mask", "source_amplifier_map", "source_y_coordinate"),
+        lifecycle=ArtifactLifecycle.SCRATCH,
     ),
     "aperture_extracted_spectrum": _spec(
         "aperture_extracted_spectrum", PhysicalScope.FIBER, Unit.ELECTRON.value,
         CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
         ("spectrum", "valid_pixel_fraction", "effective_aperture_width", "aperture_start_row", "fractional_weights", "extraction_valid"),
+        lifecycle=ArtifactLifecycle.SCRATCH,
     ),
-    "extracted_variance": _spec("extracted_variance", PhysicalScope.FIBER, Unit.ELECTRON_VARIANCE.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("variance",)),
+    "extracted_variance": _spec("extracted_variance", PhysicalScope.FIBER, Unit.ELECTRON_VARIANCE.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("variance",), lifecycle=ArtifactLifecycle.SCRATCH),
     "within_amp_fiber_normalization": _spec(
         "within_amp_fiber_normalization", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value,
         CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
@@ -91,12 +101,50 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
     "final_astrometry": _spec("final_astrometry", PhysicalScope.EXPOSURE, "deg", CoordinateConvention.ICRS, ("parameters", "fit_evidence")),
     "fiber_sky_coordinates": _spec("fiber_sky_coordinates", PhysicalScope.FIBER, "deg", CoordinateConvention.ICRS, ("coordinates", "fiber_identity", "focal_plane_coordinates")),
     "sky_fiber_mask": _spec("sky_fiber_mask", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value, CoordinateConvention.NONE, ("mask", "broadband_flux", "fiber_identity")),
-    "incident_sky_spectrum": _spec("incident_sky_spectrum", PhysicalScope.EXPOSURE, Unit.ELECTRON.value, CoordinateConvention.WAVELENGTH_ANGSTROM, ("wavelength", "spectrum", "variance", "sample_count")),
-    "fiber_sky_prediction": _spec("fiber_sky_prediction", PhysicalScope.FIBER, Unit.ELECTRON.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("prediction", "fiber_identity")),
-    "sky_subtracted_spectrum": _spec("sky_subtracted_spectrum", PhysicalScope.FIBER, Unit.ELECTRON.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("spectrum", "variance", "fiber_identity")),
+    "incident_sky_spectrum": _spec("incident_sky_spectrum", PhysicalScope.EXPOSURE, Unit.ELECTRON.value, CoordinateConvention.WAVELENGTH_ANGSTROM, ("wavelength", "spectrum", "variance", "sample_count"), lifecycle=ArtifactLifecycle.SCRATCH),
+    "sky_model": _spec(
+        "sky_model", PhysicalScope.EXPOSURE, Unit.ELECTRON.value,
+        CoordinateConvention.WAVELENGTH_ANGSTROM,
+        ("latent_wavelength", "latent_flux_density", "latent_variance_density", "sample_count", "fiber_coefficients", "fiber_identity"),
+        lifecycle=ArtifactLifecycle.MODEL,
+    ),
+    "fiber_sky_prediction": _spec("fiber_sky_prediction", PhysicalScope.FIBER, Unit.ELECTRON.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("prediction", "fiber_identity"), lifecycle=ArtifactLifecycle.SCRATCH),
+    "sky_subtracted_spectrum": _spec("sky_subtracted_spectrum", PhysicalScope.FIBER, Unit.ELECTRON.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("spectrum", "variance", "fiber_identity"), lifecycle=ArtifactLifecycle.SCRATCH),
     "baseline_relative_response": _spec("baseline_relative_response", PhysicalScope.INSTRUMENT_EPOCH, Unit.DIMENSIONLESS.value, CoordinateConvention.WAVELENGTH_ANGSTROM, ("wavelength", "response")),
     "exposure_illumination_correction": _spec("exposure_illumination_correction", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.NONE, ("fiber_factor", "amplifier_factor", "fiber_identity")),
-    "final_exposure_response": _spec("final_exposure_response", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("response", "baseline_response", "illumination_factor", "fiber_identity")),
+    "final_exposure_response": _spec("final_exposure_response", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("response", "baseline_response", "illumination_factor", "fiber_identity"), lifecycle=ArtifactLifecycle.SCRATCH),
+    "fiber_response_model": _spec(
+        "fiber_response_model", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value,
+        CoordinateConvention.WAVELENGTH_ANGSTROM,
+        ("wavelength_knots", "within_amp_knots", "amplifier_factors", "illumination_factors", "fiber_identity"),
+        lifecycle=ArtifactLifecycle.MODEL,
+    ),
+    "calibrated_fiber_observation": _spec(
+        "calibrated_fiber_observation", PhysicalScope.OBSERVATION,
+        "1e-17 erg s-1 cm-2 Angstrom-1", CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
+        ("flux", "variance", "mask", "wavelength", "fiber_identity", "sky_coordinates", "focal_plane_coordinates", "exposure_index"),
+        lifecycle=ArtifactLifecycle.CANONICAL,
+    ),
+    "analysis_materialization": _spec(
+        "analysis_materialization", PhysicalScope.OBSERVATION, None,
+        CoordinateConvention.NONE, ("data",), lifecycle=ArtifactLifecycle.ANALYSIS,
+    ),
+    "bias_stability": _spec(
+        "bias_stability", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value,
+        CoordinateConvention.NONE,
+        ("source_artifact_id", "median_bias_level", "median_bias_scatter"),
+        lifecycle=ArtifactLifecycle.ANALYSIS,
+    ),
+    "candidate_sky_model": _spec(
+        "candidate_sky_model", PhysicalScope.EXPOSURE, Unit.ELECTRON.value,
+        CoordinateConvention.WAVELENGTH_ANGSTROM, ("latent_wavelength", "latent_flux_density"),
+        lifecycle=ArtifactLifecycle.ANALYSIS,
+    ),
+    "candidate_scattered_light_model": _spec(
+        "candidate_scattered_light_model", PhysicalScope.PHYSICAL_CCD, Unit.ELECTRON.value,
+        CoordinateConvention.PHYSICAL_CCD_ZERO_INDEXED, ("model_parameters", "detector_shape"),
+        lifecycle=ArtifactLifecycle.ANALYSIS,
+    ),
     "exposure_mode_classification": _spec("exposure_mode_classification", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.NONE, ("classification", "source_fields")),
     "effective_exposure_time": _spec("effective_exposure_time", PhysicalScope.EXPOSURE, Unit.SECOND.value, CoordinateConvention.NONE, ("effective_seconds", "source_fields")),
     "exposure_completion_manifest": _spec("exposure_completion_manifest", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.NONE, ("coverage", "amplifier_identity")),

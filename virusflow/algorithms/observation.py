@@ -7,6 +7,8 @@ from typing import Sequence
 
 import numpy as np
 
+from .exposure import CalibratedFiberState
+
 
 ALGORITHM_VERSION = "observation-dither-baseline-1"
 
@@ -18,6 +20,38 @@ class DitherAssignmentResult:
     ambiguous: bool
     duplicate_count: int
     extra_count: int
+
+
+def combine_calibrated_fiber_states(
+    states: Sequence[CalibratedFiberState],
+) -> dict[str, np.ndarray]:
+    """Concatenate three atomic exposure states without coadding their measurements."""
+
+    if len(states) != 3:
+        raise ValueError("a complete calibrated VIRUS observation requires exactly three exposures")
+    identities = [str(state.exposure_id) for state in states]
+    if len(set(identities)) != 3:
+        raise ValueError("calibrated observation members must have unique exposure identities")
+    sample_counts = {np.asarray(state.flux).shape[1] for state in states}
+    if len(sample_counts) != 1:
+        raise ValueError("observation members must share a compatible spectral sample count")
+    arrays = {
+        "flux": np.concatenate([np.asarray(state.flux, dtype=np.float32) for state in states]),
+        "variance": np.concatenate([np.asarray(state.variance, dtype=np.float32) for state in states]),
+        "mask": np.concatenate([np.asarray(state.mask, dtype=np.uint16) for state in states]),
+        "wavelength": np.concatenate([np.asarray(state.wavelength, dtype=np.float32) for state in states]),
+        "fiber_identity": np.concatenate([np.asarray(state.fiber_identity, dtype=np.int32) for state in states]),
+        "sky_coordinates": np.concatenate([np.asarray(state.sky_coordinates, dtype=np.float64) for state in states]),
+        "focal_plane_coordinates": np.concatenate([np.asarray(state.focal_plane_coordinates, dtype=np.float32) for state in states]),
+        "exposure_index": np.concatenate([
+            np.full(np.asarray(state.flux).shape[0], index, dtype=np.uint8)
+            for index, state in enumerate(states)
+        ]),
+    }
+    shape = arrays["flux"].shape
+    if arrays["variance"].shape != shape or arrays["mask"].shape != shape or arrays["wavelength"].shape != shape:
+        raise ValueError("final spectral planes are not shape matched")
+    return arrays
 
 
 def assign_nominal_dithers(

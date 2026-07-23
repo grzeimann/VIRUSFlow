@@ -22,6 +22,7 @@ from virusflow.publication.context import PublicationContext
 from virusflow.publication.service import DefaultPublicationService
 from virusflow.tasks.base import TaskContext
 from virusflow.tasks.science import PhysicalCCDTask
+from virusflow.tasks.science import ReducedAmplifierState
 
 
 def _pair(side="left", nx=24):
@@ -105,7 +106,7 @@ def _publish(service, root: Path, request: ArtifactRequest):
     return publication.publish([request], context)[0]
 
 
-def test_physical_ccd_task_publishes_two_products_with_complete_components_and_lineage(tmp_path: Path):
+def test_physical_ccd_task_publishes_compact_model_and_keeps_evaluation_in_memory(tmp_path: Path):
     db_path = tmp_path / "registry.sqlite3"
     service = ArtifactService(str(db_path))
     exposure_id = "20260609T031649.6"
@@ -114,19 +115,16 @@ def test_physical_ccd_task_publishes_two_products_with_complete_components_and_l
     upper = ZipCode("060", "003", "206", "LU", "S/N 0039")
     trace = np.array([[100.0] * 24, [108.0] * 24, [420.0] * 24, [428.0] * 24, [800.0] * 24, [808.0] * 24])
     source_ids = []
+    states = []
     trace_ids = []
     for index, zipcode in enumerate((lower, upper)):
         image = np.full((1032, 24), 10.0 + index)
         scope = Scope(zipcode=zipcode, exposure_id=exposure_id, physical_scope=PhysicalScope.AMPLIFIER)
-        source_ids.append(_publish(service, tmp_path, ArtifactRequest(
-            kind="reduced_science_image", role="reduction", scope=scope,
-            validity=Validity(at, at, "exposure_identity"),
-            components={
-                "image": LogicalComponent("image", "array2d", image, "electron", "oriented_amplifier_blue_to_red"),
-                "variance": LogicalComponent("variance", "array2d", np.ones_like(image), "electron2", "oriented_amplifier_blue_to_red"),
-                "pixel_mask": LogicalComponent("pixel_mask", "array2d", np.zeros_like(image, dtype=np.uint8), "1", "oriented_amplifier_blue_to_red"),
-            },
-        )).id)
+        source_ids.append(10_000 + index)
+        states.append(ReducedAmplifierState(
+            zipcode, exposure_id, image.astype(np.float32), np.ones_like(image, dtype=np.float32),
+            np.zeros_like(image, dtype=np.uint8), {}, (source_ids[-1],), {},
+        ))
         trace_ids.append(_publish(service, tmp_path, ArtifactRequest(
             kind="trace_map", scope=Scope(zipcode=zipcode), validity=Validity(at, at, "fixture"),
             components={"fiber_trace_map": LogicalComponent(
@@ -135,18 +133,17 @@ def test_physical_ccd_task_publishes_two_products_with_complete_components_and_l
         )).id)
 
     target = PhysicalCCDTarget(exposure_id, "206", "left", lower, upper, at)
-    result = PhysicalCCDTask(TaskContext(str(db_path), str(tmp_path / "artifacts")), target=target).run({})
-    assert set(result) == {"ccd_scattered_light_model", "scatter_subtracted_image"}
-    model, subtracted = result["ccd_scattered_light_model"], result["scatter_subtracted_image"]
+    result = PhysicalCCDTask(TaskContext(str(db_path), str(tmp_path / "artifacts")), target=target).run(
+        {"lower_state": states[0], "upper_state": states[1]}
+    )
+    assert set(result) == {"ccd_scattered_light_model", "physical_ccd_state"}
+    model = result["ccd_scattered_light_model"]
     model_description = service.describe(model.id)
-    subtracted_description = service.describe(subtracted.id)
     assert {c["name"] for c in model_description["components"]} == {
-        "model", "gap_sample_mask", "fit_sample_mask", "holdout_sample_mask",
-        "fit_residual", "model_parameters", "seam_mask", "inter_amplifier_gap_mask",
-        "source_amplifier_map", "source_y_coordinate",
+        "model_parameters", "detector_shape", "gap_sample_indices", "fit_sample_indices",
+        "holdout_sample_indices", "residual_sample_indices", "residual_sample_values",
     }
     assert {r["parent_id"] for r in model_description["relations"]} == set(source_ids + trace_ids)
-    assert {r["parent_id"] for r in subtracted_description["relations"]} == set(source_ids + [model.id])
-    for artifact in (model, subtracted):
-        for component in service.describe(artifact.id)["components"]:
-            service.load_component(artifact.id, component["name"], verify_checksum=True)
+    assert "scatter_subtracted_image" in result["physical_ccd_state"].scatter.arrays
+    for component in service.describe(model.id)["components"]:
+        service.load_component(model.id, component["name"], verify_checksum=True)

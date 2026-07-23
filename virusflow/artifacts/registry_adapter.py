@@ -75,9 +75,10 @@ class RegistryAdapter:
             if key not in seen:
                 relation_rows.append({"parent_id": key[0], "relation": key[1]})
                 seen.add(key)
-        db.save_artifact_details(
-            artifact_id,
-            record={
+        try:
+            db.save_artifact_details(
+                artifact_id,
+                record={
                 "canonical_kind": canonical_kind(art.kind),
                 "role": art.role,
                 "payload_type": art.payload_type,
@@ -93,12 +94,23 @@ class RegistryAdapter:
                 "configuration_refs": [asdict(x) for x in (getattr(art, "configuration_refs", []) or [])],
                 "metadata": dict(art.metadata or {}),
                 "validity_policy": getattr(getattr(art, "validity", None), "policy", None),
+                "lifecycle": getattr(getattr(art, "lifecycle", None), "value", getattr(art, "lifecycle", "canonical")),
+                "state": getattr(art, "state", "active"),
+                "payload_bytes": int(getattr(art, "payload_bytes", 0) or 0),
                 "created_at": getattr(getattr(art, "provenance", None), "created_at", datetime.utcnow()).isoformat(),
-            },
-            components=list(components or []),
-            relations=relation_rows,
-            db_path=self.db_path,
-        )
+                },
+                components=list(components or []),
+                relations=relation_rows,
+                db_path=self.db_path,
+            )
+        except BaseException:
+            # The legacy artifact/provenance shell is written by an older API
+            # before canonical details. Roll it back if the canonical write
+            # fails (notably when another worker won the revision race).
+            with db.connect(self.db_path) as connection:
+                connection.execute("DELETE FROM provenance WHERE artifact_id=?", (int(artifact_id),))
+                connection.execute("DELETE FROM artifacts WHERE id=?", (int(artifact_id),))
+            raise
         return artifact_id
 
     # --- Retrieval ---
@@ -115,6 +127,17 @@ class RegistryAdapter:
 
     def list_relations(self, artifact_id: int) -> List[dict]:
         return db.list_artifact_relations(int(artifact_id), db_path=self.db_path)
+
+    def find_by_revision(self, revision: str) -> Optional[dict]:
+        row = db.get_artifact_by_revision(str(revision), db_path=self.db_path)
+        if row:
+            details = db.get_artifact_details(int(row["id"]), db_path=self.db_path)
+            if details:
+                row.update(details)
+        return row
+
+    def set_state(self, artifact_id: int, state: str) -> None:
+        db.set_artifact_state(int(artifact_id), state, db_path=self.db_path)
 
     def find(self, *, kind: Optional[str], zipcode, at_time: Optional[datetime], limit: Optional[int] = None) -> List[dict]:
         rows = db.find_artifacts(kind=kind, zipcode=zipcode, at_time=at_time, db_path=self.db_path, limit=limit)

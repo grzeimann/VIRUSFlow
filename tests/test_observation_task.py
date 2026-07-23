@@ -15,6 +15,7 @@ from virusflow.publication.service import DefaultPublicationService
 from virusflow.registry import database as db
 from virusflow.tasks.base import TaskContext
 from virusflow.tasks.observation import ObservationTask
+from virusflow.algorithms.exposure import CalibratedFiberState
 from virusflow.ontology.scopes import PhysicalScope
 
 
@@ -40,6 +41,7 @@ def test_observation_task_preserves_atomic_exposures_registration_coverage_and_q
     exposure_ids = ("20260609T031649.6", "20260609T031859.3", "20260609T032112.2")
     dec0 = -8.5
     nominal = np.asarray([[0.0, 0.0], [1.27, 0.73], [0.0, 1.46]])
+    calibrated_states = []
     for index, exposure_id in enumerate(exposure_ids):
         path = tmp_path / f"{exposure_id}.fits"
         header = fits.Header({
@@ -70,13 +72,27 @@ def test_observation_task_preserves_atomic_exposures_registration_coverage_and_q
         )
         ra = 202.5 + nominal[index, 0] / np.cos(np.deg2rad(dec0)) / 3600
         dec = dec0 + nominal[index, 1] / 3600
-        _publish(
+        astrometry_product = _publish(
             service, tmp_path, "final_astrometry", exposure_id,
             {"parameters": np.asarray([ra, dec, 180.0, 88.45]), "fit_evidence": np.asarray([0.0, 0.0, 0.0])},
             at, {"refined": 1, "accepted_match_count": 5},
         )
+        calibrated_states.append(CalibratedFiberState(
+            exposure_id=exposure_id,
+            flux=np.full((2, 4), (index + 1) * 1e-17, dtype=np.float32),
+            variance=np.full((2, 4), 4e-34, dtype=np.float32),
+            mask=np.zeros((2, 4), dtype=np.uint16),
+            wavelength=np.tile(np.linspace(3500, 3503, 4, dtype=np.float32), (2, 1)),
+            fiber_identity=np.asarray([[index, 0, 60, 206, 0], [index, 1, 60, 206, 0]], dtype=np.int32),
+            sky_coordinates=np.asarray([[202.5, -8.5], [202.5001, -8.5001]], dtype=np.float64),
+            focal_plane_coordinates=np.asarray([[0, 0], [1, 1]], dtype=np.float32),
+            model_artifact_ids=(int(astrometry_product.id),),
+            metadata={"fixture": True},
+        ))
 
-    context = TaskContext(str(database), str(tmp_path / "artifacts"), {"configuration_root": str(Path.cwd())})
+    context = TaskContext(str(database), str(tmp_path / "artifacts"), {
+        "configuration_root": str(Path.cwd()), "calibrated_fiber_states": calibrated_states,
+    })
     target = ObservationTarget("20260609-OBSID6", "20260609-OBSID6-DITHER", exposure_ids)
     result = ObservationTask(context, target=target).run({})
     assert len(result["exposure_states"]) == 3
@@ -86,8 +102,16 @@ def test_observation_task_preserves_atomic_exposures_registration_coverage_and_q
     np.testing.assert_allclose(residual, 0.0, atol=2e-4)
     coverage = service.load_component(result["dither_coverage_map"].id, "coverage")["data"]
     assert np.any(coverage == 0) and np.any(coverage > 1)
-    assert len(service.query_observation(target.observation_id)) == 8
-    assert len(service.query_dither_set(target.dither_set_id)) == 8
+    assert "calibrated_fiber_observation" in result
+    final = service.describe(result["calibrated_fiber_observation"].id)
+    assert final["summary"]["exposure_count"] == 3
+    assert final["summary"]["fiber_count"] == 6
+    stored_flux = service.load_component(result["calibrated_fiber_observation"].id, "flux")
+    assert stored_flux["data"].dtype == np.float32
+    assert np.nanmedian(stored_flux["stored_data"]) == 2.0
+    assert stored_flux["header"]["BUNIT"].startswith("1e-17")
+    assert len(service.query_observation(target.observation_id)) == 9
+    assert len(service.query_dither_set(target.dither_set_id)) == 9
     assert len(service.query_observation_set([target.observation_id], kind="observation_summary")) == 1
     for artifact in (*result["exposure_states"], *(value for key, value in result.items() if key != "exposure_states")):
         for component in service.describe(artifact.id)["components"]:

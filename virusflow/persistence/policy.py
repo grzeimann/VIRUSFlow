@@ -50,7 +50,7 @@ class DefaultPersistencePolicy:
 
     def decide(self, *, artifact_kind: str, component_name: str, model_type: str) -> RepresentationDecision:
         mt = (model_type or "").strip().lower()
-        if mt in ("array2d", "array1d"):
+        if mt in ("array2d", "array1d", "mask"):
             return RepresentationDecision(storage_format="fits", serializer="array", uri_scheme=self.backend)
         # Future: other mappings (image/png, table/parquet, etc.)
         return RepresentationDecision(storage_format="fits", serializer="array", uri_scheme=self.backend)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Pure physical-CCD assembly and baseline gap-constrained scatter algorithms."""
 
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -13,6 +14,73 @@ from ..ontology.coordinates import UPPER_AMPLIFIER_REFLECTION_INDEX
 ALGORITHM_VERSION = "physical-ccd-gap-polynomial-1.0"
 TRANSFORM_VERSION = "indexed-1"
 PAIRING = {"left": ("LL", "LU"), "right": ("RU", "RL")}
+
+
+@dataclass(frozen=True)
+class ScatteredLightModel:
+    """Compact total-degree-two physical-CCD surface."""
+
+    coefficients: np.ndarray
+    detector_shape: tuple[int, int]
+    representation: str = "robust_total_degree_2_polynomial"
+
+    def __post_init__(self) -> None:
+        coefficients = np.asarray(self.coefficients, dtype=np.float32)
+        if coefficients.shape != (6,):
+            raise ValueError("total-degree-two scattered-light model requires six coefficients")
+        if len(self.detector_shape) != 2 or min(self.detector_shape) < 1:
+            raise ValueError("detector_shape must contain two positive dimensions")
+        object.__setattr__(self, "coefficients", coefficients)
+        object.__setattr__(self, "detector_shape", tuple(int(x) for x in self.detector_shape))
+
+    def evaluate(self, x=None, y=None) -> np.ndarray:
+        ny, nx = self.detector_shape
+        if x is None and y is None:
+            yy, xx = np.indices(self.detector_shape, dtype=np.float32)
+        elif x is None or y is None:
+            raise ValueError("x and y must either both be supplied or both be omitted")
+        else:
+            xx, yy = np.broadcast_arrays(np.asarray(x, dtype=np.float32), np.asarray(y, dtype=np.float32))
+        xn = 2.0 * xx / max(1, nx - 1) - 1.0
+        yn = 2.0 * yy / max(1, ny - 1) - 1.0
+        design = _design(xn.ravel(), yn.ravel())
+        return (design @ self.coefficients).reshape(xx.shape).astype(np.float32)
+
+
+def compact_scattered_light_payload(result: AlgoResult) -> dict[str, np.ndarray]:
+    """Extract the reconstructable model and bounded fit evidence from a fit result."""
+
+    def bounded_indices(mask: np.ndarray, limit: int = 2048) -> np.ndarray:
+        indices = np.flatnonzero(mask)
+        if indices.size <= limit:
+            return indices.astype(np.int32)
+        # Keep diagnostic evidence deterministic and distributed across the
+        # detector without allowing it to grow into another dense payload.
+        selection = np.linspace(0, indices.size - 1, limit, dtype=np.int64)
+        return indices[selection].astype(np.int32)
+
+    model = np.asarray(result.get_array("model"))
+    gap = np.asarray(result.get_array("gap_sample_mask"), dtype=bool)
+    fit = np.asarray(result.get_array("retained_fit_sample_mask"), dtype=bool)
+    holdout = np.asarray(result.get_array("holdout_sample_mask"), dtype=bool)
+    residual = np.asarray(result.get_array("fit_residual"), dtype=np.float32)
+    finite_residual = np.isfinite(residual)
+    residual_indices = bounded_indices(finite_residual)
+    return {
+        "model_parameters": np.asarray(result.get_array("model_parameters"), dtype=np.float32),
+        "detector_shape": np.asarray(model.shape, dtype=np.int32),
+        "gap_sample_indices": bounded_indices(gap),
+        "fit_sample_indices": bounded_indices(fit),
+        "holdout_sample_indices": bounded_indices(holdout),
+        "residual_sample_indices": residual_indices,
+        "residual_sample_values": residual.ravel()[residual_indices].astype(np.float32),
+    }
+
+
+def scattered_light_model_from_payload(payload: dict[str, np.ndarray]) -> ScatteredLightModel:
+    return ScatteredLightModel(
+        payload["model_parameters"], tuple(np.asarray(payload["detector_shape"], dtype=int))
+    )
 
 
 def upper_y(y):
@@ -235,6 +303,8 @@ def fit_gap_scattered_light(
     continuity = float(np.nanmedian(np.abs(model[seam_row] - model[seam_row - 1])))
     boundary_band = np.r_[residual_image[max(0, seam_row - 4):seam_row].ravel(), residual_image[seam_row:seam_row + 4].ravel()]
     boundary_band = boundary_band[np.isfinite(boundary_band)]
+    retained_fit_mask = np.zeros(image.shape, dtype=bool)
+    retained_fit_mask[yy[keep], xx[keep]] = True
 
     return AlgoResult(
         kind="ccd_scattered_light_model",
@@ -262,6 +332,7 @@ def fit_gap_scattered_light(
             "model": model.astype(np.float32),
             "gap_sample_mask": gap.astype(np.uint8),
             "fit_sample_mask": fit_mask.astype(np.uint8),
+            "retained_fit_sample_mask": retained_fit_mask.astype(np.uint8),
             "holdout_sample_mask": holdout.astype(np.uint8),
             "fit_residual": residual_image,
             "model_parameters": coefficients,

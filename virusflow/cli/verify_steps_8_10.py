@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 
 import numpy as np
 
@@ -24,23 +23,26 @@ LEFT_ZIPCODE = "060+003+206+LL+S/N 0039"
 RIGHT_ZIPCODE = "060+003+206+RU+S/N 0039"
 
 STEP_KINDS = {
-    "reduced_science_image", "ccd_scattered_light_model", "scatter_subtracted_image",
-    "aperture_extracted_spectrum", "extracted_variance", "within_amp_fiber_normalization",
-    "amp_to_amp_normalization", "fiber_normalization", "initial_astrometry",
+    "ccd_scattered_light_model", "amp_to_amp_normalization", "initial_astrometry",
     "source_detection_catalog", "catalog_match_table", "final_astrometry",
-    "fiber_sky_coordinates", "sky_fiber_mask", "incident_sky_spectrum",
-    "fiber_sky_prediction", "sky_subtracted_spectrum", "baseline_relative_response",
-    "exposure_illumination_correction", "final_exposure_response",
+    "fiber_sky_coordinates", "sky_fiber_mask", "sky_model", "baseline_relative_response",
+    "exposure_illumination_correction", "fiber_response_model",
     "exposure_mode_classification", "effective_exposure_time", "exposure_completion_manifest",
     "observation_exposure_state", "observation_membership", "dither_assignment",
     "dither_registration", "dither_coverage_map", "observation_summary",
+    "calibrated_fiber_observation",
+}
+
+FORBIDDEN_PERSISTENT_KINDS = {
+    "reduced_science_image", "scatter_subtracted_image", "aperture_extracted_spectrum",
+    "extracted_variance", "incident_sky_spectrum", "fiber_sky_prediction",
+    "sky_subtracted_spectrum", "final_exposure_response",
 }
 
 EXPOSURE_RESULT_KINDS = (
     "exposure_completion_manifest", "initial_astrometry", "source_detection_catalog",
     "catalog_match_table", "final_astrometry", "fiber_sky_coordinates", "sky_fiber_mask",
-    "incident_sky_spectrum", "fiber_sky_prediction", "sky_subtracted_spectrum",
-    "baseline_relative_response", "exposure_illumination_correction", "final_exposure_response",
+    "sky_model", "baseline_relative_response", "exposure_illumination_correction", "fiber_response_model",
     "exposure_mode_classification", "effective_exposure_time", "amp_to_amp_normalization",
 )
 
@@ -113,6 +115,13 @@ def _row_manifest(service, row: dict) -> dict:
 def _validate(service) -> tuple[list[dict], dict[str, int]]:
     from virusflow.ontology.artifact_kinds import kind_spec
 
+    forbidden = [
+        row for row in service.adapter.list_all()
+        if (row.get("canonical_kind") or row.get("kind")) in FORBIDDEN_PERSISTENT_KINDS
+        and str(row.get("state") or "active") == "active"
+    ]
+    if forbidden:
+        _fail("Scratch-only Products were persisted: " + ", ".join(str(row["id"]) for row in forbidden[:20]))
     all_rows = [
         row for row in service.adapter.list_all()
         if (row.get("canonical_kind") or row.get("kind")) in STEP_KINDS
@@ -158,19 +167,16 @@ def _validate(service) -> tuple[list[dict], dict[str, int]]:
     if qa_failures:
         _fail("Failed/unusable required Products: " + "; ".join(qa_failures[:20]))
     expected = {
-        "reduced_science_image": 900,
         "ccd_scattered_light_model": 450,
-        "scatter_subtracted_image": 450,
-        "aperture_extracted_spectrum": 897,
-        "extracted_variance": 897,
-        "within_amp_fiber_normalization": 897,
-        "fiber_normalization": 897,
+        "sky_model": 3,
+        "fiber_response_model": 3,
         "observation_exposure_state": 3,
         "observation_membership": 1,
         "dither_assignment": 1,
         "dither_registration": 1,
         "dither_coverage_map": 1,
         "observation_summary": 1,
+        "calibrated_fiber_observation": 1,
     }
     for kind, minimum in expected.items():
         if counts.get(kind, 0) < minimum:
@@ -193,22 +199,16 @@ def _latest(service, kind: str, *, exposure_id: str | None = None, zipcode=None,
 
 
 def _existing_exposure_result(service, exposure_id: str) -> dict | None:
-    result = {}
-    for kind in EXPOSURE_RESULT_KINDS:
-        row = _latest(
-            service, kind,
-            exposure_id=None if kind == "baseline_relative_response" else exposure_id,
-        )
-        if row is None:
-            return None
-        result[kind] = SimpleNamespace(id=int(row["id"]), kind=kind)
-    return result
+    # The final per-exposure spectral state is intentionally run-local. Reuse
+    # begins at the complete observation Product, not at removed dense stages.
+    return None
 
 
 def _physical_figure(output_dir: Path, service) -> dict:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from virusflow.algorithms.physical_ccd import ScatteredLightModel
     from virusflow.core.identity import parse_zipcode_key
 
     facts = {}
@@ -216,29 +216,26 @@ def _physical_figure(output_dir: Path, service) -> dict:
     for row_index, (side, key) in enumerate((("left", LEFT_ZIPCODE), ("right", RIGHT_ZIPCODE))):
         zipcode = parse_zipcode_key(key)
         model_row = _latest(service, "ccd_scattered_light_model", exposure_id=EXPOSURE_ID, zipcode=zipcode)
-        sub_row = _latest(service, "scatter_subtracted_image", exposure_id=EXPOSURE_ID, zipcode=zipcode)
-        if model_row is None or sub_row is None:
-            _fail(f"Missing representative {side} physical CCD Products")
-        model = np.asarray(service.load_component(model_row, "model")["data"], dtype=float)
-        residual = np.asarray(service.load_component(model_row, "fit_residual")["data"], dtype=float)
-        fit_mask = np.asarray(service.load_component(model_row, "fit_sample_mask")["data"], dtype=bool)
-        gap = np.asarray(service.load_component(model_row, "gap_sample_mask")["data"], dtype=bool)
-        corrected = np.asarray(service.load_component(sub_row, "image")["data"], dtype=float)
-        assembled = corrected + model
-        lo, hi = np.nanpercentile(assembled, [5, 99])
-        axes[row_index, 0].imshow(assembled, origin="lower", aspect="auto", vmin=lo, vmax=hi)
-        axes[row_index, 0].set_title(f"{side}: assembled source")
-        evidence = np.zeros(gap.shape, dtype=float)
-        evidence[gap] = 1
-        evidence[fit_mask] = 2
+        if model_row is None:
+            _fail(f"Missing representative {side} compact physical CCD model")
+        coefficients = service.load_component(model_row, "model_parameters")["data"]
+        shape = tuple(service.load_component(model_row, "detector_shape")["data"].astype(int))
+        model = ScatteredLightModel(coefficients, shape).evaluate()
+        gap_index = service.load_component(model_row, "gap_sample_indices")["data"].astype(int)
+        fit_index = service.load_component(model_row, "fit_sample_indices")["data"].astype(int)
+        residual = service.load_component(model_row, "residual_sample_values")["data"]
+        evidence = np.zeros(shape, dtype=float)
+        evidence.ravel()[gap_index] = 1
+        evidence.ravel()[fit_index] = 2
+        axes[row_index, 0].imshow(model, origin="lower", aspect="auto")
+        axes[row_index, 0].set_title(f"{side}: reconstructed compact model")
         axes[row_index, 1].imshow(evidence, origin="lower", aspect="auto", cmap="viridis")
         axes[row_index, 1].axhline(1031.5, color="red", lw=0.7)
         axes[row_index, 1].set_title("gap/fit samples + seam")
         mlo, mhi = np.nanpercentile(model, [2, 98])
         axes[row_index, 2].imshow(model, origin="lower", aspect="auto", vmin=mlo, vmax=mhi)
         axes[row_index, 2].set_title("scattered-light model")
-        values = residual[fit_mask & np.isfinite(residual)]
-        axes[row_index, 3].hist(values, bins=80, histtype="step", density=True)
+        axes[row_index, 3].hist(residual[np.isfinite(residual)], bins=80, histtype="step", density=True)
         axes[row_index, 3].set_title("retained fit residuals")
         summary = model_row.get("metadata") or {}
         facts[side] = {
@@ -266,10 +263,9 @@ def _exposure_figure(output_dir: Path, service, exposure_result: dict) -> dict:
     axes[0, 0].imshow(completion.T, aspect="auto", interpolation="nearest", vmin=0, vmax=1)
     axes[0, 0].set_title("amplifier/IFU completion")
 
-    extracted_row = service.adapter.list_all(kind="aperture_extracted_spectrum")[0]
-    variance_rows = service.adapter.list_all(kind="extracted_variance")
-    spectrum = np.asarray(service.load_component(extracted_row, "spectrum")["data"], dtype=float)
-    variance = np.asarray(service.load_component(variance_rows[0], "variance")["data"], dtype=float)
+    state = exposure_result["calibrated_fiber_state"]
+    spectrum = np.asarray(state.flux, dtype=float)
+    variance = np.asarray(state.variance, dtype=float)
     axes[0, 1].plot(np.nanmedian(spectrum, axis=0), label="median flux")
     axes[0, 1].plot(np.sqrt(np.nanmedian(variance, axis=0)), label="sqrt variance")
     axes[0, 1].legend(fontsize=7)
@@ -295,14 +291,14 @@ def _exposure_figure(output_dir: Path, service, exposure_result: dict) -> dict:
     axes[1, 0].scatter(focal[sky_mask, 0], focal[sky_mask, 1], s=0.3, alpha=0.5)
     axes[1, 0].set_title("explicit sky-fiber selection")
 
-    incident_row = service.adapter.get_row(int(exposure_result["incident_sky_spectrum"].id))
-    sky_wave = np.asarray(service.load_component(incident_row, "wavelength")["data"], dtype=float)
-    sky = np.asarray(service.load_component(incident_row, "spectrum")["data"], dtype=float)
+    incident_row = service.adapter.get_row(int(exposure_result["sky_model"].id))
+    sky_wave = np.asarray(service.load_component(incident_row, "latent_wavelength")["data"], dtype=float)
+    sky = np.asarray(service.load_component(incident_row, "latent_flux_density")["data"], dtype=float)
     axes[1, 1].plot(sky_wave, sky, lw=0.5)
     axes[1, 1].set_title("oversampled incident sky")
 
-    response_row = service.adapter.get_row(int(exposure_result["final_exposure_response"].id))
-    response = np.asarray(service.load_component(response_row, "response")["data"], dtype=float)
+    response_row = service.adapter.get_row(int(exposure_result["fiber_response_model"].id))
+    response = np.asarray(service.load_component(response_row, "illumination_factors")["data"], dtype=float)
     axes[1, 2].hist(response[np.isfinite(response)], bins=50, histtype="step")
     axes[1, 2].set_title("final response")
 
@@ -474,12 +470,13 @@ def main(argv: list[str] | None = None) -> int:
     observation_result = ObservationTask(
         context,
         target=ObservationTarget(OBSERVATION_ID, DITHER_SET_ID, OBSERVATION_EXPOSURES),
-    ).run({})
+    ).run(exposure_results)
     manifest, counts = _validate(service)
     facts = {
         "physical_ccd": _physical_figure(output_dir, service),
         "exposure": _exposure_figure(output_dir, service, exposure_result),
         "observation": _observation_figure(output_dir, service, observation_result),
+        "storage": service.storage_summary(),
     }
     completion = facts["exposure"]["completion"]
     if int(completion.get("raw_amplifier_count", 0)) != 300 or int(completion.get("extracted_amplifier_count", 0)) != 299:

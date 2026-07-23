@@ -95,7 +95,9 @@ def test_bias_stability_uses_named_components_and_records_all_source_lineage(tmp
     output = BiasStabilityStudy(service).run(
         BiasStabilityParams(tmp_path / "analytics", _Target.zipcode)
     )
-    assert output["source_ids"] == [first.id, second.id]
+    # Identical repeated publications resolve to one content-derived canonical
+    # revision; analytic lineage records each unique source Product once.
+    assert output["source_ids"] == sorted({first.id, second.id})
     desc = service.describe(output["artifact_id"])
     assert {item["name"] for item in desc["components"]} == {
         "source_artifact_id", "median_bias_level", "median_bias_scatter"

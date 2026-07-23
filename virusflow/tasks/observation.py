@@ -7,18 +7,20 @@ from typing import Iterable
 
 import numpy as np
 
-from .exposure import _component
+from .exposure import _component, _mask_component
 from .science import _SciencePublisher, _instant
-from ..algorithms.exposure import parse_header_pointing
+from ..algorithms.exposure import CalibratedFiberState, parse_header_pointing
 from ..algorithms.observation import (
     ALGORITHM_VERSION,
     assign_nominal_dithers,
+    combine_calibrated_fiber_states,
     dither_coverage_map,
     refine_relative_offsets,
 )
 from ..artifacts import ArtifactService, Scope, Validity
 from ..artifacts.models import ConfigurationReference
 from ..artifacts.requests import ArtifactRequest
+from ..artifacts.storage_conventions import scaled_flux_component, scaled_variance_component
 from ..config import ConfigurationService
 from ..config.defaults import DITHER_POLICY
 from ..io import RawFrameLoader
@@ -89,6 +91,22 @@ class ObservationTask(_SciencePublisher):
         )
         refs = [policy_ref, fiber_ref]
         exposure_ids = tuple(str(value) for value in self.target.exposure_ids)
+
+        calibrated_states: dict[str, CalibratedFiberState] = {}
+
+        def collect(value) -> None:
+            if isinstance(value, CalibratedFiberState):
+                calibrated_states[str(value.exposure_id)] = value
+            elif isinstance(value, dict):
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, (tuple, list)):
+                for child in value:
+                    collect(child)
+
+        collect(inputs)
+        if isinstance(self.ctx.config, dict):
+            collect(self.ctx.config.get("calibrated_fiber_states"))
         state_artifacts = []
         astrometry_rows = []
         astrometry_valid = []
@@ -115,7 +133,7 @@ class ObservationTask(_SciencePublisher):
             completion = service.select_best(kind="exposure_completion_manifest", scope=exposure_scope, at_time=when)
             final = service.select_best(kind="final_astrometry", scope=exposure_scope, at_time=when)
             initial = service.select_best(kind="initial_astrometry", scope=exposure_scope, at_time=when)
-            response = service.select_best(kind="final_exposure_response", scope=exposure_scope, at_time=when)
+            response = service.select_best(kind="fiber_response_model", scope=exposure_scope, at_time=when)
             effective = service.select_best(kind="effective_exposure_time", scope=exposure_scope, at_time=when)
 
             ra0, dec0, pa, pointing_evidence = parse_header_pointing(header)
@@ -348,7 +366,7 @@ class ObservationTask(_SciencePublisher):
             status="pass" if assignment.complete and covered.any() and registration_consistent else "warn",
             usability="usable" if assignment.complete and covered.any() and registration_consistent else "degraded",
         )
-        return {
+        result = {
             "observation_membership": membership_artifact,
             "dither_assignment": assignment_artifact,
             "dither_registration": registration_artifact,
@@ -356,3 +374,72 @@ class ObservationTask(_SciencePublisher):
             "observation_summary": observation_artifact,
             "exposure_states": tuple(state_artifacts),
         }
+        if assignment.complete and all(exposure_id in calibrated_states for exposure_id in exposure_ids):
+            ordered_states = [calibrated_states[exposure_id] for exposure_id in exposure_ids]
+            final_arrays = combine_calibrated_fiber_states(ordered_states)
+            final_parents = {
+                int(observation_artifact.id), int(membership_artifact.id), int(registration_artifact.id),
+                *(parent for state in ordered_states for parent in state.model_artifact_ids),
+            }
+            calibrated_observation = self._request(
+                kind="calibrated_fiber_observation",
+                scope=membership_scope,
+                components={
+                    "flux": scaled_flux_component(
+                        "flux", final_arrays["flux"], "fiber_by_dispersion_pixel"
+                    ),
+                    "variance": scaled_variance_component(
+                        "variance", final_arrays["variance"], "fiber_by_dispersion_pixel"
+                    ),
+                    "mask": _mask_component(
+                        "mask", final_arrays["mask"], "1", "fiber_by_dispersion_pixel"
+                    ),
+                    "wavelength": _component(
+                        "wavelength", final_arrays["wavelength"], "Angstrom",
+                        "fiber_by_dispersion_pixel",
+                    ),
+                    "fiber_identity": _component(
+                        "fiber_identity", final_arrays["fiber_identity"], "1", "none"
+                    ),
+                    "sky_coordinates": _component(
+                        "sky_coordinates", final_arrays["sky_coordinates"], "deg", "icrs"
+                    ),
+                    "focal_plane_coordinates": _component(
+                        "focal_plane_coordinates", final_arrays["focal_plane_coordinates"],
+                        "arcsec", "none",
+                    ),
+                    "exposure_index": _component(
+                        "exposure_index", final_arrays["exposure_index"], "1", "none"
+                    ),
+                },
+                parents=sorted(final_parents),
+                summaries={
+                    "exposure_count": 3,
+                    "fiber_count": int(final_arrays["flux"].shape[0]),
+                    "wavelength_sample_count": int(final_arrays["flux"].shape[1]),
+                    "spectral_plane_count": 3,
+                    "masked_sample_fraction": float(np.mean(final_arrays["mask"] != 0)),
+                },
+                metadata={
+                    "member_exposure_ids": list(exposure_ids),
+                    "spectral_planes": ["flux", "variance", "mask"],
+                    "wavelength_sampling": "per_fiber_native_bin_centers",
+                    "flux_scale": 1e-17,
+                    "uncertainty_convention": "variance",
+                    "model_artifact_ids_by_exposure": {
+                        state.exposure_id: list(state.model_artifact_ids) for state in ordered_states
+                    },
+                    "exposure_metadata": {
+                        state.exposure_id: dict(state.metadata) for state in ordered_states
+                    },
+                    "intermediates_retained": False,
+                },
+                refs=refs,
+                assumptions=[
+                    "Exposure measurements remain separate rows; the observation product concatenates rather than coadds dithers."
+                ],
+                status="pass" if registration_consistent else "warn",
+                usability="usable" if registration_consistent else "degraded",
+            )
+            result["calibrated_fiber_observation"] = calibrated_observation
+        return result

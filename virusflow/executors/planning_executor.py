@@ -25,8 +25,11 @@ class _Node:
 
 
 class PlanningExecutor:
-    def __init__(self, max_workers: int = 1, debug: bool = False) -> None:
-        self.max_workers = max(1, int(max_workers))
+    def __init__(self, max_workers: int | None = None, debug: bool = False) -> None:
+        from .execution_context import in_task_worker
+
+        requested = 4 if max_workers is None else max(1, int(max_workers))
+        self.max_workers = 1 if in_task_worker() else requested
         self.debug = bool(debug)
         self._nodes: Dict[str, _Node] = {}
         # Execution statistics populated after run()
@@ -44,6 +47,8 @@ class PlanningExecutor:
             self._live_enabled_default = False
 
     def add_task(self, node_id: str, task: object, kind: Optional[str] = None, depends_on: List[str] | None = None) -> None:
+        if node_id in self._nodes:
+            raise ValueError(f"task node is already registered: {node_id}")
         k = kind or getattr(task, "kind", "task")
         self._nodes[node_id] = _Node(id=node_id, kind=str(k), task=task, deps=list(depends_on or []))
 
@@ -56,24 +61,34 @@ class PlanningExecutor:
                 dependents.setdefault(d, []).append(nid)
         return indeg, dependents
 
-    def run(self) -> None:
+    def run(self) -> Dict[str, object]:
         from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        from .execution_context import enter_worker, leave_worker
         import time as _time
 
         indeg, dependents = self._indeg_and_dependents()
         ready = [k for k, v in indeg.items() if v == 0]
         done: Dict[str, bool] = {}
         failed: Dict[str, str] = {}
+        results: Dict[str, object] = {}
         _start_ts = _time.perf_counter()
 
         def _has_failed_dep(nid: str) -> bool:
             return any((d in failed) for d in self._nodes[nid].deps)
 
         def _run_one(nid: str):
+            token = enter_worker(f"worker-{nid}")
             try:
-                return nid, self._nodes[nid].task.run({}), None
+                dependency_outputs = {
+                    dependency: results[dependency]
+                    for dependency in self._nodes[nid].deps
+                    if dependency in results
+                }
+                return nid, self._nodes[nid].task.run(dependency_outputs), None
             except Exception as e:  # pragma: no cover - behavior mirrored from LocalExecutor
                 return nid, None, str(e)
+            finally:
+                leave_worker(token)
 
         # Simple progress counters by kind
         totals: Dict[str, int] = {}
@@ -190,6 +205,7 @@ class PlanningExecutor:
                         failed[nid] = err
                         _bump(k, False)
                     else:
+                        results[nid] = _res
                         _bump(k, True)
                     done[nid] = True
                     for dep in dependents.get(nid, []):
@@ -221,6 +237,7 @@ class PlanningExecutor:
                                 failed[nid] = err
                                 _bump(k, False)
                             else:
+                                results[nid] = _res
                                 _bump(k, True)
                             done[nid] = True
                             for dep in dependents.get(nid, []):
@@ -293,3 +310,4 @@ class PlanningExecutor:
                     pass
         except Exception:
             pass
+        return results

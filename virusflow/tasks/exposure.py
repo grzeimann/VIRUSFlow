@@ -13,13 +13,17 @@ from .calibs import BiasTask, CmpTask, DarkTask, FlatTask, TraceTask, TwiTask, W
 from .science import PhysicalCCDTask, ReducedScienceAmplifierTask, _SciencePublisher, _instant
 from ..algorithms.exposure import (
     ASTROMETRY_VERSION,
+    CalibratedFiberState,
     EXTRACTION_VERSION,
+    LatentSkyModel,
     NORMALIZATION_VERSION,
     RESPONSE_VERSION,
     SKY_VERSION,
     amplifier_normalization,
+    compact_fiber_response,
     classify_mode_and_effective_time,
     detect_fiber_sources,
+    derive_sky_oversampling_factor,
     extract_fractional_aperture,
     fit_catalog_astrometry,
     oversampled_incident_sky,
@@ -28,10 +32,12 @@ from ..algorithms.exposure import (
     select_sky_fibers,
     tan_fiber_coordinates,
     within_amplifier_normalization,
+    wavelength_bin_edges,
 )
 from ..algorithms.physical_ccd import assemble_physical_ccd, fit_gap_scattered_light
 from ..artifacts import ArtifactService, Scope, Validity
 from ..artifacts.requests import ArtifactRequest, LogicalComponent
+from ..artifacts.storage_conventions import FLUX_SCALE, VARIANCE_SCALE
 from ..config import ConfigurationService
 from ..config.defaults import BASELINE_RESPONSE_CONFIGURATION, EFFECTIVE_EXPOSURE_POLICY
 from ..io import PanSTARRSCSVProvider, RawFrameLoader
@@ -57,6 +63,10 @@ def _component(name, value, units, coordinates, **metadata):
         name, "array1d" if array.ndim == 1 else "array2d", array,
         units, coordinates, metadata,
     )
+
+
+def _mask_component(name, value, units="1", coordinates="none", **metadata):
+    return LogicalComponent(name, "mask", np.asarray(value), units, coordinates, metadata)
 
 
 class ExposureTask(_SciencePublisher):
@@ -157,13 +167,13 @@ class ExposureTask(_SciencePublisher):
         reduced = {}
         for zipcode in zipcodes:
             try:
-                artifact = ReducedScienceAmplifierTask(
+                state = ReducedScienceAmplifierTask(
                     self.ctx, target=SimpleNamespace(zipcode=zipcode, exposure_id=exposure_id),
                     params={"apply_calibrations": True},
-                ).run({})["reduced_science_image"]
-                reduced[zipcode.key()] = service.adapter.get_row(int(artifact.id))
+                ).run({})["reduced_science_state"]
+                reduced[zipcode.key()] = state
             except Exception as exc:
-                failures.setdefault(zipcode.key(), []).append(f"reduced_science_image: {type(exc).__name__}: {exc}")
+                failures.setdefault(zipcode.key(), []).append(f"reduced_science_state: {type(exc).__name__}: {exc}")
 
         groups = {}
         for zipcode in zipcodes:
@@ -188,28 +198,31 @@ class ExposureTask(_SciencePublisher):
                     continue
                 try:
                     target = PhysicalCCDTarget(exposure_id, lower.specid, side, lower, upper, at)
-                    result = PhysicalCCDTask(self.ctx, target=target).run({})
+                    result = PhysicalCCDTask(self.ctx, target=target).run({
+                        "lower_state": reduced[lower.key()],
+                        "upper_state": reduced[upper.key()],
+                    })
                     physical[(identity, side)] = {
                         "model": result["ccd_scattered_light_model"],
-                        "subtracted": result["scatter_subtracted_image"],
+                        "state": result["physical_ccd_state"],
                     }
                 except Exception as exc:
                     failures.setdefault(lower.key(), []).append(f"{side} CCD: {type(exc).__name__}: {exc}")
                     failures.setdefault(upper.key(), []).append(f"{side} CCD: {type(exc).__name__}: {exc}")
 
         amp_results = {}
-        extracted_artifacts = []
-        variance_artifacts = []
-        within_artifacts = []
+        reduction_parent_ids = []
         for identity, amps in sorted(groups.items()):
             for side, pair in (("left", ("LL", "LU")), ("right", ("RU", "RL"))):
                 product = physical.get((identity, side))
                 if product is None:
                     continue
-                sub_row = service.adapter.get_row(int(product["subtracted"].id))
-                physical_image = service.load_component(sub_row, "image")["data"]
-                physical_variance = service.load_component(sub_row, "variance")["data"]
-                physical_mask = service.load_component(sub_row, "pixel_mask")["data"]
+                physical_state = product["state"]
+                physical_image = np.asarray(physical_state.scatter.get_array("scatter_subtracted_image"), dtype=np.float32)
+                physical_variance = np.asarray(physical_state.assembly.get_array("variance"), dtype=np.float32)
+                physical_mask = np.asarray(physical_state.assembly.get_array("pixel_mask"), dtype=np.uint8)
+                scatter_model_id = int(product["model"].id)
+                reduction_parent_ids.append(scatter_model_id)
                 lower, upper = amps[pair[0]], amps[pair[1]]
                 lower_trace_row = calibration[lower.key()]["trace_map"]
                 upper_trace_row = calibration[upper.key()]["trace_map"]
@@ -250,57 +263,6 @@ class ExposureTask(_SciencePublisher):
                     )
                     wave_row = calibration[zipcode.key()]["wavelength_map"]
                     wavelength = np.asarray(service.load_component(wave_row, "wavelength_map")["data"], dtype=np.float32)
-                    scope = Scope(zipcode=zipcode, exposure_id=exposure_id, physical_scope=PhysicalScope.FIBER)
-                    extracted = self._request(
-                        kind="aperture_extracted_spectrum", scope=scope,
-                        components={
-                            "spectrum": _component("spectrum", extraction.spectrum, "electron", "fiber_by_dispersion_pixel"),
-                            "valid_pixel_fraction": _component("valid_pixel_fraction", extraction.valid_pixel_fraction, "1", "fiber_by_dispersion_pixel"),
-                            "effective_aperture_width": _component("effective_aperture_width", extraction.effective_aperture_width, "pixel", "fiber_by_dispersion_pixel"),
-                            "aperture_start_row": _component("aperture_start_row", extraction.aperture_start_row, "pixel", "fiber_by_dispersion_pixel"),
-                            "fractional_weights": _component(
-                                "fractional_weights", extraction.fractional_weights.reshape(extraction.spectrum.shape[0], -1),
-                                "1", "fiber_by_dispersion_pixel", original_shape=list(extraction.fractional_weights.shape),
-                            ),
-                            "extraction_valid": _component("extraction_valid", extraction.extraction_valid, "1", "fiber_by_dispersion_pixel"),
-                        },
-                        parents=[int(sub_row["id"]), int(trace_row["id"]), int(wave_row["id"])],
-                        summaries={
-                            "aperture_width": 5.0,
-                            "median_valid_pixel_fraction": float(np.nanmedian(extraction.valid_pixel_fraction)),
-                            "invalid_sample_fraction": float(np.mean(extraction.valid_pixel_fraction < 1.0)),
-                        },
-                        metadata={"output_scale": "sum", "weights_shape": list(extraction.fractional_weights.shape)},
-                        refs=exposure_refs, algorithm="virusflow.algorithms.exposure.extract_fractional_aperture",
-                        version=EXTRACTION_VERSION,
-                    )
-                    extracted_variance = self._request(
-                        kind="extracted_variance", scope=scope,
-                        components={"variance": _component("variance", extraction.variance, "electron2", "fiber_by_dispersion_pixel")},
-                        parents=[int(extracted.id), int(sub_row["id"])],
-                        summaries={"median_variance": float(np.nanmedian(extraction.variance))},
-                        refs=exposure_refs, algorithm="virusflow.algorithms.exposure.extract_fractional_aperture",
-                        version=EXTRACTION_VERSION,
-                    )
-                    within_artifact = self._request(
-                        kind="within_amp_fiber_normalization", scope=scope,
-                        components={
-                            "raw_ratio": _component("raw_ratio", raw_ratio, "1", "fiber_by_dispersion_pixel"),
-                            "normalization": _component("normalization", within, "1", "fiber_by_dispersion_pixel"),
-                            "valid_mask": _component("valid_mask", normalization_valid, "1", "fiber_by_dispersion_pixel"),
-                            "common_twilight": _component("common_twilight", common_twi, "electron", "wavelength_pixel"),
-                        },
-                        parents=[int(twi_row["id"]), int(trace_row["id"])],
-                        summaries={
-                            "median_factor": float(np.nanmedian(within)),
-                            "invalid_factor_fraction": float(np.mean(normalization_valid == 0)),
-                            "twilight_scatter_holdout_sigma": float(twi_scatter.scalars["holdout_residual_robust_sigma"]),
-                        },
-                        metadata={"twilight_scatter_policy": "physical_ccd_gap_model_in_memory"},
-                        refs=exposure_refs, assumptions=["Center-track twilight is uniform at exposure scope."],
-                        algorithm="virusflow.algorithms.exposure.within_amplifier_normalization",
-                        version=NORMALIZATION_VERSION,
-                    )
                     amp_results[zipcode.key()] = {
                         "zipcode": zipcode,
                         "spectrum": extraction.spectrum,
@@ -309,13 +271,10 @@ class ExposureTask(_SciencePublisher):
                         "within": within,
                         "wavelength": wavelength,
                         "twilight_level": float(np.nanmedian(common_twi)),
-                        "extracted_id": int(extracted.id),
-                        "variance_id": int(extracted_variance.id),
-                        "within_id": int(within_artifact.id),
+                        "parent_ids": [scatter_model_id, int(trace_row["id"]), int(wave_row["id"]), int(twi_row["id"])],
+                        "normalization_valid": normalization_valid,
+                        "twilight_scatter_sigma": float(twi_scatter.scalars["holdout_residual_robust_sigma"]),
                     }
-                    extracted_artifacts.append(int(extracted.id))
-                    variance_artifacts.append(int(extracted_variance.id))
-                    within_artifacts.append(int(within_artifact.id))
 
         ordered_keys = sorted(amp_results)
         levels = np.asarray([amp_results[key]["twilight_level"] for key in ordered_keys], dtype=float)
@@ -333,7 +292,7 @@ class ExposureTask(_SciencePublisher):
                 "reference_level": _component("reference_level", np.asarray([reference_level]), "electron", "none"),
                 "amplifier_identity": _component("amplifier_identity", amp_identity, "1", "none"),
             },
-            parents=within_artifacts,
+            parents=sorted({parent for item in amp_results.values() for parent in item["parent_ids"]}),
             summaries={
                 "amplifier_count": len(ordered_keys),
                 "factor_median": float(np.nanmedian(amp_factors)),
@@ -349,7 +308,8 @@ class ExposureTask(_SciencePublisher):
         global_wavelength = []
         global_identity = []
         global_focal = []
-        normalization_ids = []
+        global_within = []
+        normalization_parent_ids = [int(amp_artifact.id)]
         amp_index_by_key = {key: index for index, key in enumerate(ordered_keys)}
         for key, amp_factor in zip(ordered_keys, amp_factors):
             item = amp_results[key]
@@ -357,20 +317,7 @@ class ExposureTask(_SciencePublisher):
             normalized = item["spectrum"] / final
             normalized_variance = item["variance"] / np.square(final)
             zipcode = item["zipcode"]
-            scope = Scope(zipcode=zipcode, exposure_id=exposure_id, physical_scope=PhysicalScope.FIBER)
-            artifact = self._request(
-                kind="fiber_normalization", scope=scope,
-                components={
-                    "normalization": _component("normalization", final, "1", "fiber_by_dispersion_pixel"),
-                    "within_amp_factor": _component("within_amp_factor", item["within"], "1", "fiber_by_dispersion_pixel"),
-                    "amp_to_amp_factor": _component("amp_to_amp_factor", np.asarray([amp_factor]), "1", "none"),
-                },
-                parents=[item["within_id"], int(amp_artifact.id)],
-                summaries={"median_final_factor": float(np.nanmedian(final))}, refs=exposure_refs,
-                algorithm="virusflow.algorithms.exposure.final_fiber_normalization", version=NORMALIZATION_VERSION,
-            )
-            item["normalization_id"] = int(artifact.id)
-            normalization_ids.append(int(artifact.id))
+            normalization_parent_ids.extend(item["parent_ids"])
             n_fiber = normalized.shape[0]
             if zipcode.ifuslot not in fplane:
                 failures.setdefault(key, []).append("IFUSLOT absent from fplane configuration")
@@ -391,6 +338,7 @@ class ExposureTask(_SciencePublisher):
             global_wavelength.append(item["wavelength"].astype(np.float32))
             global_identity.append(identities)
             global_focal.append(focal.astype(np.float32))
+            global_within.append(item["within"].astype(np.float32))
 
         if not global_spectrum:
             raise RuntimeError(f"Exposure {exposure_id} produced no extractable amplifier")
@@ -400,6 +348,7 @@ class ExposureTask(_SciencePublisher):
         wavelength = np.concatenate(global_wavelength)
         fiber_identity = np.concatenate(global_identity)
         focal = np.concatenate(global_focal)
+        within_response = np.concatenate(global_within)
 
         ra0, dec0, pa, header_evidence = parse_header_pointing(header)
         initial_ra, initial_dec, initial_rotation = tan_fiber_coordinates(ra0, dec0, pa, focal[:, 0], focal[:, 1])
@@ -409,7 +358,7 @@ class ExposureTask(_SciencePublisher):
                 "parameters": _component("parameters", np.asarray([ra0, dec0, pa, initial_rotation]), "deg", "icrs"),
                 "header_evidence": _component("header_evidence", np.asarray([ra0, dec0, pa]), "deg", "icrs"),
             },
-            parents=extracted_artifacts,
+            parents=sorted(set(reduction_parent_ids)),
             summaries={"fiber_count": int(spectrum.shape[0]), "initial_ra": ra0, "initial_dec": dec0, "initial_pa": pa},
             metadata={"header_evidence": header_evidence}, refs=exposure_refs,
             algorithm="virusflow.algorithms.exposure.tan_fiber_coordinates", version=ASTROMETRY_VERSION,
@@ -427,7 +376,7 @@ class ExposureTask(_SciencePublisher):
         detection_artifact = self._request(
             kind="source_detection_catalog", scope=exposure_scope,
             components={"detections": _component("detections", detections, "electron", "icrs")},
-            parents=[int(initial_artifact.id), *extracted_artifacts],
+            parents=[int(initial_artifact.id), *sorted(set(reduction_parent_ids))],
             summaries={"detection_count": int(detections.shape[0])}, refs=exposure_refs,
             algorithm="virusflow.algorithms.exposure.detect_fiber_sources", version=ASTROMETRY_VERSION,
         )
@@ -517,30 +466,32 @@ class ExposureTask(_SciencePublisher):
         sky_mask_artifact = self._request(
             kind="sky_fiber_mask", scope=Scope(zipcode=None, exposure_id=exposure_id, physical_scope=PhysicalScope.FIBER),
             components={
-                "mask": _component("mask", sky_mask, "1", "none"),
+                "mask": _mask_component("mask", sky_mask),
                 "broadband_flux": _component("broadband_flux", broadband_flux, "electron", "none"),
                 "fiber_identity": _component("fiber_identity", fiber_identity, "1", "none"),
             },
-            parents=[int(coordinates_artifact.id), int(detection_artifact.id), *normalization_ids],
+            parents=[int(coordinates_artifact.id), int(detection_artifact.id), *sorted(set(normalization_parent_ids))],
             summaries={
                 "sky_fiber_count": int(sky_mask.sum()), "sky_ifuslot_count": int(np.unique(fiber_identity[sky_mask.astype(bool), 2]).size),
                 "sky_broadband_center": sky_center, "sky_broadband_robust_sigma": sky_sigma,
             }, refs=exposure_refs, algorithm="virusflow.algorithms.exposure.select_sky_fibers", version=SKY_VERSION,
         )
+        representative_width = float(np.nanmedian(np.diff(wavelength_bin_edges(wavelength), axis=1)))
+        minimum_lsf_fwhm = float(self.params.get("minimum_lsf_fwhm", 2.0 * representative_width))
+        sampling_target = float(self.params.get("sky_samples_per_fwhm", 6.0))
+        configured_oversample = self.params.get("sky_oversample")
+        if configured_oversample is None:
+            oversampling_factor, native_samples_per_fwhm = derive_sky_oversampling_factor(
+                minimum_lsf_fwhm, representative_width,
+                target_samples_per_fwhm=sampling_target,
+            )
+        else:
+            oversampling_factor = max(1, int(configured_oversample))
+            native_samples_per_fwhm = minimum_lsf_fwhm / representative_width
         sky_wave, incident_sky, sky_variance, sky_counts = oversampled_incident_sky(
-            wavelength, spectrum, sky_mask, oversample=int(self.params.get("sky_oversample", 2))
-        )
-        incident_artifact = self._request(
-            kind="incident_sky_spectrum", scope=exposure_scope,
-            components={
-                "wavelength": _component("wavelength", sky_wave, "Angstrom", "wavelength_angstrom"),
-                "spectrum": _component("spectrum", incident_sky, "electron", "wavelength_angstrom"),
-                "variance": _component("variance", sky_variance, "electron2", "wavelength_angstrom"),
-                "sample_count": _component("sample_count", sky_counts, "1", "wavelength_angstrom"),
-            },
-            parents=[int(sky_mask_artifact.id), *extracted_artifacts, *normalization_ids],
-            summaries={"grid_samples": int(sky_wave.size), "minimum_sample_count": int(np.min(sky_counts))}, refs=exposure_refs,
-            algorithm="virusflow.algorithms.exposure.oversampled_incident_sky", version=SKY_VERSION,
+            wavelength, spectrum, sky_mask, oversample=oversampling_factor,
+            minimum_lsf_fwhm=minimum_lsf_fwhm,
+            target_samples_per_fwhm=sampling_target,
         )
 
         # Exposure illumination remains separate from baseline response and sky.
@@ -567,31 +518,49 @@ class ExposureTask(_SciencePublisher):
             },
             refs=exposure_refs, algorithm="virusflow.algorithms.exposure.exposure_illumination", version=RESPONSE_VERSION,
         )
-        sky_prediction = predict_sky(wavelength, sky_wave, incident_sky) * fiber_illumination[:, None]
+        sky_model = LatentSkyModel(
+            sky_wave, incident_sky, sky_variance,
+            sampling_target=sampling_target,
+            oversampling_factor=oversampling_factor,
+            reference_resolution="intrinsic_without_accepted_lsf",
+        )
+        sky_model_artifact = self._request(
+            kind="sky_model", scope=exposure_scope,
+            components={
+                "latent_wavelength": _component("latent_wavelength", sky_wave, "Angstrom", "wavelength_angstrom"),
+                "latent_flux_density": _component("latent_flux_density", incident_sky, "electron / Angstrom", "wavelength_angstrom"),
+                "latent_variance_density": _component("latent_variance_density", sky_variance, "electron2 / Angstrom2", "wavelength_angstrom"),
+                "sample_count": _component("sample_count", sky_counts, "1", "wavelength_angstrom"),
+                "fiber_coefficients": _component("fiber_coefficients", fiber_illumination, "1", "none"),
+                "fiber_identity": _component("fiber_identity", fiber_identity, "1", "none"),
+            },
+            parents=[int(sky_mask_artifact.id), int(illumination_artifact.id), *sorted(set(normalization_parent_ids))],
+            summaries={
+                "grid_samples": int(sky_wave.size),
+                "minimum_sample_count": int(np.min(sky_counts)),
+                "sampling_target_per_fwhm": sampling_target,
+                "native_samples_per_fwhm": float(native_samples_per_fwhm),
+                "oversampling_factor": int(oversampling_factor),
+            },
+            metadata={
+                "representation": "supersampled_regular_flux_density_grid",
+                "reference_resolution": sky_model.reference_resolution,
+                "lsf_model_reference": None,
+                "pixel_integration": sky_model.integration_method,
+                "sampling_rule": "ceil(target_samples_per_fwhm / native_samples_per_fwhm)",
+                "minimum_lsf_fwhm_angstrom": minimum_lsf_fwhm,
+                "representative_native_pixel_width_angstrom": representative_width,
+            },
+            refs=exposure_refs,
+            algorithm="virusflow.algorithms.exposure.oversampled_incident_sky",
+            version=SKY_VERSION,
+        )
+        sky_prediction = sky_model.evaluate(
+            wavelength_bin_edges(wavelength), coefficients=fiber_illumination
+        )
         sky_subtracted = spectrum - sky_prediction
         residual = sky_subtracted[sky_mask.astype(bool)]
         residual_sigma = float(1.4826 * np.nanmedian(np.abs(residual - np.nanmedian(residual))))
-        prediction_artifact = self._request(
-            kind="fiber_sky_prediction", scope=Scope(zipcode=None, exposure_id=exposure_id, physical_scope=PhysicalScope.FIBER),
-            components={
-                "prediction": _component("prediction", sky_prediction.astype(np.float32), "electron", "fiber_by_dispersion_pixel"),
-                "fiber_identity": _component("fiber_identity", fiber_identity, "1", "none"),
-            },
-            parents=[int(incident_artifact.id), int(illumination_artifact.id)],
-            summaries={"prediction_median": float(np.nanmedian(sky_prediction))}, refs=exposure_refs,
-            algorithm="virusflow.algorithms.exposure.predict_sky", version=SKY_VERSION,
-        )
-        sky_subtracted_artifact = self._request(
-            kind="sky_subtracted_spectrum", scope=Scope(zipcode=None, exposure_id=exposure_id, physical_scope=PhysicalScope.FIBER),
-            components={
-                "spectrum": _component("spectrum", sky_subtracted.astype(np.float32), "electron", "fiber_by_dispersion_pixel"),
-                "variance": _component("variance", spectrum_variance.astype(np.float32), "electron2", "fiber_by_dispersion_pixel"),
-                "fiber_identity": _component("fiber_identity", fiber_identity, "1", "none"),
-            },
-            parents=[int(prediction_artifact.id), *extracted_artifacts, *variance_artifacts, *normalization_ids],
-            summaries={"sky_residual_robust_sigma": residual_sigma, "sky_fiber_count": int(sky_mask.sum())}, refs=exposure_refs,
-            algorithm="virusflow.algorithms.exposure.sky_subtract", version=SKY_VERSION,
-        )
 
         baseline_response = np.ones(sky_wave.shape, dtype=np.float32)
         baseline_artifact = self._request(
@@ -606,22 +575,58 @@ class ExposureTask(_SciencePublisher):
             algorithm="virusflow.algorithms.exposure.baseline_relative_response", version=BASELINE_RESPONSE_CONFIGURATION.version,
             status="warn", usability="degraded",
         )
-        baseline_native = predict_sky(wavelength, sky_wave, baseline_response)
-        final_response = baseline_native * fiber_illumination[:, None]
+        response_model = compact_fiber_response(
+            wavelength, within_response, amp_factors, fiber_illumination,
+            fiber_identity, knot_stride=int(self.params.get("response_knot_stride", 16)),
+        )
         response_artifact = self._request(
-            kind="final_exposure_response", scope=exposure_scope,
+            kind="fiber_response_model", scope=exposure_scope,
             components={
-                "response": _component("response", final_response.astype(np.float32), "1", "fiber_by_dispersion_pixel"),
-                "baseline_response": _component("baseline_response", baseline_response, "1", "wavelength_angstrom"),
-                "illumination_factor": _component("illumination_factor", fiber_illumination.astype(np.float32), "1", "none"),
+                "wavelength_knots": _component("wavelength_knots", response_model.wavelength_knots, "Angstrom", "wavelength_angstrom"),
+                "within_amp_knots": _component("within_amp_knots", response_model.within_amp_knots, "1", "wavelength_angstrom"),
+                "amplifier_factors": _component("amplifier_factors", amp_factors, "1", "none"),
+                "illumination_factors": _component("illumination_factors", fiber_illumination, "1", "none"),
                 "fiber_identity": _component("fiber_identity", fiber_identity, "1", "none"),
             },
-            parents=[int(baseline_artifact.id), int(illumination_artifact.id)],
+            parents=[int(baseline_artifact.id), int(illumination_artifact.id), int(amp_artifact.id), *sorted(set(normalization_parent_ids))],
             summaries={
-                "response_median": float(np.nanmedian(final_response)),
-                "response_outlier_fraction": float(np.mean(np.abs(final_response - np.nanmedian(final_response)) > 5 * np.nanstd(final_response))),
-            }, refs=exposure_refs, algorithm="virusflow.algorithms.exposure.final_response", version=RESPONSE_VERSION,
+                "response_median": float(np.nanmedian(fiber_illumination)),
+                "response_outlier_fraction": float(np.mean(np.abs(fiber_illumination - np.nanmedian(fiber_illumination)) > 5 * np.nanstd(fiber_illumination))),
+                "knot_count": int(response_model.wavelength_knots.shape[1]),
+            },
+            metadata={
+                "composition": ["baseline_relative_response", "within_amplifier_fiber_normalization", "amplifier_normalization", "exposure_illumination_correction"],
+                "interpolation": "linear_in_wavelength",
+            },
+            refs=exposure_refs, algorithm="virusflow.algorithms.exposure.final_response", version=RESPONSE_VERSION,
             status="warn", usability="degraded",
+        )
+        final_response = fiber_illumination[:, None]
+        calibrated_flux = sky_subtracted / final_response
+        calibrated_variance = spectrum_variance / np.square(final_response)
+        final_mask = np.zeros(calibrated_flux.shape, dtype=np.uint16)
+        final_mask[~np.isfinite(calibrated_flux) | ~np.isfinite(calibrated_variance) | ~np.isfinite(wavelength)] |= 1
+        final_mask[valid_fraction < 0.8] |= 2
+        calibrated_state = CalibratedFiberState(
+            exposure_id=exposure_id,
+            flux=(calibrated_flux * FLUX_SCALE).astype(np.float32),
+            variance=(calibrated_variance * VARIANCE_SCALE).astype(np.float32),
+            mask=final_mask,
+            wavelength=wavelength.astype(np.float32),
+            fiber_identity=fiber_identity.astype(np.int32),
+            sky_coordinates=np.column_stack((final_ra, final_dec)).astype(np.float64),
+            focal_plane_coordinates=focal.astype(np.float32),
+            model_artifact_ids=(
+                int(sky_model_artifact.id), int(response_artifact.id),
+                int(final_artifact.id), *tuple(sorted(set(reduction_parent_ids))),
+            ),
+            metadata={
+                "sky_residual_robust_sigma": residual_sigma,
+                "sky_evaluator_version": SKY_VERSION,
+                "pixel_integration": sky_model.integration_method,
+                "response_evidence_state": BASELINE_RESPONSE_CONFIGURATION.evidence_state,
+                "variance_terms": "extracted_statistical_only; sky-model and response-model covariance not yet added",
+            },
         )
 
         mode, effective_seconds, time_evidence = classify_mode_and_effective_time(
@@ -673,7 +678,7 @@ class ExposureTask(_SciencePublisher):
                 "coverage": _component("coverage", coverage_array, "1", "none"),
                 "amplifier_identity": _component("amplifier_identity", np.asarray(identities, dtype=np.int32), "1", "none"),
             },
-            parents=[int(sky_subtracted_artifact.id), int(response_artifact.id), int(effective_artifact.id), int(final_artifact.id)],
+            parents=[int(sky_model_artifact.id), int(response_artifact.id), int(effective_artifact.id), int(final_artifact.id)],
             summaries={
                 "raw_amplifier_count": len(zipcodes), "reduced_amplifier_count": int(coverage_array[:, 0].sum()),
                 "extracted_amplifier_count": int(coverage_array[:, 3].sum()),
@@ -684,7 +689,13 @@ class ExposureTask(_SciencePublisher):
                 "suspect_product_count": exposure_product_status["warn"] + exposure_product_status["unknown"],
                 "failed_product_count": exposure_product_status["fail"],
             },
-            metadata={"failures": failures, "zipcode_order": [zipcode.key() for zipcode in zipcodes], "coverage_columns": ["reduced", "trace", "wavelength", "extracted", "no_recorded_failure"]},
+            metadata={
+                "failures": failures,
+                "zipcode_order": [zipcode.key() for zipcode in zipcodes],
+                "coverage_columns": ["reduced", "trace", "wavelength", "extracted", "no_recorded_failure"],
+                "persistent_science_intermediates": [],
+                "scratch_cleanup": "in_memory_released_after_observation_assembly",
+            },
             refs=exposure_refs, algorithm="virusflow.tasks.exposure.ExposureTask", version=self.version,
             status=completion_status, usability=completion_usability,
         )
@@ -696,13 +707,12 @@ class ExposureTask(_SciencePublisher):
             "final_astrometry": final_artifact,
             "fiber_sky_coordinates": coordinates_artifact,
             "sky_fiber_mask": sky_mask_artifact,
-            "incident_sky_spectrum": incident_artifact,
-            "fiber_sky_prediction": prediction_artifact,
-            "sky_subtracted_spectrum": sky_subtracted_artifact,
+            "sky_model": sky_model_artifact,
             "baseline_relative_response": baseline_artifact,
             "exposure_illumination_correction": illumination_artifact,
-            "final_exposure_response": response_artifact,
+            "fiber_response_model": response_artifact,
             "exposure_mode_classification": mode_artifact,
             "effective_exposure_time": effective_artifact,
             "amp_to_amp_normalization": amp_artifact,
+            "calibrated_fiber_state": calibrated_state,
         }

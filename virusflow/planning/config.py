@@ -61,6 +61,7 @@ class NodeConfig:
 @dataclass(frozen=True)
 class PlanningConfig:
     version: int = 1
+    nworkers: Optional[int] = None
     nodes: Dict[str, NodeConfig] = field(default_factory=dict)
     edges: List[Edge] = field(default_factory=list)
 
@@ -180,7 +181,14 @@ def load_planning_config_from_dict(cfg: Mapping[str, Any]) -> PlanningConfig:
             raise ValueError(f"nodes.{kind} must be a mapping")
         nodes[kind] = _parse_node(kind, nd)
     edges = _parse_edges(cfg.get("edges"))
-    return PlanningConfig(version=version, nodes=nodes, edges=edges)
+    execution = cfg.get("execution") or {}
+    configured_workers = execution.get("nworkers") if isinstance(execution, Mapping) else None
+    if configured_workers is None:
+        configured_workers = cfg.get("nworkers")
+    nworkers = None if configured_workers is None else int(configured_workers)
+    if nworkers is not None and nworkers < 1:
+        raise ValueError("nworkers must be at least one")
+    return PlanningConfig(version=version, nworkers=nworkers, nodes=nodes, edges=edges)
 
 
 def load_planning_config(path: str) -> PlanningConfig:

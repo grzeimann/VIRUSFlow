@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from ..core.identity import ZipCode
 from ..ontology.relations import RelationKind
+from ..ontology.lifecycle import ArtifactLifecycle
 from ..ontology.scopes import PhysicalScope
 
 
@@ -84,6 +85,9 @@ class Artifact:
     relations: List[ArtifactRelation] = field(default_factory=list)
     revision: Optional[str] = None
     checksum: Optional[str] = None
+    lifecycle: ArtifactLifecycle = ArtifactLifecycle.CANONICAL
+    state: str = "active"
+    payload_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -106,3 +110,6 @@ class ArtifactDescription:
     relations: List[ArtifactRelation] = field(default_factory=list)
     revision: Optional[str] = None
     checksum: Optional[str] = None
+    lifecycle: ArtifactLifecycle = ArtifactLifecycle.CANONICAL
+    state: str = "active"
+    payload_bytes: int = 0
