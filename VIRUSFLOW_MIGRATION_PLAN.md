@@ -1,6 +1,6 @@
 # VIRUSFlow Migration Plan
 
-Status: Steps 1–7 complete and accepted on 2026-07-22. Step 8 is implemented and has passed its internal gate. Steps 9–10 remain authorized in the same autonomous tranche. Step 11 remains unauthorized.
+Status: Steps 1–7 are complete and accepted. Steps 8–10 are implemented and passed their internal scientific and verification gates on 2026-07-22. Step 11 remains unauthorized and unstarted.
 
 ## 1. Migration strategy
 

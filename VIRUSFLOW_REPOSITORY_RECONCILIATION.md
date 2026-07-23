@@ -1,6 +1,6 @@
 # VIRUSFlow Repository Reconciliation
 
-Status: authoritative reconciliation; Migration Plan Steps 1–7 are accepted and Step 8 is implemented with its internal gate passed. Steps 9–10 remain authorized as one autonomous tranche. Step 11 remains unauthorized and unstarted.
+Status: authoritative reconciliation; Migration Plan Steps 1–7 are accepted, and Steps 8–10 are implemented with their internal scientific and verification gates passed on 2026-07-22. Step 11 remains unauthorized and unstarted.
 
 ## 1. Evidence and decision rules
 
