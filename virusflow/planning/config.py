@@ -15,19 +15,21 @@ nodes:
     scope_mode: per_zipcode
     inputs_raw: ["zro"]
     cadence:
-      type: time
-      every_days: 30
-      min_n_inputs: 25
+      type: nightly
+      minimum_exposures: 1
   master_dark:
     cadence:
-      type: exposure_count
-      min_n: 20
-      max_span_days: 45
+      type: monthly
+      minimum_exposures: 1
 edges:
   - src: master_ldls
     dst: trace_map
     policy: latest_valid
     tolerance_days: 90
+  - src: master_hg
+    dst: master_arc
+    policy: nearest_valid
+    tolerance_days: 1
   - src: master_arc
     dst: wavelength_map
     policy: latest_valid
@@ -44,7 +46,7 @@ try:
 except Exception:  # pragma: no cover - yaml is an optional runtime dep but present in CLI env
     yaml = None  # type: ignore
 
-from .targets import TimeCadence, ExposureCountCadence, CadencePolicy
+from .targets import TimeCadence, ExposureCountCadence, PurposeCadence, CadencePolicy
 from .graph import TaskSpec, Edge
 
 
@@ -52,8 +54,11 @@ SUPPORTED_CALIBRATION_KINDS = frozenset({
     "master_bias",
     "master_dark",
     "master_ldls",
+    "master_hg",
+    "master_cd",
     "master_arc",
     "master_twilight",
+    "master_sci",
     "trace_map",
     "wavelength_map",
 })
@@ -141,6 +146,14 @@ def _parse_cadence(d: Mapping[str, Any] | None) -> Optional[CadencePolicy]:
         if min_n <= 0 or span <= 0:
             raise ValueError("exposure_count cadence requires min_n and max_span_days > 0")
         return ExposureCountCadence(min_n=min_n, max_span_days=span)
+    if t in {"purpose", "nightly", "rolling_24h", "monthly", "weekly", "isolated", "paired",
+             "observing_block", "dark_time"}:
+        policy = str(d.get("policy", t if t != "purpose" else "")).strip().lower()
+        if policy not in {"nightly", "rolling_24h", "monthly", "weekly", "isolated", "paired",
+                          "observing_block", "dark_time"}:
+            raise ValueError(f"purpose cadence requires a supported policy, got {policy!r}")
+        options = {str(key): value for key, value in d.items() if key not in {"type", "policy"}}
+        return PurposeCadence(policy, **options)
     raise ValueError(f"Unknown cadence type: {t!r}")
 
 

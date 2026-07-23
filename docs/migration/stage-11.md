@@ -19,11 +19,11 @@ run → ReductionGraph.plan → planning.schedule → PlanningExecutor
     → Task → algorithm → DefaultPublicationService → ArtifactService.persist_request
 ```
 
-Tasks and diagnostics load components through `ArtifactService.load_component`. The old `master_sci` stack was removed; science continues through the per-exposure reduction and complete-observation publication path. The only retained Artifact-name compatibility is `LEGACY_KIND_ALIASES`, explicitly limited to reading existing registries and locating migration candidates. It cannot publish new records.
+Tasks and diagnostics load components through `ArtifactService.load_component`. The old `master_sci` stack remains removed; the later cadence work reintroduced a new canonical calibration implementation through this same Task/algorithm/publication path, without reviving the deleted stack. Per-exposure science still continues through complete-observation publication. The only retained Artifact-name compatibility is `LEGACY_KIND_ALIASES`, explicitly limited to reading existing registries and locating migration candidates. It cannot publish new records.
 
 Execution defaults to four workers and progress enabled. Planning YAML execution fields are `nworkers`, `progress`, `progress_mode`, `progress_interval`, `progress_path`, and `max_retries`. Explicit CLI values override them; `--serial` forces one.
 
-Planning node and edge names must use the seven canonical calibration kinds. Dependencies have one configuration representation: explicit edges. The removed `preprocess_requires` and mapping-helper flags are not interpreted.
+Planning node and edge names must use canonical calibration kinds. The post-Phase-11 cadence implementation adds `master_hg`, `master_cd`, and `master_sci` while retaining `master_arc` as an explicitly composed Hg+Cd Product. Dependencies have one configuration representation: explicit edges. The removed `preprocess_requires` and mapping-helper flags are not interpreted.
 
 The stages 8–10 migration identifies active superseded dense kinds and old dense scattered-light representations. Dry-run inventory is the default:
 

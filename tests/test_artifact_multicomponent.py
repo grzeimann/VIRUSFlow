@@ -5,7 +5,7 @@ import numpy as np
 
 from virusflow.artifacts import ConfigurationReference, Scope, Validity
 from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
-from virusflow.artifacts.service import ArtifactLoadError, ArtifactService
+from virusflow.artifacts.service import ArtifactService
 from virusflow.config import CCD_TRANSFORM_CONFIGURATION, ConfigurationService, EFFECTIVE_EXPOSURE_POLICY
 from virusflow.core.identity import ZipCode
 from virusflow.persistence.policy import DefaultPersistencePolicy
@@ -106,6 +106,28 @@ def test_revision_uses_effective_inputs_and_configuration_not_nominal_validity(t
     assert same_computation.revision == first.revision
     assert changed_config.id != first.id
     assert changed_config.revision != first.revision
+
+
+def test_nearest_selection_prefers_closest_applicability_interval(tmp_path: Path):
+    svc = ArtifactService(str(tmp_path / "registry.sqlite"))
+    pub = DefaultPublicationService(
+        svc=svc, policy=DefaultPersistencePolicy(), base_dir=str(tmp_path / "products")
+    )
+    zc = ZipCode("013", "043", "412", "LL", "S_N_0021")
+    first = pub.publish([_request(
+        zc, validity=Validity(datetime(2026, 5, 1), datetime(2026, 6, 1)),
+        configuration_refs=[ConfigurationReference("gain", "1")],
+    )], _context())[0]
+    second = pub.publish([_request(
+        zc, validity=Validity(datetime(2026, 7, 1), datetime(2026, 8, 1)),
+        configuration_refs=[ConfigurationReference("gain", "2")],
+    )], _context())[0]
+    selected = svc.select_best(
+        kind="master_bias", scope=Scope(zc), at_time=datetime(2026, 6, 25),
+        policy="nearest",
+    )
+    assert int(selected["id"]) == int(second.id)
+    assert int(selected["id"]) != int(first.id)
 
 
 def test_configuration_baselines_preserve_unknown_and_provisional_evidence():

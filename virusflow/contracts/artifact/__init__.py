@@ -143,6 +143,44 @@ class MasterArcContract:
         )
 
 
+class MasterHgContract:
+    def spec(self) -> ArtifactContractSpec:
+        return ArtifactContractSpec(
+            kind="master_hg",
+            components=[LogicalComponentSpec(name="master_hg", model_type="array2d", required=True)],
+            applicability="Isolated mercury lamp calibration group",
+            validity_semantics="Paired by nearest temporal center within three hours",
+        )
+
+
+class MasterCdContract:
+    def spec(self) -> ArtifactContractSpec:
+        return ArtifactContractSpec(
+            kind="master_cd",
+            components=[LogicalComponentSpec(name="master_cd", model_type="array2d", required=True)],
+            applicability="Isolated cadmium lamp calibration group",
+            validity_semantics="Paired by nearest temporal center within three hours",
+        )
+
+
+class MasterSciContract:
+    def spec(self) -> ArtifactContractSpec:
+        return ArtifactContractSpec(
+            kind="master_sci",
+            components=[
+                LogicalComponentSpec(name="master_sci", model_type="array2d", required=True),
+                LogicalComponentSpec(
+                    name="fiber_wavelength_mask_support", model_type="array2d", required=True,
+                    description="Detector-coordinate robust scatter evidence for trace/wavelength projection",
+                ),
+            ],
+            summaries=["n_inputs", "robust_illumination", "finite_fraction"],
+            required_metadata=["calibration_group"],
+            applicability="Sufficient long-exposure science calibration group",
+            validity_semantics="Monthly, dark-time, or named observing block applicability",
+        )
+
+
 class MasterTwilightContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(

@@ -13,9 +13,10 @@ from virusflow.tasks.base import TaskContext
 from virusflow.tasks.mapping import default_kind_to_task
 
 
-def _seed(conn, zipcode, frame_type, count):
+def _seed(conn, zipcode, frame_type, count, *, lamp=None, exptime=30.0):
+    hour = {"zro": 0, "drk": 1, "flt": 2, "hg": 3, "cd": 4, "twi": 5, "sci": 6}[frame_type]
     for index in range(count):
-        exposure_id = f"20260609T{index:06d}_{frame_type}"
+        exposure_id = f"20260609T{hour:02d}{index // 60:02d}{index % 60:02d}.{index % 10}"
         conn.execute(
             "INSERT OR IGNORE INTO exposures(id, when_utc, frame_type) VALUES(?,?,?)",
             (exposure_id, "20260609", frame_type),
@@ -23,6 +24,10 @@ def _seed(conn, zipcode, frame_type, count):
         conn.execute(
             "INSERT INTO raw_files(exposure_id, frame_type, path, tar_member, storage_backend, amp_key) VALUES(?,?,?,?,?,?)",
             (exposure_id, frame_type, f"/{exposure_id}.fits", None, "filesystem", zipcode.key()),
+        )
+        conn.execute(
+            "INSERT INTO exposure_details(exposure_id,exptime,pexptime,lamp) VALUES(?,?,?,?)",
+            (exposure_id, exptime, exptime, lamp),
         )
 
 
@@ -34,17 +39,22 @@ class _Loader:
         return RawFrameData(data, header, path, tar_member)
 
 
-def test_canonical_graph_declares_raw_arc_and_trace_to_wavelength_dependency():
+def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
     nodes, edges = default_calibration_graph()
     by_kind = {node.kind: node for node in nodes}
     assert set(by_kind) == {
-        "master_bias", "master_dark", "master_ldls", "master_arc",
-        "master_twilight", "trace_map", "wavelength_map",
+        "master_bias", "master_dark", "master_ldls", "master_hg", "master_cd",
+        "master_arc", "master_twilight", "master_sci", "trace_map", "wavelength_map",
     }
-    assert by_kind["master_arc"].inputs_raw == ["cmp"]
-    assert not by_kind["master_arc"].inputs_artifacts
+    assert by_kind["master_hg"].inputs_raw == ["cmp", "hg"]
+    assert by_kind["master_cd"].inputs_raw == ["cmp", "cd"]
+    assert by_kind["master_arc"].inputs_raw is None
+    assert by_kind["master_arc"].inputs_artifacts == ["master_hg", "master_cd"]
+    assert by_kind["master_sci"].inputs_raw == ["sci"]
     assert {(edge.src.kind, edge.dst.kind) for edge in edges} >= {
         ("master_ldls", "trace_map"),
+        ("master_hg", "master_arc"),
+        ("master_cd", "master_arc"),
         ("master_arc", "wavelength_map"),
         ("trace_map", "wavelength_map"),
     }
@@ -60,8 +70,9 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
             "INSERT INTO amplifiers(key, ifuslot, ifuid, specid, amp, controller) VALUES(?,?,?,?,?,?)",
             (zipcode.key(), zipcode.ifuslot, zipcode.ifuid, zipcode.specid, zipcode.amp, zipcode.controller),
         )
-        for frame_type, count in (("zro", 25), ("drk", 20), ("flt", 30), ("cmp", 1), ("twi", 1)):
-            _seed(conn, zipcode, frame_type, count)
+        for frame_type, count in (("zro", 25), ("drk", 20), ("flt", 30), ("hg", 1), ("cd", 1), ("twi", 1)):
+            _seed(conn, zipcode, frame_type, count, lamp=frame_type if frame_type in {"hg", "cd"} else None)
+        _seed(conn, zipcode, "sci", 3, exptime=700.0)
 
     reference_dir = tmp_path / "Fiber_Locations" / "20260609"
     reference_dir.mkdir(parents=True)
@@ -151,9 +162,20 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
     assert {item["name"] for item in service.describe(rows["wavelength_map"])["components"]} == {
         "wavelength_map", "per_fiber_wavelength_residual_rms", "arc_identification"
     }
+    assert {item["name"] for item in service.describe(rows["master_sci"])["components"]} == {
+        "master_sci", "fiber_wavelength_mask_support"
+    }
+    arc_relations = service.describe(rows["master_arc"])["relations"]
+    assert {item["parent_id"] for item in arc_relations} == {
+        int(rows["master_hg"]["id"]), int(rows["master_cd"]["id"])
+    }
     trace_relations = service.describe(rows["trace_map"])["relations"]
     wave_relations = service.describe(rows["wavelength_map"])["relations"]
     assert {item["parent_id"] for item in trace_relations} == {int(rows["master_ldls"]["id"])}
     assert {item["parent_id"] for item in wave_relations} == {
         int(rows["master_arc"]["id"]), int(rows["trace_map"]["id"])
     }
+
+    rerun, rerun_report = graph.plan(db_path=database, scopes=[Scope(zipcode=zipcode)])
+    assert rerun == []
+    assert len(rerun_report.existing) == len(nodes)

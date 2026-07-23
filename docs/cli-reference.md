@@ -29,7 +29,7 @@ Run `virusflow COMMAND --help` or `virusflow COMMAND SUBCOMMAND --help` for auth
 
 Planning configuration supports the same values under `execution`: `nworkers`, `progress`, `progress_mode`, `progress_interval`, `progress_path`, and `max_retries`. CLI values override YAML.
 
-Planning YAML node and edge names must be canonical: `master_bias`, `master_dark`, `master_ldls`, `master_arc`, `master_twilight`, `trace_map`, and `wavelength_map`. The CLI does not expose task-class or task-version selection.
+Planning YAML node and edge names must be canonical: `master_bias`, `master_dark`, `master_ldls`, `master_hg`, `master_cd`, `master_arc`, `master_twilight`, `master_sci`, `trace_map`, and `wavelength_map`. Cadence types include `nightly`, `rolling_24h`, `monthly`, `weekly`, `isolated`, `paired`, `observing_block`, and `dark_time` through the purpose-policy interface. The CLI does not expose task-class or task-version selection. `--plan-only` writes exact membership, exclusions, sufficiency, temperature, pairing, applicability, computation identity, and downstream requesters; see [calibration cadence](calibration-cadence.md).
 
 See [performance.md](performance.md) for timing fields, controlled-comparison commands, measured regression findings, and current database boundaries.
 

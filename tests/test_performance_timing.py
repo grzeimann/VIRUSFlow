@@ -158,11 +158,10 @@ def test_saved_report_and_scientific_value_comparison():
     assert overhead["active_nanoseconds_per_phase"] >= 0
 
 
-def test_concurrent_exposures_singleflight_missing_calibrations(monkeypatch, tmp_path):
+def test_exposure_selection_does_not_construct_missing_calibrations(monkeypatch, tmp_path):
     import virusflow.tasks.exposure as exposure_module
 
-    calls = 0
-    published = {}
+    selections = 0
     state_lock = __import__("threading").Lock()
 
     class FakeService:
@@ -170,32 +169,13 @@ def test_concurrent_exposures_singleflight_missing_calibrations(monkeypatch, tmp
             self.adapter = self
 
         def select_best(self, *, kind, scope, at_time):
+            nonlocal selections
             with state_lock:
-                return published.get((kind, scope.zipcode.key()))
-
-        def get_row(self, artifact_id):
-            with state_lock:
-                return next(row for row in published.values() if row["id"] == artifact_id)
-
-    class FakeCalibration:
-        artifact_name = "master_bias"
-
-        def __init__(self, ctx, target):
-            self.target = target
-
-        def run(self, inputs):
-            nonlocal calls
-            time.sleep(0.02)
-            with state_lock:
-                calls += 1
-                artifact = SimpleNamespace(id=calls)
-                published[("master_bias", self.target.zipcode.key())] = {
-                    "id": artifact.id, "kind": "master_bias",
-                }
-            return {self.artifact_name: artifact}
+                selections += 1
+                return None
 
     monkeypatch.setattr(exposure_module, "ArtifactService", FakeService)
-    monkeypatch.setattr(exposure_module, "CALIBRATION_TASKS", ((FakeCalibration, "master_bias"),))
+    monkeypatch.setattr(exposure_module, "CALIBRATION_KINDS", ("master_bias",))
     zipcode = ZipCode("013", "043", "412", "LL", "S/N 0021")
     context = TaskContext(str(tmp_path / "registry.sqlite3"), str(tmp_path), {})
     task = ExposureTask(context, target=SimpleNamespace())
@@ -205,8 +185,10 @@ def test_concurrent_exposures_singleflight_missing_calibrations(monkeypatch, tmp
     ]
     with ThreadPoolExecutor(max_workers=3) as pool:
         results = list(pool.map(lambda at: task._ensure_calibrations([zipcode], at), instants))
-    assert calls == 1
-    assert all("master_bias" in result[0][zipcode.key()] for result in results)
+    assert selections == 3
+    assert all(result[0][zipcode.key()] == {} for result in results)
+    assert all("run 'virusflow run calibrations' first" in result[1][zipcode.key()][0]
+               for result in results)
 
 
 def test_interrupted_partial_report_is_writable(tmp_path: Path):

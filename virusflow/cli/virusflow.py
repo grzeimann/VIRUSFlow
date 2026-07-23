@@ -347,6 +347,8 @@ def _run_planned(args: argparse.Namespace) -> None:
                     "start": (ws.isoformat() if ws else None),
                     "end": (we.isoformat() if we else None),
                 } if window is not None else None,
+                "group_id": getattr(getattr(t, "group", None), "group_id", None),
+                "computation_identity": getattr(getattr(t, "group", None), "computation_id", None),
             }
         except Exception:
             return {"repr": repr(t)}
@@ -356,6 +358,9 @@ def _run_planned(args: argparse.Namespace) -> None:
         "existing": [_tgt(t) for t in report.existing],
         "skipped": [_tgt(t) for t in report.skipped],
         "reasons": report.reasons,
+        "cadence_groups": report.cadence_groups,
+        "grouping_exclusions": report.exclusions,
+        "lamp_pairs": report.lamp_pairs,
         "summary": {
             "n_planned": len(report.planned),
             "n_existing": len(report.existing),

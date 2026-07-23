@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 # Public planning interfaces
-from .targets import TemporalWindow, Target, CadencePolicy, TimeCadence, ExposureCountCadence
+from .targets import (
+    CalibrationGroup, CadencePolicy, ExposureCountCadence, PurposeCadence,
+    Target, TemporalWindow, TimeCadence,
+)
 from .graph import TaskSpec, Edge, PlanningReport, ReductionGraph
 from .defaults import default_calibration_graph
 from .config import (
@@ -21,6 +24,8 @@ __all__ = [
     "CadencePolicy",
     "TimeCadence",
     "ExposureCountCadence",
+    "PurposeCadence",
+    "CalibrationGroup",
     # adapter
     "PlanningTargetAdapter",
     "adapt_target",

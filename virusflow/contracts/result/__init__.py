@@ -75,3 +75,8 @@ class CmpResultContract(_BaseSimpleContract):
 
 class TwiResultContract(_BaseSimpleContract):
     required_arrays = ["master_twilight"]
+
+
+class MasterSciResultContract(_BaseSimpleContract):
+    required_arrays = ["master_sci", "fiber_wavelength_mask_support"]
+    required_scalars = ["n_inputs", "robust_illumination"]

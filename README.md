@@ -40,7 +40,7 @@ Execution uses four graph workers by default. Add `--serial` to a `run` command 
 
 Targets describe requested calibration, exposure, or observation work. Calibration execution has one path: `ReductionGraph.plan` builds Targets, `planning.schedule` creates dependencies, and `PlanningExecutor` runs each graph node once. Tasks load published inputs with `ArtifactService.load_component`, call deterministic algorithms, and publish through `DefaultPublicationService` to `ArtifactService.persist_request`. The service records components, checksums, dtype, shape, units, validity, producer, parents, QA, lifecycle, and state.
 
-New calibration plans and publications use only `master_bias`, `master_dark`, `master_ldls`, `master_arc`, `master_twilight`, `trace_map`, and `wavelength_map`. Deprecated names such as `master_flat`, `master_cmp`, `trace`, and `wave` are accepted only while reading or retiring old registry records; publication rejects them.
+Canonical calibration plans and publications use `master_bias`, `master_dark`, `master_ldls`, separate `master_hg` and `master_cd`, their composed `master_arc`, `master_twilight`, `master_sci`, `trace_map`, and `wavelength_map`. Deprecated names such as `master_flat`, `master_cmp`, `trace`, and `wave` are accepted only while reading or retiring old registry records; publication rejects them. Exact raw membership is resolved before deduplication; see [calibration cadence](docs/calibration-cadence.md).
 
 Storage has five deliberately distinct classes:
 
@@ -75,6 +75,7 @@ Cleanup commands inventory candidates by default. Scratch/cache deletion require
 ## Documentation
 
 - [Getting started](docs/getting-started.md)
+- [Calibration cadence and Master Science](docs/calibration-cadence.md)
 - [CLI reference](docs/cli-reference.md)
 - [Worked examples](docs/examples.md)
 - [Troubleshooting](docs/troubleshooting.md)

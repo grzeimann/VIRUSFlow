@@ -23,8 +23,11 @@ def test_canonical_calibration_kinds_and_legacy_aliases():
         "master_bias",
         "master_dark",
         "master_ldls",
+        "master_hg",
+        "master_cd",
         "master_arc",
         "master_twilight",
+        "master_sci",
         "trace_map",
         "wavelength_map",
     }

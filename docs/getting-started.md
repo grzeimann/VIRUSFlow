@@ -26,7 +26,7 @@ virusflow exposures --db ./run/registry.sqlite3 --limit 20
 virusflow config show --db ./run/registry.sqlite3 --workdir ./run/artifacts
 ```
 
-Planning YAML may override only the seven canonical calibration nodes and their explicit edges. Historical names (`master_flat`, `master_cmp`, `trace`, and `wave`) remain readable in old registries but cannot be used to create new plans or Products.
+Planning YAML may override only canonical calibration nodes and their explicit edges. These include separate Hg/Cd masters and canonical `master_sci`. Historical names (`master_flat`, `master_cmp`, `trace`, and `wave`) remain readable in old registries but cannot be used to create new plans or Products. Rescan an older registry once to backfill exposure time, lamp, ambient-temperature, and observing-block headers.
 
 ## Run work
 
@@ -34,8 +34,13 @@ Calibration planning and execution use scanned dates and ZipCodes:
 
 ```bash
 virusflow run calibrations --db ./run/registry.sqlite3 --workdir ./run/artifacts \
-  --start-date 20260609 --end-date 20260609
+  --start-date 20260609 --end-date 20260609 --plan-only
 ```
+
+Review `./run/artifacts/planning_report.yml`, then omit `--plan-only` to execute
+the exact inspected groups. The report includes members, exclusions, lamp
+pairing, temperature, exposure-time and `master_sci` sufficiency evidence. See
+[calibration cadence](calibration-cadence.md).
 
 Reduce one exposure:
 

@@ -357,7 +357,8 @@ class ArtifactService:
         at_time: Optional[datetime] = None,
         policy: str = "latest_valid",
     ) -> Optional[dict]:
-        at = None if policy == "latest" else at_time
+        nearest = policy in {"nearest", "nearest_valid"} and at_time is not None
+        at = None if policy == "latest" or nearest else at_time
         rows = []
         for candidate in kind_candidates(kind):
             rows.extend(self.adapter.find(kind=candidate, zipcode=(scope.zipcode if scope else None), at_time=at, limit=None))
@@ -374,6 +375,24 @@ class ArtifactService:
             ]
         if not rows:
             return None
+        if nearest:
+            def distance(row: dict) -> float:
+                start = _dt(row.get("validity_start"))
+                end = _dt(row.get("validity_end"))
+                if start is not None and at_time < start:
+                    return (start - at_time).total_seconds()
+                if end is not None and at_time > end:
+                    return (at_time - end).total_seconds()
+                if start is not None or end is not None:
+                    return 0.0
+                return float("inf")
+
+            rows.sort(key=lambda row: (
+                distance(row),
+                -(_dt(row.get("created_at")).timestamp() if _dt(row.get("created_at")) else 0.0),
+                -int(row.get("id") or 0),
+            ))
+            return self.adapter.get_row(int(rows[0]["id"])) or rows[0]
         rows.sort(key=lambda row: (str(row.get("created_at") or ""), int(row.get("id") or 0)), reverse=True)
         return self.adapter.get_row(int(rows[0]["id"])) or rows[0]
 

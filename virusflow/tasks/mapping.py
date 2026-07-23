@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Default mapping from planning kinds to task classes.
 
@@ -7,10 +5,15 @@ This utility lives in the tasks layer (not planning) to avoid introducing a
 reverse dependency from planning → tasks. Callers that want to run a plan can
 import this to obtain a baseline kind→task mapping.
 """
+
+from __future__ import annotations
 from typing import Dict, Type
 
 from .base import Task
-from .calibs import BiasTask, DarkTask, FlatTask, CmpTask, TraceTask, WaveTask, TwiTask
+from .calibs import (
+    ArcTask, BiasTask, CdTask, DarkTask, FlatTask, HgTask, MasterSciTask,
+    TraceTask, TwiTask, WaveTask,
+)
 
 
 def default_kind_to_task() -> Dict[str, Type[Task]]:
@@ -23,8 +26,11 @@ def default_kind_to_task() -> Dict[str, Type[Task]]:
         "master_bias": BiasTask,
         "master_dark": DarkTask,
         "master_ldls": FlatTask,
-        "master_arc": CmpTask,
+        "master_hg": HgTask,
+        "master_cd": CdTask,
+        "master_arc": ArcTask,
         "master_twilight": TwiTask,
+        "master_sci": MasterSciTask,
         "trace_map": TraceTask,
         "wavelength_map": WaveTask,
     }

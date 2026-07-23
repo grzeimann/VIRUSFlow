@@ -1,22 +1,17 @@
-from __future__ import annotations
-
 """Canonical full-width baseline reduction for one atomic VIRUS Exposure."""
 
-from datetime import datetime, timedelta
-import hashlib
-from pathlib import Path
-from threading import Lock
+from __future__ import annotations
+
+from datetime import datetime
 from types import SimpleNamespace
 from typing import Iterable
 
 import numpy as np
 
-from .calibs import BiasTask, CmpTask, DarkTask, FlatTask, TraceTask, TwiTask, WaveTask
 from .science import PhysicalCCDTask, ReducedScienceAmplifierTask, _SciencePublisher, _instant
 from ..algorithms.exposure import (
     ASTROMETRY_VERSION,
     CalibratedFiberState,
-    EXTRACTION_VERSION,
     LatentSkyModel,
     NORMALIZATION_VERSION,
     RESPONSE_VERSION,
@@ -30,7 +25,6 @@ from ..algorithms.exposure import (
     fit_catalog_astrometry,
     oversampled_incident_sky,
     parse_header_pointing,
-    predict_sky,
     select_sky_fibers,
     tan_fiber_coordinates,
     within_amplifier_normalization,
@@ -43,26 +37,15 @@ from ..artifacts.storage_conventions import FLUX_SCALE, VARIANCE_SCALE
 from ..config import ConfigurationService
 from ..config.defaults import BASELINE_RESPONSE_CONFIGURATION, EFFECTIVE_EXPOSURE_POLICY
 from ..io import PanSTARRSCSVProvider, RawFrameLoader
-from ..ontology.artifact_kinds import kind_spec
 from ..ontology.scopes import PhysicalScope
 from ..planning.targets import PhysicalCCDTarget
 
 
 AMP_CODE = {"LL": 0, "LU": 1, "RU": 2, "RL": 3}
-CALIBRATION_TASKS = (
-    (BiasTask, "master_bias"), (DarkTask, "master_dark"),
-    (FlatTask, "master_ldls"), (CmpTask, "master_arc"),
-    (TwiTask, "master_twilight"), (TraceTask, "trace_map"),
-    (WaveTask, "wavelength_map"),
+CALIBRATION_KINDS = (
+    "master_bias", "master_dark", "master_ldls", "master_arc",
+    "master_twilight", "trace_map", "wavelength_map",
 )
-_CALIBRATION_LOCKS: dict[tuple[str, str, str, str], Lock] = {}
-_CALIBRATION_LOCKS_GUARD = Lock()
-
-
-def _calibration_lock(database: str, date: str, zipcode: str, kind: str) -> Lock:
-    key = (str(Path(database).resolve()), str(date), str(zipcode), str(kind))
-    with _CALIBRATION_LOCKS_GUARD:
-        return _CALIBRATION_LOCKS.setdefault(key, Lock())
 
 
 def _component(name, value, units, coordinates, **metadata):
@@ -114,50 +97,21 @@ class ExposureTask(_SciencePublisher):
         from ..performance import phase
 
         service = ArtifactService(self.ctx.db_path)
-        date = at.strftime("%Y%m%d")
-        end = (at + timedelta(days=1)).strftime("%Y%m%d")
         available = {}
         failures = {}
-        reuse = bool(self.params.get("reuse_calibrations", True))
-        ordered = list(zipcodes)
-        if ordered:
-            # Concurrent dither exposures start in different deterministic parts
-            # of the focal plane.  This retains amplifier parallelism while the
-            # keyed single-flight locks prevent duplicate calibration work.
-            digest = hashlib.sha256(at.isoformat().encode("ascii")).digest()
-            start = int.from_bytes(digest[:4], "big") % len(ordered)
-            ordered = ordered[start:] + ordered[:start]
-        for zipcode in ordered:
-            target = SimpleNamespace(
-                zipcode=zipcode, start_date=date, end_date=end,
-                start_dt=datetime.strptime(date, "%Y%m%d"), end_dt=datetime.strptime(end, "%Y%m%d"),
-            )
+        for zipcode in zipcodes:
             kinds = {}
-            for task_type, kind in CALIBRATION_TASKS:
-                lock = _calibration_lock(self.ctx.db_path, date, zipcode.key(), kind)
-                try:
-                    with phase("calibration_singleflight_wait"):
-                        lock.acquire()
-                    try:
-                        existing = (
-                            service.select_best(
-                                kind=kind, scope=Scope(zipcode=zipcode), at_time=at
-                            )
-                            if reuse else None
-                        )
-                        if existing is not None:
-                            kinds[kind] = existing
-                            continue
-                        output = task_type(self.ctx, target=target).run({})
-                        artifact = output[task_type.artifact_name]
-                        kinds[kind] = service.adapter.get_row(int(artifact.id))
-                    finally:
-                        lock.release()
-                except Exception as exc:
-                    failures.setdefault(zipcode.key(), []).append(f"{kind}: {type(exc).__name__}: {exc}")
-                    # Trace failure necessarily prevents Wavelength; retain earlier detector calibrations.
-                    if kind == "trace_map":
-                        break
+            for kind in CALIBRATION_KINDS:
+                with phase("calibration_selection"):
+                    existing = service.select_best(
+                        kind=kind, scope=Scope(zipcode=zipcode), at_time=at
+                    )
+                if existing is None:
+                    failures.setdefault(zipcode.key(), []).append(
+                        f"{kind}: missing published calibration; run 'virusflow run calibrations' first"
+                    )
+                    continue
+                kinds[kind] = existing
             available[zipcode.key()] = kinds
         return available, failures
 

@@ -11,6 +11,9 @@ from ..contracts.artifact import (
     MasterBiasContract,
     MasterDarkContract,
     MasterLDLSContract,
+    MasterHgContract,
+    MasterCdContract,
+    MasterSciContract,
     MasterArcContract,
     MasterTwilightContract,
     TraceMapContract,
@@ -42,6 +45,9 @@ _KIND_TO_CONTRACT: Dict[str, ArtifactContract] = {
     "master_bias": MasterBiasContract(),
     "master_dark": MasterDarkContract(),
     "master_ldls": MasterLDLSContract(),
+    "master_hg": MasterHgContract(),
+    "master_cd": MasterCdContract(),
+    "master_sci": MasterSciContract(),
     "master_arc": MasterArcContract(),
     "master_twilight": MasterTwilightContract(),
     "trace_map": TraceMapContract(),
@@ -95,6 +101,11 @@ class DefaultPublicationService:
                 missing.append(c.name)
         if missing:
             raise ValueError(f"Missing required components for kind={req.kind}: {', '.join(missing)}")
+        missing_metadata = [name for name in spec.required_metadata if req.metadata.get(name) is None]
+        if missing_metadata:
+            raise ValueError(
+                f"Missing required metadata for kind={req.kind}: {', '.join(missing_metadata)}"
+            )
         # Model type checks (best-effort)
         for c in (spec.components or []):
             rc = req.get_component(c.name)

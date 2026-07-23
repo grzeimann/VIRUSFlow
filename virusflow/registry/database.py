@@ -7,8 +7,7 @@ import tarfile
 import time
 from threading import Lock
 from contextlib import contextmanager
-from dataclasses import asdict
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Set, Any
 
@@ -170,6 +169,11 @@ CREATE TABLE IF NOT EXISTS exposure_details (
     date TEXT,
     qra TEXT,
     qdec TEXT,
+    exptime REAL,           -- commanded/raw EXPTIME, seconds
+    ambient_temperature REAL,
+    object_name TEXT,
+    lamp TEXT,
+    observing_block TEXT,
     FOREIGN KEY(exposure_id) REFERENCES exposures(id)
 );
 
@@ -414,6 +418,18 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
             ):
                 if name not in component_columns:
                     conn.execute(f"ALTER TABLE artifact_components ADD COLUMN {name} {definition}")
+            exposure_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(exposure_details)").fetchall()
+            }
+            for name, definition in (
+                ("exptime", "REAL"),
+                ("ambient_temperature", "REAL"),
+                ("object_name", "TEXT"),
+                ("lamp", "TEXT"),
+                ("observing_block", "TEXT"),
+            ):
+                if name not in exposure_columns:
+                    conn.execute(f"ALTER TABLE exposure_details ADD COLUMN {name} {definition}")
         stat = path.stat()
         if not legacy_baseline_enabled():
             _INITIALIZED_DATABASES[resolved] = (int(stat.st_dev), int(stat.st_ino))
@@ -515,6 +531,43 @@ def _read_ifuslot_metadata_from_file(path: str) -> Dict[str, Optional[str]]:
         return {"ifuid": None, "specid": None, "controller": None}
 
 
+def _exposure_header_fields(hdr) -> Dict[str, Optional[str]]:
+    """Extract grouping metadata without interpreting cadence policy."""
+
+    ambient = next((hdr.get(key) for key in (
+        "AMBTEMP", "AMBIENT", "TAMBIENT", "TEMPAMB", "OUTTEMP"
+    ) if hdr.get(key) is not None), None)
+    lamp = next((hdr.get(key) for key in (
+        "LAMP", "LAMPNAME", "LAMPTYPE", "OBJECT", "QOBJECT"
+    ) if hdr.get(key) not in (None, "")), None)
+    block = next((hdr.get(key) for key in (
+        "OBSBLOCK", "BLOCKID", "OBSID", "QPROG"
+    ) if hdr.get(key) not in (None, "")), None)
+    return {
+        "qobject": hdr.get("QOBJECT"),
+        "qprog": hdr.get("QPROG"),
+        "pexptime": (str(hdr.get("PEXPTIME")) if hdr.get("PEXPTIME") is not None else None),
+        "exptime": (str(hdr.get("EXPTIME")) if hdr.get("EXPTIME") is not None else None),
+        "ambient_temperature": (str(ambient) if ambient is not None else None),
+        "object_name": hdr.get("OBJECT") or hdr.get("QOBJECT"),
+        "lamp": (str(lamp) if lamp is not None else None),
+        "observing_block": (str(block) if block is not None else None),
+        "date": hdr.get("DATE"),
+        "qra": hdr.get("QRA"),
+        "qdec": hdr.get("QDEC"),
+    }
+
+
+def _optional_float(value) -> Optional[float]:
+    if value in (None, "", "nan"):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if result == result else None
+
+
 def _read_exposure_header_fields_from_tar(tar_path: str, member_name: str) -> Dict[str, Optional[str]]:
     """Read selected exposure-level keywords from a FITS member inside a tar.
 
@@ -528,14 +581,7 @@ def _read_exposure_header_fields_from_tar(tar_path: str, member_name: str) -> Di
                 return {"qobject": None, "qprog": None, "pexptime": None, "date": None, "qra": None, "qdec": None}
             with fits.open(ef, memmap=False) as hdul:  # type: ignore[arg-type]
                 hdr = hdul[0].header
-                return {
-                    "qobject": hdr.get("QOBJECT"),
-                    "qprog": hdr.get("QPROG"),
-                    "pexptime": (str(hdr.get("PEXPTIME")) if hdr.get("PEXPTIME") is not None else None),
-                    "date": hdr.get("DATE"),
-                    "qra": hdr.get("QRA"),
-                    "qdec": hdr.get("QDEC"),
-                }
+                return _exposure_header_fields(hdr)
     except Exception:
         return {"qobject": None, "qprog": None, "pexptime": None, "date": None, "qra": None, "qdec": None}
 
@@ -544,14 +590,7 @@ def _read_exposure_header_fields_from_file(path: str) -> Dict[str, Optional[str]
     try:
         with fits.open(path, memmap=False) as hdul:
             hdr = hdul[0].header
-            return {
-                "qobject": hdr.get("QOBJECT"),
-                "qprog": hdr.get("QPROG"),
-                "pexptime": (str(hdr.get("PEXPTIME")) if hdr.get("PEXPTIME") is not None else None),
-                "date": hdr.get("DATE"),
-                "qra": hdr.get("QRA"),
-                "qdec": hdr.get("QDEC"),
-            }
+            return _exposure_header_fields(hdr)
     except Exception:
         return {"qobject": None, "qprog": None, "pexptime": None, "date": None, "qra": None, "qdec": None}
 
@@ -695,8 +734,11 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
             # Upsert into exposure_details; keep any pre-existing non-null values
             conn_.execute(
                 """
-                INSERT INTO exposure_details(exposure_id, tar_path, expnum, qobject, qprog, pexptime, date, qra, qdec)
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO exposure_details(
+                    exposure_id, tar_path, expnum, qobject, qprog, pexptime, date, qra, qdec,
+                    exptime, ambient_temperature, object_name, lamp, observing_block
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(exposure_id) DO UPDATE SET
                     tar_path=COALESCE(exposure_details.tar_path, excluded.tar_path),
                     expnum=COALESCE(exposure_details.expnum, excluded.expnum),
@@ -705,7 +747,12 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
                     pexptime=COALESCE(exposure_details.pexptime, excluded.pexptime),
                     date=COALESCE(exposure_details.date, excluded.date),
                     qra=COALESCE(exposure_details.qra, excluded.qra),
-                    qdec=COALESCE(exposure_details.qdec, excluded.qdec)
+                    qdec=COALESCE(exposure_details.qdec, excluded.qdec),
+                    exptime=COALESCE(exposure_details.exptime, excluded.exptime),
+                    ambient_temperature=COALESCE(exposure_details.ambient_temperature, excluded.ambient_temperature),
+                    object_name=COALESCE(exposure_details.object_name, excluded.object_name),
+                    lamp=COALESCE(exposure_details.lamp, excluded.lamp),
+                    observing_block=COALESCE(exposure_details.observing_block, excluded.observing_block)
                 """,
                 (
                     exposure_id,
@@ -713,10 +760,15 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
                     expnum,
                     hdr_fields.get("qobject"),
                     hdr_fields.get("qprog"),
-                    (float(hdr_fields["pexptime"]) if (hdr_fields.get("pexptime") not in (None, "", "nan")) else None),
+                    _optional_float(hdr_fields.get("pexptime")),
                     hdr_fields.get("date"),
                     hdr_fields.get("qra"),
                     hdr_fields.get("qdec"),
+                    _optional_float(hdr_fields.get("exptime")),
+                    _optional_float(hdr_fields.get("ambient_temperature")),
+                    hdr_fields.get("object_name"),
+                    hdr_fields.get("lamp"),
+                    hdr_fields.get("observing_block"),
                 ),
             )
             _POPULATED_EXPOSURE_DETAILS.add(exposure_id)
@@ -879,6 +931,71 @@ def list_raw_files_scoped(
             )
             out.append((int(r[0]), rf))
         return out
+
+
+def list_raw_files_by_ids(
+    raw_ids: Iterable[int], *, db_path: str = DEFAULT_DB_PATH
+) -> List[Tuple[int, RawFileId]]:
+    """Resolve an already-planned raw membership without re-querying a window."""
+
+    wanted = tuple(dict.fromkeys(int(value) for value in raw_ids))
+    if not wanted:
+        return []
+    placeholders = ",".join("?" for _ in wanted)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT rf.id, rf.exposure_id, rf.frame_type, rf.path, rf.tar_member, "
+            "rf.storage_backend, rf.amp_key, a.ifuslot, a.ifuid, a.specid, a.amp, "
+            "a.controller, tm.offset, tm.size FROM raw_files rf "
+            "LEFT JOIN amplifiers a ON rf.amp_key=a.key "
+            "LEFT JOIN tar_members tm ON tm.tar_path=rf.path AND tm.member=rf.tar_member "
+            f"WHERE rf.id IN ({placeholders})",
+            wanted,
+        ).fetchall()
+    by_id = {}
+    for row in rows:
+        zipcode = None
+        if row[7] is not None:
+            zipcode = ZipCode(row[7], row[8], row[9], row[10], row[11])
+        by_id[int(row[0])] = RawFileId(
+            exposure_id=row[1], frame_type=row[2], path=row[3], tar_member=row[4],
+            storage_backend=row[5], zipcode=zipcode,
+            archive_offset=row[12], archive_size=row[13],
+        )
+    missing = set(wanted) - set(by_id)
+    if missing:
+        raise KeyError(f"planned raw rows no longer exist: {sorted(missing)}")
+    return [(value, by_id[value]) for value in wanted]
+
+
+def list_calibration_grouping_rows(
+    *, db_path: str, zipcode: ZipCode, frame_types: Iterable[str],
+    start_date: Optional[str] = None, end_date: Optional[str] = None,
+) -> List[dict]:
+    """Return raw identities plus exposure metadata used only for grouping/reporting."""
+
+    types = tuple(dict.fromkeys(str(value).lower() for value in frame_types))
+    if not types:
+        return []
+    placeholders = ",".join("?" for _ in types)
+    sql = (
+        "SELECT rf.id AS raw_id, rf.exposure_id, lower(rf.frame_type) AS frame_type, "
+        "e.when_utc, d.exptime, d.pexptime, d.ambient_temperature, d.object_name, "
+        "d.qobject, d.lamp, d.observing_block, d.qprog "
+        "FROM raw_files rf JOIN exposures e ON e.id=rf.exposure_id "
+        "LEFT JOIN exposure_details d ON d.exposure_id=rf.exposure_id "
+        f"WHERE rf.amp_key=? AND lower(rf.frame_type) IN ({placeholders})"
+    )
+    params: List[object] = [zipcode.key(), *types]
+    if start_date:
+        sql += " AND substr(replace(e.when_utc,'-',''),1,8) >= ?"
+        params.append(_date8(start_date))
+    if end_date:
+        sql += " AND substr(replace(e.when_utc,'-',''),1,8) <= ?"
+        params.append(_date8(end_date))
+    sql += " ORDER BY rf.exposure_id, rf.id"
+    with connect(db_path) as conn:
+        return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
 
 
 def save_artifact(artifact, prov, db_path: str = DEFAULT_DB_PATH) -> int:

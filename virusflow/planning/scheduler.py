@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Thin scheduler for planned Targets.
 
@@ -13,8 +11,11 @@ Notes:
 - This keeps planning independent: no imports from algorithms/storage layers here.
 - Integration with CLI/executors is left to the runner; this module only assembles.
 """
+
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple, Optional
+from typing import Dict, List, Sequence, Tuple, Optional
 
 from .graph import TaskSpec, Edge
 from .targets import Target
@@ -77,7 +78,6 @@ def schedule(
     # Precompute topological order by kinds
     order = _topo_order_kinds(nodes, edges)
     # Group targets by kind then by a stable scope key
-    from ..artifacts.models import Scope  # type: ignore  # type only
     def _scope_key(t: Target) -> Tuple:
         z = getattr(t.scope, 'zipcode', None)
         if z is None:
@@ -90,14 +90,23 @@ def schedule(
         grouped[k].sort(key=_scope_key)
     # Map to scheduled tasks and compute intra-scope deps
     scheduled: List[ScheduledTask] = []
-    name_target_to_id: Dict[Tuple[str, Tuple], str] = {}
+    group_target_to_id: Dict[Tuple[str, str], str] = {}
+    scope_target_to_ids: Dict[Tuple[str, Tuple], List[str]] = {}
     def _make_node_id(t: Target) -> str:
         w = t.window
         ws = getattr(w, 'start', None)
         we = getattr(w, 'end', None)
         z = getattr(t.scope, 'zipcode', None)
         zkey = (z.ifuslot, z.ifuid, z.specid, z.amp, z.controller) if z is not None else (None,)
-        return f"{t.kind}:{':'.join(str(x) for x in zkey)}:{getattr(ws, 'isoformat', lambda: None)()}:{getattr(we, 'isoformat', lambda: None)()}"
+        group = getattr(t, "group", None)
+        identity = getattr(group, "computation_id", None)
+        return f"{t.kind}:{':'.join(str(x) for x in zkey)}:{identity or getattr(ws, 'isoformat', lambda: None)()}:{getattr(we, 'isoformat', lambda: None)()}"
+    for target in targets:
+        node_id = _make_node_id(target)
+        scope_k = _scope_key(target)
+        scope_target_to_ids.setdefault((target.kind, scope_k), []).append(node_id)
+        if target.group is not None:
+            group_target_to_id[(target.kind, target.group.group_id)] = node_id
     # Build in topo order by kinds
     for kind in order:
         for t in grouped.get(kind, []):
@@ -109,16 +118,24 @@ def schedule(
             else:
                 ctx = task_context_factory() if task_context_factory else None
                 tgt_for_task = target_adapter(t) if target_adapter else t
-                task_obj = task_cls(ctx, target=tgt_for_task)
+                task_obj = task_cls(
+                    ctx, target=tgt_for_task,
+                    params=dict(getattr(node_by_kind.get(kind), "params_schema", None) or {}),
+                )
             # Determine deps: for each incoming edge (src→dst with dst==kind), depend on src task of same scope
             deps_ids: List[str] = []
             scope_k = _scope_key(t)
-            for e in edges:
-                if e.dst.kind != kind:
-                    continue
-                dep_id = name_target_to_id.get((e.src.kind, scope_k))
-                if dep_id and dep_id not in deps_ids:
-                    deps_ids.append(dep_id)
+            if t.parent_groups:
+                for parent in t.parent_groups:
+                    dep_id = group_target_to_id.get(parent)
+                    if dep_id and dep_id not in deps_ids:
+                        deps_ids.append(dep_id)
+            else:
+                for e in edges:
+                    if e.dst.kind != kind:
+                        continue
+                    candidates = scope_target_to_ids.get((e.src.kind, scope_k), [])
+                    if len(candidates) == 1 and candidates[0] not in deps_ids:
+                        deps_ids.append(candidates[0])
             scheduled.append(ScheduledTask(id=node_id, kind=kind, task=task_obj, depends_on=deps_ids))
-            name_target_to_id[(kind, scope_k)] = node_id
     return scheduled

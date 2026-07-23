@@ -90,7 +90,7 @@ class CalibrationTask(Task):
         scope = Scope(zipcode=zipcode)
         row = svc.select_best(kind=kind, scope=scope, at_time=at_time, policy="latest_valid")
         if not row:
-            row = svc.select_best(kind=kind, scope=scope, at_time=None, policy="latest")
+            row = svc.select_best(kind=kind, scope=scope, at_time=at_time, policy="nearest")
         if not row:
             if required:
                 zkey = zipcode.key() if zipcode else "UNKNOWN"
@@ -105,15 +105,25 @@ class CalibrationTask(Task):
         if not self.frame_type:
             raise ValueError(f"{self.__class__.__name__}.frame_type is not set")
         with phase("raw_lookup"):
-            scoped = _db.list_raw_files_scoped(
-                frame_type=self.frame_type,
-                start_date=self.target.start_date,
-                end_date=self.target.end_date,
-                zipcode=getattr(self.target, "zipcode", None),
-                db_path=self.ctx.db_path,
-                start_time=getattr(self.target, "start_dt", None),
-                end_time=getattr(self.target, "end_dt", None),
-            )
+            planned_ids = tuple(getattr(self.target, "raw_ids", ()) or ())
+            if planned_ids:
+                scoped = _db.list_raw_files_by_ids(planned_ids, db_path=self.ctx.db_path)
+                wrong_scope = [
+                    raw.exposure_id for _, raw in scoped
+                    if raw.zipcode != getattr(self.target, "zipcode", None)
+                ]
+                if wrong_scope:
+                    raise RuntimeError(f"planned raw membership has wrong ZIP code: {wrong_scope}")
+            else:
+                scoped = _db.list_raw_files_scoped(
+                    frame_type=self.frame_type,
+                    start_date=self.target.start_date,
+                    end_date=self.target.end_date,
+                    zipcode=getattr(self.target, "zipcode", None),
+                    db_path=self.ctx.db_path,
+                    start_time=getattr(self.target, "start_dt", None),
+                    end_time=getattr(self.target, "end_dt", None),
+                )
         raw_inputs = [{
             "path": r.path, "tar_member": r.tar_member, "storage_backend": r.storage_backend,
             "archive_offset": r.archive_offset, "archive_size": r.archive_size,

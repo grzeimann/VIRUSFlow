@@ -15,6 +15,11 @@ virusflow model list --db ./run/registry.sqlite3 --state active
 virusflow qa list --db ./run/registry.sqlite3 --kind trace_map
 ```
 
+Inspect `planning_report.yml` before the second command. For a known unstable
+dark period, a planning YAML override may set `master_dark.cadence.type` to
+`weekly`; explicit dark-time intervals and `master_sci` sufficiency examples
+are in [calibration cadence](calibration-cadence.md).
+
 ## Single exposure
 
 ```bash

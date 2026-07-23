@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Default calibration reduction graph specification.
 
@@ -11,10 +9,12 @@ callers (CLI/scheduler) can map kinds to concrete task classes at run time if
 needed. For now we store a simple placeholder object in task_cls.
 """
 
+from __future__ import annotations
+
 from typing import List, Tuple
 
 from .graph import TaskSpec, Edge
-from .targets import TimeCadence, ExposureCountCadence
+from .targets import PurposeCadence
 from .config import PlanningConfig
 
 
@@ -26,11 +26,12 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
     """Build default calibration TaskSpec nodes and Edge list, optionally apply overrides.
 
     Canonical kinds and cadences:
-    - master_bias: TimeCadence(every_days=30, min_n_inputs=25), inputs_raw=["zro"]
-    - master_dark: ExposureCountCadence(min_n=20, max_span_days=45), inputs_raw=["drk"]
-    - master_ldls: ExposureCountCadence(min_n=30, max_span_days=30), inputs_raw=["flt"]
-    - master_arc: TimeCadence(every_days=90, min_n_inputs=1), inputs_raw=["cmp"]
-    - master_twilight: ExposureCountCadence(min_n=1, max_span_days=30), inputs_raw=["twi"]
+    - master_bias: nightly, all available frames
+    - master_dark: calendar-month groups (weekly is configurable)
+    - master_ldls: isolated <=3-hour groups with at least three exposures
+    - master_hg/master_cd: separate isolated <=3-hour groups, paired into master_arc
+    - master_twilight: weekly groups
+    - master_sci: eligible >300 s science in monthly groups, subject to sufficiency
     - trace_map: derived from master_ldls
     - wavelength_map: derived from master_arc + trace_map
 
@@ -44,7 +45,7 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         inputs_raw=["zro"],
         inputs_artifacts=None,
         scope_mode="per_zipcode",
-        cadence=TimeCadence(every_days=30, min_n_inputs=25),
+        cadence=PurposeCadence("nightly", minimum_exposures=1),
     )
     dark = TaskSpec(
         kind="master_dark",
@@ -52,7 +53,7 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         inputs_raw=["drk"],
         inputs_artifacts=None,
         scope_mode="per_zipcode",
-        cadence=ExposureCountCadence(min_n=20, max_span_days=45),
+        cadence=PurposeCadence("monthly", minimum_exposures=1),
     )
     flat = TaskSpec(
         kind="master_ldls",
@@ -60,15 +61,25 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         inputs_raw=["flt"],
         inputs_artifacts=None,
         scope_mode="per_zipcode",
-        cadence=ExposureCountCadence(min_n=30, max_span_days=30),
+        cadence=PurposeCadence("isolated", maximum_span_hours=3, minimum_exposures=3),
     )
-    cmpn = TaskSpec(
+    hg = TaskSpec(
+        kind="master_hg", task_cls=_TaskPlaceholder, inputs_raw=["cmp", "hg"],
+        inputs_artifacts=None, scope_mode="per_zipcode",
+        cadence=PurposeCadence("isolated", maximum_span_hours=3, minimum_exposures=1),
+    )
+    cd = TaskSpec(
+        kind="master_cd", task_cls=_TaskPlaceholder, inputs_raw=["cmp", "cd"],
+        inputs_artifacts=None, scope_mode="per_zipcode",
+        cadence=PurposeCadence("isolated", maximum_span_hours=3, minimum_exposures=1),
+    )
+    arc = TaskSpec(
         kind="master_arc",
         task_cls=_TaskPlaceholder,
-        inputs_raw=["cmp"],
-        inputs_artifacts=None,
+        inputs_raw=None,
+        inputs_artifacts=["master_hg", "master_cd"],
         scope_mode="per_zipcode",
-        cadence=TimeCadence(every_days=90, min_n_inputs=1),
+        cadence=PurposeCadence("paired", maximum_pair_separation_hours=3.0),
     )
     twilight = TaskSpec(
         kind="master_twilight",
@@ -76,7 +87,15 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         inputs_raw=["twi"],
         inputs_artifacts=None,
         scope_mode="per_zipcode",
-        cadence=ExposureCountCadence(min_n=1, max_span_days=30),
+        cadence=PurposeCadence("weekly", minimum_exposures=1),
+    )
+    master_sci = TaskSpec(
+        kind="master_sci", task_cls=_TaskPlaceholder, inputs_raw=["sci"],
+        inputs_artifacts=None, scope_mode="per_zipcode",
+        cadence=PurposeCadence(
+            "monthly", minimum_exposure_seconds=300.0, minimum_exposures=3,
+            minimum_total_exposure_seconds=1800.0,
+        ),
     )
     trace = TaskSpec(
         kind="trace_map",
@@ -95,12 +114,14 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         cadence=None,
     )
 
-    nodes = [bias, dark, flat, cmpn, twilight, trace, wave]
+    nodes = [bias, dark, flat, hg, cd, arc, twilight, master_sci, trace, wave]
 
     # Edges (base)
     edges: List[Edge] = [
         Edge(src=flat, dst=trace, policy="latest_valid", tolerance_days=90),
-        Edge(src=cmpn, dst=wave, policy="latest_valid", tolerance_days=90),
+        Edge(src=hg, dst=arc, policy="nearest_valid", tolerance_days=1),
+        Edge(src=cd, dst=arc, policy="nearest_valid", tolerance_days=1),
+        Edge(src=arc, dst=wave, policy="latest_valid", tolerance_days=90),
         Edge(src=trace, dst=wave, policy="latest_valid", tolerance_days=90),
     ]
 

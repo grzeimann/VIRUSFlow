@@ -7,10 +7,12 @@ import numpy as np
 from .base import CalibrationTask
 from ..algorithms.bias import step_bias
 from ..algorithms.cmp import step_cmp
+from ..algorithms.arc import compose_master_arc
 from ..algorithms.dark import step_dark
 from ..algorithms.flat import step_flt
 from ..algorithms.trace import fit_fiber_traces
 from ..algorithms.twi import step_twi
+from ..algorithms.master_sci import build_master_sci
 from ..algorithms.wave import fit_wavelength_solution
 from ..artifacts import ArtifactService, Scope
 from ..artifacts.models import ConfigurationReference
@@ -24,6 +26,7 @@ from ..contracts.result import (
     TraceResultContract,
     TwiResultContract,
     WaveResultContract,
+    MasterSciResultContract,
 )
 from ..core.algo_result import AlgoResult, ensure_algo_result
 from ..ontology.artifact_kinds import kind_spec
@@ -41,6 +44,18 @@ class _CanonicalTask(CalibrationTask):
     result_contract: Type = object
     component_map: Dict[str, str] = {}
     algorithm_name: str = ""
+
+    @staticmethod
+    def _dependency(inputs, kind: str):
+        """Return the exact artifact produced by a scheduled prerequisite."""
+
+        for value in (inputs or {}).values():
+            if not isinstance(value, dict):
+                continue
+            artifact = value.get(kind)
+            if artifact is not None:
+                return artifact
+        return None
 
     def _params(self) -> dict:
         params = dict(self.params or {})
@@ -78,7 +93,11 @@ class _CanonicalTask(CalibrationTask):
             kind=self.artifact_name,
             components=components,
             summaries=summaries,
-            metadata={"n_inputs": summaries.get("n_inputs", 0)},
+            metadata={
+                "n_inputs": summaries.get("n_inputs", 0),
+                "calibration_group_id": getattr(self.target, "group_id", None),
+                "calibration_group": getattr(self.target, "group_metadata", None),
+            },
             scope=Scope(zipcode=self.target.zipcode),
             parents=parent_ids,
             validity=self.target_validity(),
@@ -107,6 +126,9 @@ class _CanonicalTask(CalibrationTask):
 class _RawCalibrationTask(_CanonicalTask):
     combine_method = "unspecified"
 
+    def validate_scientific_result(self, result: AlgoResult) -> None:
+        return None
+
     def run(self, inputs):
         from ..performance import current_task_timing, phase
 
@@ -130,6 +152,7 @@ class _RawCalibrationTask(_CanonicalTask):
         report = self.result_contract().validate(result)
         if not report.ok:
             raise ValueError(f"{self.__class__.__name__} result contract: {'; '.join(report.errors)}")
+        self.validate_scientific_result(result)
         artifact = self._publish(result, parent_ids)
         return {self.artifact_name: artifact}
 
@@ -184,6 +207,80 @@ class CmpTask(_RawCalibrationTask):
     component_map = {"master_comparison_lamp": "master_arc"}
     combine_method = "chunked fixed-center biweight_location"
 
+
+class HgTask(CmpTask):
+    name = "hg"
+    artifact_name = "master_hg"
+    component_map = {"master_comparison_lamp": "master_hg"}
+
+
+class CdTask(CmpTask):
+    name = "cd"
+    artifact_name = "master_cd"
+    component_map = {"master_comparison_lamp": "master_cd"}
+
+
+class ArcTask(_CanonicalTask):
+    name = "arc"
+    version = "v2"
+    artifact_name = "master_arc"
+    algorithm_name = "virusflow.algorithms.arc.compose_master_arc"
+    result_kind = "cmp"
+    result_contract = CmpResultContract
+    component_map = {"master_comparison_lamp": "master_arc"}
+
+    def run(self, inputs):
+        self._require_target()
+        service = ArtifactService(self.ctx.db_path)
+        hg = self._dependency(inputs, "master_hg") or self._resolve_artifact("master_hg", required=True)
+        cd = self._dependency(inputs, "master_cd") or self._resolve_artifact("master_cd", required=True)
+        hg_id = int(hg.id) if hasattr(hg, "id") else int(hg["id"])
+        cd_id = int(cd.id) if hasattr(cd, "id") else int(cd["id"])
+        result = compose_master_arc(
+            service.load_component(hg_id, "master_hg")["data"],
+            service.load_component(cd_id, "master_cd")["data"],
+        )
+        report = self.result_contract().validate(result)
+        if not report.ok:
+            raise ValueError("ArcTask result contract: " + "; ".join(report.errors))
+        artifact = self._publish(result, [hg_id, cd_id])
+        return {self.artifact_name: artifact}
+
+
+class MasterSciTask(_RawCalibrationTask):
+    name = "master_sci"
+    version = "v1"
+    frame_type = "sci"
+    artifact_name = "master_sci"
+    algorithm = staticmethod(build_master_sci)
+    algorithm_name = "virusflow.algorithms.master_sci.build_master_sci"
+    result_kind = "master_sci"
+    result_contract = MasterSciResultContract
+    component_map = {
+        "master_sci": "master_sci",
+        "fiber_wavelength_mask_support": "fiber_wavelength_mask_support",
+    }
+    combine_method = "chunked fixed-center biweight_location + fractional MAD support"
+
+    def validate_scientific_result(self, result: AlgoResult) -> None:
+        metadata = getattr(self.target, "group_metadata", None) or {}
+        grouping = metadata.get("grouping_configuration") or {}
+        sufficiency = metadata.setdefault("sufficiency", {})
+        measured = float(result.scalars["robust_illumination"])
+        minimum = grouping.get("minimum_robust_illumination")
+        illumination_ok = minimum is None or measured >= float(minimum)
+        sufficiency.update({
+            "measured_robust_illumination": measured,
+            "illumination_measurement_pending": False,
+            "illumination_sufficient": illumination_ok,
+        })
+        sufficiency["sufficient"] = bool(sufficiency.get("sufficient", True) and illumination_ok)
+        if not illumination_ok:
+            raise RuntimeError(
+                "master_sci insufficient robust illumination: "
+                f"measured={measured}, minimum={float(minimum)}"
+            )
+
 class TwiTask(_RawCalibrationTask):
     name = "twi"
     version = "v2"
@@ -217,8 +314,9 @@ class TraceTask(_CanonicalTask):
 
         self._require_target()
         service = ArtifactService(self.ctx.db_path)
-        parent = self._resolve_artifact("master_ldls", required=True)
-        master = service.load_component(parent, "master_ldls")["data"]
+        parent = self._dependency(inputs, "master_ldls") or self._resolve_artifact("master_ldls", required=True)
+        parent_id = int(parent.id) if hasattr(parent, "id") else int(parent["id"])
+        master = service.load_component(parent_id, "master_ldls")["data"]
         root = self.ctx.config.get("configuration_root") if isinstance(self.ctx.config, dict) else None
         config = ConfigurationService(root=root)
         reference, trace_ref = config.resolve_trace_reference(
@@ -234,7 +332,7 @@ class TraceTask(_CanonicalTask):
         if not report.ok:
             raise ValueError("TraceTask result contract: " + "; ".join(report.errors))
         refs = self.configuration_references() + [trace_ref]
-        artifact = self._publish(result, [int(parent["id"])], configuration_refs=refs)
+        artifact = self._publish(result, [parent_id], configuration_refs=refs)
         return {self.artifact_name: artifact}
 
 
@@ -256,10 +354,12 @@ class WaveTask(_CanonicalTask):
     def run(self, inputs):
         self._require_target()
         service = ArtifactService(self.ctx.db_path)
-        arc_row = self._resolve_artifact("master_arc", required=True)
-        trace_row = self._resolve_artifact("trace_map", required=True)
-        arc = service.load_component(arc_row, "master_arc")["data"]
-        trace = service.load_component(trace_row, "fiber_trace_map")["data"]
+        arc_row = self._dependency(inputs, "master_arc") or self._resolve_artifact("master_arc", required=True)
+        trace_row = self._dependency(inputs, "trace_map") or self._resolve_artifact("trace_map", required=True)
+        arc_id = int(arc_row.id) if hasattr(arc_row, "id") else int(arc_row["id"])
+        trace_id = int(trace_row.id) if hasattr(trace_row, "id") else int(trace_row["id"])
+        arc = service.load_component(arc_id, "master_arc")["data"]
+        trace = service.load_component(trace_id, "fiber_trace_map")["data"]
 
         mask = None
         masks = []
@@ -310,6 +410,6 @@ class WaveTask(_CanonicalTask):
             mask_policy.kind, mask_policy.version, self.target.zipcode.key(), mask_policy.evidence_state
         )]
         artifact = self._publish(
-            result, [int(arc_row["id"]), int(trace_row["id"])], configuration_refs=refs
+            result, [arc_id, trace_id], configuration_refs=refs
         )
         return {self.artifact_name: artifact}

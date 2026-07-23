@@ -61,7 +61,7 @@ def _seed_artifact(conn, *, kind: str, z: ZipCode, created_at: datetime, vstart:
     return db.save_artifact(art, prov, db_path=conn.execute("PRAGMA database_list").fetchone()[2])
 
 
-def test_planner_idempotent_skip_with_existing_artifact(tmp_path: Path):
+def test_planner_does_not_hide_distinct_inputs_behind_nominally_valid_artifact(tmp_path: Path):
     db_path = str(tmp_path / "test2.sqlite3")
     db.init_db(db_path=db_path)
     # Prepare zipcode and enough raw zero frames to satisfy TimeCadence min_n_inputs=25
@@ -82,9 +82,7 @@ def test_planner_idempotent_skip_with_existing_artifact(tmp_path: Path):
     scopes = [Scope(zipcode=z)]
     planned, report = G.plan(db_path=db_path, scopes=scopes)
 
-    # Since an existing master_bias is present and time-cadence emits an open window, planner should mark it as existing/skip
-    existing_keys = set()
-    for t in report.existing:
-        if t.kind == "master_bias":
-            existing_keys.add(t.kind)
-    assert "master_bias" in existing_keys or all(t.kind != "master_bias" for t in report.planned)
+    # A nominally valid legacy artifact without the same raw-parent identity
+    # cannot suppress a scientifically distinct nightly group.
+    assert any(t.kind == "master_bias" for t in report.planned)
+    assert all(t.kind != "master_bias" for t in report.existing)
