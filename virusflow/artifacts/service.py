@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, Optional
 
 import numpy as np
 
+from ..core.pathutils import sanitize_for_filename
 from ..ontology.artifact_kinds import (
     LEGACY_KIND_ALIASES,
     canonical_kind,
@@ -135,10 +136,10 @@ class ArtifactService:
             validity = Validity(scope.start_time, scope.end_time, validity.policy)
         scope_parts = []
         if scope.zipcode is not None:
-            scope_parts.append(scope.zipcode.key())
+            scope_parts.append(sanitize_for_filename(scope.zipcode.key()))
         for value in (scope.exposure_id, scope.observation_id, scope.dither_set_id):
             if value:
-                scope_parts.append(str(value))
+                scope_parts.append(sanitize_for_filename(str(value)))
         scope_token = "__".join(scope_parts) or "global"
         validity_token = "open"
         if validity.start is not None or validity.end is not None:
@@ -147,7 +148,7 @@ class ArtifactService:
             validity_token = f"{start}_{end}"
         tokens = {
             "kind": kind,
-            "scope": scope_token.replace("/", "_"),
+            "scope": scope_token,
             "validity": validity_token,
             "revision": "pending",
         }

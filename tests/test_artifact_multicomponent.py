@@ -47,11 +47,14 @@ def test_multicomponent_roundtrip_validity_revision_checksum_and_lineage(tmp_pat
     db.init_db(str(database))
     svc = ArtifactService(str(database))
     pub = DefaultPublicationService(svc=svc, policy=DefaultPersistencePolicy(), base_dir=str(tmp_path / "products"))
-    zc = ZipCode("013", "043", "412", "LL", "S_N_0021")
+    zc = ZipCode("013", "043", "412", "RU", "S_N 0021")
 
     first = pub.publish([_request(zc)], _context())[0]
     second = pub.publish([_request(zc, [first.id])], _context([first.id]))[0]
 
+    scope_folder = Path(first.storage.uri).relative_to(tmp_path / "products").parts[1]
+    assert scope_folder == "013_043_412_RU_S_N_0021"
+    assert first.scope.zipcode.key() == "013+043+412+RU+S_N 0021"
     assert first.storage.uri != second.storage.uri
     assert first.revision != second.revision
     assert first.checksum and second.checksum
