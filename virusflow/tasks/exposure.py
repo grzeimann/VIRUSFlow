@@ -178,8 +178,12 @@ class ExposureTask(_SciencePublisher):
         config = ConfigurationService(root=config_root)
         fplane_path = self.ctx.config.get("fplane_path") if isinstance(self.ctx.config, dict) else None
         fplane, fplane_ref = config.resolve_fplane(fplane_path)
-        fiber_offsets, fiber_ref = config.fiber_offsets()
-        exposure_refs = config.exposure_references() + [fplane_ref, fiber_ref]
+        fiber_offsets_by_ifuid = {}
+        fiber_refs = []
+        for ifuid in sorted({zipcode.ifuid for zipcode in zipcodes}):
+            fiber_offsets_by_ifuid[ifuid], fiber_ref = config.fiber_offsets(ifuid)
+            fiber_refs.append(fiber_ref)
+        exposure_refs = config.exposure_references() + [fplane_ref, *fiber_refs]
 
         calibration, failures = self._ensure_calibrations(zipcodes, at)
         complete_calibration_keys = {
@@ -378,7 +382,7 @@ class ExposureTask(_SciencePublisher):
             valid_rows = item["valid_wavelength_rows"]
             original_fiber_indices = np.flatnonzero(valid_rows)
             n_fiber = original_fiber_indices.size
-            local = fiber_offsets[zipcode.amp]
+            local = fiber_offsets_by_ifuid[zipcode.ifuid][zipcode.amp]
             fp_x, fp_y = fplane[zipcode.ifuslot]
             focal = local[valid_rows] + np.asarray([fp_x, fp_y])
             identities = np.column_stack((

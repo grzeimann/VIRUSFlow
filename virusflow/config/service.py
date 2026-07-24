@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
-from pathlib import Path
+from functools import lru_cache
 import hashlib
-from typing import Iterable, List, Optional, Tuple
+from pathlib import Path
+from typing import List, Tuple
 
 import numpy as np
 
@@ -18,6 +19,30 @@ from .defaults import (
     BASELINE_RESPONSE_CONFIGURATION,
     FIBER_GEOMETRY_CONFIGURATION,
 )
+
+
+@lru_cache(maxsize=None)
+def _load_fiber_position_table(
+    path: Path,
+    usecols: tuple[int, ...],
+    skiprows: int,
+    expected_shape: tuple[int, int],
+) -> np.ndarray:
+    """Load and retain an immutable authoritative fiber-position table."""
+
+    if not path.is_file():
+        raise FileNotFoundError(f"VIRUS fiber-position configuration not found: {path}")
+    table = np.asarray(
+        np.loadtxt(path, usecols=usecols, skiprows=skiprows),
+        dtype=float,
+    )
+    if table.shape != expected_shape:
+        raise ValueError(
+            f"VIRUS fiber-position configuration {path} has shape {table.shape}; "
+            f"expected {expected_shape}"
+        )
+    table.setflags(write=False)
+    return table
 
 
 class ConfigurationService:
@@ -91,37 +116,108 @@ class ConfigurationService:
             identity=str(selected.name), evidence_state="verified",
         )
 
-    def fiber_offsets(self) -> Tuple[dict[str, np.ndarray], ConfigurationReference]:
-        """Return the explicit versioned baseline 448-fiber local IFU geometry."""
-
+    def _corrected_fiber_position_table(self, ifuid: str) -> tuple[np.ndarray, str]:
         config = FIBER_GEOMETRY_CONFIGURATION
-        columns = int(config.value["columns"])
-        rows = int(config.value["rows"])
-        separation = float(config.value["fiber_separation_arcsec"])
-        points = []
-        for column in range(columns):
-            x = (column - (columns - 1) / 2.0) * separation
-            for row in range(rows):
-                y = (row - (rows - 1) / 2.0) * separation * np.sqrt(3.0) / 2.0
-                y += (column % 2) * separation * np.sqrt(3.0) / 4.0
-                points.append((x, y))
-        geometry = np.asarray(points, dtype=float)
-        remove = int(config.value["remove_outermost"])
-        keep = np.argsort(np.sum(np.square(geometry), axis=1))[: geometry.shape[0] - remove]
-        geometry = geometry[np.sort(keep)]
-        if geometry.shape != (448, 2):
-            raise RuntimeError(f"configured fiber geometry has unexpected shape {geometry.shape}")
-        by_amp = {}
-        for index, amp in enumerate(config.value["amplifier_order"]):
-            by_amp[str(amp)] = geometry[index * 112 : (index + 1) * 112].copy()
-        return by_amp, ConfigurationReference(
-            config.kind, config.version, identity="VIRUS-448", evidence_state=config.evidence_state
+        values = config.value
+        ifuid_text = str(ifuid).strip()
+        if not ifuid_text.isdigit() or len(ifuid_text) > 3:
+            raise ValueError(f"Invalid VIRUS IFUID {ifuid!r}; expected one to three digits")
+        normalized_ifuid = ifuid_text.zfill(3)
+        source = values["alternate_sources"].get(normalized_ifuid, values["default_source"])
+        path = self.root / values["directory"] / source
+        base = _load_fiber_position_table(
+            path,
+            tuple(values["load_usecols"]),
+            int(values["skiprows"]),
+            tuple(values["table_shape"]),
         )
+
+        # Every IFU-specific operation is made on a working copy. The cached
+        # source table remains immutable and can safely serve later IFUs.
+        table = base.copy()
+        reversal = values["right_side_reversals"].get(normalized_ifuid)
+        if reversal is not None:
+            start, stop = map(int, reversal)
+            if not 0 <= start < stop <= table.shape[0]:
+                raise ValueError(
+                    f"Invalid fiber-position reversal {reversal} for IFU {normalized_ifuid}"
+                )
+            table[start:stop] = table[start:stop][::-1].copy()
+
+        coordinate_start, coordinate_stop = map(int, values["coordinate_columns"])
+        for first, second in values["coordinate_swaps"].get(normalized_ifuid, ()):
+            if not 0 <= int(first) < table.shape[0] or not 0 <= int(second) < table.shape[0]:
+                raise ValueError(
+                    f"Invalid fiber-position coordinate swap {(first, second)} "
+                    f"for IFU {normalized_ifuid}"
+                )
+            coordinates = table[[int(first), int(second)], coordinate_start:coordinate_stop].copy()
+            table[int(first), coordinate_start:coordinate_stop] = coordinates[1]
+            table[int(second), coordinate_start:coordinate_stop] = coordinates[0]
+        return table, normalized_ifuid
+
+    @staticmethod
+    def _fiber_geometry_reference(ifuid: str) -> ConfigurationReference:
+        config = FIBER_GEOMETRY_CONFIGURATION
+        return ConfigurationReference(
+            config.kind,
+            config.version,
+            identity=f"IFUID:{ifuid}",
+            evidence_state=config.evidence_state,
+        )
+
+    def fiber_positions(
+        self, ifuid: str, amplifier: str
+    ) -> Tuple[np.ndarray, ConfigurationReference]:
+        """Return calibrated IFU coordinates in extracted-spectrum order."""
+
+        values = FIBER_GEOMETRY_CONFIGURATION.value
+        amp = str(amplifier).upper()
+        if amp not in values["amplifier_slices"]:
+            recognized = ", ".join(values["amplifier_slices"])
+            raise ValueError(f"Unknown VIRUS amplifier {amplifier!r}; expected one of {recognized}")
+        table, normalized_ifuid = self._corrected_fiber_position_table(ifuid)
+        start, stop = map(int, values["amplifier_slices"][amp])
+        if not 0 <= start < stop <= table.shape[0]:
+            raise ValueError(f"Invalid fiber-position slice {(start, stop)} for amplifier {amp}")
+        coordinate_start, coordinate_stop = map(int, values["coordinate_columns"])
+        positions = table[start:stop, coordinate_start:coordinate_stop]
+        if values["reverse_for_extracted_spectrum_order"]:
+            positions = positions[::-1]
+        positions = positions.copy()
+        if positions.shape != (112, 2):
+            raise ValueError(
+                f"Fiber positions for IFU {normalized_ifuid} amplifier {amp} "
+                f"have shape {positions.shape}; expected (112, 2)"
+            )
+        return positions, self._fiber_geometry_reference(normalized_ifuid)
+
+    def fiber_offsets(
+        self, ifuid: str
+    ) -> Tuple[dict[str, np.ndarray], ConfigurationReference]:
+        """Return calibrated positions for every amplifier of one VIRUS IFU."""
+
+        table, normalized_ifuid = self._corrected_fiber_position_table(ifuid)
+        values = FIBER_GEOMETRY_CONFIGURATION.value
+        coordinate_start, coordinate_stop = map(int, values["coordinate_columns"])
+        by_amp: dict[str, np.ndarray] = {}
+        for amp, bounds in values["amplifier_slices"].items():
+            start, stop = map(int, bounds)
+            if not 0 <= start < stop <= table.shape[0]:
+                raise ValueError(f"Invalid fiber-position slice {bounds} for amplifier {amp}")
+            positions = table[start:stop, coordinate_start:coordinate_stop]
+            if values["reverse_for_extracted_spectrum_order"]:
+                positions = positions[::-1]
+            by_amp[str(amp)] = positions.copy()
+        unexpected = {amp: value.shape for amp, value in by_amp.items() if value.shape != (112, 2)}
+        if unexpected:
+            raise ValueError(f"Unexpected VIRUS amplifier fiber-position shapes: {unexpected}")
+        return by_amp, self._fiber_geometry_reference(normalized_ifuid)
 
     def exposure_references(self) -> List[ConfigurationReference]:
         return [
             ConfigurationReference(
                 config.kind, config.version, identity="exposure-baseline", evidence_state=config.evidence_state
             )
-            for config in (ASTROMETRY_CONFIGURATION, FIBER_GEOMETRY_CONFIGURATION, BASELINE_RESPONSE_CONFIGURATION)
+            for config in (ASTROMETRY_CONFIGURATION, BASELINE_RESPONSE_CONFIGURATION)
         ]

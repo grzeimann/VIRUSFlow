@@ -41,16 +41,41 @@ DITHER_POLICY = DitherPolicy()
 
 FIBER_GEOMETRY_CONFIGURATION = VersionedConfiguration(
     kind="ifu_fiber_geometry",
-    version="documented-20x23-448-baseline-1",
+    version="archival-ifucen-r3-1",
     value={
-        "columns": 20,
-        "rows": 23,
-        "fiber_separation_arcsec": 2.2,
-        "remove_outermost": 12,
-        "amplifier_order": ["LL", "LU", "RU", "RL"],
+        "directory": "IFUcen_files",
+        "default_source": "IFUcen_HETDEX.txt",
+        "alternate_sources": {"004": "IFUcen_HETDEX_reverse_R.txt"},
+        "load_usecols": (0, 1, 2, 4),
+        "skiprows": 30,
+        "table_shape": (448, 4),
+        "coordinate_columns": (1, 3),
+        "right_side_reversals": {
+            "003": (224, 448),
+            "004": (224, 448),
+            "005": (224, 448),
+            "008": (224, 448),
+        },
+        "coordinate_swaps": {
+            "007": ((37, 38),),
+            "025": ((208, 213),),
+            "030": ((445, 446),),
+            "038": ((302, 303),),
+            "041": ((251, 252),),
+        },
+        "amplifier_slices": {
+            "LU": (0, 112),
+            "LL": (112, 224),
+            "RL": (224, 336),
+            "RU": (336, 448),
+        },
+        "reverse_for_extracted_spectrum_order": True,
     },
-    evidence_state="provisional",
-    source="VIRUS 448-fiber IFU geometry documented by pyhetdex IFUCenter contract",
+    evidence_state="verified",
+    source=(
+        "IFUcen_HETDEX.txt, IFUcen_HETDEX_reverse_R.txt, and "
+        "VIRUSFlow_Knowledge_Note_Fiber_Positions"
+    ),
 )
 
 ASTROMETRY_CONFIGURATION = VersionedConfiguration(

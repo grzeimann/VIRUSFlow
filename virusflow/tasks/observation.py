@@ -84,7 +84,19 @@ class ObservationTask(_SciencePublisher):
         loader = self.ctx.config.get("raw_frame_loader") if isinstance(self.ctx.config, dict) else None
         config_root = self.ctx.config.get("configuration_root") if isinstance(self.ctx.config, dict) else None
         config = ConfigurationService(config_root)
-        fiber_offsets, fiber_ref = config.fiber_offsets()
+        first_raw_rows = [
+            row for row in db.list_raw_file_rows(str(self.target.exposure_ids[0]), self.ctx.db_path)
+            if row[1].frame_type == "sci"
+        ]
+        if not first_raw_rows:
+            raise RuntimeError(f"Observation member has no real science input: {self.target.exposure_ids[0]}")
+        first_raw = first_raw_rows[0][1]
+        if first_raw.zipcode is not None:
+            geometry_ifuid = first_raw.zipcode.ifuid
+        else:
+            first_header = (loader or RawFrameLoader()).load_ref(first_raw).header
+            geometry_ifuid = first_header.get("IFUID", "")
+        fiber_offsets, fiber_ref = config.fiber_offsets(geometry_ifuid)
         policy_ref = ConfigurationReference(
             "dither_pattern", DITHER_POLICY.version, self.target.dither_set_id,
             DITHER_POLICY.evidence_state,

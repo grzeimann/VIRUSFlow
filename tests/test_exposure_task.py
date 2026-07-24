@@ -101,7 +101,7 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
 
     config = ConfigurationService(root=Path.cwd())
     fplane, _ = config.resolve_fplane(Path.cwd() / "fplaneall.txt")
-    offsets, _ = config.fiber_offsets()
+    offsets, _ = config.fiber_offsets("003")
     ra0 = (13 + 30 / 60 + 13.64 / 3600) * 15
     dec0 = -(8 + 34 / 60 + 29.47 / 3600)
     catalog = []
