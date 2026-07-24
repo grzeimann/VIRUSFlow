@@ -180,3 +180,19 @@ def test_arc_matching_rejection_recovery_and_residual_evidence(monkeypatch):
     )
     assert result.get_array("per_fiber_wavelength_residual_rms").tolist() == [0.1, 0.2]
     assert result.get_array("arc_identification").shape == (1, 6)
+
+
+def test_wave_failure_preserves_scientific_reason_before_publication():
+    from virusflow.tasks.calibs import WaveTask
+
+    trace = np.broadcast_to(np.arange(8, dtype=float)[:, None], (8, 16))
+    result = fit_wavelength_solution(
+        comparison_lamp_fiber_spectra=np.zeros_like(trace), fiber_trace_map=trace,
+    )
+
+    assert result.get_array("wavelength_map") is None
+    assert result.meta["failure_reason"] == (
+        "comparison-lamp extraction contains no finite nonzero signal"
+    )
+    with pytest.raises(RuntimeError, match=result.meta["failure_reason"]):
+        WaveTask._require_wavelength_map(result)

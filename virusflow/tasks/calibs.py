@@ -351,6 +351,13 @@ class WaveTask(_CanonicalTask):
         "arc_identification": "arc_identification",
     }
 
+    @staticmethod
+    def _require_wavelength_map(result: AlgoResult) -> None:
+        if result.get_array("wavelength_map") is not None:
+            return
+        reason = result.meta.get("failure_reason") or "wavelength modeling produced no solution"
+        raise RuntimeError(f"WaveTask: {reason}")
+
     def run(self, inputs):
         self._require_target()
         service = ArtifactService(self.ctx.db_path)
@@ -398,6 +405,7 @@ class WaveTask(_CanonicalTask):
             params={**algorithm_params, "mask_applied": bool(mask is not None), **mask_facts},
         )
         result = ensure_algo_result(result, kind="wave")
+        self._require_wavelength_map(result)
         result.scalars.update(mask_facts)
         result.meta.update({
             "input_mask_policy_version": mask_policy.version,

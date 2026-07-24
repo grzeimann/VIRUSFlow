@@ -91,8 +91,11 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
             "sampled_trace_positions": trace[:, [0, nx - 1]],
             "per_fiber_trace_residual_rms": np.zeros(trace.shape[0]),
         }, at)
+        amplifier_wavelength = wavelength.copy()
+        if zipcode.amp == "LL":
+            amplifier_wavelength[7, 20] = amplifier_wavelength[7, 19] - 0.25
         _publish(service, tmp_path, "wavelength_map", zipcode, {
-            "wavelength_map": wavelength,
+            "wavelength_map": amplifier_wavelength,
             "per_fiber_wavelength_residual_rms": np.zeros(trace.shape[0]),
         }, at)
 
@@ -123,6 +126,9 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     manifest = service.describe(result["exposure_completion_manifest"].id)
     assert manifest["summary"]["raw_amplifier_count"] == 4
     assert manifest["summary"]["extracted_amplifier_count"] == 4
+    assert manifest["summary"]["excluded_wavelength_fiber_count"] == 1
+    exclusions = manifest["summary"]["wavelength_fiber_exclusions"]
+    assert exclusions[zipcodes[0].key()]["fiber_indices"] == [7]
     assert service.describe(result["final_astrometry"].id)["summary"]["refined"] == 1
     forbidden = {
         "reduced_science_image", "scatter_subtracted_image", "aperture_extracted_spectrum",
@@ -131,8 +137,50 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     }
     assert not any(service.adapter.list_all(kind=kind) for kind in forbidden)
     assert result["calibrated_fiber_state"].flux.dtype == np.float32
+    identity = result["calibrated_fiber_state"].fiber_identity
+    assert identity.shape[0] == 4 * 112 - 1
+    assert not np.any((identity[:, 4] == 0) & (identity[:, 1] == 7))
+    assert np.any((identity[:, 4] == 0) & (identity[:, 1] == 8))
     for name, artifact in result.items():
         if name == "calibrated_fiber_state":
             continue
         for component in service.describe(artifact.id)["components"]:
             service.load_component(artifact.id, component["name"], verify_checksum=True)
+
+
+def test_exposure_without_calibrations_fails_before_publishing_empty_products(tmp_path: Path):
+    database = tmp_path / "registry.sqlite3"
+    db.init_db(str(database))
+    exposure_id = "20260609T031649.6"
+    at = datetime.strptime(exposure_id, "%Y%m%dT%H%M%S.%f")
+    zipcode = ZipCode("060", "003", "206", "LL", "S/N 0039")
+    path = tmp_path / f"{exposure_id}_060LL_sci.fits"
+    fits.PrimaryHDU(np.ones((4, 4)), header=fits.Header({
+        "IFUSLOT": 60, "IFUID": "003", "SPECID": 206,
+        "CCDPOS": "L", "CCDHALF": "L", "AMPNAME": "XX", "CONTID": "S/N 0039",
+    })).writeto(path)
+    with db.connect(str(database)) as connection:
+        connection.execute(
+            "INSERT INTO exposures(id,when_utc,frame_type) VALUES(?,?,?)",
+            (exposure_id, exposure_id, "sci"),
+        )
+        connection.execute(
+            "INSERT INTO amplifiers(key,ifuslot,ifuid,specid,amp,controller) VALUES(?,?,?,?,?,?)",
+            (zipcode.key(), zipcode.ifuslot, zipcode.ifuid, zipcode.specid, zipcode.amp, zipcode.controller),
+        )
+        connection.execute(
+            "INSERT INTO raw_files(exposure_id,frame_type,path,tar_member,storage_backend,amp_key) "
+            "VALUES(?,?,?,?,?,?)",
+            (exposure_id, "sci", str(path), None, "filesystem", zipcode.key()),
+        )
+
+    context = TaskContext(str(database), str(tmp_path / "artifacts"), {
+        "configuration_root": str(Path.cwd()), "fplane_path": str(Path.cwd() / "fplaneall.txt"),
+    })
+    with np.testing.assert_raises_regex(
+        RuntimeError,
+        "no amplifier has complete calibration coverage.*master_bias: missing published calibration.*1 amplifier",
+    ):
+        ExposureTask(context, target=ExposureTarget(exposure_id, at)).run({})
+
+    assert ArtifactService(str(database)).adapter.list_all() == []

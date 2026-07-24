@@ -115,16 +115,33 @@ class ReducedScienceAmplifierTask(_SciencePublisher):
         dark_scale = 0.0
         if bool(self.params.get("apply_calibrations", True)):
             cal_scope = Scope(zipcode=zipcode)
-            bias_row = service.select_best(kind="master_bias", scope=cal_scope, at_time=at)
-            dark_row = service.select_best(kind="master_dark", scope=cal_scope, at_time=at)
-            ldls_row = service.select_best(kind="master_ldls", scope=cal_scope, at_time=at)
+
+            def calibration(kind):
+                row = inputs.get(kind) if isinstance(inputs, dict) else None
+                if row is None:
+                    row = service.select_best(
+                        kind=kind, scope=cal_scope, at_time=at, policy="latest_valid"
+                    )
+                if row is None:
+                    row = service.select_best(
+                        kind=kind, scope=cal_scope, at_time=at, policy="nearest"
+                    )
+                return row
+
+            def artifact_id(row):
+                return int(row.id) if hasattr(row, "id") else int(row["id"])
+
+            bias_row = calibration("master_bias")
+            dark_row = calibration("master_dark")
+            ldls_row = calibration("master_ldls")
             if bias_row is None or dark_row is None:
                 raise RuntimeError(f"Missing Bias/Dark calibration for {exposure_id}/{zipcode.key()}")
-            bias = np.asarray(service.load_component(bias_row, "master")["data"], dtype=np.float32)
+            bias_id, dark_id = artifact_id(bias_row), artifact_id(dark_row)
+            bias = np.asarray(service.load_component(bias_id, "master")["data"], dtype=np.float32)
             bias_scatter = np.asarray(
-                service.load_component(bias_row, "per_pixel_bias_scatter")["data"], dtype=np.float32
+                service.load_component(bias_id, "per_pixel_bias_scatter")["data"], dtype=np.float32
             )
-            dark = np.asarray(service.load_component(dark_row, "master_dark")["data"], dtype=np.float32)
+            dark = np.asarray(service.load_component(dark_id, "master_dark")["data"], dtype=np.float32)
             dark_rows = db.list_raw_files_scoped(
                 frame_type="drk", start_date=exposure_id[:8], end_date=exposure_id[:8],
                 zipcode=zipcode, db_path=self.ctx.db_path,
@@ -138,11 +155,14 @@ class ReducedScienceAmplifierTask(_SciencePublisher):
             dark_residual = dark - bias
             image = image - bias - np.float32(dark_scale) * dark_residual
             variance = variance + np.square(bias_scatter, dtype=np.float32)
-            mask |= np.asarray(service.load_component(dark_row, "dark_pixel_mask")["data"], dtype=np.uint8)
-            calibration_parents.extend([int(bias_row["id"]), int(dark_row["id"])])
+            mask |= np.asarray(service.load_component(dark_id, "dark_pixel_mask")["data"], dtype=np.uint8)
+            calibration_parents.extend([bias_id, dark_id])
             if ldls_row is not None:
-                mask |= np.asarray(service.load_component(ldls_row, "flat_response_mask")["data"], dtype=np.uint8)
-                calibration_parents.append(int(ldls_row["id"]))
+                ldls_id = artifact_id(ldls_row)
+                mask |= np.asarray(
+                    service.load_component(ldls_id, "flat_response_mask")["data"], dtype=np.uint8
+                )
+                calibration_parents.append(ldls_id)
             mask |= (~np.isfinite(image) | ~np.isfinite(variance)).astype(np.uint8)
             calibration_policy = "bias_plus_exptime_scaled_dark_residual-1"
         summaries = {
@@ -207,15 +227,30 @@ class PhysicalCCDTask(_SciencePublisher):
                 params={"apply_calibrations": True},
             ).run({})["reduced_science_state"]
 
-        def trace(zipcode):
-            row = service.select_best(kind="trace_map", scope=Scope(zipcode=zipcode), at_time=at)
+        def trace(zipcode, label):
+            row = inputs.get(label) if isinstance(inputs, dict) else None
+            if row is None:
+                row = service.select_best(
+                    kind="trace_map", scope=Scope(zipcode=zipcode), at_time=at,
+                    policy="latest_valid",
+                )
+            if row is None:
+                row = service.select_best(
+                    kind="trace_map", scope=Scope(zipcode=zipcode), at_time=at,
+                    policy="nearest",
+                )
             if row is None:
                 raise RuntimeError(f"Missing trace_map Product for {zipcode.key()}")
             return row
 
+        def artifact_id(row):
+            return int(row.id) if hasattr(row, "id") else int(row["id"] if isinstance(row, dict) else row)
+
         lower_state = source(target.lower_zipcode, "lower_state")
         upper_state = source(target.upper_zipcode, "upper_state")
-        lower_trace_row, upper_trace_row = trace(target.lower_zipcode), trace(target.upper_zipcode)
+        lower_trace_row = trace(target.lower_zipcode, "lower_trace")
+        upper_trace_row = trace(target.upper_zipcode, "upper_trace")
+        lower_trace_id, upper_trace_id = artifact_id(lower_trace_row), artifact_id(upper_trace_row)
         assembly = assemble_physical_ccd(
             lower_state.image, upper_state.image,
             side=target.side,
@@ -228,8 +263,8 @@ class PhysicalCCDTask(_SciencePublisher):
         )
         scatter = fit_gap_scattered_light(
             assembly,
-            service.load_component(lower_trace_row, "fiber_trace_map")["data"],
-            service.load_component(upper_trace_row, "fiber_trace_map")["data"],
+            service.load_component(lower_trace_id, "fiber_trace_map")["data"],
+            service.load_component(upper_trace_id, "fiber_trace_map")["data"],
             **{key: value for key, value in self.params.items() if key in {
                 "core_exclusion_pixels", "minimum_group_gap_pixels", "holdout_chunk_period", "sigma_clip", "iterations"
             }},
@@ -237,7 +272,7 @@ class PhysicalCCDTask(_SciencePublisher):
         coordinate = kind_spec("ccd_scattered_light_model").coordinates.value
         parents = [
             *lower_state.parent_ids, *upper_state.parent_ids,
-            int(lower_trace_row["id"]), int(upper_trace_row["id"]),
+            lower_trace_id, upper_trace_id,
         ]
         metadata = {
             **dict(assembly.meta or {}), **dict(scatter.meta or {}),

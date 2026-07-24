@@ -168,7 +168,7 @@ def test_exposure_selection_does_not_construct_missing_calibrations(monkeypatch,
         def __init__(self, path):
             self.adapter = self
 
-        def select_best(self, *, kind, scope, at_time):
+        def select_best(self, *, kind, scope, at_time, policy):
             nonlocal selections
             with state_lock:
                 selections += 1
@@ -185,10 +185,39 @@ def test_exposure_selection_does_not_construct_missing_calibrations(monkeypatch,
     ]
     with ThreadPoolExecutor(max_workers=3) as pool:
         results = list(pool.map(lambda at: task._ensure_calibrations([zipcode], at), instants))
-    assert selections == 3
+    assert selections == 6
     assert all(result[0][zipcode.key()] == {} for result in results)
     assert all("run 'virusflow run calibrations' first" in result[1][zipcode.key()][0]
                for result in results)
+
+
+def test_exposure_selection_falls_back_to_nearest_calibration(monkeypatch, tmp_path):
+    import virusflow.tasks.exposure as exposure_module
+
+    policies = []
+    nearest = {"id": 42, "kind": "master_bias"}
+
+    class FakeService:
+        def __init__(self, path):
+            self.adapter = self
+
+        def select_best(self, *, kind, scope, at_time, policy):
+            policies.append(policy)
+            return nearest if policy == "nearest" else None
+
+    monkeypatch.setattr(exposure_module, "ArtifactService", FakeService)
+    monkeypatch.setattr(exposure_module, "CALIBRATION_KINDS", ("master_bias",))
+    zipcode = ZipCode("013", "043", "412", "LL", "S/N 0021")
+    context = TaskContext(str(tmp_path / "registry.sqlite3"), str(tmp_path), {})
+    task = ExposureTask(context, target=SimpleNamespace())
+
+    available, failures = task._ensure_calibrations(
+        [zipcode], __import__("datetime").datetime(2026, 6, 9, 3, 16, 49)
+    )
+
+    assert policies == ["latest_valid", "nearest"]
+    assert available[zipcode.key()] == {"master_bias": nearest}
+    assert failures == {}
 
 
 def test_interrupted_partial_report_is_writable(tmp_path: Path):

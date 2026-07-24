@@ -22,6 +22,13 @@ virusflow init --db ./run/registry.sqlite3
 virusflow scan --db ./run/registry.sqlite3 /path/to/raw/virus
 virusflow exposures --db ./run/registry.sqlite3 --start-date 20260609 --end-date 20260609
 
+virusflow run calibrations \
+  --db ./run/registry.sqlite3 \
+  --workdir ./run/artifacts \
+  --configuration-root . \
+  --start-date 20260609 \
+  --end-date 20260609
+
 virusflow run observation \
   --db ./run/registry.sqlite3 \
   --workdir ./run/artifacts \
@@ -33,6 +40,11 @@ virusflow artifact list --db ./run/registry.sqlite3 --kind calibrated_fiber_obse
 virusflow storage report --db ./run/registry.sqlite3
 virusflow cleanup scratch --workdir ./run/artifacts
 ```
+
+Calibration execution is strict: it exits nonzero if any requested Product is scientifically
+unavailable. Successfully published Products remain registered and can support a later exposure
+run with explicit degraded amplifier coverage; inspect the reported target before deciding whether
+the missing coverage is acceptable.
 
 Execution uses four graph workers by default. Add `--serial` to a `run` command to force one worker. Terminal progress updates in place; redirected output receives plain periodic summaries. `--progress-mode json` emits JSON to standard output, and `--progress-file` always records JSONL events.
 

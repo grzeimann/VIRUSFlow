@@ -486,14 +486,20 @@ def fit_wavelength_solution(*,
     if wave is None:
         failure_reason = "wavelength modeling failed"
         try:
-            if rms_rows is not None:
+            extracted = np.asarray(comparison_lamp_fiber_spectra, dtype=float)
+            finite_nonzero = np.isfinite(extracted) & (extracted != 0)
+            if not np.any(finite_nonzero):
+                failure_reason = "comparison-lamp extraction contains no finite nonzero signal"
+            elif rms_rows is not None:
                 arr = np.asarray(rms_rows, dtype=float).ravel()
                 fin = arr[np.isfinite(arr) & (arr > 0)]
-                tried = int(np.count_nonzero(np.isfinite(arr)))
+                candidate_rows = np.hstack([np.arange(2, arr.size, 8), arr.size - 3])
+                candidate_rows = np.unique(np.clip(candidate_rows, 0, arr.size - 1))
                 good = int(np.count_nonzero((arr > 0) & (arr < float(res_lim))))
                 med = float(np.nanmedian(fin)) if fin.size else np.nan
                 failure_reason = (f"insufficient good seed rows: {good} < 7 (res_lim={float(res_lim)}) ; "
-                                   f"tried_rows={tried}/{arr.size}; median_rms={med if (med==med) else 'nan'}")
+                                   f"successful_seed_fits={fin.size}/{candidate_rows.size}; "
+                                   f"median_rms={med if (med==med) else 'nan'}")
         except Exception:
             pass
         meta["failure_reason"] = failure_reason

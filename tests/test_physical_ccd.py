@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -126,7 +126,8 @@ def test_physical_ccd_task_publishes_compact_model_and_keeps_evaluation_in_memor
             np.zeros_like(image, dtype=np.uint8), {}, (source_ids[-1],), {},
         ))
         trace_ids.append(_publish(service, tmp_path, ArtifactRequest(
-            kind="trace_map", scope=Scope(zipcode=zipcode), validity=Validity(at, at, "fixture"),
+            kind="trace_map", scope=Scope(zipcode=zipcode),
+            validity=Validity(at + timedelta(hours=7), at + timedelta(hours=8), "fixture"),
             components={
                 "fiber_trace_map": LogicalComponent(
                     "fiber_trace_map", "array2d", trace, "pixel", "fiber_by_dispersion_pixel"
@@ -145,7 +146,10 @@ def test_physical_ccd_task_publishes_compact_model_and_keeps_evaluation_in_memor
 
     target = PhysicalCCDTarget(exposure_id, "206", "left", lower, upper, at)
     result = PhysicalCCDTask(TaskContext(str(db_path), str(tmp_path / "artifacts")), target=target).run(
-        {"lower_state": states[0], "upper_state": states[1]}
+        {
+            "lower_state": states[0], "upper_state": states[1],
+            "lower_trace": trace_ids[0], "upper_trace": trace_ids[1],
+        }
     )
     assert set(result) == {"ccd_scattered_light_model", "physical_ccd_state"}
     model = result["ccd_scattered_light_model"]

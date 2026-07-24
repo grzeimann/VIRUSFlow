@@ -608,7 +608,11 @@ class ArtifactService:
             digest.update(name.encode("utf-8"))
             digest.update(str(array.dtype).encode("ascii"))
             digest.update(str(array.shape).encode("ascii"))
-            digest.update(memoryview(array).cast("B"))
+            # Python 3.14 rejects casting a memoryview whose shape contains a
+            # zero-length dimension. Dtype and shape already distinguish empty
+            # arrays, and their byte payload is canonically empty.
+            if array.nbytes:
+                digest.update(memoryview(array).cast("B"))
             digest.update(json.dumps(component.metadata, sort_keys=True, default=str).encode("utf-8"))
         return digest.hexdigest()[:32]
 

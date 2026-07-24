@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Iterable
@@ -66,6 +67,32 @@ class ExposureTask(_SciencePublisher):
     name = "full_exposure"
     version = "v1"
 
+    @staticmethod
+    def _no_extractable_message(exposure_id: str, failures: dict, *, reason: str | None = None) -> str:
+        calibration_hint = "; run 'virusflow run calibrations' first"
+        include_calibration_hint = False
+        by_failure = defaultdict(set)
+        for zipcode_key, messages in failures.items():
+            for message in messages:
+                message = str(message)
+                if message.endswith(calibration_hint):
+                    message = message.removesuffix(calibration_hint)
+                    include_calibration_hint = True
+                by_failure[message].add(str(zipcode_key))
+        details = []
+        for message, zipcode_keys in sorted(
+            by_failure.items(), key=lambda item: (-len(item[1]), item[0])
+        )[:8]:
+            count = len(zipcode_keys)
+            details.append(f"{message} ({count} amplifier{'s' if count != 1 else ''})")
+        omitted = max(0, len(by_failure) - len(details))
+        if omitted:
+            details.append(f"{omitted} additional failure reason{'s' if omitted != 1 else ''}")
+        context = f": {reason}" if reason else ""
+        summary = f"; failures: {'; '.join(details)}" if details else ""
+        next_step = calibration_hint if include_calibration_hint else ""
+        return f"Exposure {exposure_id} produced no extractable amplifier{context}{summary}{next_step}"
+
     def _request(
         self,
         *,
@@ -104,8 +131,14 @@ class ExposureTask(_SciencePublisher):
             for kind in CALIBRATION_KINDS:
                 with phase("calibration_selection"):
                     existing = service.select_best(
-                        kind=kind, scope=Scope(zipcode=zipcode), at_time=at
+                        kind=kind, scope=Scope(zipcode=zipcode), at_time=at,
+                        policy="latest_valid",
                     )
+                    if existing is None:
+                        existing = service.select_best(
+                            kind=kind, scope=Scope(zipcode=zipcode), at_time=at,
+                            policy="nearest",
+                        )
                 if existing is None:
                     failures.setdefault(zipcode.key(), []).append(
                         f"{kind}: missing published calibration; run 'virusflow run calibrations' first"
@@ -149,13 +182,21 @@ class ExposureTask(_SciencePublisher):
         exposure_refs = config.exposure_references() + [fplane_ref, fiber_ref]
 
         calibration, failures = self._ensure_calibrations(zipcodes, at)
+        complete_calibration_keys = {
+            key for key, kinds in calibration.items()
+            if all(kind in kinds for kind in CALIBRATION_KINDS)
+        }
+        if not complete_calibration_keys:
+            raise RuntimeError(self._no_extractable_message(
+                exposure_id, failures, reason="no amplifier has complete calibration coverage",
+            ))
         reduced = {}
         for zipcode in zipcodes:
             try:
                 state = ReducedScienceAmplifierTask(
                     self.ctx, target=SimpleNamespace(zipcode=zipcode, exposure_id=exposure_id),
                     params={"apply_calibrations": True},
-                ).run({})["reduced_science_state"]
+                ).run(calibration.get(zipcode.key(), {}))["reduced_science_state"]
                 reduced[zipcode.key()] = state
             except Exception as exc:
                 failures.setdefault(zipcode.key(), []).append(f"reduced_science_state: {type(exc).__name__}: {exc}")
@@ -186,6 +227,8 @@ class ExposureTask(_SciencePublisher):
                     result = PhysicalCCDTask(self.ctx, target=target).run({
                         "lower_state": reduced[lower.key()],
                         "upper_state": reduced[upper.key()],
+                        "lower_trace": calibration[lower.key()]["trace_map"],
+                        "upper_trace": calibration[upper.key()]["trace_map"],
                     })
                     physical[(identity, side)] = {
                         "model": result["ccd_scattered_light_model"],
@@ -196,6 +239,7 @@ class ExposureTask(_SciencePublisher):
                     failures.setdefault(upper.key(), []).append(f"{side} CCD: {type(exc).__name__}: {exc}")
 
         amp_results = {}
+        wavelength_fiber_exclusions = {}
         reduction_parent_ids = []
         for identity, amps in sorted(groups.items()):
             for side, pair in (("left", ("LL", "LU")), ("right", ("RU", "RL"))):
@@ -248,6 +292,28 @@ class ExposureTask(_SciencePublisher):
                     )
                     wave_row = calibration[zipcode.key()]["wavelength_map"]
                     wavelength = np.asarray(service.load_component(wave_row, "wavelength_map")["data"], dtype=np.float32)
+                    if wavelength.shape != extraction.spectrum.shape:
+                        failures.setdefault(zipcode.key(), []).append(
+                            "wavelength map shape does not match extracted spectrum"
+                        )
+                        continue
+                    finite_rows = np.all(np.isfinite(wavelength), axis=1)
+                    increasing_rows = np.all(np.diff(wavelength, axis=1) > 0.0, axis=1)
+                    valid_wavelength_rows = finite_rows & increasing_rows
+                    excluded_rows = np.flatnonzero(~valid_wavelength_rows)
+                    if excluded_rows.size:
+                        wavelength_fiber_exclusions[zipcode.key()] = {
+                            "excluded_count": int(excluded_rows.size),
+                            "fiber_indices": excluded_rows.tolist(),
+                            "non_finite_fiber_indices": np.flatnonzero(~finite_rows).tolist(),
+                            "non_increasing_fiber_indices": np.flatnonzero(~increasing_rows).tolist(),
+                            "wavelength_map_artifact_id": int(wave_row["id"]),
+                        }
+                    if not valid_wavelength_rows.any():
+                        failures.setdefault(zipcode.key(), []).append(
+                            "wavelength calibration has no finite, strictly increasing fiber rows"
+                        )
+                        continue
                     amp_results[zipcode.key()] = {
                         "zipcode": zipcode,
                         "spectrum": extraction.spectrum,
@@ -255,6 +321,7 @@ class ExposureTask(_SciencePublisher):
                         "valid_fraction": extraction.valid_pixel_fraction,
                         "within": within,
                         "wavelength": wavelength,
+                        "valid_wavelength_rows": valid_wavelength_rows,
                         "twilight_level": float(np.nanmedian(common_twi)),
                         "parent_ids": [scatter_model_id, int(trace_row["id"]), int(wave_row["id"]), int(twi_row["id"])],
                         "normalization_valid": normalization_valid,
@@ -262,6 +329,8 @@ class ExposureTask(_SciencePublisher):
                     }
 
         ordered_keys = sorted(amp_results)
+        if not ordered_keys:
+            raise RuntimeError(self._no_extractable_message(exposure_id, failures))
         levels = np.asarray([amp_results[key]["twilight_level"] for key in ordered_keys], dtype=float)
         amp_factors, reference_level = amplifier_normalization(levels)
         amp_identity = np.asarray([
@@ -303,30 +372,32 @@ class ExposureTask(_SciencePublisher):
             normalized_variance = item["variance"] / np.square(final)
             zipcode = item["zipcode"]
             normalization_parent_ids.extend(item["parent_ids"])
-            n_fiber = normalized.shape[0]
             if zipcode.ifuslot not in fplane:
                 failures.setdefault(key, []).append("IFUSLOT absent from fplane configuration")
                 continue
+            valid_rows = item["valid_wavelength_rows"]
+            original_fiber_indices = np.flatnonzero(valid_rows)
+            n_fiber = original_fiber_indices.size
             local = fiber_offsets[zipcode.amp]
             fp_x, fp_y = fplane[zipcode.ifuslot]
-            focal = local + np.asarray([fp_x, fp_y])
+            focal = local[valid_rows] + np.asarray([fp_x, fp_y])
             identities = np.column_stack((
                 np.full(n_fiber, amp_index_by_key[key]),
-                np.arange(n_fiber),
+                original_fiber_indices,
                 np.full(n_fiber, int(zipcode.ifuslot)),
                 np.full(n_fiber, int(zipcode.specid)),
                 np.full(n_fiber, AMP_CODE[zipcode.amp]),
             )).astype(np.int32)
-            global_spectrum.append(normalized.astype(np.float32))
-            global_variance.append(normalized_variance.astype(np.float32))
-            global_valid.append(item["valid_fraction"].astype(np.float32))
-            global_wavelength.append(item["wavelength"].astype(np.float32))
+            global_spectrum.append(normalized[valid_rows].astype(np.float32))
+            global_variance.append(normalized_variance[valid_rows].astype(np.float32))
+            global_valid.append(item["valid_fraction"][valid_rows].astype(np.float32))
+            global_wavelength.append(item["wavelength"][valid_rows].astype(np.float32))
             global_identity.append(identities)
             global_focal.append(focal.astype(np.float32))
-            global_within.append(item["within"].astype(np.float32))
+            global_within.append(item["within"][valid_rows].astype(np.float32))
 
         if not global_spectrum:
-            raise RuntimeError(f"Exposure {exposure_id} produced no extractable amplifier")
+            raise RuntimeError(self._no_extractable_message(exposure_id, failures))
         spectrum = np.concatenate(global_spectrum)
         spectrum_variance = np.concatenate(global_variance)
         valid_fraction = np.concatenate(global_valid)
@@ -611,6 +682,7 @@ class ExposureTask(_SciencePublisher):
                 "pixel_integration": sky_model.integration_method,
                 "response_evidence_state": BASELINE_RESPONSE_CONFIGURATION.evidence_state,
                 "variance_terms": "extracted_statistical_only; sky-model and response-model covariance not yet added",
+                "wavelength_fiber_exclusions": wavelength_fiber_exclusions,
             },
         )
 
@@ -648,8 +720,8 @@ class ExposureTask(_SciencePublisher):
             ])
             identities.append([int(zipcode.ifuslot), int(zipcode.specid), AMP_CODE[zipcode.amp]])
         coverage_array = np.asarray(coverage, dtype=np.uint8)
-        completion_status = "pass" if not failures else "warn"
-        completion_usability = "usable" if not failures else "degraded"
+        completion_status = "pass" if not failures and not wavelength_fiber_exclusions else "warn"
+        completion_usability = "usable" if not failures and not wavelength_fiber_exclusions else "degraded"
         exposure_product_status = {"pass": 0, "warn": 0, "fail": 0, "unknown": 0}
         for row in service.adapter.list_all():
             if row.get("exposure_id") != exposure_id:
@@ -670,12 +742,17 @@ class ExposureTask(_SciencePublisher):
                 "ifuslot_count": len({zipcode.ifuslot for zipcode in zipcodes}),
                 "extracted_ifuslot_count": len({amp_results[key]["zipcode"].ifuslot for key in ordered_keys}),
                 "failed_or_missing_amplifier_count": len(failures),
+                "excluded_wavelength_fiber_count": sum(
+                    item["excluded_count"] for item in wavelength_fiber_exclusions.values()
+                ),
+                "amplifier_count_with_wavelength_fiber_exclusions": len(wavelength_fiber_exclusions),
                 "usable_product_count": exposure_product_status["pass"],
                 "suspect_product_count": exposure_product_status["warn"] + exposure_product_status["unknown"],
                 "failed_product_count": exposure_product_status["fail"],
             },
             metadata={
                 "failures": failures,
+                "wavelength_fiber_exclusions": wavelength_fiber_exclusions,
                 "zipcode_order": [zipcode.key() for zipcode in zipcodes],
                 "coverage_columns": ["reduced", "trace", "wavelength", "extracted", "no_recorded_failure"],
                 "persistent_science_intermediates": [],
