@@ -23,6 +23,7 @@ from ..artifacts.requests import ArtifactRequest
 from ..artifacts.storage_conventions import scaled_flux_component, scaled_variance_component
 from ..config import ConfigurationService
 from ..config.defaults import DITHER_POLICY
+from ..core.exposure_metadata import interpret_virus_exposure_header
 from ..io import RawFrameLoader
 from ..ontology.scopes import PhysicalScope
 
@@ -127,6 +128,7 @@ class ObservationTask(_SciencePublisher):
         state_values = []
         coverage_values = []
         state_metadata = []
+        exposure_contexts = []
         astrometry_parent_ids = []
 
         start = min(_instant(value) for value in exposure_ids)
@@ -136,6 +138,8 @@ class ObservationTask(_SciencePublisher):
                 raise RuntimeError(f"Observation member has no real science input: {exposure_id}")
             representative = (loader or RawFrameLoader()).load_ref(raw_rows[0][1])
             header = representative.header
+            exposure_context = interpret_virus_exposure_header(header, frame_type="sci")
+            exposure_contexts.append(exposure_context)
             when = _instant(exposure_id)
             sequence.append((when - start).total_seconds())
             obsid = _header_float(header, "OBSID")
@@ -207,8 +211,10 @@ class ObservationTask(_SciencePublisher):
                     "astrometry_source": astrometry_source,
                     "pointing_evidence": pointing_evidence,
                     "header_state": {name: header.get(name) for name in (
-                        "OBJECT", "OBSID", "EXPTIME", "PEXPTIME", "SEEING", "IQ", "TRANSPAR", "TRANSP",
+                        "OBJECT", "QOBJECT", "QRA", "QDEC", "QPROG", "OBSID",
+                        "EXPTIME", "PEXPTIME", "SEEING", "IQ", "TRANSPAR", "TRANSP",
                     )},
+                    "exposure_context": exposure_context.as_dict(),
                     "state_columns": ["seeing", "transparency", "response_median", "effective_seconds", "raw_amplifiers", "raw_ifuslots"],
                     "coverage_columns": ["raw", "reduced", "extracted", "failed_or_missing"],
                 },
@@ -219,10 +225,26 @@ class ObservationTask(_SciencePublisher):
             state_artifacts.append(state_artifact)
             state_values.append(state)
             coverage_values.append(coverage_summary)
-            state_metadata.append({"exposure_id": exposure_id, "astrometry_source": astrometry_source})
+            state_metadata.append({
+                "exposure_id": exposure_id,
+                "astrometry_source": astrometry_source,
+                "exposure_context": exposure_context.as_dict(),
+            })
 
+        member_modes = {context.observing_mode for context in exposure_contexts}
+        observation_mode = next(iter(member_modes)) if len(member_modes) == 1 else "mixed"
+        dither_mode = "standard" if observation_mode == "primary" else "none"
         assignment = assign_nominal_dithers(
-            exposure_ids, sequence, np.asarray(DITHER_POLICY.nominal_pattern_arcsec, dtype=float)
+            exposure_ids,
+            sequence,
+            np.asarray(DITHER_POLICY.nominal_pattern_arcsec, dtype=float),
+            dither_mode=dither_mode,
+        )
+        assignment_valid = assignment.valid and observation_mode != "mixed"
+        virus_primary = (
+            True if observation_mode == "primary"
+            else False if observation_mode == "parallel"
+            else None
         )
         membership_scope = Scope(
             zipcode=None, physical_scope=PhysicalScope.OBSERVATION,
@@ -243,14 +265,19 @@ class ObservationTask(_SciencePublisher):
                 "exposure_count": len(exposure_ids),
                 "unique_exposure_count": len(set(exposure_ids)),
                 "complete_standard_sequence": int(assignment.complete),
+                "valid_operational_group": int(assignment_valid),
             },
             metadata={
                 "member_exposure_ids": list(exposure_ids),
                 "state_evidence": state_metadata,
+                "observing_mode": observation_mode,
+                "virus_primary": virus_primary,
+                "dither_mode": dither_mode,
+                "coverage_mode": "complete_dither" if dither_mode == "standard" else "sparse",
                 "membership_columns": ["input_index", "sequence_rank", "dither_index", "exposure_state_product_id"],
             }, refs=refs,
-            status="pass" if assignment.complete else "warn",
-            usability="usable" if assignment.complete else "degraded",
+            status="pass" if assignment_valid else "warn",
+            usability="usable" if assignment_valid else "degraded",
         )
 
         dither_scope = Scope(
@@ -268,18 +295,30 @@ class ObservationTask(_SciencePublisher):
                 "member_count": len(exposure_ids), "duplicate_count": assignment.duplicate_count,
                 "extra_count": assignment.extra_count, "ambiguous": int(assignment.ambiguous),
                 "complete": int(assignment.complete),
+                "valid": int(assignment_valid),
             },
             metadata={
                 "member_exposure_ids": list(exposure_ids),
-                "assignment_method": "timestamp_sequence_plus_nominal_three_exposure_rule",
+                "assignment_method": (
+                    "timestamp_sequence_plus_nominal_three_exposure_rule"
+                    if dither_mode == "standard"
+                    else "no_dither_from_virus_operational_context"
+                ),
+                "observing_mode": observation_mode,
+                "virus_primary": virus_primary,
+                "dither_mode": dither_mode,
+                "coverage_mode": "complete_dither" if dither_mode == "standard" else "sparse",
                 "policy_version": DITHER_POLICY.version,
                 "policy_source": DITHER_POLICY.source,
                 "assignment_columns": ["input_index", "sequence_rank", "dither_index", "nominal_dx", "nominal_dy", "duplicate", "extra", "ambiguous_order"],
                 "sequence_columns": ["input_index", "seconds_from_first", "OBSID", "header_dither"],
             }, refs=refs,
-            assumptions=["The provisional nominal pattern remains configurable pending authoritative history."],
-            status="pass" if assignment.complete else "warn",
-            usability="usable" if assignment.complete else "degraded",
+            assumptions=(
+                ["The provisional nominal pattern remains configurable pending authoritative history."]
+                if dither_mode == "standard" else []
+            ),
+            status="pass" if assignment_valid else "warn",
+            usability="usable" if assignment_valid else "degraded",
         )
 
         nominal = assignment.assignments[:, 3:5]
@@ -294,6 +333,7 @@ class ObservationTask(_SciencePublisher):
             and np.isfinite(registration_rms)
             and registration_rms <= DITHER_POLICY.registration_warn_rms_arcsec
         )
+        registration_acceptable = registration_consistent or dither_mode == "none"
         registration_artifact = self._request(
             kind="dither_registration", scope=dither_scope,
             components={
@@ -315,9 +355,11 @@ class ObservationTask(_SciencePublisher):
                 "nominal_and_refined_stored_separately": True,
                 "fallback": "nominal_offset_when_catalog_refined_astrometry_unavailable",
                 "registration_warn_rms_arcsec": DITHER_POLICY.registration_warn_rms_arcsec,
+                "registration_required": dither_mode == "standard",
+                "dither_mode": dither_mode,
             }, refs=refs,
-            status="pass" if registration_consistent and assignment.complete else "warn",
-            usability="usable" if registration_consistent and assignment.complete else "degraded",
+            status="pass" if registration_acceptable and assignment_valid else "warn",
+            usability="usable" if registration_acceptable and assignment_valid else "degraded",
         )
 
         coverage_offsets = np.where(registration_success[:, None].astype(bool), refined, nominal)
@@ -367,16 +409,20 @@ class ObservationTask(_SciencePublisher):
                 "exposure_count": len(exposure_ids),
                 "fully_extracted_exposure_count": int(np.sum(np.asarray(coverage_values)[:, 2] > 0)),
                 "catalog_refined_exposure_count": int(np.sum(astrometry_valid)),
-                "observation_usable": int(assignment.complete and covered.any()),
+                "observation_usable": int(assignment_valid and covered.any()),
                 "registration_consistent": int(registration_consistent),
             },
             metadata={
                 "member_exposure_ids": list(exposure_ids),
                 "per_exposure_state_preserved": True,
+                "observing_mode": observation_mode,
+                "virus_primary": virus_primary,
+                "dither_mode": dither_mode,
+                "coverage_mode": "complete_dither" if dither_mode == "standard" else "sparse",
                 "qa_columns": ["input_index", "catalog_refined_astrometry", "has_extraction", "failed_or_missing_amplifiers"],
             }, refs=refs,
-            status="pass" if assignment.complete and covered.any() and registration_consistent else "warn",
-            usability="usable" if assignment.complete and covered.any() and registration_consistent else "degraded",
+            status="pass" if assignment_valid and covered.any() and registration_acceptable else "warn",
+            usability="usable" if assignment_valid and covered.any() and registration_acceptable else "degraded",
         )
         result = {
             "observation_membership": membership_artifact,

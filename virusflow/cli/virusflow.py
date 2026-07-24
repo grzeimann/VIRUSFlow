@@ -61,7 +61,15 @@ def cmd_scan(args: argparse.Namespace) -> None:
 
 
 def cmd_exposures(args: argparse.Namespace) -> None:
-    rows = db.list_exposure_table(db_path=args.db, start_date=args.start_date, end_date=args.end_date, limit=args.limit)
+    rows = db.list_exposure_table(
+        db_path=args.db,
+        start_date=args.start_date,
+        end_date=args.end_date,
+        requested_target=args.requested_target,
+        requested_program=args.requested_program,
+        observing_mode=args.observing_mode,
+        limit=args.limit,
+    )
     if not rows:
         msg = "No exposures found"
         if args.start_date and args.end_date:
@@ -769,7 +777,15 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("scan", help="Register raw FITS inputs")
     _add_db(sp); sp.add_argument("root"); sp.set_defaults(func=cmd_scan)
     sp = sub.add_parser("exposures", help="List scanned exposures")
-    _add_db(sp); sp.add_argument("--start-date"); sp.add_argument("--end-date"); sp.add_argument("--limit", type=int); sp.add_argument("--csv", action="store_true"); sp.set_defaults(func=cmd_exposures)
+    _add_db(sp)
+    sp.add_argument("--start-date")
+    sp.add_argument("--end-date")
+    sp.add_argument("--requested-target")
+    sp.add_argument("--requested-program")
+    sp.add_argument("--observing-mode", choices=["primary", "parallel", "calibration"])
+    sp.add_argument("--limit", type=int)
+    sp.add_argument("--csv", action="store_true")
+    sp.set_defaults(func=cmd_exposures)
     run = sub.add_parser("run", help="Execute the task graph").add_subparsers(dest="run_cmd", required=True)
     cal = run.add_parser("calibrations", help="Plan and execute calibration products")
     _add_science_run(cal)

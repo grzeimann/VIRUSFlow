@@ -140,3 +140,47 @@ def test_observation_task_repeated_identity_is_retained_as_degraded(tmp_path: Pa
     summary = ArtifactService(str(database)).describe(result["dither_assignment"].id)["summary"]
     assert summary["duplicate_count"] == 2
     assert summary["complete"] == 0
+
+
+def test_parallel_virus_observation_retains_target_but_has_no_standard_dither(tmp_path: Path):
+    database = tmp_path / "registry.sqlite3"
+    db.init_db(str(database))
+    exposure_id = "20260724T031649.6"
+    path = tmp_path / "parallel.fits"
+    fits.PrimaryHDU(np.ones((4, 4)), header=fits.Header({
+        "IFUSLOT": 60, "IFUID": "003", "SPECID": 206,
+        "CCDPOS": "L", "CCDHALF": "L", "AMPNAME": "XX", "CONTID": "S/N 0039",
+        "OBJECT": "parallel", "QOBJECT": "Target_Name", "QRA": "13:30:00",
+        "QDEC": "-08:30:00", "QPROG": "P001", "OBSID": 8,
+        "PARANGLE": 180.0, "EXPTIME": 2007.5, "PEXPTIME": 2000.0,
+    })).writeto(path)
+    with db.connect(str(database)) as connection:
+        connection.execute(
+            "INSERT INTO exposures(id,when_utc,frame_type) VALUES(?,?,?)",
+            (exposure_id, exposure_id, "sci"),
+        )
+        connection.execute(
+            "INSERT INTO raw_files(exposure_id,frame_type,path,tar_member,storage_backend) "
+            "VALUES(?,?,?,?,?)",
+            (exposure_id, "sci", str(path), None, "filesystem"),
+        )
+    context = TaskContext(
+        str(database), str(tmp_path / "artifacts"), {"configuration_root": str(Path.cwd())}
+    )
+    result = ObservationTask(
+        context,
+        target=ObservationTarget("20260724-OBSID8", "20260724-OBSID8-DITHER", (exposure_id,)),
+    ).run({})
+    service = ArtifactService(str(database))
+    assignment = service.describe(result["dither_assignment"].id)["summary"]
+    assert assignment["observing_mode"] == "parallel"
+    assert assignment["virus_primary"] is False
+    assert assignment["dither_mode"] == "none"
+    assert assignment["coverage_mode"] == "sparse"
+    assert assignment["complete"] == 0 and assignment["valid"] == 1
+    values = service.load_component(result["dither_assignment"].id, "assignments")["data"]
+    assert values[0, 2] == -1
+    np.testing.assert_array_equal(values[0, 3:5], 0.0)
+    exposure_state = service.describe(result["exposure_states"][0].id)["summary"]
+    assert exposure_state["exposure_context"]["requested_target"] == "Target_Name"
+    assert exposure_state["exposure_context"]["virus_object"] == "parallel"

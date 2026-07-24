@@ -85,13 +85,26 @@ def test_header_tan_projection_and_effective_time_policy():
     assert abs(dec[0] - 30.0) < 1e-3
     assert np.isclose(rotation, 88.45)
     mode, effective, evidence = classify_mode_and_effective_time(
-        {"OBJECT": "science", "EXPTIME": 67.4, "PEXPTIME": 75.5}
+        {
+            "OBJECT": "Target_Name_082_W", "QOBJECT": "Target_Name",
+            "QRA": "13:30:00", "QDEC": "-08:30:00", "QPROG": "P001",
+            "EXPTIME": 67.4, "PEXPTIME": 75.5,
+        }
     )
     assert (mode, effective, evidence["source"]) == ("primary", 67.4, "EXPTIME")
+    assert evidence["requested_target"] == "Target_Name"
+    assert evidence["requested_ifuslot"] == "082" and evidence["het_track"] == "W"
+    assert evidence["virus_primary"] is True
     mode, effective, evidence = classify_mode_and_effective_time(
-        {"OBJECT": "parallel", "EXPTIME": 2007.5, "PEXPTIME": 2000.0}
+        {
+            "OBJECT": "parallel", "QOBJECT": "Target_Name", "QRA": "13:30:00",
+            "QDEC": "-08:30:00", "QPROG": "P001", "EXPTIME": 2007.5,
+            "PEXPTIME": 2000.0,
+        }
     )
     assert (mode, effective, evidence["source"]) == ("parallel", 1992.0, "PEXPTIME_minus_offset")
+    assert evidence["requested_target"] == "Target_Name"
+    assert evidence["requested_ifuslot"] is None and evidence["virus_primary"] is False
 
 
 def test_catalog_fit_retains_candidates_rejections_and_recovers_shift():

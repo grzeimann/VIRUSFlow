@@ -322,6 +322,80 @@ A future implementation may add supporting evidence from:
 
 ---
 
+# VIRUS `OBJECT` and Requested-Target Metadata
+
+The VIRUS operational label and the science-database request are related but
+must remain distinct:
+
+| Header field | Meaning |
+|---|---|
+| `OBJECT` | Raw operational context of the VIRUS exposure |
+| `QOBJECT` | User-requested astronomical target identity |
+| `QRA`, `QDEC` | User-requested target coordinates |
+| `QPROG` | User-requested program |
+
+For a primary VIRUS science exposure, `OBJECT` normally has the form:
+
+```text
+<QOBJECT>_<IFUSLOT>_<TRACK>
+```
+
+The placement and track are the two terminal underscore-separated fields.
+Target names may contain underscores, so parsing must proceed from the right.
+`IFUSLOT` is three digits: `000` places the requested target at the VIRUS field
+center, while values such as `082` place it at the center of that IFU slot.
+`TRACK` is `E` or `W` for the east or west HET track.
+
+For example:
+
+```text
+QOBJECT = Target_Name
+OBJECT  = Target_Name_082_W
+```
+
+The full suffixed `OBJECT` value is not the astronomical target identity. The
+raw value, parsed placement, and parsed track must all be retained separately.
+If `QOBJECT` is unavailable but a primary `OBJECT` suffix parses cleanly, its
+prefix may be retained as an explicitly derived fallback target; the source of
+that fallback must be recorded.
+
+For parallel VIRUS science:
+
+```text
+OBJECT = parallel
+```
+
+while `QOBJECT`, `QRA`, `QDEC`, and `QPROG` continue to describe the user
+request. A populated `QOBJECT` therefore provides no evidence that VIRUS was
+the primary instrument. Parallel membership must not be promoted to a standard
+three-position VIRUS dither merely because three exposures share an operational
+observation identifier.
+
+For calibration exposures, the `Q*` fields are not expected. Their absence is
+normal and is not a metadata failure. Calibration classification derives from
+the frame kind, while the raw `OBJECT` label remains useful calibration
+evidence.
+
+The canonical exposure metadata representation therefore preserves:
+
+```text
+virus_object                 raw OBJECT
+qobject, qra, qdec, qprog   raw requested fields
+requested_target            QOBJECT, or an explicit parsed fallback
+requested_target_source     QOBJECT or OBJECT_prefix
+requested_ifuslot           parsed terminal three-digit placement
+het_track                    parsed E/W track
+observing_mode               primary, parallel, or calibration
+virus_primary                true, false, or not applicable
+q_metadata_expected          true only for science exposures
+q_metadata_complete          completeness when expected; otherwise not applicable
+object_qobject_consistent    parsed-prefix comparison when both are available
+```
+
+Raw fields must never be overwritten by these interpretations.
+
+---
+
 # HET Shutter
 
 The HET shutter is a rotating device.

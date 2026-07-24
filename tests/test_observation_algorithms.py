@@ -31,6 +31,15 @@ def test_incomplete_extra_ambiguous_and_repeated_members_remain_explicit():
     assert repeated.assignments[:2, 5].tolist() == [1, 1]
 
 
+def test_parallel_members_are_not_assigned_a_standard_dither_from_count_alone():
+    parallel = assign_nominal_dithers(
+        ["a", "b", "c"], [0, 1, 2], PATTERN, dither_mode="none"
+    )
+    assert parallel.valid and not parallel.complete and parallel.dither_mode == "none"
+    assert parallel.assignments[:, 2].tolist() == [-1, -1, -1]
+    np.testing.assert_array_equal(parallel.assignments[:, 3:5], 0.0)
+
+
 def test_nominal_and_refined_offsets_are_separate_with_explicit_fallback():
     dec0 = 30.0
     params = np.asarray([

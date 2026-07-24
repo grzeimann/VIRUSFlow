@@ -10,13 +10,15 @@ import numpy as np
 from .exposure import CalibratedFiberState
 
 
-ALGORITHM_VERSION = "observation-dither-baseline-1"
+ALGORITHM_VERSION = "observation-dither-context-2"
 
 
 @dataclass(frozen=True)
 class DitherAssignmentResult:
     assignments: np.ndarray
     complete: bool
+    valid: bool
+    dither_mode: str
     ambiguous: bool
     duplicate_count: int
     extra_count: int
@@ -58,6 +60,8 @@ def assign_nominal_dithers(
     exposure_ids: Sequence[str],
     sequence_values: Sequence[float],
     nominal_pattern: np.ndarray,
+    *,
+    dither_mode: str = "standard",
 ) -> DitherAssignmentResult:
     """Assign sequence-ordered members without inventing absent positions.
 
@@ -72,6 +76,8 @@ def assign_nominal_dithers(
         raise ValueError("sequence_values must have one value per exposure")
     if pattern.ndim != 2 or pattern.shape[1] != 2 or pattern.shape[0] < 1:
         raise ValueError("nominal_pattern must have shape (position, 2)")
+    if dither_mode not in {"standard", "none"}:
+        raise ValueError("dither_mode must be 'standard' or 'none'")
 
     finite = np.isfinite(sequence)
     ambiguous = bool(not finite.all() or len(np.unique(sequence[finite])) != int(finite.sum()))
@@ -83,6 +89,19 @@ def assign_nominal_dithers(
     duplicate = np.asarray([counts[identity] > 1 for identity in ids], dtype=bool)
     duplicate_count = int(sum(count - 1 for count in counts.values() if count > 1))
     rows = np.full((len(ids), 8), np.nan, dtype=float)
+    if dither_mode == "none":
+        for input_index in range(len(ids)):
+            rows[input_index, :5] = (input_index, int(rank[input_index]), -1, 0.0, 0.0)
+            rows[input_index, 5:] = (int(duplicate[input_index]), 0, int(ambiguous))
+        return DitherAssignmentResult(
+            rows,
+            complete=False,
+            valid=duplicate_count == 0 and not ambiguous,
+            dither_mode=dither_mode,
+            ambiguous=ambiguous,
+            duplicate_count=duplicate_count,
+            extra_count=0,
+        )
     for input_index in range(len(ids)):
         sequence_rank = int(rank[input_index])
         extra = sequence_rank >= pattern.shape[0]
@@ -93,7 +112,9 @@ def assign_nominal_dithers(
         rows[input_index, 5:] = (int(duplicate[input_index]), int(extra), int(ambiguous))
     extra_count = max(0, len(ids) - pattern.shape[0])
     complete = len(ids) == pattern.shape[0] and duplicate_count == 0 and not ambiguous
-    return DitherAssignmentResult(rows, complete, ambiguous, duplicate_count, extra_count)
+    return DitherAssignmentResult(
+        rows, complete, complete, dither_mode, ambiguous, duplicate_count, extra_count
+    )
 
 
 def refine_relative_offsets(

@@ -6,7 +6,7 @@ Run `virusflow COMMAND --help` or `virusflow COMMAND SUBCOMMAND --help` for auth
 |---|---|
 | `init` | Initialize the SQLite registry. |
 | `scan` | Index filesystem/tar FITS inputs and exposure metadata. |
-| `exposures` | List scanned exposure metadata. |
+| `exposures` | List raw `OBJECT`/`Q*` and interpreted exposure metadata; filter with `--requested-target`, `--requested-program`, or `--observing-mode`. |
 | `run calibrations` | Plan and optionally execute the calibration graph. `--plan-only` writes `planning_report.yml`. |
 | `run exposure` | Reduce one atomic exposure. |
 | `run observation` | Resolve real observation membership and run exposure nodes followed by observation publication. |

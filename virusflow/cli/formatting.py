@@ -73,7 +73,7 @@ def format_artifacts_table(rows: List[dict], *, csv: bool = False, include_summa
 def format_exposures_table(rows: List[dict], *, csv: bool = False) -> str:
     """Render joined exposure rows as CSV or fixed-width table.
 
-    Expected row keys: exposure_id, when_utc, frame_type, expnum, qobject, qprog, pexptime, date, qra, qdec, tar_path
+    Raw OBJECT and Q* values remain distinct from interpreted target/context fields.
     """
     if csv:
         import csv as _csv
@@ -85,12 +85,22 @@ def format_exposures_table(rows: List[dict], *, csv: bool = False) -> str:
             "when_utc",
             "frame_type",
             "expnum",
+            "object",
             "qobject",
+            "requested_target",
             "qprog",
-            "pexptime",
-            "date",
             "qra",
             "qdec",
+            "observing_mode",
+            "virus_primary",
+            "requested_ifuslot",
+            "het_track",
+            "q_metadata_expected",
+            "q_metadata_complete",
+            "object_qobject_consistent",
+            "exptime",
+            "pexptime",
+            "date",
             "tar_path",
         ]
         buf = _io.StringIO()
@@ -105,12 +115,17 @@ def format_exposures_table(rows: List[dict], *, csv: bool = False) -> str:
         ("when_utc", "DATE"),
         ("frame_type", "TYPE"),
         ("expnum", "EXP#"),
+        ("object", "OBJECT"),
         ("qobject", "QOBJECT"),
+        ("requested_target", "TARGET"),
+        ("observing_mode", "MODE"),
+        ("virus_primary", "PRIMARY"),
+        ("requested_ifuslot", "PLACED"),
+        ("het_track", "TRACK"),
         ("qprog", "QPROG"),
-        ("pexptime", "PEXPTIME"),
-        ("date", "DATEHDR"),
         ("qra", "QRA"),
         ("qdec", "QDEC"),
+        ("pexptime", "PEXPTIME"),
         ("tar_path", "TAR")
     ]
     widths = []

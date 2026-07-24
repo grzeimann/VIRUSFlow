@@ -38,6 +38,13 @@ def test_clean_cli_exposes_real_commands_and_retires_plan_stubs(tmp_path: Path):
     assert args.run_cmd == "observation"
     assert args.progress is None
     assert args.nworkers is None
+    exposure_args = parser.parse_args([
+        "exposures", "--requested-target", "Target_Name",
+        "--requested-program", "P001", "--observing-mode", "parallel",
+    ])
+    assert exposure_args.requested_target == "Target_Name"
+    assert exposure_args.requested_program == "P001"
+    assert exposure_args.observing_mode == "parallel"
     with pytest.raises(SystemExit):
         parser.parse_args(["plan", "night", "--date", "20260609"])
     with pytest.raises(SystemExit):

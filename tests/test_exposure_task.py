@@ -64,7 +64,8 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
                 "IFUSLOT": 60, "IFUID": "003", "SPECID": 206,
                 "CCDPOS": zipcode.amp[0], "CCDHALF": zipcode.amp[1], "AMPNAME": "XX", "CONTID": "S/N 0039",
                 "GAIN": 1.0, "RDNOISE": 2.0, "EXPTIME": 67.4, "PEXPTIME": 75.5,
-                "OBJECT": "WD1327-083_052_E", "QRA": "13:30:13.64", "QDEC": "-08:34:29.47",
+                "OBJECT": "WD1327-083_052_E", "QOBJECT": "WD1327-083",
+                "QRA": "13:30:13.64", "QDEC": "-08:34:29.47", "QPROG": "SCIENCE-1",
                 "PARANGLE": 180.0, "OBSID": 6,
             })
             fits.PrimaryHDU(raw, header=header).writeto(path)
@@ -130,6 +131,11 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     exclusions = manifest["summary"]["wavelength_fiber_exclusions"]
     assert exclusions[zipcodes[0].key()]["fiber_indices"] == [7]
     assert service.describe(result["final_astrometry"].id)["summary"]["refined"] == 1
+    mode = service.describe(result["exposure_mode_classification"].id)["summary"]
+    assert mode["OBJECT"] == "WD1327-083_052_E"
+    assert mode["QOBJECT"] == mode["requested_target"] == "WD1327-083"
+    assert mode["requested_ifuslot"] == "052" and mode["het_track"] == "E"
+    assert mode["virus_primary"] is True and mode["q_metadata_complete"] is True
     forbidden = {
         "reduced_science_image", "scatter_subtracted_image", "aperture_extracted_spectrum",
         "extracted_variance", "fiber_sky_prediction", "sky_subtracted_spectrum",

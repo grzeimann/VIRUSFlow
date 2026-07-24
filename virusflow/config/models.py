@@ -18,7 +18,7 @@ class VersionedConfiguration:
 
 @dataclass(frozen=True)
 class EffectiveExposurePolicy:
-    version: str = "baseline-1"
+    version: str = "object-context-2"
     parallel_offset_seconds: float = 8.0
     evidence_state: str = "provisional"
 

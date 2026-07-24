@@ -11,6 +11,8 @@ from astropy import units as u
 from astropy.wcs import WCS
 from scipy.ndimage import median_filter
 
+from ..core.exposure_metadata import interpret_virus_exposure_header
+
 
 EXTRACTION_VERSION = "fractional-sum-aperture-1.0"
 NORMALIZATION_VERSION = "twilight-within-and-amplifier-1.0"
@@ -548,8 +550,8 @@ def sky_sampling_convergence(
 
 
 def classify_mode_and_effective_time(header: Mapping, *, parallel_offset_seconds: float = 8.0):
-    object_label = str(header.get("OBJECT") or "").strip().lower()
-    mode = "parallel" if object_label == "parallel" else "primary"
+    context = interpret_virus_exposure_header(header, frame_type="sci")
+    mode = context.observing_mode
     exptime = float(header["EXPTIME"]) if header.get("EXPTIME") is not None else None
     pexptime = float(header["PEXPTIME"]) if header.get("PEXPTIME") is not None else None
     if mode == "primary":
@@ -558,4 +560,21 @@ def classify_mode_and_effective_time(header: Mapping, *, parallel_offset_seconds
     else:
         effective = None if pexptime is None else max(0.0, pexptime - float(parallel_offset_seconds))
         source = "PEXPTIME_minus_offset"
-    return mode, effective, {"EXPTIME": exptime, "PEXPTIME": pexptime, "OBJECT": header.get("OBJECT"), "source": source}
+    return mode, effective, {
+        "EXPTIME": exptime,
+        "PEXPTIME": pexptime,
+        "OBJECT": context.virus_object,
+        "QOBJECT": context.qobject,
+        "QRA": context.qra,
+        "QDEC": context.qdec,
+        "QPROG": context.qprog,
+        "requested_target": context.requested_target,
+        "requested_target_source": context.requested_target_source,
+        "requested_ifuslot": context.requested_ifuslot,
+        "het_track": context.het_track,
+        "virus_primary": context.virus_primary,
+        "q_metadata_expected": context.q_metadata_expected,
+        "q_metadata_complete": context.q_metadata_complete,
+        "object_qobject_consistent": context.object_qobject_consistent,
+        "source": source,
+    }

@@ -13,6 +13,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Tuple, Set, Any
 
 from astropy.io import fits
 
+from ..core.exposure_metadata import interpret_virus_exposure_header
 from ..core.identity import RawFileId, ZipCode
 
 
@@ -171,7 +172,17 @@ CREATE TABLE IF NOT EXISTS exposure_details (
     qdec TEXT,
     exptime REAL,           -- commanded/raw EXPTIME, seconds
     ambient_temperature REAL,
-    object_name TEXT,
+    object_name TEXT,       -- legacy OBJECT-or-QOBJECT field; retained for compatibility
+    virus_object TEXT,      -- raw VIRUS OBJECT operational label
+    requested_target TEXT, -- interpreted requested target, normally QOBJECT
+    requested_target_source TEXT,
+    requested_ifuslot TEXT,
+    het_track TEXT,
+    observing_mode TEXT,
+    virus_primary INTEGER,
+    q_metadata_expected INTEGER,
+    q_metadata_complete INTEGER,
+    object_qobject_consistent INTEGER,
     lamp TEXT,
     observing_block TEXT,
     FOREIGN KEY(exposure_id) REFERENCES exposures(id)
@@ -425,11 +436,32 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
                 ("exptime", "REAL"),
                 ("ambient_temperature", "REAL"),
                 ("object_name", "TEXT"),
+                ("virus_object", "TEXT"),
+                ("requested_target", "TEXT"),
+                ("requested_target_source", "TEXT"),
+                ("requested_ifuslot", "TEXT"),
+                ("het_track", "TEXT"),
+                ("observing_mode", "TEXT"),
+                ("virus_primary", "INTEGER"),
+                ("q_metadata_expected", "INTEGER"),
+                ("q_metadata_complete", "INTEGER"),
+                ("object_qobject_consistent", "INTEGER"),
                 ("lamp", "TEXT"),
                 ("observing_block", "TEXT"),
             ):
                 if name not in exposure_columns:
                     conn.execute(f"ALTER TABLE exposure_details ADD COLUMN {name} {definition}")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS exposure_details_requested_target_idx "
+                "ON exposure_details(requested_target)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS exposure_details_qprog_idx ON exposure_details(qprog)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS exposure_details_observing_mode_idx "
+                "ON exposure_details(observing_mode)"
+            )
         stat = path.stat()
         if not legacy_baseline_enabled():
             _INITIALIZED_DATABASES[resolved] = (int(stat.st_dev), int(stat.st_ino))
@@ -531,7 +563,7 @@ def _read_ifuslot_metadata_from_file(path: str) -> Dict[str, Optional[str]]:
         return {"ifuid": None, "specid": None, "controller": None}
 
 
-def _exposure_header_fields(hdr) -> Dict[str, Optional[str]]:
+def _exposure_header_fields(hdr, *, frame_type: str) -> Dict[str, Any]:
     """Extract grouping metadata without interpreting cadence policy."""
 
     ambient = next((hdr.get(key) for key in (
@@ -543,18 +575,29 @@ def _exposure_header_fields(hdr) -> Dict[str, Optional[str]]:
     block = next((hdr.get(key) for key in (
         "OBSBLOCK", "BLOCKID", "OBSID", "QPROG"
     ) if hdr.get(key) not in (None, "")), None)
+    context = interpret_virus_exposure_header(hdr, frame_type=frame_type)
     return {
-        "qobject": hdr.get("QOBJECT"),
-        "qprog": hdr.get("QPROG"),
+        "qobject": context.qobject,
+        "qprog": context.qprog,
         "pexptime": (str(hdr.get("PEXPTIME")) if hdr.get("PEXPTIME") is not None else None),
         "exptime": (str(hdr.get("EXPTIME")) if hdr.get("EXPTIME") is not None else None),
         "ambient_temperature": (str(ambient) if ambient is not None else None),
-        "object_name": hdr.get("OBJECT") or hdr.get("QOBJECT"),
+        "object_name": context.virus_object,
+        "virus_object": context.virus_object,
+        "requested_target": context.requested_target,
+        "requested_target_source": context.requested_target_source,
+        "requested_ifuslot": context.requested_ifuslot,
+        "het_track": context.het_track,
+        "observing_mode": context.observing_mode,
+        "virus_primary": context.virus_primary,
+        "q_metadata_expected": context.q_metadata_expected,
+        "q_metadata_complete": context.q_metadata_complete,
+        "object_qobject_consistent": context.object_qobject_consistent,
         "lamp": (str(lamp) if lamp is not None else None),
         "observing_block": (str(block) if block is not None else None),
         "date": hdr.get("DATE"),
-        "qra": hdr.get("QRA"),
-        "qdec": hdr.get("QDEC"),
+        "qra": context.qra,
+        "qdec": context.qdec,
     }
 
 
@@ -568,7 +611,9 @@ def _optional_float(value) -> Optional[float]:
     return result if result == result else None
 
 
-def _read_exposure_header_fields_from_tar(tar_path: str, member_name: str) -> Dict[str, Optional[str]]:
+def _read_exposure_header_fields_from_tar(
+    tar_path: str, member_name: str, *, frame_type: str
+) -> Dict[str, Any]:
     """Read selected exposure-level keywords from a FITS member inside a tar.
 
     Returns dict with keys: qobject, qprog, pexptime, date, qra, qdec.
@@ -581,16 +626,16 @@ def _read_exposure_header_fields_from_tar(tar_path: str, member_name: str) -> Di
                 return {"qobject": None, "qprog": None, "pexptime": None, "date": None, "qra": None, "qdec": None}
             with fits.open(ef, memmap=False) as hdul:  # type: ignore[arg-type]
                 hdr = hdul[0].header
-                return _exposure_header_fields(hdr)
+                return _exposure_header_fields(hdr, frame_type=frame_type)
     except Exception:
         return {"qobject": None, "qprog": None, "pexptime": None, "date": None, "qra": None, "qdec": None}
 
 
-def _read_exposure_header_fields_from_file(path: str) -> Dict[str, Optional[str]]:
+def _read_exposure_header_fields_from_file(path: str, *, frame_type: str) -> Dict[str, Any]:
     try:
         with fits.open(path, memmap=False) as hdul:
             hdr = hdul[0].header
-            return _exposure_header_fields(hdr)
+            return _exposure_header_fields(hdr, frame_type=frame_type)
     except Exception:
         return {"qobject": None, "qprog": None, "pexptime": None, "date": None, "qra": None, "qdec": None}
 
@@ -728,17 +773,22 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
             expnum = expn if (expn is not None and expn < 999) else None
             # Read selected header fields from this representative file
             if tar_member:
-                hdr_fields = _read_exposure_header_fields_from_tar(path, tar_member)
+                hdr_fields = _read_exposure_header_fields_from_tar(
+                    path, tar_member, frame_type=frame_type
+                )
             else:
-                hdr_fields = _read_exposure_header_fields_from_file(path)
+                hdr_fields = _read_exposure_header_fields_from_file(path, frame_type=frame_type)
             # Upsert into exposure_details; keep any pre-existing non-null values
             conn_.execute(
                 """
                 INSERT INTO exposure_details(
                     exposure_id, tar_path, expnum, qobject, qprog, pexptime, date, qra, qdec,
-                    exptime, ambient_temperature, object_name, lamp, observing_block
+                    exptime, ambient_temperature, object_name, virus_object, requested_target,
+                    requested_target_source, requested_ifuslot, het_track, observing_mode,
+                    virus_primary, q_metadata_expected, q_metadata_complete,
+                    object_qobject_consistent, lamp, observing_block
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(exposure_id) DO UPDATE SET
                     tar_path=COALESCE(exposure_details.tar_path, excluded.tar_path),
                     expnum=COALESCE(exposure_details.expnum, excluded.expnum),
@@ -751,6 +801,16 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
                     exptime=COALESCE(exposure_details.exptime, excluded.exptime),
                     ambient_temperature=COALESCE(exposure_details.ambient_temperature, excluded.ambient_temperature),
                     object_name=COALESCE(exposure_details.object_name, excluded.object_name),
+                    virus_object=COALESCE(exposure_details.virus_object, excluded.virus_object),
+                    requested_target=COALESCE(exposure_details.requested_target, excluded.requested_target),
+                    requested_target_source=COALESCE(exposure_details.requested_target_source, excluded.requested_target_source),
+                    requested_ifuslot=COALESCE(exposure_details.requested_ifuslot, excluded.requested_ifuslot),
+                    het_track=COALESCE(exposure_details.het_track, excluded.het_track),
+                    observing_mode=COALESCE(exposure_details.observing_mode, excluded.observing_mode),
+                    virus_primary=COALESCE(exposure_details.virus_primary, excluded.virus_primary),
+                    q_metadata_expected=COALESCE(exposure_details.q_metadata_expected, excluded.q_metadata_expected),
+                    q_metadata_complete=COALESCE(exposure_details.q_metadata_complete, excluded.q_metadata_complete),
+                    object_qobject_consistent=COALESCE(exposure_details.object_qobject_consistent, excluded.object_qobject_consistent),
                     lamp=COALESCE(exposure_details.lamp, excluded.lamp),
                     observing_block=COALESCE(exposure_details.observing_block, excluded.observing_block)
                 """,
@@ -767,6 +827,16 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
                     _optional_float(hdr_fields.get("exptime")),
                     _optional_float(hdr_fields.get("ambient_temperature")),
                     hdr_fields.get("object_name"),
+                    hdr_fields.get("virus_object"),
+                    hdr_fields.get("requested_target"),
+                    hdr_fields.get("requested_target_source"),
+                    hdr_fields.get("requested_ifuslot"),
+                    hdr_fields.get("het_track"),
+                    hdr_fields.get("observing_mode"),
+                    hdr_fields.get("virus_primary"),
+                    hdr_fields.get("q_metadata_expected"),
+                    hdr_fields.get("q_metadata_complete"),
+                    hdr_fields.get("object_qobject_consistent"),
                     hdr_fields.get("lamp"),
                     hdr_fields.get("observing_block"),
                 ),
@@ -1540,6 +1610,9 @@ def list_exposure_table(
     db_path: str = DEFAULT_DB_PATH,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    requested_target: Optional[str] = None,
+    requested_program: Optional[str] = None,
+    observing_mode: Optional[str] = None,
     limit: Optional[int] = None,
 ) -> List[dict]:
     """Return joined exposure rows as dicts for a quick human-readable table.
@@ -1558,7 +1631,12 @@ def list_exposure_table(
         sql = (
             "SELECT e.id AS exposure_id, "
             "substr(replace(e.when_utc,'-',''),1,8) AS when_utc, "
-            "e.frame_type, d.expnum, d.qobject, d.qprog, d.pexptime, d.date, d.qra, d.qdec, d.tar_path "
+            "e.frame_type, d.expnum, d.virus_object AS object, d.qobject, "
+            "COALESCE(d.requested_target,d.qobject) AS requested_target, "
+            "d.requested_target_source, d.qprog, d.qra, d.qdec, d.requested_ifuslot, "
+            "d.het_track, d.observing_mode, d.virus_primary, d.q_metadata_expected, "
+            "d.q_metadata_complete, d.object_qobject_consistent, d.exptime, d.pexptime, "
+            "d.date, d.tar_path, d.object_name AS legacy_object_name "
             "FROM exposures e LEFT JOIN exposure_details d ON e.id = d.exposure_id "
             "WHERE 1=1 "
         )
@@ -1566,12 +1644,34 @@ def list_exposure_table(
         if sd and ed:
             sql += "AND e.when_utc IS NOT NULL AND substr(replace(e.when_utc,'-',''),1,8) BETWEEN ? AND ? "
             params.extend([sd, ed])
+        if requested_target:
+            sql += "AND COALESCE(d.requested_target,d.qobject)=? "
+            params.append(str(requested_target))
+        if requested_program:
+            sql += "AND d.qprog=? "
+            params.append(str(requested_program))
+        if observing_mode:
+            sql += "AND d.observing_mode=? "
+            params.append(str(observing_mode).lower())
         sql += "ORDER BY e.id"
         if limit and limit > 0:
             sql += " LIMIT ?"
             params.append(int(limit))
         rows = conn.execute(sql, tuple(params)).fetchall()
         return [dict(r) for r in rows]
+
+
+def get_exposure_metadata(exposure_id: str, db_path: str = DEFAULT_DB_PATH) -> Optional[dict]:
+    """Return raw and interpreted metadata for one atomic exposure."""
+
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT e.id AS exposure_id, e.when_utc, e.frame_type, d.* "
+            "FROM exposures e LEFT JOIN exposure_details d ON d.exposure_id=e.id "
+            "WHERE e.id=?",
+            (str(exposure_id),),
+        ).fetchone()
+    return dict(row) if row is not None else None
 
 
 def ensure_tar_index(tar_path: str, db_path: str = DEFAULT_DB_PATH, conn: Optional[sqlite3.Connection] = None) -> None:

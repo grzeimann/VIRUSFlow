@@ -18,6 +18,8 @@ mkdir -p ./run
 virusflow init --db ./run/registry.sqlite3
 virusflow scan --db ./run/registry.sqlite3 /path/to/raw/virus
 virusflow exposures --db ./run/registry.sqlite3 --limit 20
+virusflow exposures --db ./run/registry.sqlite3 --observing-mode parallel
+virusflow exposures --db ./run/registry.sqlite3 --requested-target Target_Name
 ```
 
 `VIRUSFLOW_DB`, `VIRUSFLOW_WORKDIR`, and `VIRUSFLOW_CONFIG_ROOT` provide defaults where the CLI supports them. Explicit options win. Planning YAML values sit between built-in defaults and explicit CLI options. Inspect the resolved execution values with:
@@ -26,7 +28,7 @@ virusflow exposures --db ./run/registry.sqlite3 --limit 20
 virusflow config show --db ./run/registry.sqlite3 --workdir ./run/artifacts
 ```
 
-Planning YAML may override only canonical calibration nodes and their explicit edges. These include separate Hg/Cd masters and canonical `master_sci`. Historical names (`master_flat`, `master_cmp`, `trace`, and `wave`) remain readable in old registries but cannot be used to create new plans or Products. Rescan an older registry once to backfill exposure time, lamp, ambient-temperature, and observing-block headers.
+Planning YAML may override only canonical calibration nodes and their explicit edges. These include separate Hg/Cd masters and canonical `master_sci`. Historical names (`master_flat`, `master_cmp`, `trace`, and `wave`) remain readable in old registries but cannot be used to create new plans or Products. Rescan an older registry once to backfill exposure time, lamp, ambient-temperature, observing-block headers, and the distinct raw `OBJECT` plus interpreted requested-target/operational-context fields. Legacy `object_name` remains readable, but it cannot always reveal whether an old value originated in `OBJECT` or the former `QOBJECT` fallback.
 
 ## Run work
 
