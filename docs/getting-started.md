@@ -28,7 +28,7 @@ virusflow exposures --db ./run/registry.sqlite3 --requested-target Target_Name
 virusflow config show --db ./run/registry.sqlite3 --workdir ./run/artifacts
 ```
 
-Planning YAML may override only canonical calibration nodes and their explicit edges. These include separate Hg/Cd masters and canonical `master_sci`. Historical names (`master_flat`, `master_cmp`, `trace`, and `wave`) remain readable in old registries but cannot be used to create new plans or Products. Rescan an older registry once to backfill exposure time, lamp, ambient-temperature, observing-block headers, and the distinct raw `OBJECT` plus interpreted requested-target/operational-context fields. Legacy `object_name` remains readable, but it cannot always reveal whether an old value originated in `OBJECT` or the former `QOBJECT` fallback.
+Planning YAML may override only canonical calibration nodes and their explicit edges. These include separate Hg/Cd masters and the three-stage Master Science chain (`master_sci`, `extracted_master_sci_spectrum`, and `fiber_wavelength_spectral_mask`). Historical names (`master_flat`, `master_cmp`, `trace`, and `wave`) remain readable in old registries but cannot be used to create new plans or Products. Rescan an older registry once to backfill exposure time, lamp, ambient-temperature, observing-block headers, and the distinct raw `OBJECT` plus interpreted requested-target/operational-context fields. Legacy `object_name` remains readable, but it cannot always reveal whether an old value originated in `OBJECT` or the former `QOBJECT` fallback.
 
 ## Run work
 

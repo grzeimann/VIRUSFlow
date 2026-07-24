@@ -167,17 +167,47 @@ class MasterSciContract:
     def spec(self) -> ArtifactContractSpec:
         return ArtifactContractSpec(
             kind="master_sci",
-            components=[
-                LogicalComponentSpec(name="master_sci", model_type="array2d", required=True),
-                LogicalComponentSpec(
-                    name="fiber_wavelength_mask_support", model_type="array2d", required=True,
-                    description="Detector-coordinate robust scatter evidence for trace/wavelength projection",
-                ),
-            ],
+            components=[LogicalComponentSpec(name="master_sci", model_type="array2d", required=True)],
             summaries=["n_inputs", "robust_illumination", "finite_fraction"],
             required_metadata=["calibration_group"],
             applicability="Sufficient long-exposure science calibration group",
             validity_semantics="Monthly, dark-time, or named observing block applicability",
+        )
+
+
+class ExtractedMasterSciSpectrumContract:
+    def spec(self) -> ArtifactContractSpec:
+        return ArtifactContractSpec(
+            kind="extracted_master_sci_spectrum",
+            components=[
+                LogicalComponentSpec("spectrum", "array2d", True),
+                LogicalComponentSpec("valid_pixel_fraction", "array2d", True),
+                LogicalComponentSpec("effective_aperture_width", "array2d", True),
+                LogicalComponentSpec("extraction_valid", "array2d", True),
+            ],
+            summaries=["fiber_count", "spectral_sample_count", "valid_sample_fraction"],
+            required_metadata=["calibration_group", "algorithm_metadata"],
+            applicability="Extracted Master Science spectra in detector-column space",
+            validity_semantics="Inherited from the Master Science image",
+            provenance_expectations=["master_sci", "trace_map"],
+        )
+
+
+class FiberWavelengthSpectralMaskContract:
+    def spec(self) -> ArtifactContractSpec:
+        return ArtifactContractSpec(
+            kind="fiber_wavelength_spectral_mask",
+            components=[
+                LogicalComponentSpec("mask", "array2d", True),
+                LogicalComponentSpec("spectral_model", "array2d", True),
+                LogicalComponentSpec("normalization", "array2d", True),
+                LogicalComponentSpec("good_wavelength_solution", "array1d", True),
+            ],
+            summaries=["masked_fraction", "good_wavelength_solution_count", "fiber_count"],
+            required_metadata=["calibration_group", "algorithm_metadata"],
+            applicability="Fiber-by-spectral-sample Master Science reliability mask",
+            validity_semantics="Inherited from extracted spectra and wavelength solution",
+            provenance_expectations=["extracted_master_sci_spectrum", "wavelength_map"],
         )
 
 

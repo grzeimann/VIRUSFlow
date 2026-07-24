@@ -195,10 +195,7 @@ def test_master_sci_canonical_task_publication_loading_and_float32(tmp_path):
     artifact = MasterSciTask(context, target=adapt_target(target)).run({})["master_sci"]
     service = ArtifactService(path)
     description = service.describe(artifact.id)
-    assert {item["name"] for item in description["components"]} == {
-        "master_sci", "fiber_wavelength_mask_support",
-    }
+    assert {item["name"] for item in description["components"]} == {"master_sci"}
     assert service.get(artifact.id).metadata["calibration_group"]["sufficiency"]["sufficient"] is True
     stored_dtype = service.load_component(artifact.id, "master_sci")["data"].dtype
     assert stored_dtype.kind == "f" and stored_dtype.itemsize == 4
-    assert service.load_component(artifact.id, "fiber_wavelength_mask_support")["data"].ndim == 2

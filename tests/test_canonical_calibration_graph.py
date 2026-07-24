@@ -45,18 +45,29 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
     assert set(by_kind) == {
         "master_bias", "master_dark", "master_ldls", "master_hg", "master_cd",
         "master_arc", "master_twilight", "master_sci", "trace_map", "wavelength_map",
+        "extracted_master_sci_spectrum", "fiber_wavelength_spectral_mask",
     }
     assert by_kind["master_hg"].inputs_raw == ["cmp", "hg"]
     assert by_kind["master_cd"].inputs_raw == ["cmp", "cd"]
     assert by_kind["master_arc"].inputs_raw is None
     assert by_kind["master_arc"].inputs_artifacts == ["master_hg", "master_cd"]
     assert by_kind["master_sci"].inputs_raw == ["sci"]
+    assert by_kind["extracted_master_sci_spectrum"].inputs_artifacts == [
+        "master_sci", "trace_map",
+    ]
+    assert by_kind["fiber_wavelength_spectral_mask"].inputs_artifacts == [
+        "extracted_master_sci_spectrum", "wavelength_map",
+    ]
     assert {(edge.src.kind, edge.dst.kind) for edge in edges} >= {
         ("master_ldls", "trace_map"),
         ("master_hg", "master_arc"),
         ("master_cd", "master_arc"),
         ("master_arc", "wavelength_map"),
         ("trace_map", "wavelength_map"),
+        ("master_sci", "extracted_master_sci_spectrum"),
+        ("trace_map", "extracted_master_sci_spectrum"),
+        ("extracted_master_sci_spectrum", "fiber_wavelength_spectral_mask"),
+        ("wavelength_map", "fiber_wavelength_spectral_mask"),
     }
     assert set(default_kind_to_task()) == set(by_kind)
 
@@ -97,7 +108,9 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
         return AlgoResult(
             kind="wave", version="test-wave",
             arrays={
-                "wavelength_map": np.full(trace.shape, 4500.0),
+                "wavelength_map": np.broadcast_to(
+                    np.linspace(3500.0, 5500.0, trace.shape[1]), trace.shape
+                ).copy(),
                 "per_fiber_wavelength_residual_rms": np.array([0.1, 0.2]),
                 "arc_identification": np.array([[100.0, 4358.3, 4358.4, 0.1, 0.05, 0.0]]),
             },
@@ -162,8 +175,31 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
     assert {item["name"] for item in service.describe(rows["wavelength_map"])["components"]} == {
         "wavelength_map", "per_fiber_wavelength_residual_rms", "arc_identification"
     }
-    assert {item["name"] for item in service.describe(rows["master_sci"])["components"]} == {
-        "master_sci", "fiber_wavelength_mask_support"
+    assert {item["name"] for item in service.describe(rows["master_sci"])["components"]} == {"master_sci"}
+    assert {item["name"] for item in service.describe(
+        rows["extracted_master_sci_spectrum"]
+    )["components"]} == {
+        "spectrum", "valid_pixel_fraction", "effective_aperture_width",
+        "extraction_valid",
+    }
+    assert {item["name"] for item in service.describe(
+        rows["fiber_wavelength_spectral_mask"]
+    )["components"]} == {
+        "mask", "spectral_model", "normalization", "good_wavelength_solution",
+    }
+    extraction_description = service.describe(rows["extracted_master_sci_spectrum"])
+    assert extraction_description["summary"]["algorithm_metadata"]["extraction_method"] == (
+        "fractional_top_hat_aperture"
+    )
+    mask_description = service.describe(rows["fiber_wavelength_spectral_mask"])
+    assert mask_description["summary"]["algorithm_metadata"]["normalization_mode"] == (
+        "coarse_self_normalization"
+    )
+    assert {
+        item["kind"]
+        for item in mask_description["provenance"]["configuration_references"]
+    } >= {
+        "master_sci_spectral_mask"
     }
     arc_relations = service.describe(rows["master_arc"])["relations"]
     assert {item["parent_id"] for item in arc_relations} == {
@@ -174,6 +210,19 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
     assert {item["parent_id"] for item in trace_relations} == {int(rows["master_ldls"]["id"])}
     assert {item["parent_id"] for item in wave_relations} == {
         int(rows["master_arc"]["id"]), int(rows["trace_map"]["id"])
+    }
+    extraction_relations = service.describe(
+        rows["extracted_master_sci_spectrum"]
+    )["relations"]
+    assert {item["parent_id"] for item in extraction_relations} == {
+        int(rows["master_sci"]["id"]), int(rows["trace_map"]["id"]),
+    }
+    mask_relations = service.describe(
+        rows["fiber_wavelength_spectral_mask"]
+    )["relations"]
+    assert {item["parent_id"] for item in mask_relations} == {
+        int(rows["extracted_master_sci_spectrum"]["id"]),
+        int(rows["wavelength_map"]["id"]),
     }
 
     rerun, rerun_report = graph.plan(db_path=database, scopes=[Scope(zipcode=zipcode)])

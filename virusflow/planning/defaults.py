@@ -34,6 +34,8 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
     - master_sci: eligible >300 s science in monthly groups, subject to sufficiency
     - trace_map: derived from master_ldls
     - wavelength_map: derived from master_arc + trace_map
+    - extracted_master_sci_spectrum: derived from master_sci + trace_map
+    - fiber_wavelength_spectral_mask: derived from extracted spectra + wavelength_map
 
     Planning YAML may override canonical node fields and may replace the edge
     list. Dependencies have one representation: explicit edges.
@@ -113,8 +115,27 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         scope_mode="per_zipcode",
         cadence=None,
     )
+    master_sci_spectrum = TaskSpec(
+        kind="extracted_master_sci_spectrum",
+        task_cls=_TaskPlaceholder,
+        inputs_raw=None,
+        inputs_artifacts=["master_sci", "trace_map"],
+        scope_mode="per_zipcode",
+        cadence=None,
+    )
+    master_sci_mask = TaskSpec(
+        kind="fiber_wavelength_spectral_mask",
+        task_cls=_TaskPlaceholder,
+        inputs_raw=None,
+        inputs_artifacts=["extracted_master_sci_spectrum", "wavelength_map"],
+        scope_mode="per_zipcode",
+        cadence=None,
+    )
 
-    nodes = [bias, dark, flat, hg, cd, arc, twilight, master_sci, trace, wave]
+    nodes = [
+        bias, dark, flat, hg, cd, arc, twilight, master_sci, trace, wave,
+        master_sci_spectrum, master_sci_mask,
+    ]
 
     # Edges (base)
     edges: List[Edge] = [
@@ -123,6 +144,10 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         Edge(src=cd, dst=arc, policy="nearest_valid", tolerance_days=1),
         Edge(src=arc, dst=wave, policy="latest_valid", tolerance_days=90),
         Edge(src=trace, dst=wave, policy="latest_valid", tolerance_days=90),
+        Edge(src=master_sci, dst=master_sci_spectrum, policy="exact_parent_group", tolerance_days=0),
+        Edge(src=trace, dst=master_sci_spectrum, policy="latest_valid", tolerance_days=90),
+        Edge(src=master_sci_spectrum, dst=master_sci_mask, policy="exact_parent_group", tolerance_days=0),
+        Edge(src=wave, dst=master_sci_mask, policy="latest_valid", tolerance_days=90),
     ]
 
     # Apply external overrides if provided (edges replaced only if config.edges is non-empty)

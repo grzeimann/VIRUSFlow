@@ -59,6 +59,8 @@ SUPPORTED_CALIBRATION_KINDS = frozenset({
     "master_arc",
     "master_twilight",
     "master_sci",
+    "extracted_master_sci_spectrum",
+    "fiber_wavelength_spectral_mask",
     "trace_map",
     "wavelength_map",
 })

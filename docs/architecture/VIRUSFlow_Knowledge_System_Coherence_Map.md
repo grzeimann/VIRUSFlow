@@ -388,6 +388,7 @@ master_hg
 master_cd
 master_arc
 master_twilight
+master_sci
 ```
 
 ## 6.4 Geometry and response Products
@@ -431,6 +432,8 @@ profile_extracted_spectrum
 forward_extracted_spectrum
 extracted_variance
 aperture_capture_fraction
+extracted_master_sci_spectrum
+fiber_wavelength_spectral_mask
 ```
 
 ## 6.7 Astrometry Products

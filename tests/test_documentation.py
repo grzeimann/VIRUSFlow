@@ -11,7 +11,7 @@ DOCUMENTS = [
     ROOT / "README.md", ROOT / "docs/getting-started.md", ROOT / "docs/cli-reference.md",
     ROOT / "docs/calibration-cadence.md",
     ROOT / "docs/examples.md", ROOT / "docs/troubleshooting.md", ROOT / "docs/performance.md",
-    ROOT / "docs/migration/stage-11.md", ROOT / "docs/architecture/current-system.md",
+    ROOT / "docs/architecture/current-system.md",
 ]
 
 

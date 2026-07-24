@@ -13,11 +13,17 @@ from ..algorithms.flat import step_flt
 from ..algorithms.trace import fit_fiber_traces
 from ..algorithms.twi import step_twi
 from ..algorithms.master_sci import build_master_sci
+from ..algorithms.master_sci_spectrum import extract_master_sci_spectrum
+from ..algorithms.master_sci_mask import build_master_sci_spectral_mask
 from ..algorithms.wave import fit_wavelength_solution
 from ..artifacts import ArtifactService, Scope
 from ..artifacts.models import ConfigurationReference
 from ..artifacts.requests import ArtifactRequest, LogicalComponent
-from ..config.defaults import WAVELENGTH_INPUT_MASK_CONFIGURATION
+from ..config.defaults import (
+    MASTER_SCI_EXTRACTION_CONFIGURATION,
+    MASTER_SCI_SPECTRAL_MASK_CONFIGURATION,
+    WAVELENGTH_INPUT_MASK_CONFIGURATION,
+)
 from ..contracts.result import (
     BiasResultContract,
     CmpResultContract,
@@ -27,6 +33,8 @@ from ..contracts.result import (
     TwiResultContract,
     WaveResultContract,
     MasterSciResultContract,
+    ExtractedMasterSciSpectrumResultContract,
+    FiberWavelengthSpectralMaskResultContract,
 )
 from ..core.algo_result import AlgoResult, ensure_algo_result
 from ..ontology.artifact_kinds import kind_spec
@@ -43,6 +51,7 @@ class _CanonicalTask(CalibrationTask):
     result_kind: str = ""
     result_contract: Type = object
     component_map: Dict[str, str] = {}
+    component_units: Dict[str, str] = {}
     algorithm_name: str = ""
 
     @staticmethod
@@ -72,7 +81,9 @@ class _CanonicalTask(CalibrationTask):
             value = result.get_array(output_name)
             if value is None:
                 continue
-            unit = "1" if "mask" in component_name else spec.units
+            unit = self.component_units.get(
+                component_name, "1" if "mask" in component_name else spec.units
+            )
             components[component_name] = LogicalComponent(
                 name=component_name,
                 model_type=_model_type(value),
@@ -85,8 +96,16 @@ class _CanonicalTask(CalibrationTask):
             raise RuntimeError(f"{self.__class__.__name__}: missing required components: {sorted(missing)}")
         return components
 
-    def _publish(self, result: AlgoResult, parent_ids: Iterable[int], *, configuration_refs=None):
+    def _publish(
+        self,
+        result: AlgoResult,
+        parent_ids: Iterable[int],
+        *,
+        configuration_refs=None,
+        parameters=None,
+    ):
         parent_ids = [int(value) for value in parent_ids]
+        spec = kind_spec(self.artifact_name)
         components = self._components(result)
         summaries = dict(result.scalars or {})
         request = ArtifactRequest(
@@ -97,8 +116,9 @@ class _CanonicalTask(CalibrationTask):
                 "n_inputs": summaries.get("n_inputs", 0),
                 "calibration_group_id": getattr(self.target, "group_id", None),
                 "calibration_group": getattr(self.target, "group_metadata", None),
+                "algorithm_metadata": dict(result.meta or {}),
             },
-            scope=Scope(zipcode=self.target.zipcode),
+            scope=Scope(zipcode=self.target.zipcode, physical_scope=spec.scope),
             parents=parent_ids,
             validity=self.target_validity(),
             configuration_refs=list(configuration_refs or self.configuration_references()),
@@ -113,7 +133,7 @@ class _CanonicalTask(CalibrationTask):
             task_version=self.version,
             algorithm_name=self.algorithm_name,
             algorithm_version=result.version,
-            parameters=dict(self.params or {}),
+            parameters=dict(parameters if parameters is not None else (self.params or {})),
             # ArtifactRequest.parents is the sole authoritative parent interface.
             parent_ids=[],
             timings={},
@@ -249,18 +269,15 @@ class ArcTask(_CanonicalTask):
 
 class MasterSciTask(_RawCalibrationTask):
     name = "master_sci"
-    version = "v1"
+    version = "v2"
     frame_type = "sci"
     artifact_name = "master_sci"
     algorithm = staticmethod(build_master_sci)
     algorithm_name = "virusflow.algorithms.master_sci.build_master_sci"
     result_kind = "master_sci"
     result_contract = MasterSciResultContract
-    component_map = {
-        "master_sci": "master_sci",
-        "fiber_wavelength_mask_support": "fiber_wavelength_mask_support",
-    }
-    combine_method = "chunked fixed-center biweight_location + fractional MAD support"
+    component_map = {"master_sci": "master_sci"}
+    combine_method = "chunked fixed-center biweight_location"
 
     def validate_scientific_result(self, result: AlgoResult) -> None:
         metadata = getattr(self.target, "group_metadata", None) or {}
@@ -280,6 +297,147 @@ class MasterSciTask(_RawCalibrationTask):
                 "master_sci insufficient robust illumination: "
                 f"measured={measured}, minimum={float(minimum)}"
             )
+
+
+class ExtractedMasterSciSpectrumTask(_CanonicalTask):
+    name = "master_sci_extraction"
+    version = "v1"
+    artifact_name = "extracted_master_sci_spectrum"
+    algorithm_name = (
+        "virusflow.algorithms.master_sci_spectrum.extract_master_sci_spectrum"
+    )
+    result_kind = "extracted_master_sci_spectrum"
+    result_contract = ExtractedMasterSciSpectrumResultContract
+    component_map = {
+        "spectrum": "spectrum",
+        "valid_pixel_fraction": "valid_pixel_fraction",
+        "effective_aperture_width": "effective_aperture_width",
+        "extraction_valid": "extraction_valid",
+    }
+    component_units = {
+        "spectrum": "electron",
+        "valid_pixel_fraction": "1",
+        "effective_aperture_width": "pixel",
+        "extraction_valid": "1",
+    }
+
+    def run(self, inputs):
+        self._require_target()
+        service = ArtifactService(self.ctx.db_path)
+        master_row = self._dependency(inputs, "master_sci") or self._resolve_artifact(
+            "master_sci", required=True
+        )
+        trace_row = self._dependency(inputs, "trace_map") or self._resolve_artifact(
+            "trace_map", required=True
+        )
+        master_id = int(master_row.id) if hasattr(master_row, "id") else int(master_row["id"])
+        trace_id = int(trace_row.id) if hasattr(trace_row, "id") else int(trace_row["id"])
+        params = dict(MASTER_SCI_EXTRACTION_CONFIGURATION.value)
+        params.update(self._params())
+        result = extract_master_sci_spectrum(
+            service.load_component(master_id, "master_sci")["data"],
+            service.load_component(trace_id, "fiber_trace_map")["data"],
+            aperture_width=float(params["aperture_width"]),
+        )
+        report = self.result_contract().validate(result)
+        if not report.ok:
+            raise ValueError(
+                "ExtractedMasterSciSpectrumTask result contract: "
+                + "; ".join(report.errors)
+            )
+        refs = self.configuration_references() + [ConfigurationReference(
+            MASTER_SCI_EXTRACTION_CONFIGURATION.kind,
+            MASTER_SCI_EXTRACTION_CONFIGURATION.version,
+            self.target.zipcode.key(),
+            MASTER_SCI_EXTRACTION_CONFIGURATION.evidence_state,
+        )]
+        artifact = self._publish(
+            result, [master_id, trace_id], configuration_refs=refs, parameters=params
+        )
+        return {self.artifact_name: artifact}
+
+
+class FiberWavelengthSpectralMaskTask(_CanonicalTask):
+    name = "master_sci_spectral_mask"
+    version = "v1"
+    artifact_name = "fiber_wavelength_spectral_mask"
+    algorithm_name = (
+        "virusflow.algorithms.master_sci_mask.build_master_sci_spectral_mask"
+    )
+    result_kind = "fiber_wavelength_spectral_mask"
+    result_contract = FiberWavelengthSpectralMaskResultContract
+    component_map = {
+        "mask": "mask",
+        "spectral_model": "spectral_model",
+        "normalization": "normalization",
+        "good_wavelength_solution": "good_wavelength_solution",
+    }
+    component_units = {
+        "mask": "1",
+        "spectral_model": "electron",
+        "normalization": "1",
+        "good_wavelength_solution": "1",
+    }
+
+    def run(self, inputs):
+        self._require_target()
+        service = ArtifactService(self.ctx.db_path)
+        spectrum_row = (
+            self._dependency(inputs, "extracted_master_sci_spectrum")
+            or self._resolve_artifact("extracted_master_sci_spectrum", required=True)
+        )
+        wavelength_row = self._dependency(inputs, "wavelength_map") or self._resolve_artifact(
+            "wavelength_map", required=True
+        )
+        spectrum_id = int(spectrum_row.id) if hasattr(spectrum_row, "id") else int(spectrum_row["id"])
+        wavelength_id = int(wavelength_row.id) if hasattr(wavelength_row, "id") else int(wavelength_row["id"])
+
+        normalization = None
+        parent_ids = [spectrum_id, wavelength_id]
+        # Normalization is an explicit optional dependency, never an ambient
+        # registry lookup: otherwise the same planned target could change when
+        # a twilight product happened to appear between planning and execution.
+        normalization_row = self._dependency(inputs, "within_amp_fiber_normalization")
+        if normalization_row is not None:
+            normalization_id = (
+                int(normalization_row.id)
+                if hasattr(normalization_row, "id") else int(normalization_row["id"])
+            )
+            normalization = service.load_component(
+                normalization_id, "normalization"
+            )["data"]
+            parent_ids.append(normalization_id)
+
+        params = dict(MASTER_SCI_SPECTRAL_MASK_CONFIGURATION.value)
+        params.update(self._params())
+        result = build_master_sci_spectral_mask(
+            service.load_component(spectrum_id, "spectrum")["data"],
+            service.load_component(wavelength_id, "wavelength_map")["data"],
+            fiber_normalization=normalization,
+            coarse_bins=int(params["coarse_bins"]),
+            model_bins=int(params["model_bins"]),
+            minimum_wavelength_finite_fraction=float(
+                params["minimum_wavelength_finite_fraction"]
+            ),
+            amplifier_fibers=int(params["amplifier_fibers"]),
+            very_bad_threshold=float(params["very_bad_threshold"]),
+        )
+        report = self.result_contract().validate(result)
+        if not report.ok:
+            raise ValueError(
+                "FiberWavelengthSpectralMaskTask result contract: "
+                + "; ".join(report.errors)
+            )
+        refs = self.configuration_references() + [ConfigurationReference(
+            MASTER_SCI_SPECTRAL_MASK_CONFIGURATION.kind,
+            MASTER_SCI_SPECTRAL_MASK_CONFIGURATION.version,
+            self.target.zipcode.key(),
+            MASTER_SCI_SPECTRAL_MASK_CONFIGURATION.evidence_state,
+        )]
+        artifact = self._publish(
+            result, parent_ids, configuration_refs=refs, parameters=params
+        )
+        return {self.artifact_name: artifact}
 
 class TwiTask(_RawCalibrationTask):
     name = "twi"

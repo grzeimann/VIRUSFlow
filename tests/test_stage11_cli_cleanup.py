@@ -86,9 +86,7 @@ def test_legacy_artifact_names_are_read_only_not_publication_aliases(tmp_path: P
     from virusflow.publication.service import DefaultPublicationService
 
     assert canonical_kind("master_flat") == "master_ldls"
-    assert kind_spec("master_sci").required_components == (
-        "master_sci", "fiber_wavelength_mask_support",
-    )
+    assert kind_spec("master_sci").required_components == ("master_sci",)
 
     service = ArtifactService(str(tmp_path / "registry.sqlite3"))
     publisher = DefaultPublicationService(

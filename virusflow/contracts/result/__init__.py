@@ -78,5 +78,20 @@ class TwiResultContract(_BaseSimpleContract):
 
 
 class MasterSciResultContract(_BaseSimpleContract):
-    required_arrays = ["master_sci", "fiber_wavelength_mask_support"]
+    required_arrays = ["master_sci"]
     required_scalars = ["n_inputs", "robust_illumination"]
+
+
+class ExtractedMasterSciSpectrumResultContract(_BaseSimpleContract):
+    required_arrays = [
+        "spectrum", "valid_pixel_fraction", "effective_aperture_width",
+        "extraction_valid",
+    ]
+    required_scalars = ["fiber_count", "valid_sample_fraction"]
+
+
+class FiberWavelengthSpectralMaskResultContract(_BaseSimpleContract):
+    required_arrays = [
+        "mask", "spectral_model", "normalization", "good_wavelength_solution",
+    ]
+    required_scalars = ["masked_fraction", "good_wavelength_solution_count"]

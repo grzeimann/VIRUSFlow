@@ -28,6 +28,8 @@ def test_canonical_calibration_kinds_and_legacy_aliases():
         "master_arc",
         "master_twilight",
         "master_sci",
+        "extracted_master_sci_spectrum",
+        "fiber_wavelength_spectral_mask",
         "trace_map",
         "wavelength_map",
     }

@@ -51,7 +51,17 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
     "master_cd": _spec("master_cd", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_cd",)),
     "master_arc": _spec("master_arc", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_arc",)),
     "master_twilight": _spec("master_twilight", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_twilight",)),
-    "master_sci": _spec("master_sci", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_sci", "fiber_wavelength_mask_support")),
+    "master_sci": _spec("master_sci", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("master_sci",)),
+    "extracted_master_sci_spectrum": _spec(
+        "extracted_master_sci_spectrum", PhysicalScope.FIBER, Unit.ELECTRON.value,
+        CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
+        ("spectrum", "valid_pixel_fraction", "effective_aperture_width", "extraction_valid"),
+    ),
+    "fiber_wavelength_spectral_mask": _spec(
+        "fiber_wavelength_spectral_mask", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value,
+        CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
+        ("mask", "spectral_model", "normalization", "good_wavelength_solution"),
+    ),
     "trace_map": _spec("trace_map", PhysicalScope.AMPLIFIER, Unit.PIXEL.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("fiber_trace_map", "trace_sample_columns", "sampled_trace_positions", "per_fiber_trace_residual_rms")),
     "wavelength_map": _spec("wavelength_map", PhysicalScope.AMPLIFIER, Unit.ANGSTROM.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("wavelength_map", "per_fiber_wavelength_residual_rms"), ("arc_identification",)),
     "read_noise": _spec("read_noise", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.NONE, ("read_noise",)),

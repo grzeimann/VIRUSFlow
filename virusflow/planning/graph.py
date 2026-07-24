@@ -123,8 +123,15 @@ class ReductionGraph:
             for row in svc.adapter.list_all(kind=target.kind):
                 if row.get("amp_key") != scope_key(target.scope):
                     continue
-                if (row.get("metadata") or {}).get("calibration_group_id") == target.group.group_id:
+                registered_group_id = (row.get("metadata") or {}).get("calibration_group_id")
+                if registered_group_id == target.group.group_id:
                     return True
+                # Parent-only matching is a compatibility fallback for records
+                # predating group identities.  A record with a different group
+                # identity may represent a new algorithm/configuration revision
+                # over the same raw frames and must not suppress that work.
+                if registered_group_id is not None:
+                    continue
                 if not target.group.raw_ids:
                     continue
                 wanted = list(target.group.raw_ids)

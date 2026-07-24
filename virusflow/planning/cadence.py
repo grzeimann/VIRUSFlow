@@ -36,7 +36,7 @@ _ALGORITHM_IDENTITIES = {
     "master_hg": "cmp-1.1",
     "master_cd": "cmp-1.1",
     "master_twilight": "twi-1.1",
-    "master_sci": "master-sci-1.0",
+    "master_sci": "master-sci-2.0",
 }
 
 

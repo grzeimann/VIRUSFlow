@@ -101,3 +101,25 @@ WAVELENGTH_INPUT_MASK_CONFIGURATION = VersionedConfiguration(
     evidence_state="provisional",
     source="20260609 characterization: reject pathological near-global flat masks while retaining mask evidence",
 )
+
+MASTER_SCI_EXTRACTION_CONFIGURATION = VersionedConfiguration(
+    kind="master_sci_extraction",
+    version="fractional-aperture-5px-1",
+    value={"aperture_width": 5.0},
+    evidence_state="verified",
+    source="VIRUSFlow spectral-extraction knowledge note and canonical exposure extractor",
+)
+
+MASTER_SCI_SPECTRAL_MASK_CONFIGURATION = VersionedConfiguration(
+    kind="master_sci_spectral_mask",
+    version="archival-normalized-1",
+    value={
+        "coarse_bins": 32,
+        "model_bins": 2000,
+        "minimum_wavelength_finite_fraction": 0.8,
+        "amplifier_fibers": 112,
+        "very_bad_threshold": 10.0,
+    },
+    evidence_state="verified",
+    source="archival mask_utils build_model_spectra/make_spectral_mask behavior",
+)
