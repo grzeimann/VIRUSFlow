@@ -91,10 +91,8 @@ Cleanup commands inventory candidates by default. Scratch/cache deletion require
 - [CLI reference](docs/cli-reference.md)
 - [Worked examples](docs/examples.md)
 - [Troubleshooting](docs/troubleshooting.md)
-- [Stage 11 migration](docs/migration/stage-11.md)
 - [Target architecture](docs/architecture/VIRUSFlow_Target_Architecture.md)
 - [Current implementation flow](docs/architecture/current-system.md)
-- [Stages 8–10 storage specification](docs/tasks/VIRUSFlow_Stages_8_10_Storage_Materialization_Sky_Parallel_Revision.md)
 
 ## Testing and development
 
