@@ -47,12 +47,6 @@ def detect_dark_current_outliers(dark: np.ndarray) -> np.ndarray:
     _m, _med, s = sigma_clipped_stats(y1)
     # Base mask: 5-sigma outliers in absolute value
     mask = np.abs(y1) > 5.0 * float(s)
-    # If bright outliers > 100 ADU and the next row is also masked, flag column
-    yind, xind = np.where(y1 > 100)
-    for yi, xi in zip(yind, xind):
-        if yi + 2 < mask.shape[0]:
-            if mask[yi + 1, xi]:
-                mask[:, xi] = True
     return mask.astype(np.uint8)
 
 
