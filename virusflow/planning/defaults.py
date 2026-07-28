@@ -56,7 +56,7 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         inputs_raw=["drk"],
         inputs_artifacts=None,
         scope_mode="per_zipcode",
-        cadence=PurposeCadence("monthly", minimum_exposures=1),
+        cadence=PurposeCadence("monthly", minimum_exposures=3),
     )
     flat = TaskSpec(
         kind="master_ldls",
