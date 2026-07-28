@@ -3,8 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 
 import numpy as np
+import pytest
 from virusflow.analytics.studies.bias import BiasStabilityParams, BiasStabilityStudy
-from virusflow.artifacts import ArtifactService
+from virusflow.artifacts import ArtifactService, Scope
+from virusflow.core.algo_result import AlgoResult
 from virusflow.core.identity import ZipCode
 from virusflow.io import RawFrameData
 from virusflow.registry.database import connect, init_db
@@ -85,3 +87,51 @@ def test_bias_stability_uses_named_components_and_records_all_source_lineage(tmp
         "source_artifact_id", "median_bias_level", "median_bias_scatter"
     }
     assert {item["parent_id"] for item in desc["relations"]} == {first.id, second.id}
+
+
+def _bias_result(read_noise: float) -> AlgoResult:
+    return AlgoResult(
+        kind="bias",
+        version="test-read-noise-qa",
+        arrays={
+            "master": np.zeros((8, 8), dtype=float),
+            "per_pixel_bias_scatter": np.full((8, 8), read_noise, dtype=float),
+        },
+        scalars={"read_noise": read_noise, "n_inputs": 25},
+    )
+
+
+def test_bias_warning_is_retained_as_degraded_without_blocking(tmp_path, monkeypatch):
+    task, service = _task(tmp_path)
+    monkeypatch.setattr(BiasTask, "algorithm", staticmethod(
+        lambda *, raw_inputs, params: _bias_result(5.0)
+    ))
+
+    artifact = task.run({})["master_bias"]
+    qa = service.adapter.get_qa_bundle(artifact.id)
+    assert qa["status"] == "warn"
+    assert qa["usability"] == "degraded"
+    assert qa["policy_version"] == "2"
+    assert "4.5 electron warning ceiling" in qa["rules"][0]["message"]
+
+
+def test_bias_critical_is_retained_for_diagnostics_and_hard_fails_early(tmp_path, monkeypatch):
+    task, service = _task(tmp_path)
+    monkeypatch.setattr(BiasTask, "algorithm", staticmethod(
+        lambda *, raw_inputs, params: _bias_result(6.5)
+    ))
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"QA hard-fail for master_bias.*read_noise=6.5 electron.*6.0 electron critical",
+    ):
+        task.run({})
+
+    row = service.select_best(
+        kind="master_bias", scope=Scope(zipcode=_Target.zipcode), policy="latest"
+    )
+    assert row is not None
+    qa = service.adapter.get_qa_bundle(int(row["id"]))
+    assert qa["status"] == "fail"
+    assert qa["usability"] == "unusable"
+    assert qa["metrics"]["read_noise"] == 6.5

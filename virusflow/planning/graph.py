@@ -120,12 +120,31 @@ class ReductionGraph:
         def already_has_inputs(target: Target) -> bool:
             if target.group is None:
                 return False
+
+            def qa_accepts(row: dict) -> bool:
+                qa = svc.adapter.get_qa_bundle(int(row["id"]))
+                if qa and (
+                    str(qa.get("status") or "").lower() == "fail"
+                    or str(qa.get("usability") or "").lower() == "unusable"
+                ):
+                    return False
+                # The read-noise gate changed from the original no-op bias
+                # policy. Re-evaluate an otherwise identical bias when its
+                # persisted decision predates the active policy.
+                if target.kind == "master_bias":
+                    expected = svc.diagnostics.policy_version_for(target.kind)
+                    if not qa or str(qa.get("policy_version") or "") != expected:
+                        return False
+                return True
+
             for row in svc.adapter.list_all(kind=target.kind):
                 if row.get("amp_key") != scope_key(target.scope):
                     continue
                 registered_group_id = (row.get("metadata") or {}).get("calibration_group_id")
                 if registered_group_id == target.group.group_id:
-                    return True
+                    if qa_accepts(row):
+                        return True
+                    continue
                 # Parent-only matching is a compatibility fallback for records
                 # predating group identities.  A record with a different group
                 # identity may represent a new algorithm/configuration revision
@@ -139,7 +158,9 @@ class ReductionGraph:
                 if isinstance(parents, str):
                     parents = [int(value) for value in parents.split(",") if value]
                 if sorted(int(value) for value in parents) == sorted(wanted):
-                    return True
+                    if qa_accepts(row):
+                        return True
+                    continue
             return False
 
         def emit(target: Target) -> None:

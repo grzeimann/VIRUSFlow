@@ -34,10 +34,41 @@ def test_progress_enabled_by_default_and_tty_updates_in_place():
     result = executor.run()
     assert result == {"a": ("A", ())}
     rendered = output.getvalue()
-    assert "\x1b[2K" in rendered
+    assert "\x1b[" in rendered
+    assert "\x1b[J" in rendered
+    assert "VIRUSFlow progress" in rendered
+    assert "Task kinds" in rendered
     assert "1/1" in rendered
     assert rendered.endswith("\n")
     assert executor.execution_stats["progress"]["finalized"] is True
+
+
+def test_tty_progress_lines_are_bounded_to_the_terminal_width(monkeypatch):
+    class NarrowTTY(_TTY):
+        def fileno(self):
+            return 123
+
+    monkeypatch.setattr(
+        "virusflow.executors.progress.os.get_terminal_size",
+        lambda _fd: __import__("os").terminal_size((48, 10)),
+    )
+    output = NarrowTTY()
+    executor = PlanningExecutor(max_workers=1, progress_stream=output)
+    executor.add_task(
+        "a",
+        _Task("A"),
+        kind="calibration-kind-with-a-long-name",
+        target="zipcode=an-extremely-long-target-that-would-wrap",
+    )
+    executor.run()
+
+    printable_lines = [
+        line
+        for line in output.getvalue().replace("\r", "").splitlines()
+        if not line.startswith("\x1b[")
+    ]
+    assert printable_lines
+    assert max(map(len, printable_lines)) <= 47
 
 
 def test_plain_and_structured_progress_have_complete_graph_counters(tmp_path):

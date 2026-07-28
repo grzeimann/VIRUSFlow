@@ -11,7 +11,8 @@ virusflow run calibrations --db ./run/registry.sqlite3 --workdir ./run/artifacts
   --start-date 20260609 --end-date 20260609 --plan-only
 virusflow run calibrations --db ./run/registry.sqlite3 --workdir ./run/artifacts \
   --start-date 20260609 --end-date 20260609
-virusflow model list --db ./run/registry.sqlite3 --state active
+virusflow artifact list --db ./run/registry.sqlite3 --kind master_bias --summary
+virusflow qa list --db ./run/registry.sqlite3 --kind master_bias
 virusflow qa list --db ./run/registry.sqlite3 --kind trace_map
 ```
 
@@ -19,6 +20,14 @@ Inspect `planning_report.yml` before the second command. For a known unstable
 dark period, a planning YAML override may set `master_dark.cadence.type` to
 `weekly`; explicit dark-time intervals and `master_sci` sufficiency examples
 are in [calibration cadence](calibration-cadence.md).
+
+Calibration Products are canonical artifacts, so inspect them with `artifact`
+and `qa`; `model list` is reserved for lifecycle-model Products created during
+science processing. A `master_bias` near 3 electrons passes read-noise QA,
+values above 4.5 electrons warn and remain degraded-but-usable, and values above
+6 electrons hard-fail as unusable. The failed bias Product remains queryable for
+engineering evidence, while its amplifier's downstream calibration branches are
+blocked before wavelength fitting.
 
 ## Single exposure
 

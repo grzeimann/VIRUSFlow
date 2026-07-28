@@ -104,14 +104,42 @@ median or biweight location.
 
 Typical values:
 
-- ~3 electrons: nominal
-- >4.5 electrons: warning
-- >6 electrons: strong indication of amplifier problems
+- approximately 3 electrons: nominal
+- above 4.5 through 6 electrons: warning / degraded
+- above 6 electrons: critical / scientifically unusable by default
 
 Persistent read noise above six electrons may justify declaring the amplifier
 scientifically invalid until the condition is resolved.
 
 Thresholds should remain configurable as operational experience evolves.
+
+### Temporary operational scientific disposition
+
+Pending validation against a longer detector-health history, VIRUSFlow uses the
+nightly `master_bias` read-noise measurement as an amplifier-level calibration
+gate. A warning does not stop processing. A critical result is published and
+retained with `fail` status and `unusable` scientific usability, then blocks the
+other calibration branches for the same amplifier before trace or wavelength
+fitting.
+
+Possible causes include controller or preamplifier degradation, grounding or
+shielding changes, electromagnetic pickup, unstable detector bias or clock
+supplies, intermittent cabling, temperature-dependent electronics, recent
+hardware intervention, or error in the configured gain used to express the
+measurement in electrons. The QA classification diagnoses an electronic-health
+state; it does not by itself distinguish among these causes.
+
+The scientific reason for the temporary critical gate is relative
+heterogeneity. Increasing read noise from the nominal approximately 3 electrons
+to above 6 electrons increases the read-noise variance contribution by more than
+a factor of four. Weak lamp and science features then have substantially lower
+signal-to-noise than in otherwise comparable amplifiers, wavelength seed
+selection can become unstable, and treating the affected unit as part of one
+uniform reduction batch can make downstream failures appear algorithmic rather
+than electronic. The raw data, failed bias Product, QA facts, controller
+identity, and provenance must be retained for engineering analysis, but normal
+downstream calibration and science Products should not be treated as worth
+retaining for scientific use until reviewed.
 
 ---
 

@@ -37,4 +37,10 @@ See [performance.md](performance.md) for timing fields, controlled-comparison co
 
 Malformed targets/options produce exit status 2. Graph failures produce a nonzero status with failed and blocked nodes separated. Cleanup is non-destructive unless `--execute` or `--deactivate` is present. Canonical/model artifacts are never cache eviction candidates. Legacy payload deletion requires all three flags: `--deactivate --delete-payloads --validation-succeeded`.
 
+Default `master_bias` QA is a hard upstream health gate: read noise above 4.5
+electrons produces a warning/degraded Product, and above 6 electrons produces a
+failed/unusable Product. The latter remains inspectable through `artifact` and
+`qa`, while dependent calibration nodes are reported as blocked rather than
+allowing a later wavelength failure to become the apparent root cause.
+
 Removed public interfaces are not emulated: the nonfunctional `plan` command family, `tasks`, `debug-raw`, plural `artifacts`, and immediate `storage cleanup-scratch` path are retired. Use `run calibrations --plan-only`, `artifact`, and `cleanup`. Deprecated Artifact names remain lookup/migration vocabulary only and are rejected for publication.

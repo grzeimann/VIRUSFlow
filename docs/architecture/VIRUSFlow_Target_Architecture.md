@@ -631,6 +631,13 @@ fail:
   min: 6.0
 ```
 
+For the current read-noise policy, boundary semantics are `PASS <= 4.5
+electron`, `WARN > 4.5 and <= 6 electron`, and `FAIL > 6 electron`. The hard
+failure preserves the detector-health Product and QA evidence but makes the
+amplifier unusable as a prerequisite for normal downstream scientific
+calibration. These operational thresholds remain configurable rather than part
+of the read-noise estimator.
+
 ## 12.3 Status vocabulary
 
 ```text

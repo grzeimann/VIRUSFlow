@@ -205,5 +205,20 @@ class CalibrationTask(Task):
             artifact_id=int(artifact.id), kind=str(artifact.kind), meta=result
         )
         if service.diagnostics.should_block(kind=str(artifact.kind), status=status):
-            raise RuntimeError(f"QA hard-fail for {artifact.kind} (artifact_id={artifact.id})")
+            bundle = service.adapter.get_qa_bundle(int(artifact.id)) or {}
+            details = []
+            read_noise = (bundle.get("facts") or {}).get("read_noise") or {}
+            if read_noise.get("value") is not None:
+                details.append(
+                    f"read_noise={read_noise['value']} {read_noise.get('units') or 'electron'}"
+                )
+            details.extend(
+                str(rule.get("message"))
+                for rule in (bundle.get("rules") or [])
+                if rule.get("message")
+            )
+            suffix = f": {'; '.join(details)}" if details else ""
+            raise RuntimeError(
+                f"QA hard-fail for {artifact.kind} (artifact_id={artifact.id}){suffix}"
+            )
         return status

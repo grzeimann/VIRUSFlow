@@ -15,6 +15,7 @@ Notes:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Dict, List, Sequence, Tuple, Optional
 
 from .graph import TaskSpec, Edge
@@ -107,6 +108,54 @@ def schedule(
         scope_target_to_ids.setdefault((target.kind, scope_k), []).append(node_id)
         if target.group is not None:
             group_target_to_id[(target.kind, target.group.group_id)] = node_id
+
+    def _time_bounds(target: Target) -> Tuple[Optional[datetime], Optional[datetime]]:
+        window = target.window
+        if window is not None:
+            return window.start, window.end
+        return target.at_time, target.at_time
+
+    def _center(target: Target) -> Optional[datetime]:
+        start, end = _time_bounds(target)
+        if start is not None and end is not None:
+            return start + (end - start) / 2
+        return start or end
+
+    def _qa_gate_dependencies(edge: Edge, target: Target) -> List[str]:
+        """Resolve planned QA gates without treating them as data parents."""
+
+        scope_k = _scope_key(target)
+        candidates = [
+            candidate for candidate in grouped.get(edge.src.kind, [])
+            if _scope_key(candidate) == scope_k
+        ]
+        if not candidates:
+            # An existing, QA-accepted source is not in the planned target set
+            # and therefore needs no execution dependency.
+            return []
+        target_start, target_end = _time_bounds(target)
+        overlapping = []
+        if target_start is not None and target_end is not None:
+            for candidate in candidates:
+                source_start, source_end = _time_bounds(candidate)
+                if source_start is None or source_end is None:
+                    continue
+                if source_start <= target_end and target_start <= source_end:
+                    overlapping.append(candidate)
+        selected = overlapping
+        if not selected:
+            target_center = _center(target)
+            centered = [
+                (abs((_center(candidate) - target_center).total_seconds()), candidate)
+                for candidate in candidates
+                if _center(candidate) is not None and target_center is not None
+            ]
+            if centered:
+                distance, nearest = min(centered, key=lambda item: (item[0], _make_node_id(item[1])))
+                if distance <= max(0, int(edge.tolerance_days)) * 86400:
+                    selected = [nearest]
+        return [_make_node_id(candidate) for candidate in selected]
+
     # Build in topo order by kinds
     for kind in order:
         for t in grouped.get(kind, []):
@@ -132,10 +181,16 @@ def schedule(
                         deps_ids.append(dep_id)
             else:
                 for e in edges:
-                    if e.dst.kind != kind:
+                    if e.dst.kind != kind or e.policy == "qa_gate":
                         continue
                     candidates = scope_target_to_ids.get((e.src.kind, scope_k), [])
                     if len(candidates) == 1 and candidates[0] not in deps_ids:
                         deps_ids.append(candidates[0])
+            for edge in edges:
+                if edge.dst.kind != kind or edge.policy != "qa_gate":
+                    continue
+                for dep_id in _qa_gate_dependencies(edge, t):
+                    if dep_id not in deps_ids:
+                        deps_ids.append(dep_id)
             scheduled.append(ScheduledTask(id=node_id, kind=kind, task=task_obj, depends_on=deps_ids))
     return scheduled

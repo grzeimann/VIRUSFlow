@@ -31,6 +31,39 @@ The lamp minimum counts, isolated-group span, and
 `master_arc.cadence.maximum_pair_separation_hours` are configurable; their
 defaults are one exposure, three hours, and three hours respectively.
 
+## Amplifier read-noise QA gate
+
+The nightly `master_bias` is also the upstream electronic-health gate for every
+other calibration branch in the same amplifier ZIP code. The default QA policy
+interprets its measured read noise as follows:
+
+| Read noise | Default QA | Calibration behavior |
+|---|---|---|
+| `<= 4.5 electron` | pass | Continue normally; values near 3 electrons are expected. |
+| `> 4.5` and `<= 6 electron` | warn / degraded | Continue, but record the warning for review and trending. |
+| `> 6 electron` | fail / unusable | Retain the bias and QA evidence, but block downstream dark, illumination, lamp, trace, wavelength, twilight, and Master Science work for that amplifier. |
+
+The warning and critical ceilings are configuration-driven in
+[`qa_default.yml`](qa_default.yml). A hard QA failure is deliberately raised by
+the bias task after its artifact and QA bundle have been published. Executor
+dependency propagation therefore reports the bias as the failed root cause and
+the affected downstream products as blocked; the wavelength algorithm is not
+run and cannot obscure the earlier detector-health diagnosis.
+
+This is a temporary operational scientific disposition pending broader
+time-series validation. Elevated electronic read noise can arise from controller
+or preamplifier degradation, grounding or shielding changes, pickup, unstable
+bias/clock supplies, intermittent connections, temperature dependence, hardware
+maintenance, or an incorrect gain assumption. Whatever the cause, doubling the
+read noise from the nominal approximately 3 electrons to above 6 electrons
+raises the read-noise variance floor by more than a factor of four. The affected
+amplifier then has substantially poorer signal-to-noise than the rest of the
+instrument, can lose weak comparison-lamp features and stable wavelength seed
+rows, and is difficult to reduce consistently in the same scientific batch.
+Its raw records and failed bias Product remain valuable for engineering and
+provenance, but normal downstream Products are not retained as scientifically
+usable until the condition is reviewed.
+
 `master_sci` requires raw `EXPTIME` (falling back explicitly to `PEXPTIME`) to
 be strictly greater than 300 seconds. Exactly 300 seconds is excluded. The
 provisional defaults require at least three eligible exposures and at least

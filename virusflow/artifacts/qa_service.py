@@ -55,10 +55,13 @@ class QADiagnosticsService:
             for name, value in (result.scalars or {}).items()
             if np.isscalar(value) and not isinstance(value, (str, bytes))
         }
-        facts.update({
-            name: {"value": value, "units": None, "component": None}
-            for name, value in (decision.metrics or {}).items()
-        })
+        for name, value in (decision.metrics or {}).items():
+            # A QA metric may intentionally reuse an algorithm fact (for
+            # example read_noise). Preserve the fact's canonical units rather
+            # than replacing it with an untyped duplicate.
+            facts.setdefault(
+                name, {"value": value, "units": None, "component": None}
+            )
         for component_name, units in (
             ("per_pixel_bias_scatter", "electron"),
             ("per_fiber_trace_residual_rms", "pixel"),
@@ -82,7 +85,7 @@ class QADiagnosticsService:
             facts=facts,
             status=decision.status,
             usability=usability,
-            policy_version="1",
+            policy_version=engine.policy_version_for(kind),
             rules=[{"message": message} for message in (decision.messages or [])],
         )
         _qa_inc(kind, decision.status)
@@ -90,3 +93,6 @@ class QADiagnosticsService:
 
     def should_block(self, *, kind: str, status: Optional[str]) -> bool:
         return self._engine_or_load().policy_for(kind) == "hard" and str(status or "").lower() == "fail"
+
+    def policy_version_for(self, kind: str) -> str:
+        return self._engine_or_load().policy_version_for(kind)

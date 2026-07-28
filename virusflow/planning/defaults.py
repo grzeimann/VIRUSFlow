@@ -36,6 +36,7 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
     - wavelength_map: derived from master_arc + trace_map
     - extracted_master_sci_spectrum: derived from master_sci + trace_map
     - fiber_wavelength_spectral_mask: derived from extracted spectra + wavelength_map
+    - master_bias: hard QA gate for every other raw calibration branch
 
     Planning YAML may override canonical node fields and may replace the edge
     list. Dependencies have one representation: explicit edges.
@@ -139,6 +140,21 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
 
     # Edges (base)
     edges: List[Edge] = [
+        # These are execution/QA gates, not scientific derivation relations.
+        # A critical nightly read-noise result is retained as diagnostic
+        # evidence, then blocks all other calibration branches for that
+        # amplifier before trace or wavelength fitting can run.
+        Edge(src=bias, dst=dark, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=flat, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=hg, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=cd, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=twilight, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=master_sci, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=arc, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=trace, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=wave, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=master_sci_spectrum, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=master_sci_mask, policy="qa_gate", tolerance_days=1),
         Edge(src=flat, dst=trace, policy="latest_valid", tolerance_days=90),
         Edge(src=hg, dst=arc, policy="nearest_valid", tolerance_days=1),
         Edge(src=cd, dst=arc, policy="nearest_valid", tolerance_days=1),

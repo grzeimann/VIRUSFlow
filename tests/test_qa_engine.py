@@ -143,6 +143,30 @@ def test_master_bias_like_rule_passes_for_readnoise_near_three(tmp_path):
     assert d_none.status == "fail"
 
 
+def test_default_master_bias_read_noise_warning_and_critical_zones():
+    eng = QAEngine()
+
+    nominal = eng.evaluate(kind="master_bias", meta={"read_noise": 3.0})
+    assert nominal.policy == "hard"
+    assert eng.policy_version_for("master_bias") == "2"
+    assert nominal.status == "pass"
+    assert not nominal.should_block
+
+    warning = eng.evaluate(kind="master_bias", meta={"read_noise": 4.5001})
+    assert warning.status == "warn"
+    assert not warning.should_block
+    assert "4.5 electron warning ceiling" in " ".join(warning.messages)
+
+    boundary = eng.evaluate(kind="master_bias", meta={"read_noise": 6.0})
+    assert boundary.status == "warn"
+    assert not boundary.should_block
+
+    critical = eng.evaluate(kind="master_bias", meta={"read_noise": 6.0001})
+    assert critical.status == "fail"
+    assert critical.should_block
+    assert "6.0 electron critical ceiling" in " ".join(critical.messages)
+
+
 def test_master_arc_not_all_zero_rule(tmp_path):
     # Fail master_arc if all values are zero (p95 == 0)
     yaml_text = (

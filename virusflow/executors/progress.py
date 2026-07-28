@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import os
 from pathlib import Path
 import sys
 from threading import Event, Lock, Thread
@@ -317,6 +318,7 @@ class ProgressReporter:
         self._stop = Event()
         self._thread: Thread | None = None
         self._lock = Lock()
+        self._tty_line_count = 0
 
     def start(self) -> None:
         if not self.enabled:
@@ -352,6 +354,89 @@ class ProgressReporter:
         with self.structured_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
 
+    def _terminal_size(self) -> os.terminal_size:
+        try:
+            return os.get_terminal_size(self.stream.fileno())
+        except (AttributeError, OSError):
+            return os.terminal_size((100, 24))
+
+    @staticmethod
+    def _fit_line(text: str, width: int) -> str:
+        if len(text) <= width:
+            return text
+        if width <= 1:
+            return text[:width]
+        return text[: width - 1] + "…"
+
+    def _tty_lines(self, snapshot: ProgressSnapshot) -> list[str]:
+        size = self._terminal_size()
+        width = max(10, size.columns - 1)
+        height = max(4, size.lines - 2)
+        rate = (
+            "--" if snapshot.completion_rate_per_second is None
+            else f"{snapshot.completion_rate_per_second:.2f}/s"
+        )
+        percent = 100.0 * snapshot.fraction
+        lines = [
+            (
+                f"VIRUSFlow progress  {snapshot.completed}/{snapshot.total} ({percent:5.1f}%)"
+                f"  elapsed {self._duration(snapshot.elapsed_seconds)}"
+                f"  eta {self._duration(snapshot.eta_seconds)} ({snapshot.eta_confidence})"
+            ),
+            (
+                f"Tasks  pending {snapshot.pending}  running {snapshot.running}"
+                f"  ok {snapshot.succeeded}  failed {snapshot.failed}"
+                f"  blocked {snapshot.blocked}  cached {snapshot.cached}"
+                f"  skipped {snapshot.skipped}"
+            ),
+            (
+                f"Workers {snapshot.workers_active}/{snapshot.workers_configured}"
+                f"  rate {rate}  retries {snapshot.retried}"
+            ),
+        ]
+
+        if snapshot.active:
+            lines.append("Active workers")
+            active_budget = min(3, max(1, height - len(lines) - 3))
+            lines.extend(f"  {item}" for item in snapshot.active[:active_budget])
+            hidden = len(snapshot.active) - active_budget
+            if hidden > 0:
+                lines.append(f"  … and {hidden} more")
+
+        if snapshot.task_kind_timing and len(lines) < height:
+            lines.append("Task kinds")
+            lines.append("  kind                 done      run  wait  median    p95")
+            kind_budget = max(0, height - len(lines))
+            kinds = sorted(
+                snapshot.task_kind_timing.items(),
+                key=lambda item: (
+                    -int(item[1]["running"]),
+                    -int(item[1]["waiting"]),
+                    item[0],
+                ),
+            )
+            for kind, item in kinds[:kind_budget]:
+                median = item.get("median_seconds")
+                p95 = item.get("p95_seconds")
+                median_text = "--" if median is None else f"{median:.2f}s"
+                p95_text = "--" if p95 is None else f"{p95:.2f}s"
+                lines.append(
+                    f"  {kind[:20]:20} {item['completed']:>4}/{item['total']:<4}"
+                    f" {item['running']:>4} {item['waiting']:>5}"
+                    f" {median_text:>7} {p95_text:>7}"
+                )
+
+        return [self._fit_line(line, width) for line in lines[:height]]
+
+    def _write_tty(self, snapshot: ProgressSnapshot) -> None:
+        lines = self._tty_lines(snapshot)
+        if self._tty_line_count:
+            self.stream.write(f"\r\x1b[{self._tty_line_count}A\x1b[J")
+        else:
+            self.stream.write("\r")
+        self.stream.write("\n".join(lines) + "\n")
+        self._tty_line_count = len(lines)
+
     def emit(self, event: Mapping[str, Any], *, force: bool = False) -> None:
         if not self.enabled:
             return
@@ -361,7 +446,9 @@ class ProgressReporter:
             self._write_structured(payload)
             now = time.monotonic()
             if self.mode == "tty" or force or now - self._last_emit >= self.interval_seconds:
-                if self.mode == "json":
+                if self.mode == "tty":
+                    self._write_tty(snapshot)
+                elif self.mode == "json":
                     text = json.dumps(payload, sort_keys=True, default=str)
                 else:
                     active = ",".join(snapshot.active[:3]) or "-"
@@ -389,9 +476,7 @@ class ProgressReporter:
                                 f"p95={'--' if p95 is None else f'{p95:.2f}s'}"
                             )
                         text += " kinds=[" + "; ".join(kinds) + "]"
-                if self.mode == "tty":
-                    self.stream.write("\r\x1b[2K" + text)
-                else:
+                if self.mode != "tty":
                     self.stream.write(text + "\n")
                 self.stream.flush()
                 self._last_emit = now
@@ -403,9 +488,6 @@ class ProgressReporter:
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, self.interval_seconds * 2.0))
         self.emit(event, force=True)
-        if self.mode == "tty":
-            self.stream.write("\n")
-            self.stream.flush()
 
 
 __all__ = [

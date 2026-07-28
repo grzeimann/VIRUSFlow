@@ -59,6 +59,16 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         "extracted_master_sci_spectrum", "wavelength_map",
     ]
     assert {(edge.src.kind, edge.dst.kind) for edge in edges} >= {
+        ("master_bias", "master_dark"),
+        ("master_bias", "master_ldls"),
+        ("master_bias", "master_hg"),
+        ("master_bias", "master_cd"),
+        ("master_bias", "master_twilight"),
+        ("master_bias", "master_sci"),
+        ("master_bias", "trace_map"),
+        ("master_bias", "wavelength_map"),
+        ("master_bias", "extracted_master_sci_spectrum"),
+        ("master_bias", "fiber_wavelength_spectral_mask"),
         ("master_ldls", "trace_map"),
         ("master_hg", "master_arc"),
         ("master_cd", "master_arc"),
@@ -138,6 +148,16 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
         task_context_factory=lambda: context,
         target_adapter=adapt_target,
     )
+    bias_id = next(item.id for item in scheduled if item.kind == "master_bias")
+    for gated_kind in {
+        "master_dark", "master_ldls", "master_hg", "master_cd",
+        "master_twilight", "master_sci", "master_arc", "trace_map",
+        "wavelength_map", "extracted_master_sci_spectrum",
+        "fiber_wavelength_spectral_mask",
+    }:
+        gated = [item for item in scheduled if item.kind == gated_kind]
+        assert gated
+        assert all(bias_id in item.depends_on for item in gated)
     executor = PlanningExecutor(max_workers=1, debug=False)
     for item in scheduled:
         executor.add_task(item.id, item.task, kind=item.kind, depends_on=item.depends_on)
@@ -228,3 +248,97 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
     rerun, rerun_report = graph.plan(db_path=database, scopes=[Scope(zipcode=zipcode)])
     assert rerun == []
     assert len(rerun_report.existing) == len(nodes)
+
+    with db.connect(database) as connection:
+        connection.execute(
+            """
+            UPDATE qa_decisions
+            SET policy_version='1'
+            WHERE artifact_id=?
+            """,
+            (int(rows["master_bias"]["id"]),),
+        )
+    stale_policy_rerun, _ = graph.plan(
+        db_path=database, scopes=[Scope(zipcode=zipcode)]
+    )
+    assert [target.kind for target in stale_policy_rerun] == ["master_bias"]
+
+
+def test_critical_read_noise_blocks_calibration_branches_before_wavelength(
+    tmp_path, monkeypatch
+):
+    zipcode = ZipCode(ifuslot="020", ifuid="001", specid="001", amp="LL", controller="A")
+    database = str(tmp_path / "critical-read-noise.sqlite3")
+    db.init_db(database)
+    with db.connect(database) as conn:
+        conn.execute(
+            "INSERT INTO amplifiers(key, ifuslot, ifuid, specid, amp, controller) VALUES(?,?,?,?,?,?)",
+            (
+                zipcode.key(), zipcode.ifuslot, zipcode.ifuid,
+                zipcode.specid, zipcode.amp, zipcode.controller,
+            ),
+        )
+        for frame_type, count in (
+            ("zro", 25), ("drk", 1), ("flt", 3), ("hg", 1),
+            ("cd", 1), ("twi", 1),
+        ):
+            _seed(
+                conn, zipcode, frame_type, count,
+                lamp=frame_type if frame_type in {"hg", "cd"} else None,
+            )
+        _seed(conn, zipcode, "sci", 3, exptime=700.0)
+
+    import virusflow.tasks.calibs as calibs
+
+    def high_read_noise_bias(*, raw_inputs, params):
+        shape = np.asarray(raw_inputs[0]["data"]).shape
+        return AlgoResult(
+            kind="bias",
+            version="test-critical-read-noise",
+            arrays={
+                "master": np.zeros(shape, dtype=float),
+                "per_pixel_bias_scatter": np.full(shape, 6.5, dtype=float),
+            },
+            scalars={"read_noise": 6.5, "n_inputs": len(raw_inputs)},
+        )
+
+    monkeypatch.setattr(calibs.BiasTask, "algorithm", staticmethod(high_read_noise_bias))
+
+    nodes, edges = default_calibration_graph()
+    graph = ReductionGraph(nodes, edges)
+    _, report = graph.plan(db_path=database, scopes=[Scope(zipcode=zipcode)])
+    context = TaskContext(
+        database,
+        str(tmp_path / "products"),
+        {"raw_frame_loader": _Loader(), "configuration_root": str(tmp_path)},
+    )
+    scheduled = schedule(
+        targets=report.planned,
+        nodes=nodes,
+        edges=edges,
+        kind_to_task=default_kind_to_task(),
+        task_context_factory=lambda: context,
+        target_adapter=adapt_target,
+    )
+    executor = PlanningExecutor(
+        max_workers=4, debug=False, progress=False, raise_on_failure=False
+    )
+    for item in scheduled:
+        executor.add_task(item.id, item.task, kind=item.kind, depends_on=item.depends_on)
+    executor.run()
+
+    assert executor.execution_stats["per_kind"]["master_bias"]["failed"] == 1
+    assert executor.execution_stats["per_kind"]["wavelength_map"]["failed"] == 0
+    assert executor.execution_stats["per_kind"]["wavelength_map"]["blocked"] == 1
+    assert executor.execution_stats["blocked"] == len(scheduled) - 1
+
+    service = ArtifactService(database)
+    bias = service.select_best(
+        kind="master_bias", scope=Scope(zipcode=zipcode), policy="latest"
+    )
+    assert bias is not None
+    qa = service.adapter.get_qa_bundle(int(bias["id"]))
+    assert qa["status"] == "fail"
+    assert qa["usability"] == "unusable"
+    assert qa["metrics"]["read_noise"] == 6.5
+    assert service.adapter.list_all(kind="wavelength_map") == []
