@@ -107,4 +107,4 @@ The repository separates `algorithms`, `tasks`, `planning`, `executors`, `artifa
 
 See the [troubleshooting guide](docs/troubleshooting.md) for catalog-network degradation, missing calibrations, retained failed work, SQLite contention, and cleanup. Contributions should keep scientific objects distinct from algorithms, preserve complete hardware lineage, and include focused tests.
 
-VIRUSFlow is distributed under the [BSD 3-Clause license](LICENSE). No formal citation file is defined yet; publications should acknowledge VIRUS/VIRUSFlow and record the repository commit, configuration references, and product revisions used.
+VIRUSFlow is distributed under the [BSD 3-Clause license](LICENSE). No formal citation file is defined yet; publications should acknowledge VIRUSFlow and record the repository commit, configuration references, and product revisions used.
