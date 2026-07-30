@@ -77,6 +77,7 @@ class Artifact:
     storage: StorageRef        # where/how it is stored
     scope: Scope
     metadata: Dict[str, Any] = field(default_factory=dict)
+    scientific_metadata: Dict[str, Any] = field(default_factory=dict)
     provenance: Optional[Provenance] = None
     validity: Validity = field(default_factory=Validity)
     units: Dict[str, str] = field(default_factory=dict)
@@ -100,6 +101,7 @@ class ArtifactDescription:
     storage: Optional[StorageRef]
     scope: Optional[Scope]
     metadata: Dict[str, Any]
+    scientific_metadata: Dict[str, Any]
     provenance: Optional[Provenance]
     diagnostics: Optional[DiagnosticRecord]
     model_type: Optional[str] = None  # array2d | array1d | image | table | text | scalar | collection | unknown

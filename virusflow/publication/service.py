@@ -21,6 +21,7 @@ from ..contracts.artifact import (
     TraceMapContract,
     WavelengthMapContract,
 )
+from ..core.scientific_metadata import SCIENTIFIC_METADATA_FIELDS
 from ..persistence.policy import PersistencePolicy
 from .context import PublicationContext
 
@@ -95,6 +96,11 @@ class DefaultPublicationService:
     def _publish_one(self, req: ArtifactRequest, ctx: PublicationContext) -> Artifact:
         spec = _get_contract(req.kind).spec()
         self._validate_against_contract(req, spec)
+        unknown = set(req.scientific_metadata or {}) - set(SCIENTIFIC_METADATA_FIELDS)
+        if unknown:
+            raise ValueError(
+                "unknown scientific metadata fields: " + ", ".join(sorted(unknown))
+            )
         return self.svc.persist_request(req, context=ctx, policy=self.policy, base_dir=self.base_dir)
 
     def _validate_against_contract(self, req: ArtifactRequest, spec: ArtifactContractSpec) -> None:

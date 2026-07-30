@@ -34,22 +34,6 @@ ALGO_VERSION = "trace-1.0"
 TraceInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
 
 
-def _simple_trace_from_flat(master_flat: np.ndarray) -> np.ndarray:
-    """Compute a simple 1D trace proxy from a master flat image.
-
-    For each detector column, return the row index of maximum illumination.
-    Safe for NaNs. Returns float32 vector with length = nx (number of columns).
-    """
-    try:
-        img = np.asarray(master_flat, dtype=float)
-        if img.ndim != 2 or min(img.shape) == 0:
-            raise ValueError("master_flat must be a 2D array with positive shape")
-        col_max_idx = np.nanargmax(img, axis=0)
-        return col_max_idx.astype(np.float32)
-    except Exception:
-        # Fallback: all zeros vector
-        nx = int(np.asarray(master_flat).shape[1]) if np.asarray(master_flat).ndim == 2 else 0
-        return np.zeros((nx,), dtype=np.float32)
 
 
 def robust_polyfit_predict(x_obs: np.ndarray | List[float], y_obs: np.ndarray | List[float], x_pred: np.ndarray | List[float], degree: int = 4) -> np.ndarray:

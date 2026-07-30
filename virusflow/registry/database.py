@@ -15,6 +15,11 @@ from astropy.io import fits
 
 from ..core.exposure_metadata import interpret_virus_exposure_header
 from ..core.identity import RawFileId, ZipCode
+from ..core.scientific_metadata import (
+    SCIENTIFIC_METADATA_FIELDS,
+    scientific_metadata_for_database,
+    scientific_metadata_from_header,
+)
 
 
 DEFAULT_DB_PATH = os.environ.get("VIRUSFLOW_DB", str(Path.cwd() / "virusflow.sqlite3"))
@@ -42,7 +47,8 @@ def _record_sql(sql: str, elapsed: float) -> None:
     known_tables = (
         "exposures", "exposure_details", "amplifiers", "raw_files", "tar_files",
         "tar_members", "artifacts", "artifact_records", "artifact_components",
-        "artifact_relations", "provenance", "qa_facts", "qa_records",
+        "artifact_scientific_metadata", "artifact_relations", "provenance",
+        "qa_facts", "qa_records",
         "analysis_studies", "analysis_materializations", "performance_runs",
         "performance_tasks",
     )
@@ -205,6 +211,17 @@ CREATE TABLE IF NOT EXISTS raw_files (
     tar_member TEXT,
     storage_backend TEXT,
     amp_key TEXT,
+    observation_time TIMESTAMP,
+    ambient_temperature REAL,
+    humidity REAL,
+    pressure REAL,
+    program_id TEXT,
+    object TEXT,
+    rho_start REAL,
+    theta_start REAL,
+    phi_start REAL,
+    x_start REAL,
+    y_start REAL,
     FOREIGN KEY(exposure_id) REFERENCES exposures(id),
     FOREIGN KEY(amp_key) REFERENCES amplifiers(key)
 );
@@ -276,6 +293,22 @@ CREATE TABLE IF NOT EXISTS artifact_records (
     state TEXT NOT NULL DEFAULT 'active',
     payload_bytes INTEGER NOT NULL DEFAULT 0,
     created_at TEXT,
+    FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
+);
+
+CREATE TABLE IF NOT EXISTS artifact_scientific_metadata (
+    artifact_id INTEGER PRIMARY KEY,
+    observation_time TIMESTAMP,
+    ambient_temperature REAL,
+    humidity REAL,
+    pressure REAL,
+    program_id TEXT,
+    object TEXT,
+    rho_start REAL,
+    theta_start REAL,
+    phi_start REAL,
+    x_start REAL,
+    y_start REAL,
     FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
 );
 
@@ -389,7 +422,16 @@ CREATE INDEX IF NOT EXISTS performance_tasks_kind_idx ON performance_tasks(task_
 -- Helpful indexes (safe no-ops if already present)
 CREATE INDEX IF NOT EXISTS artifacts_kind_amp ON artifacts(kind, amp_key);
 CREATE INDEX IF NOT EXISTS provenance_created_at ON provenance(created_at);
+CREATE INDEX IF NOT EXISTS exposure_details_requested_target_idx
+ON exposure_details(requested_target);
+CREATE INDEX IF NOT EXISTS exposure_details_qprog_idx ON exposure_details(qprog);
+CREATE INDEX IF NOT EXISTS exposure_details_observing_mode_idx
+ON exposure_details(observing_mode);
 CREATE INDEX IF NOT EXISTS artifact_records_kind_scope ON artifact_records(canonical_kind, physical_scope);
+CREATE INDEX IF NOT EXISTS artifact_scientific_metadata_observation_time
+ON artifact_scientific_metadata(observation_time);
+CREATE INDEX IF NOT EXISTS artifact_scientific_metadata_ambient_temperature
+ON artifact_scientific_metadata(ambient_temperature);
 CREATE INDEX IF NOT EXISTS artifact_relations_child ON artifact_relations(child_id);
 """
 
@@ -408,60 +450,6 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with connect(resolved) as conn:
             conn.executescript(SCHEMA)
-            # Additive canonical migrations for registries created by earlier releases.
-            columns = {row[1] for row in conn.execute("PRAGMA table_info(artifact_records)").fetchall()}
-            if "validity_policy" not in columns:
-                conn.execute("ALTER TABLE artifact_records ADD COLUMN validity_policy TEXT")
-            for name, definition in (
-                ("lifecycle", "TEXT NOT NULL DEFAULT 'canonical'"),
-                ("state", "TEXT NOT NULL DEFAULT 'active'"),
-                ("payload_bytes", "INTEGER NOT NULL DEFAULT 0"),
-            ):
-                if name not in columns:
-                    conn.execute(f"ALTER TABLE artifact_records ADD COLUMN {name} {definition}")
-            component_columns = {
-                row[1] for row in conn.execute("PRAGMA table_info(artifact_components)").fetchall()
-            }
-            for name, definition in (
-                ("payload_bytes", "INTEGER NOT NULL DEFAULT 0"),
-                ("dtype", "TEXT"),
-                ("shape_json", "TEXT"),
-            ):
-                if name not in component_columns:
-                    conn.execute(f"ALTER TABLE artifact_components ADD COLUMN {name} {definition}")
-            exposure_columns = {
-                row[1] for row in conn.execute("PRAGMA table_info(exposure_details)").fetchall()
-            }
-            for name, definition in (
-                ("exptime", "REAL"),
-                ("ambient_temperature", "REAL"),
-                ("object_name", "TEXT"),
-                ("virus_object", "TEXT"),
-                ("requested_target", "TEXT"),
-                ("requested_target_source", "TEXT"),
-                ("requested_ifuslot", "TEXT"),
-                ("het_track", "TEXT"),
-                ("observing_mode", "TEXT"),
-                ("virus_primary", "INTEGER"),
-                ("q_metadata_expected", "INTEGER"),
-                ("q_metadata_complete", "INTEGER"),
-                ("object_qobject_consistent", "INTEGER"),
-                ("lamp", "TEXT"),
-                ("observing_block", "TEXT"),
-            ):
-                if name not in exposure_columns:
-                    conn.execute(f"ALTER TABLE exposure_details ADD COLUMN {name} {definition}")
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS exposure_details_requested_target_idx "
-                "ON exposure_details(requested_target)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS exposure_details_qprog_idx ON exposure_details(qprog)"
-            )
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS exposure_details_observing_mode_idx "
-                "ON exposure_details(observing_mode)"
-            )
         stat = path.stat()
         if not legacy_baseline_enabled():
             _INITIALIZED_DATABASES[resolved] = (int(stat.st_dev), int(stat.st_ino))
@@ -524,8 +512,8 @@ def _parse_virus_member_name(member_name: str) -> Optional[Dict[str, Optional[st
 
 
 _IFUSLOT_META_CACHE: Dict[str, Dict[str, Optional[str]]] = {}
-# Track which exposure_ids we've already populated exposure_details for in this process
-_POPULATED_EXPOSURE_DETAILS: Set[str] = set()
+# Track representative exposure headers per registry, not globally by Exposure ID.
+_POPULATED_EXPOSURE_DETAILS: Set[Tuple[str, str]] = set()
 
 
 def _read_ifuslot_metadata_from_tar(tar_path: str, member_name: str) -> Dict[str, Optional[str]]:
@@ -566,9 +554,7 @@ def _read_ifuslot_metadata_from_file(path: str) -> Dict[str, Optional[str]]:
 def _exposure_header_fields(hdr, *, frame_type: str) -> Dict[str, Any]:
     """Extract grouping metadata without interpreting cadence policy."""
 
-    ambient = next((hdr.get(key) for key in (
-        "AMBTEMP", "AMBIENT", "TAMBIENT", "TEMPAMB", "OUTTEMP"
-    ) if hdr.get(key) is not None), None)
+    scientific = scientific_metadata_from_header(hdr)
     lamp = next((hdr.get(key) for key in (
         "LAMP", "LAMPNAME", "LAMPTYPE", "OBJECT", "QOBJECT"
     ) if hdr.get(key) not in (None, "")), None)
@@ -581,7 +567,7 @@ def _exposure_header_fields(hdr, *, frame_type: str) -> Dict[str, Any]:
         "qprog": context.qprog,
         "pexptime": (str(hdr.get("PEXPTIME")) if hdr.get("PEXPTIME") is not None else None),
         "exptime": (str(hdr.get("EXPTIME")) if hdr.get("EXPTIME") is not None else None),
-        "ambient_temperature": (str(ambient) if ambient is not None else None),
+        "ambient_temperature": scientific["ambient_temperature"],
         "object_name": context.virus_object,
         "virus_object": context.virus_object,
         "requested_target": context.requested_target,
@@ -598,17 +584,20 @@ def _exposure_header_fields(hdr, *, frame_type: str) -> Dict[str, Any]:
         "date": hdr.get("DATE"),
         "qra": context.qra,
         "qdec": context.qdec,
+        **scientific,
     }
 
 
 def _optional_float(value) -> Optional[float]:
+    import math
+
     if value in (None, "", "nan"):
         return None
     try:
         result = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    return result if result == result else None
+    return result if math.isfinite(result) else None
 
 
 def _read_exposure_header_fields_from_tar(
@@ -704,6 +693,8 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
     'virusXXXXXXX' or 'virusXXXXXXX.tar' where the 7-digit number >= 999. Such
     files are ignored (not inserted into the DB), and the function returns None.
     """
+    if conn is None:
+        init_db(db_path)
     # Check observation number in the path context (use tar filename if provided)
     obs_num = _extract_observation_number(path)
     if obs_num is not None and obs_num >= 999:
@@ -728,6 +719,15 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
                 meta = _read_ifuslot_metadata_from_file(path)
             _IFUSLOT_META_CACHE[ifuslot] = meta
         zipcode = _zipcode_from_amp_token(amp_token, meta)
+
+    if tar_member:
+        hdr_fields = _read_exposure_header_fields_from_tar(
+            path, tar_member, frame_type=frame_type
+        )
+    else:
+        hdr_fields = _read_exposure_header_fields_from_file(path, frame_type=frame_type)
+    scientific = scientific_metadata_for_database(hdr_fields)
+    exposure_details_key = (str(Path(db_path).resolve()), exposure_id)
 
     def _do_insert(conn_: sqlite3.Connection) -> None:
         # Upsert amplifier mapping if available
@@ -759,25 +759,39 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
         abs_path = os.path.abspath(path)
         conn_.execute(
             """
-            INSERT OR IGNORE INTO raw_files(exposure_id, frame_type, path, tar_member, storage_backend, amp_key)
-            VALUES(?, ?, ?, ?, ?, ?)
+            INSERT INTO raw_files(
+                exposure_id, frame_type, path, tar_member, storage_backend, amp_key,
+                observation_time, ambient_temperature, humidity, pressure,
+                program_id, object, rho_start, theta_start, phi_start, x_start, y_start
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(exposure_id, frame_type, path, tar_member) DO UPDATE SET
+                storage_backend=excluded.storage_backend,
+                amp_key=excluded.amp_key,
+                observation_time=excluded.observation_time,
+                ambient_temperature=excluded.ambient_temperature,
+                humidity=excluded.humidity,
+                pressure=excluded.pressure,
+                program_id=excluded.program_id,
+                object=excluded.object,
+                rho_start=excluded.rho_start,
+                theta_start=excluded.theta_start,
+                phi_start=excluded.phi_start,
+                x_start=excluded.x_start,
+                y_start=excluded.y_start
             """,
-            (exposure_id, frame_type, abs_path, tar_member, storage_backend, amp_key),
+            (
+                exposure_id, frame_type, abs_path, tar_member, storage_backend, amp_key,
+                *(scientific[field] for field in SCIENTIFIC_METADATA_FIELDS),
+            ),
         )
 
         # Populate exposure_details once per exposure in this process to avoid repeated header I/O
-        if exposure_id not in _POPULATED_EXPOSURE_DETAILS:
+        if exposure_details_key not in _POPULATED_EXPOSURE_DETAILS:
             # Determine tar_path (only for tar backend) and expnum (<999 considered non-test)
             tar_path = abs_path if storage_backend == "tar" else None
             expn = _extract_observation_number(path)
             expnum = expn if (expn is not None and expn < 999) else None
-            # Read selected header fields from this representative file
-            if tar_member:
-                hdr_fields = _read_exposure_header_fields_from_tar(
-                    path, tar_member, frame_type=frame_type
-                )
-            else:
-                hdr_fields = _read_exposure_header_fields_from_file(path, frame_type=frame_type)
             # Upsert into exposure_details; keep any pre-existing non-null values
             conn_.execute(
                 """
@@ -841,7 +855,7 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
                     hdr_fields.get("observing_block"),
                 ),
             )
-            _POPULATED_EXPOSURE_DETAILS.add(exposure_id)
+            _POPULATED_EXPOSURE_DETAILS.add(exposure_details_key)
 
     if conn is None:
         with connect(db_path) as conn_ctx:
@@ -937,6 +951,26 @@ def list_raw_file_rows(exposure_id: str, db_path: str = DEFAULT_DB_PATH) -> List
                 zipcode = None
         out.append((int(row[0]), RawFileId(row[1], row[2], row[3], row[4], row[5], zipcode)))
     return out
+
+
+def list_raw_scientific_metadata(
+    raw_ids: Iterable[int], *, db_path: str = DEFAULT_DB_PATH
+) -> List[Dict[str, Any]]:
+    """Return compact raw scientific state for an already selected membership."""
+
+    wanted = tuple(dict.fromkeys(int(value) for value in raw_ids))
+    if not wanted:
+        return []
+    placeholders = ",".join("?" for _ in wanted)
+    columns = ", ".join(SCIENTIFIC_METADATA_FIELDS)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT id AS raw_id, {columns} FROM raw_files "
+            f"WHERE id IN ({placeholders})",
+            wanted,
+        ).fetchall()
+    by_id = {int(row["raw_id"]): dict(row) for row in rows}
+    return [by_id[value] for value in wanted if value in by_id]
 
 
 def list_raw_files_scoped(
@@ -1161,7 +1195,7 @@ def save_artifact_details(
     relations: Iterable[Dict[str, Any]],
     db_path: str = DEFAULT_DB_PATH,
 ) -> None:
-    """Persist additive canonical Artifact details without rewriting legacy rows."""
+    """Persist canonical Artifact registry rows, components, relations, and state."""
     import json
 
     init_db(db_path)
@@ -1216,6 +1250,31 @@ def save_artifact_details(
                 record.get("state") or "active",
                 int(record.get("payload_bytes") or 0),
                 record.get("created_at") or datetime.utcnow().isoformat(),
+            ),
+        )
+        scientific = scientific_metadata_for_database(record.get("scientific_metadata"))
+        conn.execute(
+            """
+            INSERT INTO artifact_scientific_metadata(
+                artifact_id, observation_time, ambient_temperature, humidity, pressure,
+                program_id, object, rho_start, theta_start, phi_start, x_start, y_start
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(artifact_id) DO UPDATE SET
+                observation_time=excluded.observation_time,
+                ambient_temperature=excluded.ambient_temperature,
+                humidity=excluded.humidity,
+                pressure=excluded.pressure,
+                program_id=excluded.program_id,
+                object=excluded.object,
+                rho_start=excluded.rho_start,
+                theta_start=excluded.theta_start,
+                phi_start=excluded.phi_start,
+                x_start=excluded.x_start,
+                y_start=excluded.y_start
+            """,
+            (
+                int(artifact_id),
+                *(scientific[field] for field in SCIENTIFIC_METADATA_FIELDS),
             ),
         )
         for component in components:
@@ -1284,6 +1343,22 @@ def get_artifact_details(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Op
             except Exception:
                 out[key] = [] if key == "configuration_refs" else {}
         return out
+
+
+def get_artifact_scientific_metadata(
+    artifact_id: int, db_path: str = DEFAULT_DB_PATH
+) -> Optional[Dict[str, Any]]:
+    init_db(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM artifact_scientific_metadata WHERE artifact_id=?",
+            (int(artifact_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    result = dict(row)
+    result.pop("artifact_id", None)
+    return result
 
 
 def get_artifact_by_revision(revision: str, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
@@ -1431,6 +1506,160 @@ def list_artifacts(
             params.append(int(limit))
         rows = conn.execute(sql, tuple(params)).fetchall()
         return _rows_to_dicts(rows)
+
+
+def find_artifact_summaries(
+    *,
+    kind: Optional[str] = None,
+    hardware_scope: Optional[ZipCode | str] = None,
+    observation_time: Optional[Tuple[Optional[datetime], Optional[datetime]]] = None,
+    ambient_temperature: Optional[Tuple[Optional[float], Optional[float]]] = None,
+    humidity: Optional[Tuple[Optional[float], Optional[float]]] = None,
+    pressure: Optional[Tuple[Optional[float], Optional[float]]] = None,
+    program_id: Optional[str] = None,
+    object_name: Optional[str] = None,
+    db_path: str = DEFAULT_DB_PATH,
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Find compact Artifact state with one joined registry query."""
+
+    init_db(db_path)
+    sql = """
+        WITH component_names AS (
+            SELECT artifact_id, group_concat(name, char(31)) AS names
+            FROM (
+                SELECT artifact_id, name
+                FROM artifact_components
+                ORDER BY artifact_id, name
+            )
+            GROUP BY artifact_id
+        ),
+        parent_ids AS (
+            SELECT child_id, group_concat(parent_id, char(31)) AS ids
+            FROM (
+                SELECT DISTINCT child_id, parent_id
+                FROM artifact_relations
+                ORDER BY child_id, parent_id
+            )
+            GROUP BY child_id
+        )
+        SELECT
+            a.id AS artifact_id,
+            COALESCE(ar.canonical_kind, a.kind) AS kind,
+            a.amp_key,
+            amp.ifuslot,
+            amp.ifuid,
+            amp.specid,
+            amp.amp,
+            amp.controller,
+            ar.physical_scope,
+            ar.exposure_id,
+            ar.observation_id,
+            ar.dither_set_id,
+            ar.state,
+            a.validity_start,
+            a.validity_end,
+            p.created_at,
+            COALESCE(qd.status, qr.status) AS qa_status,
+            qd.usability,
+            sm.observation_time,
+            sm.ambient_temperature,
+            sm.humidity,
+            sm.pressure,
+            sm.program_id,
+            sm.object,
+            sm.rho_start,
+            sm.theta_start,
+            sm.phi_start,
+            sm.x_start,
+            sm.y_start,
+            component_names.names AS component_names,
+            parent_ids.ids AS parent_ids
+        FROM artifacts a
+        JOIN artifact_records ar ON ar.artifact_id=a.id
+        LEFT JOIN amplifiers amp ON amp.key=a.amp_key
+        LEFT JOIN provenance p ON p.artifact_id=a.id
+        LEFT JOIN qa_decisions qd ON qd.artifact_id=a.id
+        LEFT JOIN qa_results qr ON qr.artifact_id=a.id
+        LEFT JOIN artifact_scientific_metadata sm ON sm.artifact_id=a.id
+        LEFT JOIN component_names ON component_names.artifact_id=a.id
+        LEFT JOIN parent_ids ON parent_ids.child_id=a.id
+        WHERE ar.state='active'
+    """
+    params: List[Any] = []
+    if kind is not None:
+        sql += " AND COALESCE(ar.canonical_kind, a.kind)=?"
+        params.append(str(kind))
+    if hardware_scope is not None:
+        key = hardware_scope.key() if isinstance(hardware_scope, ZipCode) else str(hardware_scope)
+        sql += " AND a.amp_key=?"
+        params.append(key)
+
+    if observation_time is not None:
+        start, end = observation_time
+        if start is not None:
+            start_value = scientific_metadata_for_database(
+                {"observation_time": start}
+            )["observation_time"]
+            if start_value is None:
+                raise ValueError("invalid observation-time interval start")
+            sql += " AND sm.observation_time>=?"
+            params.append(start_value)
+        if end is not None:
+            end_value = scientific_metadata_for_database(
+                {"observation_time": end}
+            )["observation_time"]
+            if end_value is None:
+                raise ValueError("invalid observation-time interval end")
+            sql += " AND sm.observation_time<=?"
+            params.append(end_value)
+
+    for column, bounds in (
+        ("ambient_temperature", ambient_temperature),
+        ("humidity", humidity),
+        ("pressure", pressure),
+    ):
+        if bounds is None:
+            continue
+        minimum, maximum = bounds
+        if minimum is not None:
+            value = _optional_float(minimum)
+            if value is None:
+                raise ValueError(f"invalid {column} interval minimum")
+            sql += f" AND sm.{column}>=?"
+            params.append(value)
+        if maximum is not None:
+            value = _optional_float(maximum)
+            if value is None:
+                raise ValueError(f"invalid {column} interval maximum")
+            sql += f" AND sm.{column}<=?"
+            params.append(value)
+    if program_id is not None:
+        sql += " AND sm.program_id=?"
+        params.append(str(program_id))
+    if object_name is not None:
+        sql += " AND sm.object=?"
+        params.append(str(object_name))
+    sql += " ORDER BY p.created_at DESC, a.id DESC"
+    if limit is not None and int(limit) > 0:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+
+    with connect(db_path) as conn:
+        rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+    separator = chr(31)
+    for row in rows:
+        row["component_names"] = (
+            str(row["component_names"]).split(separator)
+            if row.get("component_names")
+            else []
+        )
+        row["parent_ids"] = (
+            [int(value) for value in str(row["parent_ids"]).split(separator)]
+            if row.get("parent_ids")
+            else []
+        )
+    return rows
 
 
 def save_qa_results(

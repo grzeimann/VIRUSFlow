@@ -13,7 +13,6 @@ from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
 from virusflow.config import ConfigurationService
 from virusflow.core.identity import ZipCode
 from virusflow.io.catalogs import FixtureCatalogProvider
-from virusflow.ontology.scopes import PhysicalScope
 from virusflow.persistence.policy import DefaultPersistencePolicy
 from virusflow.planning.targets import ExposureTarget
 from virusflow.publication.context import PublicationContext
@@ -67,6 +66,10 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
                 "OBJECT": "WD1327-083_052_E", "QOBJECT": "WD1327-083",
                 "QRA": "13:30:13.64", "QDEC": "-08:34:29.47", "QPROG": "SCIENCE-1",
                 "PARANGLE": 180.0, "OBSID": 6,
+                "DATE": "2026-06-09T03:16:49.600000",
+                "AMBTEMP": 12.5, "HUMIDITY": 44.0, "PRESSURE": 798.2,
+                "RHO_STRT": 1.1, "THE_STRT": 2.2, "PHI_STRT": 3.3,
+                "X_STRT": 4.4, "Y_STRT": 5.5,
             })
             fits.PrimaryHDU(raw, header=header).writeto(path)
             connection.execute(
@@ -136,6 +139,18 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     assert mode["QOBJECT"] == mode["requested_target"] == "WD1327-083"
     assert mode["requested_ifuslot"] == "052" and mode["het_track"] == "E"
     assert mode["virus_primary"] is True and mode["q_metadata_complete"] is True
+    scientific = service.get_scientific_metadata(result["final_astrometry"].id)
+    assert scientific["observation_time"] == at
+    assert {
+        field: scientific[field]
+        for field in ("rho_start", "theta_start", "phi_start", "x_start", "y_start")
+    } == {
+        "rho_start": 1.1,
+        "theta_start": 2.2,
+        "phi_start": 3.3,
+        "x_start": 4.4,
+        "y_start": 5.5,
+    }
     forbidden = {
         "reduced_science_image", "scatter_subtracted_image", "aperture_extracted_spectrum",
         "extracted_variance", "fiber_sky_prediction", "sky_subtracted_spectrum",

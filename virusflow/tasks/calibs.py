@@ -37,6 +37,11 @@ from ..contracts.result import (
     FiberWavelengthSpectralMaskResultContract,
 )
 from ..core.algo_result import AlgoResult, ensure_algo_result
+from ..core.scientific_metadata import (
+    SCIENTIFIC_METADATA_FIELDS,
+    aggregate_scientific_metadata,
+    normalize_scientific_metadata,
+)
 from ..ontology.artifact_kinds import kind_spec
 from ..persistence.policy import DefaultPersistencePolicy
 from ..publication.context import PublicationContext
@@ -108,6 +113,11 @@ class _CanonicalTask(CalibrationTask):
         spec = kind_spec(self.artifact_name)
         components = self._components(result)
         summaries = dict(result.scalars or {})
+        scientific_metadata = normalize_scientific_metadata(result.meta)
+        algorithm_metadata = {
+            key: value for key, value in dict(result.meta or {}).items()
+            if key not in SCIENTIFIC_METADATA_FIELDS
+        }
         request = ArtifactRequest(
             kind=self.artifact_name,
             components=components,
@@ -116,8 +126,9 @@ class _CanonicalTask(CalibrationTask):
                 "n_inputs": summaries.get("n_inputs", 0),
                 "calibration_group_id": getattr(self.target, "group_id", None),
                 "calibration_group": getattr(self.target, "group_metadata", None),
-                "algorithm_metadata": dict(result.meta or {}),
+                "algorithm_metadata": algorithm_metadata,
             },
+            scientific_metadata=scientific_metadata,
             scope=Scope(zipcode=self.target.zipcode, physical_scope=spec.scope),
             parents=parent_ids,
             validity=self.target_validity(),
@@ -173,6 +184,11 @@ class _RawCalibrationTask(_CanonicalTask):
         if not report.ok:
             raise ValueError(f"{self.__class__.__name__} result contract: {'; '.join(report.errors)}")
         self.validate_scientific_result(result)
+        from ..registry import database as db
+
+        result.meta.update(aggregate_scientific_metadata(
+            db.list_raw_scientific_metadata(parent_ids, db_path=self.ctx.db_path)
+        ))
         artifact = self._publish(result, parent_ids)
         return {self.artifact_name: artifact}
 
@@ -260,6 +276,10 @@ class ArcTask(_CanonicalTask):
             service.load_component(hg_id, "master_hg")["data"],
             service.load_component(cd_id, "master_cd")["data"],
         )
+        result.meta.update(aggregate_scientific_metadata([
+            service.get_scientific_metadata(hg_id),
+            service.get_scientific_metadata(cd_id),
+        ]))
         report = self.result_contract().validate(result)
         if not report.ok:
             raise ValueError("ArcTask result contract: " + "; ".join(report.errors))
@@ -339,6 +359,7 @@ class ExtractedMasterSciSpectrumTask(_CanonicalTask):
             service.load_component(trace_id, "fiber_trace_map")["data"],
             aperture_width=float(params["aperture_width"]),
         )
+        result.meta.update(service.get_scientific_metadata(master_id))
         report = self.result_contract().validate(result)
         if not report.ok:
             raise ValueError(
@@ -422,6 +443,7 @@ class FiberWavelengthSpectralMaskTask(_CanonicalTask):
             amplifier_fibers=int(params["amplifier_fibers"]),
             very_bad_threshold=float(params["very_bad_threshold"]),
         )
+        result.meta.update(service.get_scientific_metadata(spectrum_id))
         report = self.result_contract().validate(result)
         if not report.ok:
             raise ValueError(
@@ -486,6 +508,7 @@ class TraceTask(_CanonicalTask):
             zipcode=self.target.zipcode,
         )
         result = ensure_algo_result(result, kind="trace")
+        result.meta.update(service.get_scientific_metadata(parent_id))
         report = self.result_contract().validate(result)
         if not report.ok:
             raise ValueError("TraceTask result contract: " + "; ".join(report.errors))
@@ -563,6 +586,7 @@ class WaveTask(_CanonicalTask):
             params={**algorithm_params, "mask_applied": bool(mask is not None), **mask_facts},
         )
         result = ensure_algo_result(result, kind="wave")
+        result.meta.update(service.get_scientific_metadata(arc_id))
         self._require_wavelength_map(result)
         result.scalars.update(mask_facts)
         result.meta.update({

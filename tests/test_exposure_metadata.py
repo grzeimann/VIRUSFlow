@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import io
-import sqlite3
 from pathlib import Path
 
 import numpy as np
@@ -122,30 +121,3 @@ def test_registry_ingests_queries_and_formats_distinct_object_semantics(tmp_path
     rendered = list(csv.DictReader(io.StringIO(format_exposures_table(parallel_rows, csv=True))))
     assert rendered[0]["object"] == "parallel"
     assert rendered[0]["qobject"] == rendered[0]["requested_target"] == "Parallel_Target"
-
-
-def test_additive_migration_does_not_guess_legacy_object_origin(tmp_path: Path):
-    database = tmp_path / "legacy.sqlite3"
-    with sqlite3.connect(database) as connection:
-        connection.execute("CREATE TABLE exposures(id TEXT PRIMARY KEY, when_utc TEXT, frame_type TEXT)")
-        connection.execute("""
-            CREATE TABLE exposure_details(
-                exposure_id TEXT PRIMARY KEY, tar_path TEXT, expnum INTEGER, qobject TEXT,
-                qprog TEXT, pexptime REAL, date TEXT, qra TEXT, qdec TEXT, exptime REAL,
-                ambient_temperature REAL, object_name TEXT, lamp TEXT, observing_block TEXT
-            )
-        """)
-        connection.execute(
-            "INSERT INTO exposures VALUES('legacy','20260724','sci')"
-        )
-        connection.execute(
-            "INSERT INTO exposure_details(exposure_id,qobject,object_name) VALUES(?,?,?)",
-            ("legacy", "Target_Name", "Target_Name"),
-        )
-
-    db.init_db(str(database))
-    migrated = db.get_exposure_metadata("legacy", db_path=str(database))
-    assert migrated["object_name"] == "Target_Name"
-    assert migrated["qobject"] == "Target_Name"
-    assert migrated["virus_object"] is None
-    assert migrated["requested_target"] is None

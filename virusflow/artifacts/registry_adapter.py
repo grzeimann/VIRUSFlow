@@ -5,7 +5,7 @@ from typing import Dict, Iterable, List, Optional
 from datetime import datetime
 
 from ..registry import database as db
-from .models import Artifact, Provenance, StorageRef, Scope, DiagnosticRecord
+from .models import Artifact
 from ..ontology.artifact_kinds import canonical_kind
 
 
@@ -93,6 +93,7 @@ class RegistryAdapter:
                 "coordinates": dict(getattr(art, "coordinates", {}) or {}),
                 "configuration_refs": [asdict(x) for x in (getattr(art, "configuration_refs", []) or [])],
                 "metadata": dict(art.metadata or {}),
+                "scientific_metadata": dict(art.scientific_metadata or {}),
                 "validity_policy": getattr(getattr(art, "validity", None), "policy", None),
                 "lifecycle": getattr(getattr(art, "lifecycle", None), "value", getattr(art, "lifecycle", "canonical")),
                 "state": getattr(art, "state", "active"),
@@ -127,6 +128,14 @@ class RegistryAdapter:
 
     def list_relations(self, artifact_id: int) -> List[dict]:
         return db.list_artifact_relations(int(artifact_id), db_path=self.db_path)
+
+    def get_scientific_metadata(self, artifact_id: int) -> Optional[dict]:
+        return db.get_artifact_scientific_metadata(
+            int(artifact_id), db_path=self.db_path
+        )
+
+    def find_summaries(self, **filters) -> List[dict]:
+        return db.find_artifact_summaries(db_path=self.db_path, **filters)
 
     def find_by_revision(self, revision: str) -> Optional[dict]:
         row = db.get_artifact_by_revision(str(revision), db_path=self.db_path)

@@ -37,6 +37,7 @@ class ArtifactRequest:
     components: Mapping[str, LogicalComponent] = field(default_factory=dict)
     summaries: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    scientific_metadata: Dict[str, Any] = field(default_factory=dict)
     scope: Optional[Scope] = None
     parents: List[int] = field(default_factory=list)
     labels: List[str] = field(default_factory=list)

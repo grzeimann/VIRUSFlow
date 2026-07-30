@@ -37,6 +37,7 @@ from ..artifacts.requests import ArtifactRequest, LogicalComponent
 from ..artifacts.storage_conventions import FLUX_SCALE, VARIANCE_SCALE
 from ..config import ConfigurationService
 from ..config.defaults import BASELINE_RESPONSE_CONFIGURATION, EFFECTIVE_EXPOSURE_POLICY
+from ..core.scientific_metadata import scientific_metadata_from_header
 from ..io import PanSTARRSCSVProvider, RawFrameLoader
 from ..ontology.scopes import PhysicalScope
 from ..planning.targets import PhysicalCCDTarget
@@ -113,6 +114,11 @@ class ExposureTask(_SciencePublisher):
         request = ArtifactRequest(
             kind=kind, role="reduction", components=components,
             summaries=dict(summaries or {}), metadata=dict(metadata or {}), scope=scope,
+            scientific_metadata=(
+                dict(getattr(self, "_exposure_scientific_metadata", {}) or {})
+                if scope.exposure_id == getattr(self.target, "exposure_id", None)
+                else {}
+            ),
             parents=[int(value) for value in parents], validity=Validity(at, at, "exposure_identity"),
             configuration_refs=list(refs), assumptions=list(assumptions),
         )
@@ -173,6 +179,7 @@ class ExposureTask(_SciencePublisher):
         loader = self.ctx.config.get("raw_frame_loader") if isinstance(self.ctx.config, dict) else None
         representative = (loader or RawFrameLoader()).load_ref(raw_rows[0])
         header = representative.header
+        self._exposure_scientific_metadata = scientific_metadata_from_header(header)
         service = ArtifactService(self.ctx.db_path)
         config_root = self.ctx.config.get("configuration_root") if isinstance(self.ctx.config, dict) else None
         config = ConfigurationService(root=config_root)

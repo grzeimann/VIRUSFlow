@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Canonical science amplifier and physical-CCD orchestration Tasks."""
+
+from __future__ import annotations
 
 from datetime import datetime
 from dataclasses import dataclass
@@ -20,6 +20,7 @@ from ..algorithms.physical_ccd import (
 from ..artifacts import ArtifactService, Scope, Validity
 from ..artifacts.models import ConfigurationReference
 from ..artifacts.requests import ArtifactRequest, LogicalComponent
+from ..core.scientific_metadata import scientific_metadata_from_header
 from ..ontology.artifact_kinds import kind_spec
 from ..ontology.scopes import PhysicalScope
 from ..persistence.policy import DefaultPersistencePolicy
@@ -295,6 +296,7 @@ class PhysicalCCDTask(_SciencePublisher):
             kind="ccd_scattered_light_model", role="reduction",
             components=self._components(compact_result, model_names, units="electron", coordinates=coordinate),
             summaries=dict(scatter.scalars or {}), metadata=metadata, scope=scope, parents=parents,
+            scientific_metadata=scientific_metadata_from_header(lower_state.header),
             validity=Validity(at, at, "exposure_identity"), configuration_refs=refs,
             assumptions=["The summed scattered-light field is smooth across the physical CCD."],
         )

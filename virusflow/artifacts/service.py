@@ -13,6 +13,10 @@ from typing import Any, Dict, Iterable, Optional
 import numpy as np
 
 from ..core.pathutils import sanitize_for_filename
+from ..core.scientific_metadata import (
+    SCIENTIFIC_METADATA_FIELDS,
+    normalize_scientific_metadata,
+)
 from ..ontology.artifact_kinds import (
     LEGACY_KIND_ALIASES,
     canonical_kind,
@@ -86,6 +90,17 @@ class ArtifactService:
             raise ValueError("Artifact.storage_format is required")
         if not artifact.storage or not artifact.storage.uri:
             raise ValueError("Artifact.storage.uri is required")
+        unknown_scientific_fields = (
+            set(artifact.scientific_metadata or {}) - set(SCIENTIFIC_METADATA_FIELDS)
+        )
+        if unknown_scientific_fields:
+            raise ValueError(
+                "unknown scientific metadata fields: "
+                + ", ".join(sorted(unknown_scientific_fields))
+            )
+        artifact.scientific_metadata = normalize_scientific_metadata(
+            artifact.scientific_metadata
+        )
         requested_kind = str(artifact.kind).strip().lower()
         if requested_kind in LEGACY_KIND_ALIASES:
             raise ValueError(
@@ -182,7 +197,7 @@ class ArtifactService:
         stable_parents = [self._stable_parent_identity(parent_id) for parent_id in parents]
         revision = request.revision or self._logical_revision(
             kind, scope, normalized_components, stable_parents, context,
-            request.configuration_refs,
+            request.configuration_refs, request.scientific_metadata,
         )
         from ..performance import current_task_timing, phase
         with phase("artifact_lookup"):
@@ -317,6 +332,9 @@ class ArtifactService:
                 "storage_warnings": storage_warnings,
                 "projected_payload_bytes": projected_bytes,
             },
+            scientific_metadata=normalize_scientific_metadata(
+                request.scientific_metadata
+            ),
             provenance=provenance,
             validity=validity,
             units=units,
@@ -431,6 +449,88 @@ class ArtifactService:
         row = self.adapter.get_row(int(artifact_id))
         return self._describe_row(row, include_payload=include_payload) if row else None
 
+    def get_scientific_metadata(self, artifact_id: int) -> dict[str, Any]:
+        """Return compact scientific state without opening Artifact components."""
+
+        values = self.adapter.get_scientific_metadata(int(artifact_id))
+        return normalize_scientific_metadata(values)
+
+    def find_artifacts(
+        self,
+        *,
+        kind: Optional[str] = None,
+        hardware_scope=None,
+        observation_time=None,
+        ambient_temperature=None,
+        humidity=None,
+        pressure=None,
+        program_id: Optional[str] = None,
+        object: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Return filterable lightweight summaries without component storage I/O."""
+
+        canonical = canonical_kind(kind) if kind is not None else None
+        rows = self.adapter.find_summaries(
+            kind=canonical,
+            hardware_scope=hardware_scope,
+            observation_time=observation_time,
+            ambient_temperature=ambient_temperature,
+            humidity=humidity,
+            pressure=pressure,
+            program_id=program_id,
+            object_name=object,
+            limit=limit,
+        )
+        summaries = []
+        for row in rows:
+            scientific = normalize_scientific_metadata(row)
+            hardware_identity = None
+            if row.get("amp_key"):
+                hardware_identity = {
+                    "ifuslot": row.get("ifuslot"),
+                    "ifuid": row.get("ifuid"),
+                    "specid": row.get("specid"),
+                    "amp": row.get("amp"),
+                    "controller": row.get("controller"),
+                }
+                if not hardware_identity["ifuslot"]:
+                    try:
+                        from ..core.identity import parse_zipcode_key
+
+                        parsed = parse_zipcode_key(str(row["amp_key"]))
+                        hardware_identity = {
+                            "ifuslot": parsed.ifuslot,
+                            "ifuid": parsed.ifuid,
+                            "specid": parsed.specid,
+                            "amp": parsed.amp,
+                            "controller": parsed.controller,
+                        }
+                    except (SystemExit, ValueError):
+                        pass
+            summaries.append({
+                "id": int(row["artifact_id"]),
+                "artifact_id": int(row["artifact_id"]),
+                "kind": str(row["kind"]),
+                "scope": {
+                    "physical_scope": row.get("physical_scope"),
+                    "hardware_scope": row.get("amp_key"),
+                    "hardware_identity": hardware_identity,
+                    "exposure_id": row.get("exposure_id"),
+                    "observation_id": row.get("observation_id"),
+                    "dither_set_id": row.get("dither_set_id"),
+                },
+                "qa_status": row.get("qa_status"),
+                "usability": row.get("usability"),
+                "scientific_metadata": scientific,
+                "parent_ids": list(row.get("parent_ids") or []),
+                "component_names": list(row.get("component_names") or []),
+                "validity_start": _dt(row.get("validity_start")),
+                "validity_end": _dt(row.get("validity_end")),
+                "created_at": _dt(row.get("created_at")),
+            })
+        return summaries
+
     def describe(self, artifact_id_or_row) -> Dict[str, Any]:
         row = artifact_id_or_row if isinstance(artifact_id_or_row, dict) else self.adapter.get_row(int(artifact_id_or_row))
         if not row:
@@ -452,6 +552,7 @@ class ArtifactService:
                 "dither_set_id": desc.scope.dither_set_id,
             },
             "summary": desc.metadata,
+            "scientific_metadata": desc.scientific_metadata,
             "qa": self.adapter.get_qa_bundle(int(desc.id)),
             "model_type": desc.model_type,
             "components": self.adapter.list_components(int(desc.id)),
@@ -586,7 +687,8 @@ class ArtifactService:
 
     @staticmethod
     def _logical_revision(
-        kind, scope, components, parents, context, configuration_refs=()
+        kind, scope, components, parents, context, configuration_refs=(),
+        scientific_metadata=None,
     ) -> str:
         digest = hashlib.sha256()
         identity = {
@@ -599,6 +701,9 @@ class ArtifactService:
             "configuration_refs": sorted(
                 (asdict(value) for value in (configuration_refs or [])),
                 key=lambda value: json.dumps(value, sort_keys=True, default=str),
+            ),
+            "scientific_metadata": normalize_scientific_metadata(
+                scientific_metadata
             ),
         }
         digest.update(json.dumps(identity, sort_keys=True, default=str).encode("utf-8"))
@@ -628,6 +733,7 @@ class ArtifactService:
             storage=desc.storage or StorageRef("", "fits", "fs"),
             scope=desc.scope or Scope(zipcode=None),
             metadata=dict(desc.metadata),
+            scientific_metadata=dict(desc.scientific_metadata),
             provenance=desc.provenance,
             validity=desc.validity or Validity(),
             units=dict(desc.units),
@@ -765,6 +871,7 @@ class ArtifactService:
             storage=StorageRef(str(path), storage_format, "fs") if path else None,
             scope=scope,
             metadata=summary,
+            scientific_metadata=self.get_scientific_metadata(int(row["id"])),
             provenance=provenance,
             diagnostics=DiagnosticRecord(**self.adapter.get_diagnostics(int(row["id"]))) if False else None,
             model_type=(components[0].get("model_type") if components else self._infer_model_type(summary)),
