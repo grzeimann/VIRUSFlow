@@ -73,7 +73,7 @@ class ArtifactService:
     """Canonical Product persistence, loading, selection, lineage and diagnostics boundary."""
 
     def __init__(self, db_path: str) -> None:
-        db.init_db(db_path)
+        db.init_artifact_db(db_path)
         self.adapter = RegistryAdapter(db_path)
         self.db_path = db_path
         self.serializers = self._default_serializers()

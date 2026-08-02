@@ -166,7 +166,7 @@ class ExposureTask(_SciencePublisher):
         exposure_id = self.target.exposure_id
         at = self.target.at_time or _instant(exposure_id)
         raw_rows = [
-            raw for raw in db.list_raw_files(exposure_id=exposure_id, db_path=self.ctx.db_path)
+            raw for raw in db.list_raw_files(exposure_id=exposure_id, db_path=self.ctx.resolved_raw_db_path())
             if raw.frame_type == "sci" and raw.zipcode is not None
         ]
         if not raw_rows:

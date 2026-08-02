@@ -19,18 +19,18 @@ from .formatting import format_artifacts_table, format_exposures_table
 
 
 def cmd_init(args: argparse.Namespace) -> None:
-    db.init_db(args.db)
-    print(f"Initialized registry at {args.db}")
+    db.init_raw_db(args.raw_db)
+    print(f"Initialized registry at {args.raw_db}")
 
 
 def cmd_scan(args: argparse.Namespace) -> None:
     storage = FileSystemStorage(args.root)
-    db.init_db(args.db)
+    db.init_raw_db(args.raw_db)
     count = 0
     zipcode_keys = set()
     indexed_tars = set()
     # Unified iteration over both filesystem FITS and FITS inside tar archives
-    with db.connect(args.db) as conn:
+    with db.connect(args.raw_db) as conn:
         for src in storage.iter_raw_sources():
             # For tar-backed members, ensure we have a DB tar index built once per tar
             if src.backend == "tar":
@@ -41,7 +41,10 @@ def cmd_scan(args: argparse.Namespace) -> None:
                     except Exception:
                         pass
                     indexed_tars.add(p)
-            rid = db.register_raw_file(str(src.path), db_path=args.db, tar_member=src.tar_member, conn=conn)
+            rid = db.register_raw_file(
+                str(src.path), db_path=args.raw_db, tar_member=src.tar_member,
+                outer_tar_member=src.outer_tar_member, conn=conn,
+            )
             if rid is not None:
                 count += 1
                 if rid.zipcode is not None:
@@ -62,7 +65,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
 
 def cmd_exposures(args: argparse.Namespace) -> None:
     rows = db.list_exposure_table(
-        db_path=args.db,
+        db_path=args.raw_db,
         start_date=args.start_date,
         end_date=args.end_date,
         requested_target=args.requested_target,
@@ -300,7 +303,7 @@ def _run_planned(args: argparse.Namespace) -> None:
     validate_graph(nodes, edges)
     G = ReductionGraph(nodes, edges)
     # Determine scopes: list zipcodes that have any raw files in optional date window
-    zcs = _db.list_zipcodes(db_path=args.db, frame_type=None, start_date=getattr(args, "plan_start_date", None), end_date=getattr(args, "plan_end_date", None))
+    zcs = _db.list_zipcodes(db_path=args.raw_db, frame_type=None, start_date=getattr(args, "plan_start_date", None), end_date=getattr(args, "plan_end_date", None))
     # Optional developer filter: only specified zipcode keys
     only_keys = getattr(args, "only_zipcodes", None)
     if only_keys:
@@ -326,7 +329,10 @@ def _run_planned(args: argparse.Namespace) -> None:
     w_end = _parse_ymd(getattr(args, "plan_end_date", None))
     when_win = _TemporalWindow(start=w_start, end=w_end) if (w_start or w_end) else None
 
-    planned, report = G.plan(db_path=args.db, scopes=scopes, when=when_win, force_replan=bool(getattr(args, "force_replan", False)))
+    planned, report = G.plan(
+        db_path=args.db, raw_db_path=args.raw_db, scopes=scopes, when=when_win,
+        force_replan=bool(getattr(args, "force_replan", False)),
+    )
     # Persist a simple planning report YAML alongside workdir
     ensure_dir(args.workdir)
     rep_path = Path(args.workdir) / "planning_report.yml"
@@ -395,7 +401,7 @@ def _run_planned(args: argparse.Namespace) -> None:
     # Ensure algorithms I/O knows which registry DB to use for tar member reads during execution
     try:
         from ..algorithms.io import set_registry_db_path as _set_registry_db_path  # type: ignore
-        _set_registry_db_path(args.db)
+        _set_registry_db_path(args.raw_db)
     except Exception:
         pass
     # Execute scheduled tasks
@@ -411,7 +417,7 @@ def _run_planned(args: argparse.Namespace) -> None:
         "debug_inputs": bool(getattr(args, "debug_inputs", False)),
         "configuration_root": str(Path(args.configuration_root).resolve()),
     }
-    ctx = _TaskContext(db_path=args.db, workdir=args.workdir, config=cfg)
+    ctx = _TaskContext(db_path=args.db, workdir=args.workdir, config=cfg, raw_db_path=args.raw_db)
 
     def _ctx_factory():
         return ctx
@@ -470,9 +476,12 @@ def _run_planned(args: argparse.Namespace) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
-    # Enforce DB mode: require an existing registry DB path
-    if not os.path.exists(args.db):
-        raise SystemExit(f"Registry DB not found at {args.db}. Initialize and scan first: 'virusflow init --db {args.db}' then 'virusflow scan --db {args.db} <root>'.")
+    # Enforce DB mode: require an existing raw-catalog DB path
+    if not os.path.exists(args.raw_db):
+        raise SystemExit(
+            f"Raw catalog DB not found at {args.raw_db}. Initialize and scan first: "
+            f"'virusflow init --raw-db {args.raw_db}' then 'virusflow scan --raw-db {args.raw_db} <root>'."
+        )
     # Planning-first is the only supported path
     _run_planned(args)
 
@@ -496,7 +505,7 @@ def _science_context(args: argparse.Namespace):
         "fplane_path": str(root / "fplaneall.txt"),
         "preserve_failed_scratch": bool(getattr(args, "preserve_failed_scratch", False)),
     }
-    return TaskContext(str(args.db), str(Path(args.workdir).resolve()), cfg)
+    return TaskContext(str(args.db), str(Path(args.workdir).resolve()), cfg, raw_db_path=str(args.raw_db))
 
 
 def _science_executor(args: argparse.Namespace):
@@ -528,8 +537,8 @@ def cmd_run_exposure(args: argparse.Namespace) -> None:
     from ..planning.targets import ExposureTarget
     from ..tasks.exposure import ExposureTask
 
-    if not Path(args.db).exists():
-        raise SystemExit(f"Registry DB not found: {args.db}; run 'virusflow init' and 'virusflow scan' first")
+    if not Path(args.raw_db).exists():
+        raise SystemExit(f"Raw catalog DB not found: {args.raw_db}; run 'virusflow init' and 'virusflow scan' first")
     try:
         at = datetime.strptime(args.exposure_id, "%Y%m%dT%H%M%S.%f")
     except ValueError as exc:
@@ -551,7 +560,7 @@ def cmd_run_observation(args: argparse.Namespace) -> None:
     from ..tasks.observation import ObservationTask
 
     explicit = tuple(args.exposure_id or ())
-    exposure_ids = explicit or tuple(observation_exposure_ids(args.observation_id, db_path=args.db))
+    exposure_ids = explicit or tuple(observation_exposure_ids(args.observation_id, db_path=args.raw_db))
     if not exposure_ids:
         raise SystemExit(f"No scanned science exposures found for {args.observation_id}")
     dither_set_id = args.dither_set_id or f"{args.observation_id}-DITHER"
@@ -658,6 +667,7 @@ def cmd_config_show(args: argparse.Namespace) -> None:
     configured = load_planning_config(args.planning_yaml) if args.planning_yaml else None
     payload = {
         "db": str(Path(args.db).resolve()),
+        "raw_db": str(Path(args.raw_db).resolve()),
         "workdir": str(Path(args.workdir).resolve()),
         "scratch_root": str((Path(args.workdir).resolve() / ".scratch")),
         "configuration_root": str(Path(args.configuration_root).resolve()),
@@ -743,7 +753,14 @@ def cmd_validate_observation(args: argparse.Namespace) -> None:
 def _add_db(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--db", default=os.environ.get("VIRUSFLOW_DB", str(Path.cwd() / "virusflow.sqlite3")),
-        help="Registry SQLite path (default: VIRUSFLOW_DB or ./virusflow.sqlite3)",
+        help="Artifact/Product registry SQLite path (default: VIRUSFLOW_DB or ./virusflow.sqlite3)",
+    )
+
+
+def _add_raw_db(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--raw-db", default=os.environ.get("VIRUSFLOW_RAW_DB", str(Path.cwd() / "virusflow_raw.sqlite3")),
+        help="Raw-frame catalog SQLite path (default: VIRUSFLOW_RAW_DB or ./virusflow_raw.sqlite3)",
     )
 
 
@@ -762,6 +779,7 @@ def _add_progress(parser: argparse.ArgumentParser) -> None:
 
 def _add_science_run(parser: argparse.ArgumentParser) -> None:
     _add_db(parser)
+    _add_raw_db(parser)
     _add_progress(parser)
     parser.add_argument("--workdir", default=os.environ.get("VIRUSFLOW_WORKDIR", str(Path.cwd() / "work")))
     parser.add_argument("--configuration-root", default=os.environ.get("VIRUSFLOW_CONFIG_ROOT", str(Path.cwd())))
@@ -773,11 +791,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp = sub.add_parser("init", help="Initialize a registry")
-    _add_db(sp); sp.set_defaults(func=cmd_init)
+    _add_raw_db(sp); sp.set_defaults(func=cmd_init)
     sp = sub.add_parser("scan", help="Register raw FITS inputs")
-    _add_db(sp); sp.add_argument("root"); sp.set_defaults(func=cmd_scan)
+    _add_raw_db(sp); sp.add_argument("root"); sp.set_defaults(func=cmd_scan)
     sp = sub.add_parser("exposures", help="List scanned exposures")
-    _add_db(sp)
+    _add_raw_db(sp)
     sp.add_argument("--start-date")
     sp.add_argument("--end-date")
     sp.add_argument("--requested-target")

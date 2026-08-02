@@ -98,6 +98,7 @@ class ReductionGraph:
         when: Optional[TemporalWindow] = None,
         service_factory: Optional[callable] = None,
         force_replan: bool = False,
+        raw_db_path: Optional[str] = None,
     ) -> Tuple[List[Target], PlanningReport]:
         """Emit a set of Targets to execute in topological order.
 
@@ -107,6 +108,7 @@ class ReductionGraph:
         - Skip targets already satisfied according to ArtifactService.select_best,
           honoring tolerance where applicable.
         """
+        raw_db_path = raw_db_path or db_path
         svc = (service_factory or ArtifactService)(db_path)
         planned: List[Target] = []
         report = PlanningReport()
@@ -191,7 +193,7 @@ class ReductionGraph:
                 start_date, end_date = bounds()
                 for scope in scopes:
                     result = resolve_calibration_groups(
-                        kind=node.kind, cadence=node.cadence, scope=scope, db_path=db_path,
+                        kind=node.kind, cadence=node.cadence, scope=scope, db_path=raw_db_path,
                         start_date=start_date, end_date=end_date,
                     )
                     report.exclusions.extend({"kind": node.kind, "zipcode": scope_key(scope), **item}
@@ -310,18 +312,18 @@ class ReductionGraph:
                     frame_type = (node.inputs_raw or [""])[0]
                     start_date, end_date = bounds()
                     try:
-                        windows = node.cadence.windows(frame_type=frame_type, scope=scope, db_path=db_path)
+                        windows = node.cadence.windows(frame_type=frame_type, scope=scope, db_path=raw_db_path)
                     except NotImplementedError:
                         if isinstance(node.cadence, TimeCadence):
                             windows = time_cadence_windows(
-                                db_path=db_path, scope=scope, frame_type=frame_type,
+                                db_path=raw_db_path, scope=scope, frame_type=frame_type,
                                 every_days=node.cadence.every_days,
                                 min_n_inputs=node.cadence.min_n_inputs,
                                 start_date=start_date, end_date=end_date,
                             )
                         elif isinstance(node.cadence, ExposureCountCadence):
                             windows = exposure_count_windows(
-                                db_path=db_path, scope=scope, frame_type=frame_type,
+                                db_path=raw_db_path, scope=scope, frame_type=frame_type,
                                 min_n=node.cadence.min_n, max_span_days=node.cadence.max_span_days,
                                 start_date=start_date, end_date=end_date,
                             )
@@ -332,7 +334,7 @@ class ReductionGraph:
                             frame_type=frame_type,
                             start_date=window.start.strftime("%Y%m%d") if window.start else "19000101",
                             end_date=window.end.strftime("%Y%m%d") if window.end else "21000101",
-                            zipcode=scope.zipcode, db_path=db_path,
+                            zipcode=scope.zipcode, db_path=raw_db_path,
                             start_time=window.start, end_time=window.end,
                         )
                         raw_ids = tuple(sorted(int(row_id) for row_id, _ in rows))

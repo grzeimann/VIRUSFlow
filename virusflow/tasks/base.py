@@ -11,6 +11,10 @@ class TaskContext:
     db_path: str
     workdir: str
     config: Dict[str, Any] = field(default_factory=dict)
+    raw_db_path: Optional[str] = None
+
+    def resolved_raw_db_path(self) -> str:
+        return self.raw_db_path or self.db_path
 
 
 class Task:
@@ -107,7 +111,7 @@ class CalibrationTask(Task):
         with phase("raw_lookup"):
             planned_ids = tuple(getattr(self.target, "raw_ids", ()) or ())
             if planned_ids:
-                scoped = _db.list_raw_files_by_ids(planned_ids, db_path=self.ctx.db_path)
+                scoped = _db.list_raw_files_by_ids(planned_ids, db_path=self.ctx.resolved_raw_db_path())
                 wrong_scope = [
                     raw.exposure_id for _, raw in scoped
                     if raw.zipcode != getattr(self.target, "zipcode", None)
@@ -120,13 +124,14 @@ class CalibrationTask(Task):
                     start_date=self.target.start_date,
                     end_date=self.target.end_date,
                     zipcode=getattr(self.target, "zipcode", None),
-                    db_path=self.ctx.db_path,
+                    db_path=self.ctx.resolved_raw_db_path(),
                     start_time=getattr(self.target, "start_dt", None),
                     end_time=getattr(self.target, "end_dt", None),
                 )
         raw_inputs = [{
             "path": r.path, "tar_member": r.tar_member, "storage_backend": r.storage_backend,
             "archive_offset": r.archive_offset, "archive_size": r.archive_size,
+            "outer_tar_member": r.outer_tar_member,
         } for (_id, r) in scoped]
         parent_ids = [pid for (pid, _r) in scoped if pid is not None]
         if not raw_inputs:
@@ -162,7 +167,12 @@ class CalibrationTask(Task):
         reduced = []
         for item in raw_inputs:
             with phase("load_raw_frames"):
-                if item.get("archive_offset") is None:
+                if item.get("outer_tar_member") is not None:
+                    frame = loader.load(
+                        str(item["path"]), item.get("tar_member"),
+                        outer_tar_member=item.get("outer_tar_member"),
+                    )
+                elif item.get("archive_offset") is None:
                     frame = loader.load(str(item["path"]), item.get("tar_member"))
                 else:
                     frame = loader.load(

@@ -53,11 +53,12 @@ class RawFrameLoader:
         *,
         archive_offset: int | None = None,
         archive_size: int | None = None,
+        outer_tar_member: Optional[str] = None,
     ) -> RawFrameData:
         from ..performance import current_task_timing, legacy_baseline_enabled, phase
 
         timing = current_task_timing()
-        identity = f"{Path(path).resolve()}::{tar_member or ''}"
+        identity = f"{Path(path).resolve()}::{outer_tar_member or ''}::{tar_member or ''}"
         started = time.perf_counter()
         cold = True
         if timing is not None:
@@ -111,6 +112,7 @@ class RawFrameLoader:
                 path, tar_member,
                 archive_offset=None if legacy_baseline else archive_offset,
                 archive_size=None if legacy_baseline else archive_size,
+                outer_tar_member=outer_tar_member,
                 timing=timing,
             )
         except BaseException:
@@ -160,10 +162,33 @@ class RawFrameLoader:
             record_access(cache_hit=False, physical=True)
         return frame
 
-    def _read_physical(self, path, tar_member, *, archive_offset, archive_size, timing):
+    def _read_physical(
+        self, path, tar_member, *, archive_offset, archive_size, outer_tar_member=None, timing
+    ):
         from ..performance import phase
 
-        if tar_member:
+        if outer_tar_member:
+            from ..storage.filesystem import RawSource, read_member_bytes
+
+            with phase("raw_archive_open"):
+                source = RawSource(
+                    path=Path(path), tar_member=tar_member,
+                    backend="date_tar", outer_tar_member=outer_tar_member,
+                )
+                if timing is not None:
+                    timing.increment("archive_opens")
+            with phase("raw_byte_read"):
+                blob = read_member_bytes(source)
+            with phase("fits_header_parse"):
+                hdul = fits.open(io.BytesIO(blob), memmap=False)
+                header = dict(hdul[0].header)
+            try:
+                with phase("pixel_array_load"):
+                    data = np.asarray(hdul[0].data)
+            finally:
+                hdul.close()
+            bytes_read = len(blob)
+        elif tar_member:
             if archive_offset is not None and archive_size is not None:
                 handle = self._archive_handles.get(path)
                 if handle is None:
@@ -225,7 +250,10 @@ class RawFrameLoader:
                 bytes_read = Path(path).stat().st_size
             except OSError:
                 bytes_read = int(getattr(data, "nbytes", 0))
-        return RawFrameData(data=data, header=header, path=str(path), tar_member=tar_member), bytes_read
+        return (
+            RawFrameData(data=data, header=header, path=str(path), tar_member=tar_member),
+            bytes_read,
+        )
 
     @classmethod
     def clear_run_cache(cls, run_id: str) -> None:
@@ -243,4 +271,5 @@ class RawFrameLoader:
             reference.path, reference.tar_member,
             archive_offset=getattr(reference, "archive_offset", None),
             archive_size=getattr(reference, "archive_size", None),
+            outer_tar_member=getattr(reference, "outer_tar_member", None),
         )

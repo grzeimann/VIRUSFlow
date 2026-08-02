@@ -53,14 +53,14 @@ def _fail(message: str) -> None:
     raise RuntimeError(message)
 
 
-def _scan(data_root: Path, database: Path) -> int:
+def _scan(data_root: Path, raw_database: Path) -> int:
     from virusflow.registry import database as db
     from virusflow.storage.filesystem import FileSystemStorage
 
-    db.init_db(str(database))
+    db.init_raw_db(str(raw_database))
     count = 0
     indexed = set()
-    with db.connect(str(database)) as connection:
+    with db.connect(str(raw_database)) as connection:
         for source in FileSystemStorage(data_root).iter_raw_sources():
             if source.backend == "tar":
                 tar_path = os.path.abspath(str(source.path))
@@ -68,8 +68,8 @@ def _scan(data_root: Path, database: Path) -> int:
                     db.ensure_tar_index(tar_path, conn=connection)
                     indexed.add(tar_path)
             raw_id = db.register_raw_file(
-                str(source.path), db_path=str(database), tar_member=source.tar_member,
-                conn=connection,
+                str(source.path), db_path=str(raw_database), tar_member=source.tar_member,
+                outer_tar_member=source.outer_tar_member, conn=connection,
             )
             count += int(raw_id is not None)
     return count
@@ -567,7 +567,7 @@ def compare_validated_baseline(facts: dict) -> dict:
     }
 
 
-def _publish_validation_report(database: Path, workspace: Path, markdown_path: Path, json_path: Path, final_artifact_id: int):
+def _publish_validation_report(artifact_database: Path, workspace: Path, markdown_path: Path, json_path: Path, final_artifact_id: int):
     from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
     from virusflow.artifacts.models import Scope
     from virusflow.ontology.scopes import PhysicalScope
@@ -587,7 +587,7 @@ def _publish_validation_report(database: Path, workspace: Path, markdown_path: P
         metadata={"schema": "virusflow.validation.v1", "observation_id": OBSERVATION_ID},
     )
     publisher = DefaultPublicationService(
-        svc=ArtifactService(str(database)), policy=DefaultPersistencePolicy(),
+        svc=ArtifactService(str(artifact_database)), policy=DefaultPersistencePolicy(),
         base_dir=str(workspace / "artifacts"),
     )
     return publisher.publish([request], PublicationContext(
@@ -618,7 +618,8 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = args.output_dir or workspace / "report"
     workspace.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
-    database = workspace / "registry.sqlite3"
+    raw_database = workspace / "raw_registry.sqlite3"
+    artifact_database = workspace / "registry.sqlite3"
 
     from virusflow.artifacts import ArtifactService
     from virusflow.io.catalogs import PanSTARRSCSVProvider
@@ -628,8 +629,8 @@ def main(argv: list[str] | None = None) -> int:
     from virusflow.tasks.observation import ObservationTask
     from virusflow.executors.planning_executor import PlanningExecutor
 
-    registered = _scan(args.data_root, database)
-    inventory = _inventory(database)
+    registered = _scan(args.data_root, raw_database)
+    inventory = _inventory(raw_database)
     if inventory["total_members"] != 14100:
         _fail(f"20260609 inventory has {inventory['total_members']} members, expected 14100")
     selected = next(item for item in inventory["science_exposures"] if item["exposure_id"] == EXPOSURE_ID)
@@ -640,15 +641,16 @@ def main(argv: list[str] | None = None) -> int:
         _fail("workers must be at least one")
     progress_file = args.progress_file or output_dir / "progress.jsonl"
     context = TaskContext(
-        str(database), str(workspace / "artifacts"),
+        str(artifact_database), str(workspace / "artifacts"),
         {
             "configuration_root": str(args.configuration_root),
             "fplane_path": str(args.configuration_root / "fplaneall.txt"),
             "catalog_provider": PanSTARRSCSVProvider(timeout_seconds=60),
             "nworkers": workers,
         },
+        raw_db_path=str(raw_database),
     )
-    service = ArtifactService(str(database))
+    service = ArtifactService(str(artifact_database))
     executor = PlanningExecutor(
         max_workers=workers, progress=True, progress_mode=args.progress_mode,
         progress_interval=args.progress_interval, progress_path=str(progress_file),
@@ -724,7 +726,8 @@ def main(argv: list[str] | None = None) -> int:
         "effective_configuration": {
             "data_root": str(args.data_root), "configuration_root": str(args.configuration_root),
             "workspace": str(workspace), "artifact_root": str(workspace / "artifacts"),
-            "registry": str(database), "scratch_root": str(scratch_root),
+            "registry": str(artifact_database), "raw_registry": str(raw_database),
+            "scratch_root": str(scratch_root),
         },
         "execution": {
             "workers": workers, "mode": "serial" if workers == 1 else "parallel",
@@ -751,7 +754,7 @@ def main(argv: list[str] | None = None) -> int:
         ],
     }
     markdown_path, json_path = _write_report(output_dir, inventory, counts, facts, manifest, validation)
-    report_artifact = _publish_validation_report(database, workspace, markdown_path, json_path, int(final_row["id"]))
+    report_artifact = _publish_validation_report(artifact_database, workspace, markdown_path, json_path, int(final_row["id"]))
     validation["validation_artifact_id"] = int(report_artifact.id)
     json_path.write_text(json.dumps(validation, indent=2, sort_keys=True, default=str) + "\n")
     print(f"PASS Steps 8–10 verification: registered={registered} workspace={workspace}")

@@ -86,7 +86,7 @@ class ObservationTask(_SciencePublisher):
         config_root = self.ctx.config.get("configuration_root") if isinstance(self.ctx.config, dict) else None
         config = ConfigurationService(config_root)
         first_raw_rows = [
-            row for row in db.list_raw_file_rows(str(self.target.exposure_ids[0]), self.ctx.db_path)
+            row for row in db.list_raw_file_rows(str(self.target.exposure_ids[0]), self.ctx.resolved_raw_db_path())
             if row[1].frame_type == "sci"
         ]
         if not first_raw_rows:
@@ -133,7 +133,7 @@ class ObservationTask(_SciencePublisher):
 
         start = min(_instant(value) for value in exposure_ids)
         for index, exposure_id in enumerate(exposure_ids):
-            raw_rows = [row for row in db.list_raw_file_rows(exposure_id, self.ctx.db_path) if row[1].frame_type == "sci"]
+            raw_rows = [row for row in db.list_raw_file_rows(exposure_id, self.ctx.resolved_raw_db_path()) if row[1].frame_type == "sci"]
             if not raw_rows:
                 raise RuntimeError(f"Observation member has no real science input: {exposure_id}")
             representative = (loader or RawFrameLoader()).load_ref(raw_rows[0][1])

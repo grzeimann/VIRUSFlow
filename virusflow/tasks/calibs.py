@@ -187,7 +187,7 @@ class _RawCalibrationTask(_CanonicalTask):
         from ..registry import database as db
 
         result.meta.update(aggregate_scientific_metadata(
-            db.list_raw_scientific_metadata(parent_ids, db_path=self.ctx.db_path)
+            db.list_raw_scientific_metadata(parent_ids, db_path=self.ctx.resolved_raw_db_path())
         ))
         artifact = self._publish(result, parent_ids)
         return {self.artifact_name: artifact}

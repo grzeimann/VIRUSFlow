@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+import io
+import tarfile
+from pathlib import Path
+
+import numpy as np
+import pytest
+from astropy.io import fits
+
+from virusflow.artifacts import ArtifactService
+from virusflow.artifacts.models import Scope
+from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
+from virusflow.cli.virusflow import build_parser
+from virusflow.core.identity import ZipCode
+from virusflow.io.raw import RawFrameLoader
+from virusflow.ontology.scopes import PhysicalScope
+from virusflow.persistence.policy import DefaultPersistencePolicy
+from virusflow.publication.context import PublicationContext
+from virusflow.publication.service import DefaultPublicationService
+from virusflow.registry import database as db
+from virusflow.storage.filesystem import FileSystemStorage, RawSource, read_member_bytes
+from virusflow.tasks.base import TaskContext
+
+
+def _write_raw(path: Path, **header_values) -> None:
+    header = fits.Header({
+        "IFUID": "043", "SPECID": "412", "CONTID": "S/N 0021", **header_values,
+    })
+    fits.PrimaryHDU(np.arange(4, dtype=float).reshape(2, 2), header=header).writeto(path)
+
+
+def _tables(db_path: Path) -> set[str]:
+    with db.connect(str(db_path)) as conn:
+        rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    return {row[0] for row in rows}
+
+
+def test_init_creates_only_the_raw_catalog_database(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    raw_db = tmp_path / "raw.sqlite3"
+    default_artifact_db = tmp_path / "virusflow.sqlite3"
+    parser = build_parser()
+    args = parser.parse_args(["init", "--raw-db", str(raw_db)])
+    args.func(args)
+    assert raw_db.exists()
+    assert not default_artifact_db.exists()
+    tables = _tables(raw_db)
+    assert {"exposures", "raw_files", "amplifiers"} <= tables
+    assert "artifacts" not in tables
+
+
+def test_scan_populates_only_the_raw_database(tmp_path: Path):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    _write_raw(
+        data_root / "20260501T010000.0_074LL_sci.fits",
+        OBJECT="Target_082_W", QOBJECT="Target",
+    )
+    raw_db = tmp_path / "raw.sqlite3"
+    artifact_db = tmp_path / "artifact.sqlite3"
+
+    parser = build_parser()
+    args = parser.parse_args(["scan", "--raw-db", str(raw_db), str(data_root)])
+    args.func(args)
+
+    assert raw_db.exists()
+    rows = db.list_raw_files(db_path=str(raw_db))
+    assert len(rows) == 1
+
+    svc = ArtifactService(str(artifact_db))
+    assert svc.select_best(kind="master_bias", scope=Scope(zipcode=None)) is None
+    assert not artifact_db.exists() or "raw_files" not in _tables(artifact_db)
+
+
+def test_artifact_publication_writes_only_to_the_artifact_database(tmp_path: Path):
+    raw_db = tmp_path / "raw.sqlite3"
+    artifact_db = tmp_path / "artifact.sqlite3"
+    db.init_raw_db(str(raw_db))
+
+    svc = ArtifactService(str(artifact_db))
+    publisher = DefaultPublicationService(
+        svc=svc, policy=DefaultPersistencePolicy(), base_dir=str(tmp_path / "products"),
+    )
+    data = np.ones((4, 4), dtype=float)
+    publisher.publish([ArtifactRequest(
+        kind="master_ldls",
+        components={
+            "master_ldls": LogicalComponent("master_ldls", "array2d", data),
+            "flat_response_mask": LogicalComponent(
+                "flat_response_mask", "array2d", np.zeros_like(data, dtype=np.uint8)
+            ),
+        },
+        scope=Scope(zipcode=None),
+    )], PublicationContext("flat", "v2", "flat", "1", {}, [], {}))
+
+    artifact_tables = _tables(artifact_db)
+    assert "artifacts" in artifact_tables
+    raw_tables = _tables(raw_db)
+    assert "raw_files" in raw_tables
+    with db.connect(str(raw_db)) as conn:
+        count = conn.execute("SELECT count(*) FROM raw_files").fetchone()[0]
+    assert count == 0
+
+
+def test_task_context_reads_raw_db_and_publishes_to_artifact_db(tmp_path: Path):
+    from virusflow.tasks.calibs import BiasTask
+
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    for amp in ("074LL", "074LU"):
+        _write_raw(data_root / f"20260501T010000.0_{amp}_zro.fits")
+
+    raw_db = tmp_path / "raw.sqlite3"
+    artifact_db = tmp_path / "artifact.sqlite3"
+    db.init_raw_db(str(raw_db))
+    with db.connect(str(raw_db)) as conn:
+        for source in FileSystemStorage(data_root).iter_raw_sources():
+            db.register_raw_file(str(source.path), db_path=str(raw_db), conn=conn)
+
+    ctx = TaskContext(str(artifact_db), str(tmp_path / "work"), {}, raw_db_path=str(raw_db))
+    zipcode = ZipCode(ifuslot="074", ifuid="043", specid="412", amp="LL", controller="S/N 0021")
+    target = type(
+        "Target", (), {
+            "zipcode": zipcode, "start_date": "20260501", "end_date": "20260501",
+            "raw_ids": (),
+        },
+    )()
+    task = BiasTask(ctx, target=target)
+    raw_inputs, parent_ids = task.query_inputs()
+    assert len(raw_inputs) == 1
+    assert not Path(artifact_db).exists() or "raw_files" not in _tables(artifact_db)
+
+
+def test_filesystem_and_tar_backends_still_enumerate_correctly(tmp_path: Path):
+    fs_root = tmp_path / "fs"
+    fs_root.mkdir()
+    _write_raw(fs_root / "20260501T010000.0_074LL_sci.fits")
+    fs_sources = list(FileSystemStorage(fs_root).iter_raw_sources())
+    assert len(fs_sources) == 1
+    assert fs_sources[0].backend == "filesystem"
+
+    tar_root = tmp_path / "tar"
+    tar_root.mkdir()
+    fits_path = tmp_path / "20260501T010000.0_074LL_sci.fits"
+    _write_raw(fits_path)
+    tar_path = tar_root / "virus0000001.tar"
+    with tarfile.open(tar_path, "w") as tf:
+        tf.add(fits_path, arcname="20260501T010000.0_074LL_sci.fits")
+    tar_sources = list(FileSystemStorage(tar_root).iter_raw_sources())
+    assert len(tar_sources) == 1
+    assert tar_sources[0].backend == "tar"
+    assert tar_sources[0].tar_member == "20260501T010000.0_074LL_sci.fits"
+
+
+def test_date_tar_backend_reads_nested_virus_tar(tmp_path: Path):
+    fits_path = tmp_path / "20260501T010000.0_074LL_sci.fits"
+    _write_raw(fits_path, OBJECT="Target_082_W", QOBJECT="Target")
+    original_bytes = fits_path.read_bytes()
+
+    virus_tar_bytes = io.BytesIO()
+    with tarfile.open(fileobj=virus_tar_bytes, mode="w") as inner:
+        inner.add(fits_path, arcname="20260501T010000.0_074LL_sci.fits")
+    virus_tar_bytes.seek(0)
+
+    date_root = tmp_path / "date_root"
+    date_root.mkdir()
+    date_tar_path = date_root / "20260501.tar"
+    virus_tar_info = tarfile.TarInfo(name="virus/virus0000001.tar")
+    virus_tar_info.size = len(virus_tar_bytes.getvalue())
+    with tarfile.open(date_tar_path, "w") as outer:
+        virus_tar_bytes.seek(0)
+        outer.addfile(virus_tar_info, virus_tar_bytes)
+
+    sources = list(FileSystemStorage(date_root).iter_raw_sources())
+    assert len(sources) == 1
+    source = sources[0]
+    assert source.backend == "date_tar"
+    assert source.outer_tar_member == "virus/virus0000001.tar"
+    assert source.tar_member == "20260501T010000.0_074LL_sci.fits"
+
+    blob = read_member_bytes(source)
+    assert blob == original_bytes
+
+    raw_db = tmp_path / "raw.sqlite3"
+    db.init_raw_db(str(raw_db))
+    with db.connect(str(raw_db)) as conn:
+        raw_id = db.register_raw_file(
+            str(source.path), db_path=str(raw_db), tar_member=source.tar_member,
+            outer_tar_member=source.outer_tar_member, conn=conn,
+        )
+    assert raw_id is not None
+    assert raw_id.storage_backend == "date_tar"
+    assert raw_id.outer_tar_member == "virus/virus0000001.tar"
+
+    loader = RawFrameLoader()
+    frame = loader.load_ref(raw_id)
+    with fits.open(io.BytesIO(original_bytes)) as hdul:
+        expected = np.asarray(hdul[0].data)
+    assert np.array_equal(frame.data, expected)

@@ -95,7 +95,7 @@ class ReducedScienceAmplifierTask(_SciencePublisher):
         rows = [
             (row_id, raw) for row_id, raw in db.list_raw_files_scoped(
                 frame_type="sci", start_date=exposure_id[:8], end_date=exposure_id[:8],
-                zipcode=zipcode, db_path=self.ctx.db_path,
+                zipcode=zipcode, db_path=self.ctx.resolved_raw_db_path(),
             ) if raw.exposure_id == exposure_id
         ]
         if len(rows) != 1:
@@ -145,7 +145,7 @@ class ReducedScienceAmplifierTask(_SciencePublisher):
             dark = np.asarray(service.load_component(dark_id, "master_dark")["data"], dtype=np.float32)
             dark_rows = db.list_raw_files_scoped(
                 frame_type="drk", start_date=exposure_id[:8], end_date=exposure_id[:8],
-                zipcode=zipcode, db_path=self.ctx.db_path,
+                zipcode=zipcode, db_path=self.ctx.resolved_raw_db_path(),
             )
             dark_exptime = None
             if dark_rows:

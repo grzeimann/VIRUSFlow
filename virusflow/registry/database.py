@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import re
 import sqlite3
@@ -23,6 +24,7 @@ from ..core.scientific_metadata import (
 
 
 DEFAULT_DB_PATH = os.environ.get("VIRUSFLOW_DB", str(Path.cwd() / "virusflow.sqlite3"))
+DEFAULT_RAW_DB_PATH = os.environ.get("VIRUSFLOW_RAW_DB", str(Path.cwd() / "virusflow_raw.sqlite3"))
 _INITIALIZED_DATABASES: Dict[str, Tuple[int, int]] = {}
 _INITIALIZE_LOCK = Lock()
 
@@ -157,7 +159,7 @@ def connect(db_path: str = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-SCHEMA = r"""
+RAW_SCHEMA = r"""
 PRAGMA journal_mode=WAL;
 CREATE TABLE IF NOT EXISTS exposures (
     id TEXT PRIMARY KEY,
@@ -209,6 +211,7 @@ CREATE TABLE IF NOT EXISTS raw_files (
     frame_type TEXT,
     path TEXT,
     tar_member TEXT,
+    outer_tar_member TEXT,
     storage_backend TEXT,
     amp_key TEXT,
     observation_time TIMESTAMP,
@@ -244,7 +247,9 @@ CREATE TABLE IF NOT EXISTS tar_members (
     size INTEGER,
     PRIMARY KEY(tar_path, member)
 );
+"""
 
+ARTIFACT_SCHEMA = r"""
 CREATE TABLE IF NOT EXISTS artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT,
@@ -422,11 +427,6 @@ CREATE INDEX IF NOT EXISTS performance_tasks_kind_idx ON performance_tasks(task_
 -- Helpful indexes (safe no-ops if already present)
 CREATE INDEX IF NOT EXISTS artifacts_kind_amp ON artifacts(kind, amp_key);
 CREATE INDEX IF NOT EXISTS provenance_created_at ON provenance(created_at);
-CREATE INDEX IF NOT EXISTS exposure_details_requested_target_idx
-ON exposure_details(requested_target);
-CREATE INDEX IF NOT EXISTS exposure_details_qprog_idx ON exposure_details(qprog);
-CREATE INDEX IF NOT EXISTS exposure_details_observing_mode_idx
-ON exposure_details(observing_mode);
 CREATE INDEX IF NOT EXISTS artifact_records_kind_scope ON artifact_records(canonical_kind, physical_scope);
 CREATE INDEX IF NOT EXISTS artifact_scientific_metadata_observation_time
 ON artifact_scientific_metadata(observation_time);
@@ -435,24 +435,56 @@ ON artifact_scientific_metadata(ambient_temperature);
 CREATE INDEX IF NOT EXISTS artifact_relations_child ON artifact_relations(child_id);
 """
 
+RAW_SCHEMA += r"""
+-- Helpful indexes (safe no-ops if already present)
+CREATE INDEX IF NOT EXISTS exposure_details_requested_target_idx
+ON exposure_details(requested_target);
+CREATE INDEX IF NOT EXISTS exposure_details_qprog_idx ON exposure_details(qprog);
+CREATE INDEX IF NOT EXISTS exposure_details_observing_mode_idx
+ON exposure_details(observing_mode);
+"""
 
-def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
+# Preserved for any code/tests that still initialize a single shared database file
+# containing both the raw catalog and the Artifact/Product registry.
+SCHEMA = RAW_SCHEMA + ARTIFACT_SCHEMA
+
+
+def _init_schema(db_path: str, schema: str) -> None:
     from ..performance import legacy_baseline_enabled
 
     resolved = str(Path(db_path).resolve())
+    cache_key = (resolved, id(schema))
     with _INITIALIZE_LOCK:
         path = Path(resolved)
         if path.exists() and not legacy_baseline_enabled():
             stat = path.stat()
             signature = (int(stat.st_dev), int(stat.st_ino))
-            if _INITIALIZED_DATABASES.get(resolved) == signature:
+            if _INITIALIZED_DATABASES.get(cache_key) == signature:
                 return
         path.parent.mkdir(parents=True, exist_ok=True)
         with connect(resolved) as conn:
-            conn.executescript(SCHEMA)
+            conn.executescript(schema)
         stat = path.stat()
         if not legacy_baseline_enabled():
-            _INITIALIZED_DATABASES[resolved] = (int(stat.st_dev), int(stat.st_ino))
+            _INITIALIZED_DATABASES[cache_key] = (int(stat.st_dev), int(stat.st_ino))
+
+
+def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
+    """Initialize a single shared database file with both raw and Artifact schemas."""
+
+    _init_schema(db_path, SCHEMA)
+
+
+def init_raw_db(db_path: str = DEFAULT_RAW_DB_PATH) -> None:
+    """Initialize the raw-frame catalog database (exposures/raw_files/tar index)."""
+
+    _init_schema(db_path, RAW_SCHEMA)
+
+
+def init_artifact_db(db_path: str = DEFAULT_DB_PATH) -> None:
+    """Initialize the Artifact/Product registry database."""
+
+    _init_schema(db_path, ARTIFACT_SCHEMA)
 
 
 def _parse_filename_meta(path: str) -> Tuple[str, str, Optional[str]]:
@@ -534,6 +566,30 @@ def _read_ifuslot_metadata_from_tar(tar_path: str, member_name: str) -> Dict[str
                     "specid": hdr.get("SPECID"),
                     "controller": hdr.get("CONTID") or hdr.get("CONTROLLER"),
                 }
+    except Exception:
+        return {"ifuid": None, "specid": None, "controller": None}
+
+
+def _read_ifuslot_metadata_from_date_tar(
+    date_tar_path: str, outer_tar_member: str, member_name: str
+) -> Dict[str, Optional[str]]:
+    """Open a FITS member nested two tar levels deep (Corral date-tar layout)."""
+
+    from ..storage.filesystem import RawSource, read_member_bytes
+
+    try:
+        source = RawSource(
+            path=Path(date_tar_path), tar_member=member_name,
+            backend="date_tar", outer_tar_member=outer_tar_member,
+        )
+        blob = read_member_bytes(source)
+        with fits.open(io.BytesIO(blob), memmap=False) as hdul:
+            hdr = hdul[0].header
+            return {
+                "ifuid": hdr.get("IFUID"),
+                "specid": hdr.get("SPECID"),
+                "controller": hdr.get("CONTID") or hdr.get("CONTROLLER"),
+            }
     except Exception:
         return {"ifuid": None, "specid": None, "controller": None}
 
@@ -620,6 +676,25 @@ def _read_exposure_header_fields_from_tar(
         return {"qobject": None, "qprog": None, "pexptime": None, "date": None, "qra": None, "qdec": None}
 
 
+def _read_exposure_header_fields_from_date_tar(
+    date_tar_path: str, outer_tar_member: str, member_name: str, *, frame_type: str
+) -> Dict[str, Any]:
+    """Read selected exposure-level keywords from a FITS member nested two tar levels deep."""
+    from ..storage.filesystem import RawSource, read_member_bytes
+
+    try:
+        source = RawSource(
+            path=Path(date_tar_path), tar_member=member_name,
+            backend="date_tar", outer_tar_member=outer_tar_member,
+        )
+        blob = read_member_bytes(source)
+        with fits.open(io.BytesIO(blob), memmap=False) as hdul:
+            hdr = hdul[0].header
+            return _exposure_header_fields(hdr, frame_type=frame_type)
+    except Exception:
+        return {"qobject": None, "qprog": None, "pexptime": None, "date": None, "qra": None, "qdec": None}
+
+
 def _read_exposure_header_fields_from_file(path: str, *, frame_type: str) -> Dict[str, Any]:
     try:
         with fits.open(path, memmap=False) as hdul:
@@ -684,7 +759,7 @@ def upsert_amplifier(conn: sqlite3.Connection, z: ZipCode) -> None:
     )
 
 
-def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str = DEFAULT_DB_PATH, tar_member: Optional[str] = None, conn: Optional[sqlite3.Connection] = None) -> Optional[RawFileId]:
+def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str = DEFAULT_RAW_DB_PATH, tar_member: Optional[str] = None, outer_tar_member: Optional[str] = None, conn: Optional[sqlite3.Connection] = None) -> Optional[RawFileId]:
     """Register a raw FITS file in the DB unless it belongs to a test observation.
 
     Supports files inside tar archives by passing tar_member (member path inside the tar).
@@ -694,7 +769,7 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
     files are ignored (not inserted into the DB), and the function returns None.
     """
     if conn is None:
-        init_db(db_path)
+        init_raw_db(db_path)
     # Check observation number in the path context (use tar filename if provided)
     obs_num = _extract_observation_number(path)
     if obs_num is not None and obs_num >= 999:
@@ -713,14 +788,20 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
         # Populate IFUSLOT metadata cache on first encounter
         meta = _IFUSLOT_META_CACHE.get(ifuslot)
         if meta is None:
-            if tar_member:
+            if outer_tar_member:
+                meta = _read_ifuslot_metadata_from_date_tar(path, outer_tar_member, tar_member)
+            elif tar_member:
                 meta = _read_ifuslot_metadata_from_tar(path, tar_member)
             else:
                 meta = _read_ifuslot_metadata_from_file(path)
             _IFUSLOT_META_CACHE[ifuslot] = meta
         zipcode = _zipcode_from_amp_token(amp_token, meta)
 
-    if tar_member:
+    if outer_tar_member:
+        hdr_fields = _read_exposure_header_fields_from_date_tar(
+            path, outer_tar_member, tar_member, frame_type=frame_type
+        )
+    elif tar_member:
         hdr_fields = _read_exposure_header_fields_from_tar(
             path, tar_member, frame_type=frame_type
         )
@@ -728,6 +809,7 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
         hdr_fields = _read_exposure_header_fields_from_file(path, frame_type=frame_type)
     scientific = scientific_metadata_for_database(hdr_fields)
     exposure_details_key = (str(Path(db_path).resolve()), exposure_id)
+    storage_backend = "date_tar" if outer_tar_member else ("tar" if tar_member else "filesystem")
 
     def _do_insert(conn_: sqlite3.Connection) -> None:
         # Upsert amplifier mapping if available
@@ -755,17 +837,17 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
             """,
             (exposure_id, when_utc, frame_type),
         )
-        storage_backend = "tar" if tar_member else "filesystem"
         abs_path = os.path.abspath(path)
         conn_.execute(
             """
             INSERT INTO raw_files(
-                exposure_id, frame_type, path, tar_member, storage_backend, amp_key,
+                exposure_id, frame_type, path, tar_member, outer_tar_member, storage_backend, amp_key,
                 observation_time, ambient_temperature, humidity, pressure,
                 program_id, object, rho_start, theta_start, phi_start, x_start, y_start
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(exposure_id, frame_type, path, tar_member) DO UPDATE SET
+                outer_tar_member=excluded.outer_tar_member,
                 storage_backend=excluded.storage_backend,
                 amp_key=excluded.amp_key,
                 observation_time=excluded.observation_time,
@@ -781,15 +863,15 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
                 y_start=excluded.y_start
             """,
             (
-                exposure_id, frame_type, abs_path, tar_member, storage_backend, amp_key,
+                exposure_id, frame_type, abs_path, tar_member, outer_tar_member, storage_backend, amp_key,
                 *(scientific[field] for field in SCIENTIFIC_METADATA_FIELDS),
             ),
         )
 
         # Populate exposure_details once per exposure in this process to avoid repeated header I/O
         if exposure_details_key not in _POPULATED_EXPOSURE_DETAILS:
-            # Determine tar_path (only for tar backend) and expnum (<999 considered non-test)
-            tar_path = abs_path if storage_backend == "tar" else None
+            # Determine tar_path (only for tar/date_tar backends) and expnum (<999 considered non-test)
+            tar_path = abs_path if storage_backend in ("tar", "date_tar") else None
             expn = _extract_observation_number(path)
             expnum = expn if (expn is not None and expn < 999) else None
             # Upsert into exposure_details; keep any pre-existing non-null values
@@ -867,12 +949,13 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
         frame_type=frame_type,
         path=os.path.abspath(path),
         tar_member=tar_member,
-        storage_backend=("tar" if tar_member else "filesystem"),
+        storage_backend=storage_backend,
         zipcode=zipcode,
+        outer_tar_member=outer_tar_member,
     )
 
 
-def list_exposures(db_path: str = DEFAULT_DB_PATH) -> List[str]:
+def list_exposures(db_path: str = DEFAULT_RAW_DB_PATH) -> List[str]:
     with connect(db_path) as conn:
         rows = conn.execute("SELECT id FROM exposures ORDER BY id").fetchall()
         return [r[0] for r in rows]
@@ -881,7 +964,7 @@ def list_exposures(db_path: str = DEFAULT_DB_PATH) -> List[str]:
 def observation_exposure_ids(
     observation_id: str,
     *,
-    db_path: str = DEFAULT_DB_PATH,
+    db_path: str = DEFAULT_RAW_DB_PATH,
 ) -> List[str]:
     """Resolve science-exposure membership from scanned observation metadata."""
 
@@ -901,16 +984,18 @@ def observation_exposure_ids(
     return [str(row[0]) for row in rows]
 
 
-def list_raw_files(exposure_id: Optional[str] = None, db_path: str = DEFAULT_DB_PATH) -> List[RawFileId]:
+def list_raw_files(exposure_id: Optional[str] = None, db_path: str = DEFAULT_RAW_DB_PATH) -> List[RawFileId]:
     with connect(db_path) as conn:
         if exposure_id:
             rows = conn.execute(
-                "SELECT exposure_id, frame_type, path, tar_member, storage_backend, amp_key FROM raw_files WHERE exposure_id=?",
+                "SELECT exposure_id, frame_type, path, tar_member, storage_backend, amp_key, outer_tar_member "
+                "FROM raw_files WHERE exposure_id=?",
                 (exposure_id,),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT exposure_id, frame_type, path, tar_member, storage_backend, amp_key FROM raw_files",
+                "SELECT exposure_id, frame_type, path, tar_member, storage_backend, amp_key, outer_tar_member "
+                "FROM raw_files",
             ).fetchall()
         out: List[RawFileId] = []
         for r in rows:
@@ -924,18 +1009,19 @@ def list_raw_files(exposure_id: Optional[str] = None, db_path: str = DEFAULT_DB_
                     zipcode = None
             out.append(
                 RawFileId(
-                    exposure_id=r[0], frame_type=r[1], path=r[2], tar_member=r[3], storage_backend=r[4], zipcode=zipcode
+                    exposure_id=r[0], frame_type=r[1], path=r[2], tar_member=r[3], storage_backend=r[4],
+                    zipcode=zipcode, outer_tar_member=r[6],
                 )
             )
         return out
 
 
-def list_raw_file_rows(exposure_id: str, db_path: str = DEFAULT_DB_PATH) -> List[Tuple[int, RawFileId]]:
+def list_raw_file_rows(exposure_id: str, db_path: str = DEFAULT_RAW_DB_PATH) -> List[Tuple[int, RawFileId]]:
     """Return raw row identities with canonical amplifier identities for lineage."""
 
     with connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT id, exposure_id, frame_type, path, tar_member, storage_backend, amp_key "
+            "SELECT id, exposure_id, frame_type, path, tar_member, storage_backend, amp_key, outer_tar_member "
             "FROM raw_files WHERE exposure_id=? ORDER BY id",
             (str(exposure_id),),
         ).fetchall()
@@ -949,12 +1035,15 @@ def list_raw_file_rows(exposure_id: str, db_path: str = DEFAULT_DB_PATH) -> List
                 zipcode = parse_zipcode_key(str(row[6]))
             except (SystemExit, ValueError):
                 zipcode = None
-        out.append((int(row[0]), RawFileId(row[1], row[2], row[3], row[4], row[5], zipcode)))
+        out.append((
+            int(row[0]),
+            RawFileId(row[1], row[2], row[3], row[4], row[5], zipcode, outer_tar_member=row[7]),
+        ))
     return out
 
 
 def list_raw_scientific_metadata(
-    raw_ids: Iterable[int], *, db_path: str = DEFAULT_DB_PATH
+    raw_ids: Iterable[int], *, db_path: str = DEFAULT_RAW_DB_PATH
 ) -> List[Dict[str, Any]]:
     """Return compact raw scientific state for an already selected membership."""
 
@@ -978,7 +1067,7 @@ def list_raw_files_scoped(
     start_date: str,
     end_date: str,
     zipcode: Optional[ZipCode] = None,
-    db_path: str = DEFAULT_DB_PATH,
+    db_path: str = DEFAULT_RAW_DB_PATH,
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
 ) -> List[Tuple[int, RawFileId]]:
@@ -991,7 +1080,7 @@ def list_raw_files_scoped(
     with connect(db_path) as conn:
         base = (
             "SELECT rf.id, rf.exposure_id, rf.frame_type, rf.path, rf.tar_member, rf.storage_backend, "
-            "rf.amp_key, a.ifuslot, a.ifuid, a.specid, a.amp, a.controller, tm.offset, tm.size "
+            "rf.amp_key, a.ifuslot, a.ifuid, a.specid, a.amp, a.controller, tm.offset, tm.size, rf.outer_tar_member "
             "FROM raw_files rf JOIN exposures e ON rf.exposure_id = e.id "
             "LEFT JOIN amplifiers a ON rf.amp_key = a.key "
             "LEFT JOIN tar_members tm ON tm.tar_path=rf.path AND tm.member=rf.tar_member "
@@ -1032,13 +1121,14 @@ def list_raw_files_scoped(
             rf = RawFileId(
                 exposure_id=r[1], frame_type=r[2], path=r[3], tar_member=r[4],
                 storage_backend=r[5], zipcode=zc, archive_offset=r[12], archive_size=r[13],
+                outer_tar_member=r[14],
             )
             out.append((int(r[0]), rf))
         return out
 
 
 def list_raw_files_by_ids(
-    raw_ids: Iterable[int], *, db_path: str = DEFAULT_DB_PATH
+    raw_ids: Iterable[int], *, db_path: str = DEFAULT_RAW_DB_PATH
 ) -> List[Tuple[int, RawFileId]]:
     """Resolve an already-planned raw membership without re-querying a window."""
 
@@ -1050,7 +1140,7 @@ def list_raw_files_by_ids(
         rows = conn.execute(
             "SELECT rf.id, rf.exposure_id, rf.frame_type, rf.path, rf.tar_member, "
             "rf.storage_backend, rf.amp_key, a.ifuslot, a.ifuid, a.specid, a.amp, "
-            "a.controller, tm.offset, tm.size FROM raw_files rf "
+            "a.controller, tm.offset, tm.size, rf.outer_tar_member FROM raw_files rf "
             "LEFT JOIN amplifiers a ON rf.amp_key=a.key "
             "LEFT JOIN tar_members tm ON tm.tar_path=rf.path AND tm.member=rf.tar_member "
             f"WHERE rf.id IN ({placeholders})",
@@ -1064,7 +1154,7 @@ def list_raw_files_by_ids(
         by_id[int(row[0])] = RawFileId(
             exposure_id=row[1], frame_type=row[2], path=row[3], tar_member=row[4],
             storage_backend=row[5], zipcode=zipcode,
-            archive_offset=row[12], archive_size=row[13],
+            archive_offset=row[12], archive_size=row[13], outer_tar_member=row[14],
         )
     missing = set(wanted) - set(by_id)
     if missing:
@@ -1198,7 +1288,7 @@ def save_artifact_details(
     """Persist canonical Artifact registry rows, components, relations, and state."""
     import json
 
-    init_db(db_path)
+    init_artifact_db(db_path)
     with connect(db_path) as conn:
         conn.execute(
             """
@@ -1330,7 +1420,7 @@ def save_artifact_details(
 def get_artifact_details(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
     import json
 
-    init_db(db_path)
+    init_artifact_db(db_path)
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM artifact_records WHERE artifact_id=?", (int(artifact_id),)).fetchone()
         if row is None:
@@ -1348,7 +1438,7 @@ def get_artifact_details(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Op
 def get_artifact_scientific_metadata(
     artifact_id: int, db_path: str = DEFAULT_DB_PATH
 ) -> Optional[Dict[str, Any]]:
-    init_db(db_path)
+    init_artifact_db(db_path)
     with connect(db_path) as conn:
         row = conn.execute(
             "SELECT * FROM artifact_scientific_metadata WHERE artifact_id=?",
@@ -1362,7 +1452,7 @@ def get_artifact_scientific_metadata(
 
 
 def get_artifact_by_revision(revision: str, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:
-    init_db(db_path)
+    init_artifact_db(db_path)
     with connect(db_path) as conn:
         row = conn.execute(
             "SELECT artifact_id FROM artifact_records WHERE revision=?", (str(revision),)
@@ -1373,7 +1463,7 @@ def get_artifact_by_revision(revision: str, db_path: str = DEFAULT_DB_PATH) -> O
 def set_artifact_state(artifact_id: int, state: str, db_path: str = DEFAULT_DB_PATH) -> None:
     if state not in {"active", "obsolete", "evicted"}:
         raise ValueError(f"invalid artifact state: {state}")
-    init_db(db_path)
+    init_artifact_db(db_path)
     with connect(db_path) as conn:
         conn.execute(
             "UPDATE artifact_records SET state=? WHERE artifact_id=?",
@@ -1384,7 +1474,7 @@ def set_artifact_state(artifact_id: int, state: str, db_path: str = DEFAULT_DB_P
 def list_artifact_components(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
     import json
 
-    init_db(db_path)
+    init_artifact_db(db_path)
     with connect(db_path) as conn:
         rows = conn.execute(
             "SELECT * FROM artifact_components WHERE artifact_id=? ORDER BY name", (int(artifact_id),)
@@ -1403,7 +1493,7 @@ def list_artifact_components(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -
 
 
 def list_artifact_relations(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
-    init_db(db_path)
+    init_artifact_db(db_path)
     with connect(db_path) as conn:
         rows = conn.execute(
             "SELECT parent_id, child_id, relation FROM artifact_relations WHERE child_id=? ORDER BY parent_id, relation",
@@ -1523,7 +1613,7 @@ def find_artifact_summaries(
 ) -> List[Dict[str, Any]]:
     """Find compact Artifact state with one joined registry query."""
 
-    init_db(db_path)
+    init_artifact_db(db_path)
     sql = """
         WITH component_names AS (
             SELECT artifact_id, group_concat(name, char(31)) AS names
@@ -1547,11 +1637,6 @@ def find_artifact_summaries(
             a.id AS artifact_id,
             COALESCE(ar.canonical_kind, a.kind) AS kind,
             a.amp_key,
-            amp.ifuslot,
-            amp.ifuid,
-            amp.specid,
-            amp.amp,
-            amp.controller,
             ar.physical_scope,
             ar.exposure_id,
             ar.observation_id,
@@ -1577,7 +1662,6 @@ def find_artifact_summaries(
             parent_ids.ids AS parent_ids
         FROM artifacts a
         JOIN artifact_records ar ON ar.artifact_id=a.id
-        LEFT JOIN amplifiers amp ON amp.key=a.amp_key
         LEFT JOIN provenance p ON p.artifact_id=a.id
         LEFT JOIN qa_decisions qd ON qd.artifact_id=a.id
         LEFT JOIN qa_results qr ON qr.artifact_id=a.id
@@ -1647,8 +1731,21 @@ def find_artifact_summaries(
 
     with connect(db_path) as conn:
         rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+    from ..core.identity import parse_zipcode_key
+
     separator = chr(31)
     for row in rows:
+        zc = None
+        if row.get("amp_key"):
+            try:
+                zc = parse_zipcode_key(str(row["amp_key"]))
+            except (SystemExit, ValueError):
+                zc = None
+        row["ifuslot"] = zc.ifuslot if zc else None
+        row["ifuid"] = zc.ifuid if zc else None
+        row["specid"] = zc.specid if zc else None
+        row["amp"] = zc.amp if zc else None
+        row["controller"] = zc.controller if zc else None
         row["component_names"] = (
             str(row["component_names"]).split(separator)
             if row.get("component_names")
@@ -1700,7 +1797,7 @@ def save_qa_bundle(
 ) -> None:
     import json
 
-    init_db(db_path)
+    init_artifact_db(db_path)
     with connect(db_path) as conn:
         for name, fact in facts.items():
             conn.execute(
@@ -1793,7 +1890,7 @@ def get_qa_bundle(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[
 
 
 def list_zipcodes(
-    db_path: str = DEFAULT_DB_PATH,
+    db_path: str = DEFAULT_RAW_DB_PATH,
     frame_type: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
@@ -1836,7 +1933,7 @@ def list_zipcodes(
 
 
 def list_exposure_table(
-    db_path: str = DEFAULT_DB_PATH,
+    db_path: str = DEFAULT_RAW_DB_PATH,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     requested_target: Optional[str] = None,
@@ -1890,7 +1987,7 @@ def list_exposure_table(
         return [dict(r) for r in rows]
 
 
-def get_exposure_metadata(exposure_id: str, db_path: str = DEFAULT_DB_PATH) -> Optional[dict]:
+def get_exposure_metadata(exposure_id: str, db_path: str = DEFAULT_RAW_DB_PATH) -> Optional[dict]:
     """Return raw and interpreted metadata for one atomic exposure."""
 
     with connect(db_path) as conn:
@@ -1903,7 +2000,7 @@ def get_exposure_metadata(exposure_id: str, db_path: str = DEFAULT_DB_PATH) -> O
     return dict(row) if row is not None else None
 
 
-def ensure_tar_index(tar_path: str, db_path: str = DEFAULT_DB_PATH, conn: Optional[sqlite3.Connection] = None) -> None:
+def ensure_tar_index(tar_path: str, db_path: str = DEFAULT_RAW_DB_PATH, conn: Optional[sqlite3.Connection] = None) -> None:
     """Ensure a DB-backed index of a tar member offsets/sizes exists for an uncompressed .tar.
 
     Stores validated (mtime,size) for the tar file. If metadata changed, reindex members.
