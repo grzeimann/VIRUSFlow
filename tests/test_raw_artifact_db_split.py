@@ -274,3 +274,37 @@ def test_date_tar_offset_index_matches_unindexed_metadata(tmp_path: Path):
         hdr = db._read_header_via_tar_offset(str(indexed_root / "20260501.tar"), offset)
         assert hdr is not None
         assert hdr.get("IFUID") == "043"
+
+
+def test_date_tar_index_powers_raw_frame_loader_fast_path(tmp_path: Path):
+    root = _build_date_tar(tmp_path, amp_names=["LL", "LU"], ifuslot="074")
+    date_tar_path = root / "20260501.tar"
+
+    raw_db = tmp_path / "raw.sqlite3"
+    db.init_raw_db(str(raw_db))
+    with db.connect(str(raw_db)) as conn:
+        for source in FileSystemStorage(root).iter_raw_sources():
+            db.ensure_date_tar_index(str(source.path), source.outer_tar_member, conn=conn)
+            db.register_raw_file(
+                str(source.path), db_path=str(raw_db), tar_member=source.tar_member,
+                outer_tar_member=source.outer_tar_member, conn=conn,
+            )
+
+    resolved = db.list_raw_files_scoped(
+        "sci", "20260501", "20260501", db_path=str(raw_db),
+    )
+    assert len(resolved) == 2
+    for _, raw_id in resolved:
+        assert raw_id.storage_backend == "date_tar"
+        assert raw_id.outer_tar_member == "virus/virus0000001.tar"
+        assert raw_id.archive_offset is not None
+        assert raw_id.archive_size is not None
+
+    loader = RawFrameLoader()
+    for _, raw_id in resolved:
+        frame = loader.load_ref(raw_id)
+        assert frame.data.shape == (2, 2)
+    # No fallback tarfile.open() should have run: the loader's archive handle
+    # cache should hold exactly one open handle (shared across both amps).
+    assert len(loader._archive_handles) == 1
+    loader.close()

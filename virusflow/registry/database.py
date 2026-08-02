@@ -1187,10 +1187,13 @@ def list_raw_files_scoped(
     with connect(db_path) as conn:
         base = (
             "SELECT rf.id, rf.exposure_id, rf.frame_type, rf.path, rf.tar_member, rf.storage_backend, "
-            "rf.amp_key, a.ifuslot, a.ifuid, a.specid, a.amp, a.controller, tm.offset, tm.size, rf.outer_tar_member "
+            "rf.amp_key, a.ifuslot, a.ifuid, a.specid, a.amp, a.controller, "
+            "COALESCE(tm.offset, dtm.offset), COALESCE(tm.size, dtm.size), rf.outer_tar_member "
             "FROM raw_files rf JOIN exposures e ON rf.exposure_id = e.id "
             "LEFT JOIN amplifiers a ON rf.amp_key = a.key "
             "LEFT JOIN tar_members tm ON tm.tar_path=rf.path AND tm.member=rf.tar_member "
+            "LEFT JOIN date_tar_members dtm ON dtm.date_tar_path=rf.path "
+            "AND dtm.outer_member=rf.outer_tar_member AND dtm.member=rf.tar_member "
             "WHERE LOWER(rf.frame_type)=LOWER(?) AND e.when_utc IS NOT NULL AND substr(replace(e.when_utc,'-',''),1,8) BETWEEN ? AND ?"
         )
         params: List[str] = [frame_type, sd, ed]
@@ -1247,9 +1250,12 @@ def list_raw_files_by_ids(
         rows = conn.execute(
             "SELECT rf.id, rf.exposure_id, rf.frame_type, rf.path, rf.tar_member, "
             "rf.storage_backend, rf.amp_key, a.ifuslot, a.ifuid, a.specid, a.amp, "
-            "a.controller, tm.offset, tm.size, rf.outer_tar_member FROM raw_files rf "
+            "a.controller, COALESCE(tm.offset, dtm.offset), COALESCE(tm.size, dtm.size), "
+            "rf.outer_tar_member FROM raw_files rf "
             "LEFT JOIN amplifiers a ON rf.amp_key=a.key "
             "LEFT JOIN tar_members tm ON tm.tar_path=rf.path AND tm.member=rf.tar_member "
+            "LEFT JOIN date_tar_members dtm ON dtm.date_tar_path=rf.path "
+            "AND dtm.outer_member=rf.outer_tar_member AND dtm.member=rf.tar_member "
             f"WHERE rf.id IN ({placeholders})",
             wanted,
         ).fetchall()

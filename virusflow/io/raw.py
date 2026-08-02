@@ -167,7 +167,41 @@ class RawFrameLoader:
     ):
         from ..performance import phase
 
-        if outer_tar_member:
+        if tar_member and archive_offset is not None and archive_size is not None:
+            # Byte-offset fast path shared by both the single-level tar backend and the
+            # Corral date-tar backend: date-tar offsets recorded by ensure_date_tar_index()
+            # are already absolute positions within `path`, so the same direct seek+read
+            # applies regardless of outer_tar_member.
+            handle = self._archive_handles.get(path)
+            if handle is None:
+                with phase("raw_archive_open"):
+                    handle = open(path, "rb")
+                self._archive_handles[path] = handle
+                if timing is not None:
+                    timing.increment("archive_opens")
+            elif timing is not None:
+                timing.increment("archive_handle_reuses")
+            with phase("raw_member_lookup"):
+                handle.seek(int(archive_offset))
+            with phase("raw_byte_read"):
+                blob = handle.read(int(archive_size))
+            if len(blob) != int(archive_size):
+                raise OSError(
+                    f"short indexed read for {tar_member}: {len(blob)} != {archive_size}"
+                )
+            if timing is not None:
+                timing.increment("resolved_raw_references")
+                timing.increment("archive_index_reuses")
+            with phase("fits_header_parse"):
+                hdul = fits.open(io.BytesIO(blob), memmap=False)
+                header = dict(hdul[0].header)
+            try:
+                with phase("pixel_array_load"):
+                    data = np.asarray(hdul[0].data)
+            finally:
+                hdul.close()
+            bytes_read = len(blob)
+        elif outer_tar_member:
             from ..storage.filesystem import RawSource, read_member_bytes
 
             with phase("raw_archive_open"):
@@ -189,42 +223,20 @@ class RawFrameLoader:
                 hdul.close()
             bytes_read = len(blob)
         elif tar_member:
-            if archive_offset is not None and archive_size is not None:
-                handle = self._archive_handles.get(path)
-                if handle is None:
-                    with phase("raw_archive_open"):
-                        handle = open(path, "rb")
-                    self._archive_handles[path] = handle
-                    if timing is not None:
-                        timing.increment("archive_opens")
-                elif timing is not None:
-                    timing.increment("archive_handle_reuses")
-                with phase("raw_member_lookup"):
-                    handle.seek(int(archive_offset))
-                with phase("raw_byte_read"):
-                    blob = handle.read(int(archive_size))
-                if len(blob) != int(archive_size):
-                    raise OSError(
-                        f"short indexed read for {tar_member}: {len(blob)} != {archive_size}"
-                    )
+            with phase("raw_archive_open"):
+                archive = tarfile.open(path, mode="r:*")
                 if timing is not None:
-                    timing.increment("resolved_raw_references")
-                    timing.increment("archive_index_reuses")
-            else:
-                with phase("raw_archive_open"):
-                    archive = tarfile.open(path, mode="r:*")
-                    if timing is not None:
-                        timing.increment("archive_opens")
-                try:
-                    with phase("raw_member_lookup"):
-                        member = archive.getmember(tar_member)
-                        stream = archive.extractfile(member)
-                    if stream is None:
-                        raise FileNotFoundError(f"Cannot extract {tar_member} from {path}")
-                    with phase("raw_byte_read"):
-                        blob = stream.read()
-                finally:
-                    archive.close()
+                    timing.increment("archive_opens")
+            try:
+                with phase("raw_member_lookup"):
+                    member = archive.getmember(tar_member)
+                    stream = archive.extractfile(member)
+                if stream is None:
+                    raise FileNotFoundError(f"Cannot extract {tar_member} from {path}")
+                with phase("raw_byte_read"):
+                    blob = stream.read()
+            finally:
+                archive.close()
             with phase("fits_header_parse"):
                 hdul = fits.open(io.BytesIO(blob), memmap=False)
                 header = dict(hdul[0].header)
