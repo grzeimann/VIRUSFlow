@@ -198,3 +198,79 @@ def test_date_tar_backend_reads_nested_virus_tar(tmp_path: Path):
     with fits.open(io.BytesIO(original_bytes)) as hdul:
         expected = np.asarray(hdul[0].data)
     assert np.array_equal(frame.data, expected)
+
+
+def _build_date_tar(tmp_path: Path, *, amp_names: list[str], ifuslot: str) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    fits_paths = []
+    for amp in amp_names:
+        p = tmp_path / f"20260501T010000.0_{ifuslot}{amp}_sci.fits"
+        _write_raw(p, OBJECT="Target_082_W", QOBJECT="Target")
+        fits_paths.append(p)
+
+    virus_tar_bytes = io.BytesIO()
+    with tarfile.open(fileobj=virus_tar_bytes, mode="w") as inner:
+        for p in fits_paths:
+            inner.add(p, arcname=p.name)
+    virus_tar_bytes.seek(0)
+
+    date_root = tmp_path / "date_root"
+    date_root.mkdir()
+    date_tar_path = date_root / "20260501.tar"
+    virus_tar_info = tarfile.TarInfo(name="virus/virus0000001.tar")
+    virus_tar_info.size = len(virus_tar_bytes.getvalue())
+    with tarfile.open(date_tar_path, "w") as outer:
+        virus_tar_bytes.seek(0)
+        outer.addfile(virus_tar_info, virus_tar_bytes)
+    return date_root
+
+
+def test_date_tar_offset_index_matches_unindexed_metadata(tmp_path: Path):
+    unindexed_root = _build_date_tar(tmp_path / "unindexed", amp_names=["LL", "LU"], ifuslot="074")
+    indexed_root = _build_date_tar(tmp_path / "indexed", amp_names=["LL", "LU"], ifuslot="075")
+
+    db._IFUSLOT_META_CACHE.clear()
+    unindexed_db = tmp_path / "unindexed.sqlite3"
+    db.init_raw_db(str(unindexed_db))
+    unindexed_ids = []
+    with db.connect(str(unindexed_db)) as conn:
+        for source in FileSystemStorage(unindexed_root).iter_raw_sources():
+            unindexed_ids.append(db.register_raw_file(
+                str(source.path), db_path=str(unindexed_db), tar_member=source.tar_member,
+                outer_tar_member=source.outer_tar_member, conn=conn,
+            ))
+
+    db._IFUSLOT_META_CACHE.clear()
+    indexed_db = tmp_path / "indexed.sqlite3"
+    db.init_raw_db(str(indexed_db))
+    indexed_ids = []
+    with db.connect(str(indexed_db)) as conn:
+        for source in FileSystemStorage(indexed_root).iter_raw_sources():
+            db.ensure_date_tar_index(
+                str(source.path), source.outer_tar_member, conn=conn,
+            )
+            indexed_ids.append(db.register_raw_file(
+                str(source.path), db_path=str(indexed_db), tar_member=source.tar_member,
+                outer_tar_member=source.outer_tar_member, conn=conn,
+            ))
+
+    assert len(unindexed_ids) == len(indexed_ids) == 2
+    for unindexed_id, indexed_id in zip(
+        sorted(unindexed_ids, key=lambda r: r.tar_member),
+        sorted(indexed_ids, key=lambda r: r.tar_member),
+    ):
+        assert unindexed_id.zipcode.ifuid == indexed_id.zipcode.ifuid
+        assert unindexed_id.zipcode.specid == indexed_id.zipcode.specid
+        assert unindexed_id.zipcode.controller == indexed_id.zipcode.controller
+        assert unindexed_id.zipcode.amp == indexed_id.zipcode.amp
+
+    with db.connect(str(indexed_db)) as conn:
+        rows = conn.execute(
+            "SELECT member, offset, size FROM date_tar_members WHERE date_tar_path=? AND outer_member=?",
+            (str((indexed_root / "20260501.tar").resolve()), "virus/virus0000001.tar"),
+        ).fetchall()
+    assert len(rows) == 2
+    for member, offset, size in rows:
+        hdr = db._read_header_via_tar_offset(str(indexed_root / "20260501.tar"), offset)
+        assert hdr is not None
+        assert hdr.get("IFUID") == "043"

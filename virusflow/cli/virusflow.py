@@ -29,6 +29,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
     count = 0
     zipcode_keys = set()
     indexed_tars = set()
+    indexed_date_tars = set()
     # Unified iteration over both filesystem FITS and FITS inside tar archives
     with db.connect(args.raw_db) as conn:
         for src in storage.iter_raw_sources():
@@ -41,6 +42,15 @@ def cmd_scan(args: argparse.Namespace) -> None:
                     except Exception:
                         pass
                     indexed_tars.add(p)
+            elif src.backend == "date_tar":
+                p = os.path.abspath(str(src.path))
+                key = (p, src.outer_tar_member)
+                if key not in indexed_date_tars:
+                    try:
+                        db.ensure_date_tar_index(p, src.outer_tar_member, conn=conn)
+                    except Exception:
+                        pass
+                    indexed_date_tars.add(key)
             rid = db.register_raw_file(
                 str(src.path), db_path=args.raw_db, tar_member=src.tar_member,
                 outer_tar_member=src.outer_tar_member, conn=conn,
@@ -61,6 +71,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
     # Report how many tar files were indexed during this scan (DB mode only)
     if indexed_tars:
         print(f"Indexed {len(indexed_tars)} tar files into registry (DB mode)")
+    if indexed_date_tars:
+        print(f"Indexed {len(indexed_date_tars)} nested date-tar members into registry (DB mode)")
 
 
 def cmd_exposures(args: argparse.Namespace) -> None:

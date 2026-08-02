@@ -247,6 +247,27 @@ CREATE TABLE IF NOT EXISTS tar_members (
     size INTEGER,
     PRIMARY KEY(tar_path, member)
 );
+
+-- Optional index for Corral date-tar layouts (a tar of nested VIRUS tars). Offsets are
+-- absolute byte positions within date_tar_path, so the same offset-based header reader
+-- used for the single-level tar backend applies unchanged.
+CREATE TABLE IF NOT EXISTS date_tar_files (
+    date_tar_path TEXT,
+    outer_member TEXT,
+    mtime REAL,
+    size INTEGER,
+    n_members INTEGER,
+    PRIMARY KEY(date_tar_path, outer_member)
+);
+
+CREATE TABLE IF NOT EXISTS date_tar_members (
+    date_tar_path TEXT,
+    outer_member TEXT,
+    member TEXT,
+    offset INTEGER,
+    size INTEGER,
+    PRIMARY KEY(date_tar_path, outer_member, member)
+);
 """
 
 ARTIFACT_SCHEMA = r"""
@@ -548,6 +569,16 @@ _IFUSLOT_META_CACHE: Dict[str, Dict[str, Optional[str]]] = {}
 _POPULATED_EXPOSURE_DETAILS: Set[Tuple[str, str]] = set()
 
 
+def _ifuslot_meta_from_header(hdr) -> Dict[str, Optional[str]]:
+    """Extract IFUSLOT-constant metadata (ifuid, specid, controller) from a FITS header."""
+
+    return {
+        "ifuid": hdr.get("IFUID"),
+        "specid": hdr.get("SPECID"),
+        "controller": hdr.get("CONTID") or hdr.get("CONTROLLER"),
+    }
+
+
 def _read_ifuslot_metadata_from_tar(tar_path: str, member_name: str) -> Dict[str, Optional[str]]:
     """Open a single FITS member from tar and return IFUSLOT-constant metadata.
 
@@ -560,12 +591,7 @@ def _read_ifuslot_metadata_from_tar(tar_path: str, member_name: str) -> Dict[str
             if ef is None:
                 return {"ifuid": None, "specid": None, "controller": None}
             with fits.open(ef, memmap=False) as hdul:  # type: ignore[arg-type]
-                hdr = hdul[0].header
-                return {
-                    "ifuid": hdr.get("IFUID"),
-                    "specid": hdr.get("SPECID"),
-                    "controller": hdr.get("CONTID") or hdr.get("CONTROLLER"),
-                }
+                return _ifuslot_meta_from_header(hdul[0].header)
     except Exception:
         return {"ifuid": None, "specid": None, "controller": None}
 
@@ -584,12 +610,7 @@ def _read_ifuslot_metadata_from_date_tar(
         )
         blob = read_member_bytes(source)
         with fits.open(io.BytesIO(blob), memmap=False) as hdul:
-            hdr = hdul[0].header
-            return {
-                "ifuid": hdr.get("IFUID"),
-                "specid": hdr.get("SPECID"),
-                "controller": hdr.get("CONTID") or hdr.get("CONTROLLER"),
-            }
+            return _ifuslot_meta_from_header(hdul[0].header)
     except Exception:
         return {"ifuid": None, "specid": None, "controller": None}
 
@@ -597,14 +618,75 @@ def _read_ifuslot_metadata_from_date_tar(
 def _read_ifuslot_metadata_from_file(path: str) -> Dict[str, Optional[str]]:
     try:
         with fits.open(path, memmap=False) as hdul:
-            hdr = hdul[0].header
-            return {
-                "ifuid": hdr.get("IFUID"),
-                "specid": hdr.get("SPECID"),
-                "controller": hdr.get("CONTID") or hdr.get("CONTROLLER"),
-            }
+            return _ifuslot_meta_from_header(hdul[0].header)
     except Exception:
         return {"ifuid": None, "specid": None, "controller": None}
+
+
+def _lookup_tar_member_offset(
+    tar_path: str, member_name: str, *, conn: Optional[sqlite3.Connection], db_path: str
+) -> Optional[int]:
+    """Look up a member's cached data offset within its tar from a prior ensure_tar_index().
+
+    Returns None when the tar hasn't been indexed (compressed tar, index not yet built,
+    or this member simply isn't present) so callers can fall back to the slower
+    tarfile.getmember() scan.
+    """
+
+    def _query(c: sqlite3.Connection) -> Optional[int]:
+        row = c.execute(
+            "SELECT offset FROM tar_members WHERE tar_path=? AND member=?",
+            (tar_path, member_name),
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    try:
+        if conn is not None:
+            return _query(conn)
+        with connect(db_path) as c:
+            return _query(c)
+    except Exception:
+        return None
+
+
+def _lookup_date_tar_member_offset(
+    date_tar_path: str, outer_member: str, member_name: str, *,
+    conn: Optional[sqlite3.Connection], db_path: str,
+) -> Optional[int]:
+    """Look up a nested-tar member's cached absolute offset from a prior ensure_date_tar_index().
+
+    Returns None when the nested tar hasn't been indexed so callers can fall back to the
+    slower two-level tarfile.getmember() extraction.
+    """
+
+    def _query(c: sqlite3.Connection) -> Optional[int]:
+        row = c.execute(
+            "SELECT offset FROM date_tar_members WHERE date_tar_path=? AND outer_member=? AND member=?",
+            (date_tar_path, outer_member, member_name),
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    try:
+        if conn is not None:
+            return _query(conn)
+        with connect(db_path) as c:
+            return _query(c)
+    except Exception:
+        return None
+
+
+def _read_header_via_tar_offset(tar_path: str, offset: int):
+    """Read only the primary FITS header at a known byte offset inside an uncompressed tar.
+
+    Avoids both the O(n) tarfile.getmember() scan and reading the member's pixel data.
+    Returns None on any failure so callers can fall back to the slow path.
+    """
+    try:
+        with open(tar_path, "rb") as fh:
+            fh.seek(offset)
+            return fits.Header.fromfile(fh, sep="", endcard=True, padding=True)
+    except Exception:
+        return None
 
 
 def _exposure_header_fields(hdr, *, frame_type: str) -> Dict[str, Any]:
@@ -781,6 +863,27 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
     exposure_id, ft, amp_token = _parse_filename_meta(parse_target)
     frame_type = frame_type or ft
 
+    # For plain (non-nested) tar members, reuse the byte offset already indexed by
+    # ensure_tar_index() to read the header directly in one seek, instead of the O(n)
+    # tarfile.getmember() scan (repeated once per file, this made scanning an exposure's
+    # ~300 amplifiers effectively quadratic in the tar's member count).
+    # The same applies to the Corral date-tar backend (a tar of nested VIRUS tars):
+    # ensure_date_tar_index() pre-computes each nested tar's member offsets as absolute
+    # positions within the date-tar file, so the same offset-based header reader works.
+    shared_header = None
+    if tar_member and not outer_tar_member:
+        tar_path_abs = os.path.abspath(path)
+        tar_offset = _lookup_tar_member_offset(tar_path_abs, tar_member, conn=conn, db_path=db_path)
+        if tar_offset is not None:
+            shared_header = _read_header_via_tar_offset(path, tar_offset)
+    elif tar_member and outer_tar_member:
+        date_tar_path_abs = os.path.abspath(path)
+        date_tar_offset = _lookup_date_tar_member_offset(
+            date_tar_path_abs, outer_tar_member, tar_member, conn=conn, db_path=db_path
+        )
+        if date_tar_offset is not None:
+            shared_header = _read_header_via_tar_offset(path, date_tar_offset)
+
     # Build a full ZipCode using filename-derived IFUSLOT/AMP plus minimal header metadata read
     zipcode = None
     if amp_token:
@@ -788,7 +891,9 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
         # Populate IFUSLOT metadata cache on first encounter
         meta = _IFUSLOT_META_CACHE.get(ifuslot)
         if meta is None:
-            if outer_tar_member:
+            if shared_header is not None:
+                meta = _ifuslot_meta_from_header(shared_header)
+            elif outer_tar_member:
                 meta = _read_ifuslot_metadata_from_date_tar(path, outer_tar_member, tar_member)
             elif tar_member:
                 meta = _read_ifuslot_metadata_from_tar(path, tar_member)
@@ -797,7 +902,9 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
             _IFUSLOT_META_CACHE[ifuslot] = meta
         zipcode = _zipcode_from_amp_token(amp_token, meta)
 
-    if outer_tar_member:
+    if shared_header is not None:
+        hdr_fields = _exposure_header_fields(shared_header, frame_type=frame_type)
+    elif outer_tar_member:
         hdr_fields = _read_exposure_header_fields_from_date_tar(
             path, outer_tar_member, tar_member, frame_type=frame_type
         )
@@ -2041,6 +2148,89 @@ def ensure_tar_index(tar_path: str, db_path: str = DEFAULT_RAW_DB_PATH, conn: Op
                     c.executemany("INSERT INTO tar_members(tar_path, member, offset, size) VALUES(?, ?, ?, ?)", rows)
         except Exception:
             # On any error (e.g., compressed tar), do not index
+            return
+
+    if conn is None:
+        with connect(db_path) as c:
+            if _needs_reindex(c):
+                _reindex(c)
+    else:
+        if _needs_reindex(conn):
+            _reindex(conn)
+
+
+def ensure_date_tar_index(
+    date_tar_path: str, outer_member: str, db_path: str = DEFAULT_RAW_DB_PATH,
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
+    """Ensure a DB-backed index of a nested VIRUS tar's member offsets exists.
+
+    Corral date-tars (e.g. 20260501.tar) contain nested VIRUS tars as ordinary
+    members; each nested tar in turn contains ~300 FITS amplifier members. A
+    freshly opened tarfile.TarFile has no member list yet, so calling
+    .getmember() on the nested tar repeatedly (once per FITS file) forces a full
+    rescan of that nested tar every time. This indexes it once per (date_tar_path,
+    outer_member) pair by opening the underlying file directly and seeking to the
+    nested tar's start offset, so the offsets tarfile records while scanning are
+    already absolute positions within date_tar_path -- the same offset-based
+    header reader used for the single-level tar backend applies unchanged.
+
+    Silently no-ops on any tar error (e.g. compressed archives).
+    """
+    import os as _os
+    import tarfile as _tarfile
+
+    try:
+        st = _os.stat(date_tar_path)
+    except OSError:
+        return
+    meta = (st.st_mtime, st.st_size)
+
+    def _needs_reindex(c: sqlite3.Connection) -> bool:
+        row = c.execute(
+            "SELECT mtime, size FROM date_tar_files WHERE date_tar_path=? AND outer_member=?",
+            (date_tar_path, outer_member),
+        ).fetchone()
+        if row is None:
+            return True
+        try:
+            return (float(row[0]) != float(meta[0])) or (int(row[1]) != int(meta[1]))
+        except Exception:
+            return True
+
+    def _reindex(c: sqlite3.Connection) -> None:
+        try:
+            with open(date_tar_path, "rb") as fh:
+                with _tarfile.open(fileobj=fh, mode="r:") as outer:
+                    om = outer.getmember(outer_member)
+                if om.offset_data is None:
+                    return
+                fh.seek(om.offset_data)
+                with _tarfile.open(fileobj=fh, mode="r:") as inner:
+                    members = [
+                        m for m in inner.getmembers()
+                        if m.isfile() and m.name.lower().endswith(".fits")
+                    ]
+                    rows = []
+                    for m in members:
+                        if m.offset_data is None or m.size is None:
+                            continue
+                        rows.append((date_tar_path, outer_member, m.name, int(m.offset_data), int(m.size)))
+            c.execute(
+                "INSERT OR REPLACE INTO date_tar_files(date_tar_path, outer_member, mtime, size, n_members) VALUES(?, ?, ?, ?, ?)",
+                (date_tar_path, outer_member, float(meta[0]), int(meta[1]), len(rows)),
+            )
+            c.execute(
+                "DELETE FROM date_tar_members WHERE date_tar_path=? AND outer_member=?",
+                (date_tar_path, outer_member),
+            )
+            if rows:
+                c.executemany(
+                    "INSERT INTO date_tar_members(date_tar_path, outer_member, member, offset, size) VALUES(?, ?, ?, ?, ?)",
+                    rows,
+                )
+        except Exception:
+            # On any error (e.g., compressed tar, missing member), do not index
             return
 
     if conn is None:

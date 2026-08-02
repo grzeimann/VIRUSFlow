@@ -60,6 +60,7 @@ def _scan(data_root: Path, raw_database: Path) -> int:
     db.init_raw_db(str(raw_database))
     count = 0
     indexed = set()
+    indexed_date_tars = set()
     with db.connect(str(raw_database)) as connection:
         for source in FileSystemStorage(data_root).iter_raw_sources():
             if source.backend == "tar":
@@ -67,6 +68,12 @@ def _scan(data_root: Path, raw_database: Path) -> int:
                 if tar_path not in indexed:
                     db.ensure_tar_index(tar_path, conn=connection)
                     indexed.add(tar_path)
+            elif source.backend == "date_tar":
+                date_tar_path = os.path.abspath(str(source.path))
+                key = (date_tar_path, source.outer_tar_member)
+                if key not in indexed_date_tars:
+                    db.ensure_date_tar_index(date_tar_path, source.outer_tar_member, conn=connection)
+                    indexed_date_tars.add(key)
             raw_id = db.register_raw_file(
                 str(source.path), db_path=str(raw_database), tar_member=source.tar_member,
                 outer_tar_member=source.outer_tar_member, conn=connection,
