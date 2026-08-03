@@ -7,7 +7,7 @@ from threading import Barrier
 import numpy as np
 import pytest
 
-from virusflow.algorithms.exposure import (
+from virusflow.algorithms.sky import (
     LatentSkyModel,
     derive_sky_oversampling_factor,
     sky_sampling_convergence,

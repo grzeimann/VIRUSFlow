@@ -7,7 +7,7 @@ import numpy as np
 from astropy.io import fits
 
 from virusflow.algorithms.ccd import orient_amplifier_image
-from virusflow.algorithms.exposure import tan_fiber_coordinates
+from virusflow.algorithms.astrometry import tan_fiber_coordinates
 from virusflow.artifacts import ArtifactService, Scope, Validity
 from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
 from virusflow.config import ConfigurationService
@@ -102,6 +102,14 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
             "wavelength_map": amplifier_wavelength,
             "per_fiber_wavelength_residual_rms": np.zeros(trace.shape[0]),
         }, at)
+        normalization = np.ones_like(amplifier_wavelength, dtype=np.float32)
+        _publish(service, tmp_path, "within_amp_fiber_normalization", zipcode, {
+            "raw_ratio": normalization,
+            "normalization": normalization,
+            "valid_mask": np.ones_like(normalization, dtype=np.uint8),
+            "common_twilight": np.full_like(normalization, 1000.0),
+            "amplifier_twilight_level": np.asarray([1000.0], dtype=np.float32),
+        }, at)
 
     config = ConfigurationService(root=Path.cwd())
     fplane, _ = config.resolve_fplane(Path.cwd() / "fplaneall.txt")
@@ -112,7 +120,9 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     for zipcode, fiber_index in zip(zipcodes, (5, 45, 80, 105)):
         fx, fy = fplane["060"]
         local = offsets[zipcode.amp][fiber_index]
-        ra, dec, _ = tan_fiber_coordinates(ra0, dec0, 180.0, [fx + local[0]], [fy + local[1]])
+        tan_result = tan_fiber_coordinates(ra0, dec0, 180.0, [fx + local[0]], [fy + local[1]])
+        ra = tan_result.get_array("ra")
+        dec = tan_result.get_array("dec")
         catalog.append((ra[0], dec[0], 18.0))
     context = TaskContext(
         str(database), str(tmp_path / "artifacts"),
@@ -157,6 +167,9 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
         "final_exposure_response",
     }
     assert not any(service.adapter.list_all(kind=kind) for kind in forbidden)
+    normalization_rows = service.adapter.list_all(kind="within_amp_fiber_normalization")
+    assert len(normalization_rows) == 4
+    assert all(row["exposure_id"] is None for row in normalization_rows)
     assert result["calibrated_fiber_state"].flux.dtype == np.float32
     identity = result["calibrated_fiber_state"].fiber_identity
     assert identity.shape[0] == 4 * 112 - 1

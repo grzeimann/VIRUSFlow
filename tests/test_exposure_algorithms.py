@@ -5,17 +5,11 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from virusflow.algorithms.exposure import (
-    amplifier_normalization,
-    classify_mode_and_effective_time,
-    extract_fractional_aperture,
-    fit_catalog_astrometry,
-    fractional_aperture_geometry,
-    oversampled_incident_sky,
-    select_sky_fibers,
-    tan_fiber_coordinates,
-    within_amplifier_normalization,
-)
+from virusflow.algorithms.astrometry import fit_catalog_astrometry, tan_fiber_coordinates
+from virusflow.algorithms.exposure_state import classify_mode_and_effective_time
+from virusflow.algorithms.extraction import extract_fractional_aperture, fractional_aperture_geometry
+from virusflow.algorithms.response import amplifier_normalization, within_amplifier_normalization
+from virusflow.algorithms.sky import oversampled_incident_sky, select_sky_fibers
 from virusflow.io.catalogs import PanSTARRSCSVProvider
 from virusflow.algorithms.fiber import get_spectra as legacy_get_spectra
 
@@ -33,21 +27,22 @@ def test_fractional_sum_extraction_and_exact_variance_use_identical_actual_weigh
     actual[mask[np.clip(rows, 0, 11), columns]] = 0.0
     expected_flux = np.sum(actual * image[np.clip(rows, 0, 11), columns], axis=-1)
     expected_variance = np.sum(np.square(actual) * variance[np.clip(rows, 0, 11), columns], axis=-1)
-    np.testing.assert_allclose(result.spectrum, expected_flux)
-    np.testing.assert_allclose(result.variance, expected_variance)
-    np.testing.assert_allclose(result.fractional_weights, actual)
+    np.testing.assert_allclose(result.get_array("spectrum"), expected_flux)
+    np.testing.assert_allclose(result.get_array("variance"), expected_variance)
+    np.testing.assert_allclose(result.get_array("fractional_weights"), actual)
     np.testing.assert_allclose(weights.sum(axis=-1)[valid], 5.0)
-    assert result.valid_pixel_fraction[0, 1] < 1.0
+    assert result.get_array("valid_pixel_fraction")[0, 1] < 1.0
 
 
 def test_extraction_rejects_edge_aperture_without_silent_zero():
     result = extract_fractional_aperture(
         np.ones((8, 3)), np.ones((8, 3)), np.array([[1.0, 4.0, 7.0]]), width=5.0
     )
-    assert np.isnan(result.spectrum[0, 0])
-    assert np.isfinite(result.spectrum[0, 1])
-    assert np.isnan(result.spectrum[0, 2])
-    assert result.extraction_valid.tolist() == [[0, 1, 0]]
+    spectrum = result.get_array("spectrum")
+    assert np.isnan(spectrum[0, 0])
+    assert np.isfinite(spectrum[0, 1])
+    assert np.isnan(spectrum[0, 2])
+    assert result.get_array("extraction_valid").tolist() == [[0, 1, 0]]
 
 
 def test_fractional_extraction_characterizes_legacy_parity_and_intentional_edge_difference():
@@ -55,23 +50,30 @@ def test_fractional_extraction_characterizes_legacy_parity_and_intentional_edge_
     trace = np.asarray([[8.2, 8.5, 8.8, 9.1, 9.4, 9.7, 10.0]])
     legacy = legacy_get_spectra(image, trace, npix=5)
     current = extract_fractional_aperture(image, np.ones_like(image), trace, width=5.0)
-    np.testing.assert_allclose(current.spectrum, legacy, rtol=0, atol=1e-5)
+    np.testing.assert_allclose(current.get_array("spectrum"), legacy, rtol=0, atol=1e-5)
 
     edge_trace = trace.copy()
     edge_trace[0, 0] = 1.0
     legacy_edge = legacy_get_spectra(image, edge_trace, npix=5)
     current_edge = extract_fractional_aperture(image, np.ones_like(image), edge_trace, width=5.0)
     assert np.all(legacy_edge == 0.0)  # legacy drops the entire fiber when one column hits an edge
-    assert np.isnan(current_edge.spectrum[0, 0])
-    assert np.all(np.isfinite(current_edge.spectrum[0, 1:]))
+    current_edge_spectrum = current_edge.get_array("spectrum")
+    assert np.isnan(current_edge_spectrum[0, 0])
+    assert np.all(np.isfinite(current_edge_spectrum[0, 1:]))
 
 
 def test_normalization_stays_decomposed_and_multiplies_exactly():
     x = np.linspace(1.0, 2.0, 101)
     twilight = np.vstack((x, 2 * x, 4 * x))
-    raw, within, valid, common = within_amplifier_normalization(twilight, smooth_pixels=11)
+    within_result = within_amplifier_normalization(twilight, smooth_pixels=11)
+    raw = within_result.get_array("raw_ratio")
+    within = within_result.get_array("normalization")
+    valid = within_result.get_array("valid_mask")
+    common = within_result.get_array("common_twilight")
     assert raw.shape == within.shape == valid.shape == twilight.shape
-    amp_factor, reference = amplifier_normalization([10.0, 20.0, 40.0])
+    amp_normalization_result = amplifier_normalization([10.0, 20.0, 40.0])
+    amp_factor = amp_normalization_result.get_array("amplifier_factors")
+    reference = amp_normalization_result.scalars["reference_level"]
     np.testing.assert_allclose(amp_factor, [0.5, 1.0, 2.0])
     assert reference == 20.0
     final = within * amp_factor[1]
@@ -80,28 +82,37 @@ def test_normalization_stays_decomposed_and_multiplies_exactly():
 
 
 def test_header_tan_projection_and_effective_time_policy():
-    ra, dec, rotation = tan_fiber_coordinates(200.0, 30.0, 180.0, [0.0], [0.0])
+    tan_result = tan_fiber_coordinates(200.0, 30.0, 180.0, [0.0], [0.0])
+    ra = tan_result.get_array("ra")
+    dec = tan_result.get_array("dec")
+    rotation = tan_result.scalars["rotation"]
     assert abs(ra[0] - 200.0) < 1e-3
     assert abs(dec[0] - 30.0) < 1e-3
     assert np.isclose(rotation, 88.45)
-    mode, effective, evidence = classify_mode_and_effective_time(
+    classification = classify_mode_and_effective_time(
         {
             "OBJECT": "Target_Name_082_W", "QOBJECT": "Target_Name",
             "QRA": "13:30:00", "QDEC": "-08:30:00", "QPROG": "P001",
             "EXPTIME": 67.4, "PEXPTIME": 75.5,
         }
     )
+    mode = classification.scalars["mode"]
+    effective = classification.scalars["effective_seconds"]
+    evidence = classification.meta["time_evidence"]
     assert (mode, effective, evidence["source"]) == ("primary", 67.4, "EXPTIME")
     assert evidence["requested_target"] == "Target_Name"
     assert evidence["requested_ifuslot"] == "082" and evidence["het_track"] == "W"
     assert evidence["virus_primary"] is True
-    mode, effective, evidence = classify_mode_and_effective_time(
+    classification = classify_mode_and_effective_time(
         {
             "OBJECT": "parallel", "QOBJECT": "Target_Name", "QRA": "13:30:00",
             "QDEC": "-08:30:00", "QPROG": "P001", "EXPTIME": 2007.5,
             "PEXPTIME": 2000.0,
         }
     )
+    mode = classification.scalars["mode"]
+    effective = classification.scalars["effective_seconds"]
+    evidence = classification.meta["time_evidence"]
     assert (mode, effective, evidence["source"]) == ("parallel", 1992.0, "PEXPTIME_minus_offset")
     assert evidence["requested_target"] == "Target_Name"
     assert evidence["requested_ifuslot"] is None and evidence["virus_primary"] is False
@@ -110,10 +121,15 @@ def test_header_tan_projection_and_effective_time_policy():
 def test_catalog_fit_retains_candidates_rejections_and_recovers_shift():
     focal = np.array([[-10, -10], [10, -10], [-10, 10], [10, 10], [30, 30]], dtype=float)
     ra0, dec0 = 200.0, 30.0
-    ra, dec, _ = tan_fiber_coordinates(ra0, dec0, 180.0, focal[:, 0], focal[:, 1])
+    tan_result = tan_fiber_coordinates(ra0, dec0, 180.0, focal[:, 0], focal[:, 1])
+    ra = tan_result.get_array("ra")
+    dec = tan_result.get_array("dec")
     detections = np.column_stack((np.arange(5), np.zeros(5), focal, np.ones(5), np.ones(5) * 10, ra, dec))
     catalog = np.column_stack((ra + 0.5 / np.cos(np.deg2rad(dec0)) / 3600.0, dec - 0.25 / 3600.0, np.full(5, 18.0)))
-    table, parameters, success = fit_catalog_astrometry(detections, ra0, dec0, catalog)
+    fit_result = fit_catalog_astrometry(detections, ra0, dec0, catalog)
+    table = fit_result.get_array("matches")
+    parameters = fit_result.get_array("parameters")
+    success = fit_result.scalars["success"]
     assert success
     assert table.shape == (5, 9)
     assert table[:, 6].sum() == 5
@@ -125,9 +141,14 @@ def test_sky_selection_and_native_grid_oversampling():
     spectrum = np.tile(np.linspace(10, 12, 8), (5, 1))
     spectrum[-1] += 100
     valid = np.ones_like(spectrum)
-    mask, broadband, center, sigma = select_sky_fibers(spectrum, valid)
+    sky_selection = select_sky_fibers(spectrum, valid)
+    mask = sky_selection.get_array("mask")
     assert mask.sum() == 4
-    grid, sky, variance, count = oversampled_incident_sky(wave, spectrum, mask, oversample=2)
+    incident_result = oversampled_incident_sky(wave, spectrum, mask, oversample=2)
+    grid = incident_result.get_array("wavelength")
+    sky = incident_result.get_array("flux_density")
+    variance = incident_result.get_array("variance_density")
+    count = incident_result.get_array("sample_count")
     assert grid.size > wave.shape[1]
     assert np.all(np.isfinite(sky))
     assert np.all(variance >= 0)

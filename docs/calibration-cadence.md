@@ -96,6 +96,32 @@ throughput with deterministic, recorded coarse-bin self-normalization. The forme
 `fiber_wavelength_mask_support` detector-stack scatter plane is no longer
 created or interpreted as spectral-mask evidence.
 
+LDLS and twilight have parallel trace-based extraction products and then meet
+in one calibration-time response task:
+
+```text
+master_ldls + trace_map
+  -> extracted_master_ldls_spectrum
+
+master_twilight + trace_map
+  -> extracted_master_twilight_spectrum
+
+extracted_master_ldls_spectrum
+  + extracted_master_twilight_spectrum
+  + wavelength_map
+  -> within_amp_fiber_normalization
+```
+
+The response factorization first divides each extracted calibration by its
+robust common spectrum. The LDLS ratio supplies fine wavelength-dependent
+structure. A broad twilight-to-LDLS continuum correction and a broader
+twilight residual correction anchor that structure under uniform illumination.
+The Product retains every factor, their product, validity, wavelength, and the
+corrected amplifier twilight level. `ExposureTask` consumes this Product and
+uses those levels for its exposure-wide amplifier comparison; it no longer
+extracts or fits twilight normalization itself. An explicitly supplied Master
+Science spectrum may add residual QA evidence, but does not alter the response.
+
 Existing `master_sci` revisions are immutable and remain readable; older ones
 may still list `fiber_wavelength_mask_support`. Master Science algorithm version
 2.0 gives new plans a distinct computation identity and publishes only the

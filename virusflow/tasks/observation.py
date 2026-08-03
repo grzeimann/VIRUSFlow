@@ -9,7 +9,8 @@ import numpy as np
 
 from .exposure import _component, _mask_component
 from .science import _SciencePublisher, _instant
-from ..algorithms.exposure import CalibratedFiberState, parse_header_pointing
+from ..algorithms.astrometry import parse_header_pointing
+from ..algorithms.exposure import CalibratedFiberState
 from ..algorithms.observation import (
     ALGORITHM_VERSION,
     assign_nominal_dithers,
@@ -152,7 +153,9 @@ class ObservationTask(_SciencePublisher):
             response = service.select_best(kind="fiber_response_model", scope=exposure_scope, at_time=when)
             effective = service.select_best(kind="effective_exposure_time", scope=exposure_scope, at_time=when)
 
-            ra0, dec0, pa, pointing_evidence = parse_header_pointing(header)
+            pointing = parse_header_pointing(header)
+            ra0, dec0, pa = pointing.scalars["ra0"], pointing.scalars["dec0"], pointing.scalars["pa"]
+            pointing_evidence = pointing.meta["evidence"]
             astrometry = np.asarray([ra0, dec0, pa], dtype=float)
             refined = False
             astrometry_source = "header_initial_tan"

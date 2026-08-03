@@ -82,12 +82,26 @@ class MasterSciResultContract(_BaseSimpleContract):
     required_scalars = ["n_inputs", "robust_illumination"]
 
 
-class ExtractedMasterSciSpectrumResultContract(_BaseSimpleContract):
+class ExtractedMasterSpectrumResultContract(_BaseSimpleContract):
     required_arrays = [
         "spectrum", "valid_pixel_fraction", "effective_aperture_width",
         "extraction_valid",
     ]
     required_scalars = ["fiber_count", "valid_sample_fraction"]
+
+
+class ExtractedMasterSciSpectrumResultContract(ExtractedMasterSpectrumResultContract):
+    """Backward-compatible name for the shared master-spectrum contract."""
+
+
+class AmplifierFiberResponseResultContract(_BaseSimpleContract):
+    required_arrays = [
+        "raw_ratio", "normalization", "valid_mask", "common_twilight",
+        "ftf_ldls", "twilight_broad_correction",
+        "twilight_residual_correction", "wavelength",
+        "amplifier_twilight_level",
+    ]
+    required_scalars = ["valid_fraction", "amplifier_twilight_level"]
 
 
 class FiberWavelengthSpectralMaskResultContract(_BaseSimpleContract):

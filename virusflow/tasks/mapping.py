@@ -11,9 +11,10 @@ from typing import Dict, Type
 
 from .base import Task
 from .calibs import (
-    ArcTask, BiasTask, CdTask, DarkTask, ExtractedMasterSciSpectrumTask,
-    FiberWavelengthSpectralMaskTask, FlatTask, HgTask, MasterSciTask, TraceTask,
-    TwiTask, WaveTask,
+    AmplifierFiberResponseTask, ArcTask, BiasTask, CdTask, DarkTask,
+    ExtractedMasterLdlsSpectrumTask, ExtractedMasterSciSpectrumTask,
+    ExtractedMasterTwilightSpectrumTask, FiberWavelengthSpectralMaskTask,
+    FlatTask, HgTask, MasterSciTask, TraceTask, TwiTask, WaveTask,
 )
 
 
@@ -32,7 +33,10 @@ def default_kind_to_task() -> Dict[str, Type[Task]]:
         "master_arc": ArcTask,
         "master_twilight": TwiTask,
         "master_sci": MasterSciTask,
+        "extracted_master_ldls_spectrum": ExtractedMasterLdlsSpectrumTask,
+        "extracted_master_twilight_spectrum": ExtractedMasterTwilightSpectrumTask,
         "extracted_master_sci_spectrum": ExtractedMasterSciSpectrumTask,
+        "within_amp_fiber_normalization": AmplifierFiberResponseTask,
         "fiber_wavelength_spectral_mask": FiberWavelengthSpectralMaskTask,
         "trace_map": TraceTask,
         "wavelength_map": WaveTask,

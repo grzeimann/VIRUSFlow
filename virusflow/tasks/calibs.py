@@ -13,7 +13,8 @@ from ..algorithms.flat import step_flt
 from ..algorithms.trace import fit_fiber_traces
 from ..algorithms.twi import step_twi
 from ..algorithms.master_sci import build_master_sci
-from ..algorithms.master_sci_spectrum import extract_master_sci_spectrum
+from ..algorithms.fiber_response import fit_within_amplifier_response
+from ..algorithms.master_spectrum import extract_master_spectrum
 from ..algorithms.master_sci_mask import build_master_sci_spectral_mask
 from ..algorithms.wave import fit_wavelength_solution
 from ..artifacts import ArtifactService, Scope
@@ -33,6 +34,8 @@ from ..contracts.result import (
     TwiResultContract,
     WaveResultContract,
     MasterSciResultContract,
+    AmplifierFiberResponseResultContract,
+    ExtractedMasterSpectrumResultContract,
     ExtractedMasterSciSpectrumResultContract,
     FiberWavelengthSpectralMaskResultContract,
 )
@@ -319,15 +322,11 @@ class MasterSciTask(_RawCalibrationTask):
             )
 
 
-class ExtractedMasterSciSpectrumTask(_CanonicalTask):
-    name = "master_sci_extraction"
+class _ExtractedMasterSpectrumTask(_CanonicalTask):
     version = "v1"
-    artifact_name = "extracted_master_sci_spectrum"
-    algorithm_name = (
-        "virusflow.algorithms.master_sci_spectrum.extract_master_sci_spectrum"
-    )
-    result_kind = "extracted_master_sci_spectrum"
-    result_contract = ExtractedMasterSciSpectrumResultContract
+    master_kind = ""
+    result_contract = ExtractedMasterSpectrumResultContract
+    algorithm_name = "virusflow.algorithms.master_spectrum.extract_master_spectrum"
     component_map = {
         "spectrum": "spectrum",
         "valid_pixel_fraction": "valid_pixel_fraction",
@@ -344,8 +343,8 @@ class ExtractedMasterSciSpectrumTask(_CanonicalTask):
     def run(self, inputs):
         self._require_target()
         service = ArtifactService(self.ctx.db_path)
-        master_row = self._dependency(inputs, "master_sci") or self._resolve_artifact(
-            "master_sci", required=True
+        master_row = self._dependency(inputs, self.master_kind) or self._resolve_artifact(
+            self.master_kind, required=True
         )
         trace_row = self._dependency(inputs, "trace_map") or self._resolve_artifact(
             "trace_map", required=True
@@ -354,16 +353,17 @@ class ExtractedMasterSciSpectrumTask(_CanonicalTask):
         trace_id = int(trace_row.id) if hasattr(trace_row, "id") else int(trace_row["id"])
         params = dict(MASTER_SCI_EXTRACTION_CONFIGURATION.value)
         params.update(self._params())
-        result = extract_master_sci_spectrum(
-            service.load_component(master_id, "master_sci")["data"],
+        result = extract_master_spectrum(
+            service.load_component(master_id, self.master_kind)["data"],
             service.load_component(trace_id, "fiber_trace_map")["data"],
+            result_kind=self.artifact_name,
             aperture_width=float(params["aperture_width"]),
         )
         result.meta.update(service.get_scientific_metadata(master_id))
         report = self.result_contract().validate(result)
         if not report.ok:
             raise ValueError(
-                "ExtractedMasterSciSpectrumTask result contract: "
+                f"{self.__class__.__name__} result contract: "
                 + "; ".join(report.errors)
             )
         refs = self.configuration_references() + [ConfigurationReference(
@@ -375,6 +375,106 @@ class ExtractedMasterSciSpectrumTask(_CanonicalTask):
         artifact = self._publish(
             result, [master_id, trace_id], configuration_refs=refs, parameters=params
         )
+        return {self.artifact_name: artifact}
+
+
+class ExtractedMasterSciSpectrumTask(_ExtractedMasterSpectrumTask):
+    name = "master_sci_extraction"
+    artifact_name = "extracted_master_sci_spectrum"
+    master_kind = "master_sci"
+    result_kind = artifact_name
+    result_contract = ExtractedMasterSciSpectrumResultContract
+
+
+class ExtractedMasterLdlsSpectrumTask(_ExtractedMasterSpectrumTask):
+    name = "master_ldls_extraction"
+    artifact_name = "extracted_master_ldls_spectrum"
+    master_kind = "master_ldls"
+    result_kind = artifact_name
+
+
+class ExtractedMasterTwilightSpectrumTask(_ExtractedMasterSpectrumTask):
+    name = "master_twilight_extraction"
+    artifact_name = "extracted_master_twilight_spectrum"
+    master_kind = "master_twilight"
+    result_kind = artifact_name
+
+
+class AmplifierFiberResponseTask(_CanonicalTask):
+    """Publish the reusable LDLS-fine, twilight-anchored amplifier response."""
+
+    name = "amplifier_fiber_response"
+    version = "v1"
+    artifact_name = "within_amp_fiber_normalization"
+    algorithm_name = "virusflow.algorithms.fiber_response.fit_within_amplifier_response"
+    result_kind = "within_amplifier_normalization"
+    result_contract = AmplifierFiberResponseResultContract
+    component_map = {
+        "raw_ratio": "raw_ratio",
+        "normalization": "normalization",
+        "valid_mask": "valid_mask",
+        "common_twilight": "common_twilight",
+        "ftf_ldls": "ftf_ldls",
+        "twilight_broad_correction": "twilight_broad_correction",
+        "twilight_residual_correction": "twilight_residual_correction",
+        "wavelength": "wavelength",
+        "amplifier_twilight_level": "amplifier_twilight_level",
+        "science_residual_per_fiber": "science_residual_per_fiber",
+    }
+    component_units = {
+        "raw_ratio": "1",
+        "normalization": "1",
+        "valid_mask": "1",
+        "common_twilight": "electron",
+        "ftf_ldls": "1",
+        "twilight_broad_correction": "1",
+        "twilight_residual_correction": "1",
+        "wavelength": "Angstrom",
+        "amplifier_twilight_level": "electron",
+        "science_residual_per_fiber": "1",
+    }
+
+    def run(self, inputs):
+        self._require_target()
+        service = ArtifactService(self.ctx.db_path)
+
+        def required(kind: str):
+            row = self._dependency(inputs, kind) or self._resolve_artifact(kind, required=True)
+            return row, int(row.id) if hasattr(row, "id") else int(row["id"])
+
+        ldls_row, ldls_id = required("extracted_master_ldls_spectrum")
+        twilight_row, twilight_id = required("extracted_master_twilight_spectrum")
+        wavelength_row, wavelength_id = required("wavelength_map")
+        science_row = self._dependency(inputs, "extracted_master_sci_spectrum")
+        science_id = None
+        science_spectrum = None
+        if science_row is not None:
+            science_id = int(science_row.id) if hasattr(science_row, "id") else int(science_row["id"])
+            science_spectrum = service.load_component(science_id, "spectrum")["data"]
+
+        params = self._params()
+        result = fit_within_amplifier_response(
+            service.load_component(ldls_id, "spectrum")["data"],
+            service.load_component(twilight_id, "spectrum")["data"],
+            service.load_component(wavelength_id, "wavelength_map")["data"],
+            science_spectrum=science_spectrum,
+            common_model_bins=int(params.get("common_model_bins", 3000)),
+            broad_twilight_bins=int(params.get("broad_twilight_bins", 5)),
+            twilight_residual_bins=int(params.get("twilight_residual_bins", 25)),
+            minimum_wavelength_finite_fraction=float(
+                params.get("minimum_wavelength_finite_fraction", 0.8)
+            ),
+        )
+        result.meta.update(service.get_scientific_metadata(twilight_id))
+        report = self.result_contract().validate(result)
+        if not report.ok:
+            raise ValueError(
+                "AmplifierFiberResponseTask result contract: " + "; ".join(report.errors)
+            )
+        parent_ids = [ldls_id, twilight_id, wavelength_id]
+        if science_id is not None:
+            parent_ids.append(science_id)
+        artifact = self._publish(result, parent_ids, parameters=params)
         return {self.artifact_name: artifact}
 
 

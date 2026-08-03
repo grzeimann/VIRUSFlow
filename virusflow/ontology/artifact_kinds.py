@@ -57,6 +57,16 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
         CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
         ("spectrum", "valid_pixel_fraction", "effective_aperture_width", "extraction_valid"),
     ),
+    "extracted_master_ldls_spectrum": _spec(
+        "extracted_master_ldls_spectrum", PhysicalScope.FIBER, Unit.ELECTRON.value,
+        CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
+        ("spectrum", "valid_pixel_fraction", "effective_aperture_width", "extraction_valid"),
+    ),
+    "extracted_master_twilight_spectrum": _spec(
+        "extracted_master_twilight_spectrum", PhysicalScope.FIBER, Unit.ELECTRON.value,
+        CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
+        ("spectrum", "valid_pixel_fraction", "effective_aperture_width", "extraction_valid"),
+    ),
     "fiber_wavelength_spectral_mask": _spec(
         "fiber_wavelength_spectral_mask", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value,
         CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
@@ -97,6 +107,11 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
         "within_amp_fiber_normalization", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value,
         CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
         ("raw_ratio", "normalization", "valid_mask", "common_twilight"),
+        (
+            "ftf_ldls", "twilight_broad_correction",
+            "twilight_residual_correction", "wavelength",
+            "amplifier_twilight_level", "science_residual_per_fiber",
+        ),
     ),
     "amp_to_amp_normalization": _spec(
         "amp_to_amp_normalization", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value,

@@ -83,7 +83,7 @@ flowchart TB
         EConfig["Evidence: configuration<br/>F-plane + per-IFUID fiber offsets<br/>exposure references"]:::evidence
         AResolve(["Action: resolve configuration<br/>and representative header"]):::action
 
-        ECal["Evidence set per amplifier:<br/>master_bias, master_dark, master_ldls,<br/>master_arc, master_twilight,<br/>trace_map, wavelength_map"]:::evidence
+        ECal["Evidence set per amplifier:<br/>master_bias, master_dark, master_ldls,<br/>master_arc, trace_map, wavelength_map,<br/>within_amp_fiber_normalization"]:::evidence
         ASelect(["Action: select each calibration<br/>latest_valid, then nearest fallback"]):::action
         GCal{"At least one amplifier has<br/>all seven calibration kinds?"}:::guard
         XCal["Abort: no complete<br/>calibration coverage"]:::terminal
@@ -142,13 +142,10 @@ flowchart TB
         AScatter --> SScatter
     end
 
-    subgraph L3["Twilight normalization and science extraction — repeated per usable amplifier"]
-        ETwilight["Evidence: paired master_twilight images"]:::evidence
-        ATwiScatter(["Action: assemble twilight physical CCD;<br/>fit and subtract scatter in memory"]):::action
-        STwiScatter[["Run-local: scatter-subtracted twilight"]]:::state
-        ATwiExtract(["Action: split to amplifier;<br/>fractional 5-pixel twilight extraction"]):::action
-        AWithin(["Action: divide each fiber by common twilight;<br/>51-pixel median smoothing;<br/>unit-median per-fiber normalization"]):::action
-        SWithin[["Run-local: within-amp response<br/>raw ratio + valid mask + common twilight"]]:::state
+    subgraph L3["Calibration response evidence and science extraction — repeated per usable amplifier"]
+        EWithin["Evidence: calibration-time<br/>within_amp_fiber_normalization<br/>LDLS fine structure + twilight broad anchor"]:::evidence
+        ALoadWithin(["Action: load normalization, validity,<br/>and corrected amplifier twilight level"]):::action
+        SWithin[["Run-local: selected within-amp response<br/>with exact calibration Product parent"]]:::state
 
         AScienceExtract(["Action: split scatter-corrected science CCD;<br/>fractional 5-pixel extraction using<br/>trace, variance, and pixel mask"]):::action
         SExtract[["Run-local: spectrum + propagated variance<br/>valid-pixel fraction + aperture evidence"]]:::state
@@ -157,11 +154,7 @@ flowchart TB
         XWave["Record amplifier failure or<br/>exclude only invalid fiber rows"]:::terminal
         SAmpResult[["Run-local amp result:<br/>spectrum, variance, validity, wavelength,<br/>within response, twilight level, parents"]]:::state
 
-        ETwilight --> ATwiScatter
-        ETracePair --> ATwiScatter
-        ATwiScatter --> STwiScatter --> ATwiExtract
-        ETracePair --> ATwiExtract
-        ATwiExtract --> AWithin --> SWithin
+        EWithin --> ALoadWithin --> SWithin
 
         SScatter --> AScienceExtract
         ETracePair --> AScienceExtract
@@ -179,7 +172,7 @@ flowchart TB
     subgraph L4["Exposure-wide fiber frame and normalization"]
         GExtract{"At least one amplifier<br/>produced extractable fibers?"}:::guard
         XExtract["Abort: no extractable amplifier"]:::terminal
-        AAmpNorm(["Action: median common-twilight level per amp;<br/>divide by exposure-wide median level"]):::action
+        AAmpNorm(["Action: use corrected twilight level per amp;<br/>divide by exposure-wide median level"]):::action
         PAmpNorm[("Product: amp_to_amp_normalization<br/>scope: EXPOSURE")]:::product
         ANormalize(["Action: final normalization = within × amp factor<br/>spectrum /= final normalization<br/>variance /= final normalization²"]):::action
         AGlobal(["Action: remove invalid wavelength fibers;<br/>attach fiber identity and<br/>F-plane + local focal offsets; concatenate"]):::action
@@ -304,6 +297,7 @@ flowchart TB
     GCal -. yes .-> ERawAmp
     GCal -. begin per-amplifier processing .-> GPair
     ECal -. master_arc has no downstream numerical use .-> GCal
+    ECal -. selected within-amp response .-> EWithin
 ```
 
 Every persisted Product above is published through `ArtifactRequest` and
@@ -320,17 +314,17 @@ become parent Artifact IDs.
 | Persisted Product | Scope | Direct parent Artifact IDs |
 |---|---|---|
 | `ccd_scattered_light_model` | Physical CCD | both raw science row IDs; both amplifiers' `master_bias` and `master_dark`; `master_ldls` where selected; both `trace_map` Products |
-| `amp_to_amp_normalization` | Exposure | each retained amplifier's scatter model, trace, wavelength map, and master twilight |
+| `amp_to_amp_normalization` | Exposure | each retained amplifier's scatter model, trace, wavelength map, and `within_amp_fiber_normalization` |
 | `initial_astrometry` | Exposure | all successful physical-CCD scatter models |
 | `source_detection_catalog` | Exposure | initial astrometry and all successful scatter models |
 | `catalog_match_table` | Exposure | initial astrometry and source-detection catalog |
 | `final_astrometry` | Exposure | initial astrometry and catalog-match table |
 | `fiber_sky_coordinates` | Fiber | final astrometry |
-| `sky_fiber_mask` | Fiber | fiber coordinates, source detections, amp normalization, and each retained amplifier's scatter/trace/wavelength/twilight parents |
+| `sky_fiber_mask` | Fiber | fiber coordinates, source detections, amp normalization, and each retained amplifier's scatter/trace/wavelength/within-response parents |
 | `exposure_illumination_correction` | Exposure | sky-fiber mask |
-| `sky_model` | Exposure | sky-fiber mask, illumination correction, amp normalization, and each retained amplifier's scatter/trace/wavelength/twilight parents |
+| `sky_model` | Exposure | sky-fiber mask, illumination correction, amp normalization, and each retained amplifier's scatter/trace/wavelength/within-response parents |
 | `baseline_relative_response` | Instrument epoch | none |
-| `fiber_response_model` | Exposure | baseline response, illumination correction, amp normalization, and each retained amplifier's scatter/trace/wavelength/twilight parents |
+| `fiber_response_model` | Exposure | baseline response, illumination correction, amp normalization, and each retained amplifier's scatter/trace/wavelength/within-response parents |
 | `exposure_mode_classification` | Exposure | initial astrometry |
 | `effective_exposure_time` | Exposure | exposure-mode classification |
 | `exposure_completion_manifest` | Exposure | sky model, fiber-response model, effective exposure time, and final astrometry |
@@ -354,8 +348,9 @@ The implementation supports the requested evidence/action reading well:
   extraction geometry;
 - wavelength maps are inferred evidence for attaching and validating native
   spectral coordinates;
-- master twilight Products are inferred evidence for within-amplifier and
-  exposure-wide normalization;
+- calibration-time within-amplifier response Products are inferred evidence
+  for fiber normalization and supply twilight-anchored amplifier levels for
+  exposure-wide comparison;
 - header fields and external catalog rows are evidence for astrometric and
   exposure-time inferences.
 
@@ -393,9 +388,9 @@ master_bias
 master_dark
 master_ldls
 master_arc
-master_twilight
 trace_map
 wavelength_map
+within_amp_fiber_normalization
 ```
 
 `master_arc` is never loaded or numerically consumed later in
@@ -404,7 +399,9 @@ selected wavelength map. Operationally it affects the global completeness gate
 and, when missing, the recorded failure state and completion status; it does not
 drive a downstream numerical action. Likewise, the `master_ldls` image is not
 used as a flat-field divisor; only its `flat_response_mask` is merged into the
-science mask.
+science mask. Its extracted spectrum contributes upstream to the selected
+`within_amp_fiber_normalization`, rather than being reprocessed by
+`ExposureTask`.
 
 ### 4. The physical-CCD boundary is correctly preserved
 
@@ -459,13 +456,12 @@ final_exposure_response
 The completion manifest records `persistent_science_intermediates: []`.
 `CalibratedFiberState` is also run-local and is passed to observation assembly.
 
-There is a notable evidence-retention gap relative to the knowledge-system
-guidance: `within_amplifier_normalization()` computes the raw twilight ratio,
-normalization-valid mask, common twilight, and a twilight scatter holdout
-sigma, but only the smoothed normalization contributes to later Products. The
-raw ratio, valid mask, and twilight fit diagnostic are not published or included
-in the returned state even though a registered
-`within_amp_fiber_normalization` Product kind exists.
+Calibration response intermediates are retained separately from this exposure
+flow. `within_amp_fiber_normalization` publishes the LDLS fine response, both
+twilight correction factors, their product, common spectra, validity,
+wavelength, corrected amplifier twilight level, and optional Master Science
+residual QA. Exposure processing loads that immutable evidence but keeps its
+dense science extraction and sky products run-local.
 
 ### 7. Variance propagation is explicit but incomplete
 
@@ -499,13 +495,12 @@ at least one valid row remains. A catalog provider failure or insufficient
 astrometric matches produces warning/degraded catalog, final-astrometry, and
 coordinate Products while retaining the header-derived TAN solution.
 
-This partial-completion behavior is not universal. For example, once a
-physical-CCD pair exists, both `master_twilight` Products are accessed by direct
-dictionary indexing without a local guard. A missing twilight can therefore
-raise an uncaught `KeyError` even though calibration selection initially records
-the missing kind as an amplifier failure. Missing usable pointing, no finite sky
-samples, and malformed configuration can likewise abort through downstream
-algorithm validation.
+This partial-completion behavior is not universal. A selected
+`within_amp_fiber_normalization` with malformed component shape or no usable
+normalization raises during amplifier processing; the exception is recorded for
+that physical pair and both amplifiers are skipped. Missing usable pointing, no
+finite sky samples, and malformed configuration can likewise abort through
+downstream algorithm validation.
 
 The completion manifest is `pass/usable` only when there are no recorded
 amplifier failures and no wavelength-fiber exclusions; otherwise it is
@@ -542,8 +537,8 @@ therefore assumes Exposure-level header consistency.
 Every published Product gets QA facts and a status/usability bundle. The
 physical-CCD model fails QA only when its holdout residual sigma is non-finite.
 Catalog-dependent Products degrade on fit failure, and baseline/fiber-response
-Products are always warning/degraded because the historical response evidence
-is absent.
+Products remain warning/degraded because the baseline relative response is
+still a provisional identity model.
 
 Calibration selection itself uses time policy (`latest_valid`, then `nearest`)
 but does not request a minimum QA state in this task. The completion manifest
@@ -557,8 +552,8 @@ status before continuing with extraction.
 
 | Classification | Finding |
 |---|---|
-| **KEEP** | Atomic Exposure scope, complete ZipCode discovery, physical-CCD paired scatter fitting, explicit astrometry fallback, per-fiber wavelength exclusions, and partial-amplifier completion |
-| **ADAPT** | Publish or otherwise retain within-amplifier raw ratios, valid masks, twilight scatter diagnostics, and complete fiber hardware identity |
+| **KEEP** | Atomic Exposure scope, calibration-time LDLS/twilight response evidence, complete ZipCode discovery, physical-CCD paired scatter fitting, explicit astrometry fallback, per-fiber wavelength exclusions, and partial-amplifier completion |
+| **ADAPT** | Retain complete fiber hardware identity and determine whether optional Master Science residual QA should be a planned dependency rather than an explicitly injected one |
 | **REFACTOR** | Move array arithmetic still embedded in `ExposureTask.run()`—illumination estimation, response application, mask construction, and several validations—behind pure algorithm contracts while preserving results |
 | **RESEARCH** | Validate the mandatory-but-unused `master_arc` gate, the raw-dark source of dark exposure time, and the intended future application of non-identity baseline response |
 
@@ -573,9 +568,10 @@ current scientific behavior.
 - [`PhysicalCCDTask.run()`](../../virusflow/tasks/science.py#L214)
 - [`reduce_amplifier_array()`](../../virusflow/algorithms/ccd.py#L49)
 - [`fit_gap_scattered_light()`](../../virusflow/algorithms/physical_ccd.py#L238)
-- [`extract_fractional_aperture()`](../../virusflow/algorithms/exposure.py#L218)
-- [`within_amplifier_normalization()`](../../virusflow/algorithms/exposure.py#L260)
-- [`fit_catalog_astrometry()`](../../virusflow/algorithms/exposure.py#L383)
-- [`oversampled_incident_sky()`](../../virusflow/algorithms/exposure.py#L448)
-- [`classify_mode_and_effective_time()`](../../virusflow/algorithms/exposure.py#L552)
+- [`extract_fractional_aperture()`](../../virusflow/algorithms/extraction.py)
+- [`fit_within_amplifier_response()`](../../virusflow/algorithms/fiber_response.py)
+- [`AmplifierFiberResponseTask`](../../virusflow/tasks/calibs.py)
+- [`fit_catalog_astrometry()`](../../virusflow/algorithms/astrometry.py)
+- [`oversampled_incident_sky()`](../../virusflow/algorithms/sky.py)
+- [`classify_mode_and_effective_time()`](../../virusflow/algorithms/exposure_state.py)
 - [`test_full_exposure_task_fixture_produces_baseline_products_and_refined_catalog_astrometry`](../../tests/test_exposure_task.py#L44)

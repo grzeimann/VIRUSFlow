@@ -45,7 +45,9 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
     assert set(by_kind) == {
         "master_bias", "master_dark", "master_ldls", "master_hg", "master_cd",
         "master_arc", "master_twilight", "master_sci", "trace_map", "wavelength_map",
-        "extracted_master_sci_spectrum", "fiber_wavelength_spectral_mask",
+        "extracted_master_ldls_spectrum", "extracted_master_twilight_spectrum",
+        "extracted_master_sci_spectrum", "within_amp_fiber_normalization",
+        "fiber_wavelength_spectral_mask",
     }
     assert by_kind["master_hg"].inputs_raw == ["cmp", "hg"]
     assert by_kind["master_cd"].inputs_raw == ["cmp", "cd"]
@@ -54,6 +56,16 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
     assert by_kind["master_sci"].inputs_raw == ["sci"]
     assert by_kind["extracted_master_sci_spectrum"].inputs_artifacts == [
         "master_sci", "trace_map",
+    ]
+    assert by_kind["extracted_master_ldls_spectrum"].inputs_artifacts == [
+        "master_ldls", "trace_map",
+    ]
+    assert by_kind["extracted_master_twilight_spectrum"].inputs_artifacts == [
+        "master_twilight", "trace_map",
+    ]
+    assert by_kind["within_amp_fiber_normalization"].inputs_artifacts == [
+        "extracted_master_twilight_spectrum", "extracted_master_ldls_spectrum",
+        "wavelength_map",
     ]
     assert by_kind["fiber_wavelength_spectral_mask"].inputs_artifacts == [
         "extracted_master_sci_spectrum", "wavelength_map",
@@ -68,6 +80,9 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         ("master_bias", "trace_map"),
         ("master_bias", "wavelength_map"),
         ("master_bias", "extracted_master_sci_spectrum"),
+        ("master_bias", "extracted_master_ldls_spectrum"),
+        ("master_bias", "extracted_master_twilight_spectrum"),
+        ("master_bias", "within_amp_fiber_normalization"),
         ("master_bias", "fiber_wavelength_spectral_mask"),
         ("master_ldls", "trace_map"),
         ("master_hg", "master_arc"),
@@ -76,6 +91,13 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         ("trace_map", "wavelength_map"),
         ("master_sci", "extracted_master_sci_spectrum"),
         ("trace_map", "extracted_master_sci_spectrum"),
+        ("master_ldls", "extracted_master_ldls_spectrum"),
+        ("trace_map", "extracted_master_ldls_spectrum"),
+        ("master_twilight", "extracted_master_twilight_spectrum"),
+        ("trace_map", "extracted_master_twilight_spectrum"),
+        ("extracted_master_twilight_spectrum", "within_amp_fiber_normalization"),
+        ("extracted_master_ldls_spectrum", "within_amp_fiber_normalization"),
+        ("wavelength_map", "within_amp_fiber_normalization"),
         ("extracted_master_sci_spectrum", "fiber_wavelength_spectral_mask"),
         ("wavelength_map", "fiber_wavelength_spectral_mask"),
     }
@@ -153,7 +175,8 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
         "master_dark", "master_ldls", "master_hg", "master_cd",
         "master_twilight", "master_sci", "master_arc", "trace_map",
         "wavelength_map", "extracted_master_sci_spectrum",
-        "fiber_wavelength_spectral_mask",
+        "extracted_master_ldls_spectrum", "extracted_master_twilight_spectrum",
+        "within_amp_fiber_normalization", "fiber_wavelength_spectral_mask",
     }:
         gated = [item for item in scheduled if item.kind == gated_kind]
         assert gated
@@ -202,6 +225,26 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
         "spectrum", "valid_pixel_fraction", "effective_aperture_width",
         "extraction_valid",
     }
+    for kind in (
+        "extracted_master_ldls_spectrum", "extracted_master_twilight_spectrum",
+    ):
+        assert {item["name"] for item in service.describe(rows[kind])["components"]} == {
+            "spectrum", "valid_pixel_fraction", "effective_aperture_width",
+            "extraction_valid",
+        }
+    response_description = service.describe(rows["within_amp_fiber_normalization"])
+    assert {item["name"] for item in response_description["components"]} >= {
+        "raw_ratio", "normalization", "valid_mask", "common_twilight",
+        "ftf_ldls", "twilight_broad_correction",
+        "twilight_residual_correction", "wavelength",
+        "amplifier_twilight_level",
+    }
+    assert response_description["summary"]["algorithm_metadata"]["fine_structure_source"] == (
+        "master_ldls"
+    )
+    assert response_description["summary"]["algorithm_metadata"]["large_scale_anchor"] == (
+        "master_twilight"
+    )
     assert {item["name"] for item in service.describe(
         rows["fiber_wavelength_spectral_mask"]
     )["components"]} == {
@@ -236,6 +279,24 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
     )["relations"]
     assert {item["parent_id"] for item in extraction_relations} == {
         int(rows["master_sci"]["id"]), int(rows["trace_map"]["id"]),
+    }
+    ldls_extraction_relations = service.describe(
+        rows["extracted_master_ldls_spectrum"]
+    )["relations"]
+    twilight_extraction_relations = service.describe(
+        rows["extracted_master_twilight_spectrum"]
+    )["relations"]
+    assert {item["parent_id"] for item in ldls_extraction_relations} == {
+        int(rows["master_ldls"]["id"]), int(rows["trace_map"]["id"]),
+    }
+    assert {item["parent_id"] for item in twilight_extraction_relations} == {
+        int(rows["master_twilight"]["id"]), int(rows["trace_map"]["id"]),
+    }
+    response_relations = response_description["relations"]
+    assert {item["parent_id"] for item in response_relations} == {
+        int(rows["extracted_master_ldls_spectrum"]["id"]),
+        int(rows["extracted_master_twilight_spectrum"]["id"]),
+        int(rows["wavelength_map"]["id"]),
     }
     mask_relations = service.describe(
         rows["fiber_wavelength_spectral_mask"]

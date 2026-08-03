@@ -1,6 +1,6 @@
 import numpy as np
 
-from virusflow.algorithms.exposure import extract_fractional_aperture
+from virusflow.algorithms.extraction import extract_fractional_aperture
 from virusflow.algorithms.master_sci import build_master_sci
 from virusflow.algorithms.master_sci_mask import build_master_sci_spectral_mask
 from virusflow.algorithms.master_sci_spectrum import extract_master_sci_spectrum
@@ -25,9 +25,9 @@ def test_master_sci_extraction_reuses_canonical_fractional_aperture():
         image, np.zeros_like(image), trace, width=5.0
     )
     result = extract_master_sci_spectrum(image, trace, aperture_width=5.0)
-    np.testing.assert_allclose(result.arrays["spectrum"], expected.spectrum)
+    np.testing.assert_allclose(result.arrays["spectrum"], expected.get_array("spectrum"))
     np.testing.assert_array_equal(
-        result.arrays["extraction_valid"], expected.extraction_valid
+        result.arrays["extraction_valid"], expected.get_array("extraction_valid")
     )
     assert result.meta["spectral_coordinate"] == "detector_column"
     assert result.meta["output_scale_convention"] == "integrated_aperture_counts"
