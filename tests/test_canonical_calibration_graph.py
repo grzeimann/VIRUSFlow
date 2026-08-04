@@ -403,3 +403,24 @@ def test_critical_read_noise_blocks_calibration_branches_before_wavelength(
     assert qa["usability"] == "unusable"
     assert qa["metrics"]["read_noise"] == 6.5
     assert service.adapter.list_all(kind="wavelength_map") == []
+
+    rerun, rerun_report = graph.plan(
+        db_path=database, scopes=[Scope(zipcode=zipcode)]
+    )
+    assert rerun == []
+    assert len(rerun_report.terminal) == len(nodes)
+    assert rerun_report.reasons[
+        next(key for key in rerun_report.reasons if key.startswith("master_bias:"))
+    ].startswith("already_recorded_terminal_task_failure:")
+    assert all(
+        reason == "already_registered_terminal_qa_failure"
+        or reason.startswith("already_recorded_terminal_task_failure:")
+        or reason.startswith("blocked_by_terminal_qa_failure:")
+        for reason in rerun_report.reasons.values()
+    )
+
+    forced, forced_report = graph.plan(
+        db_path=database, scopes=[Scope(zipcode=zipcode)], force_replan=True
+    )
+    assert len(forced) == len(nodes)
+    assert forced_report.terminal == []

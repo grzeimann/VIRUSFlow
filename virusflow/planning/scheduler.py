@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List, Sequence, Tuple, Optional
 
-from .graph import TaskSpec, Edge
+from .graph import TaskSpec, Edge, target_node_id
 from .targets import Target
 
 
@@ -94,14 +94,7 @@ def schedule(
     group_target_to_id: Dict[Tuple[str, str], str] = {}
     scope_target_to_ids: Dict[Tuple[str, Tuple], List[str]] = {}
     def _make_node_id(t: Target) -> str:
-        w = t.window
-        ws = getattr(w, 'start', None)
-        we = getattr(w, 'end', None)
-        z = getattr(t.scope, 'zipcode', None)
-        zkey = (z.ifuslot, z.ifuid, z.specid, z.amp, z.controller) if z is not None else (None,)
-        group = getattr(t, "group", None)
-        identity = getattr(group, "computation_id", None)
-        return f"{t.kind}:{':'.join(str(x) for x in zkey)}:{identity or getattr(ws, 'isoformat', lambda: None)()}:{getattr(we, 'isoformat', lambda: None)()}"
+        return target_node_id(t)
     for target in targets:
         node_id = _make_node_id(target)
         scope_k = _scope_key(target)

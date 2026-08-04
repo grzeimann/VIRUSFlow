@@ -34,7 +34,12 @@ def param_hash(params: Dict[str, Any]) -> str:
 
 
 def build_provenance(
-    algorithm: str, params: Dict[str, Any], parents: Iterable[str] | None = None
+    algorithm: str,
+    params: Dict[str, Any],
+    parents: Iterable[str] | None = None,
+    *,
+    raw_parents: Iterable[str] | None = None,
+    raw_catalog: str | None = None,
 ) -> Dict[str, Any]:
     """Build a plain dict provenance record for registry/database.save_artifact.
 
@@ -46,5 +51,7 @@ def build_provenance(
         "algorithm": algorithm,
         "parameters_hash": param_hash(params),
         "parents": list(parents) if parents else [],
+        "raw_parents": list(raw_parents) if raw_parents else [],
+        "raw_catalog": raw_catalog,
         "created_at": datetime.utcnow(),
     }

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Mapping, Sequence
@@ -156,7 +156,7 @@ class AnalysisStudyService:
         used = self._used_bytes(study.study_id)
         projected = used + int(artifact.payload_bytes)
         if projected > study.expected_bytes:
-            self.svc.evict_payload(int(artifact.id), require_cache=False)
+            self.svc._purge_payload(int(artifact.id))
             self.svc.adapter.set_state(int(artifact.id), "obsolete")
             raise RuntimeError(
                 f"analysis storage budget exceeded: projected {projected}, budget {study.expected_bytes}"
@@ -337,7 +337,7 @@ class AnalysisStudyService:
                     "SELECT artifact_id FROM analysis_materializations WHERE study_id=?", (study_id,)
                 ).fetchall()
             for row in rows:
-                self.svc.evict_payload(int(row[0]), require_cache=False)
+                self.svc._purge_payload(int(row[0]))
         with db.connect(self.db_path) as connection:
             connection.execute(
                 "UPDATE analysis_studies SET state='complete',summary_json=?,completed_at=? WHERE study_id=?",

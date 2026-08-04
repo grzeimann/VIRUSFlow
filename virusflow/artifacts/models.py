@@ -49,6 +49,8 @@ class Provenance:
     params: Dict[str, Any] = field(default_factory=dict)
     parents: List[int] = field(default_factory=list)
     created_at: datetime = field(default_factory=datetime.utcnow)
+    raw_parents: List[int] = field(default_factory=list)
+    raw_catalog: Optional[str] = None
 
 
 @dataclass(frozen=True)

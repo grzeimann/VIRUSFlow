@@ -39,7 +39,7 @@ virusflow run calibrations --db ./run/registry.sqlite3 --workdir ./run/artifacts
   --start-date 20260609 --end-date 20260609 --plan-only
 ```
 
-Review `./run/artifacts/planning_report.yml`, then omit `--plan-only` to execute
+Review `./run/artifacts/planning_report.json`, then omit `--plan-only` to execute
 the exact inspected groups. The report includes members, exclusions, lamp
 pairing, temperature, exposure-time and `master_sci` sufficiency evidence. See
 [calibration cadence](calibration-cadence.md).
@@ -83,6 +83,12 @@ virusflow cleanup cache --db ./run/registry.sqlite3 --execute
 ```
 
 The first command in each pair is a dry-run inventory. See [troubleshooting](troubleshooting.md) before retiring legacy payloads.
+Calibration runs evict cacheable dense masters as soon as their terminal evidence
+Product passes QA: wavelength maps release arc/Hg/Cd masters, amplifier fiber
+responses release dense LDLS/twilight masters, and spectral masks release science
+masters. `cleanup cache` applies the same guarded retention policy to Products
+created by runs that completed before automatic stage eviction was enabled;
+refused candidates remain intact and are listed in the command report.
 
 ## Small validation run
 

@@ -27,6 +27,7 @@ PHASES = (
     "raw_cache_wait", "fits_header_parse", "pixel_array_load", "artifact_lookup", "artifact_load",
     "compute", "serialization", "content_hash", "artifact_publish",
     "database_query", "database_transaction", "database_lock_wait", "scratch_cleanup",
+    "payload_retention",
     "process_serialize", "process_deserialize", "calibration_singleflight_wait",
     "trace_chunk_sampling", "trace_fiber_modeling", "trace_residuals",
     "trace_feature_expansion", "trace_huber_fit", "trace_huber_predict",
@@ -206,6 +207,7 @@ class _Phase:
             "raw_cache_wait", "fits_header_parse", "pixel_array_load", "artifact_load",
             "serialization", "content_hash", "artifact_publish", "database_transaction",
             "database_lock_wait", "scratch_cleanup",
+            "payload_retention",
             "calibration_singleflight_wait",
         }:
             self.task.phase_events.append({

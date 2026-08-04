@@ -66,10 +66,31 @@ class PlanningReport:
     planned: List[Target] = field(default_factory=list)
     skipped: List[Target] = field(default_factory=list)
     existing: List[Target] = field(default_factory=list)
+    terminal: List[Target] = field(default_factory=list)
     reasons: Dict[str, str] = field(default_factory=dict)  # target_key -> reason
     cadence_groups: List[dict] = field(default_factory=list)
     exclusions: List[dict] = field(default_factory=list)
     lamp_pairs: List[dict] = field(default_factory=list)
+
+
+def target_node_id(target: Target) -> str:
+    """Return the stable execution identity shared by planner and scheduler."""
+
+    window = target.window
+    start = getattr(window, "start", None)
+    end = getattr(window, "end", None)
+    zipcode = getattr(target.scope, "zipcode", None)
+    zkey = (
+        zipcode.ifuslot, zipcode.ifuid, zipcode.specid,
+        zipcode.amp, zipcode.controller,
+    ) if zipcode is not None else (None,)
+    identity = getattr(getattr(target, "group", None), "computation_id", None)
+    start_value = getattr(start, "isoformat", lambda: None)()
+    end_value = getattr(end, "isoformat", lambda: None)()
+    return (
+        f"{target.kind}:{':'.join(str(value) for value in zkey)}:"
+        f"{identity or start_value}:{end_value}"
+    )
 
 
 class ReductionGraph:
@@ -114,38 +135,73 @@ class ReductionGraph:
         report = PlanningReport()
         available: Dict[Tuple[str, str], List[Target]] = {}
         effective_raw_inputs: set[Tuple[str, str, Tuple[int, ...]]] = set()
+        terminal_groups: set[Tuple[str, str]] = set()
+        terminal_by_scope: Dict[Tuple[str, str], List[Target]] = {}
 
         def scope_key(scope: Scope) -> str:
             zipcode = getattr(scope, "zipcode", None)
             return zipcode.key() if zipcode is not None else "__global__"
 
-        def already_has_inputs(target: Target) -> bool:
-            if target.group is None:
-                return False
+        evidence_loader = getattr(svc.adapter, "list_planning_evidence", None)
+        evidence_snapshot = evidence_loader() if callable(evidence_loader) else None
+        evidence_by_scope: Dict[Tuple[str, str], List[dict]] = {}
+        if evidence_snapshot is not None:
+            for row in evidence_snapshot:
+                evidence_by_scope.setdefault(
+                    (str(row.get("kind") or ""), str(row.get("amp_key") or "")), []
+                ).append(row)
+        failure_loader = getattr(svc.adapter, "list_terminal_task_failures", None)
+        terminal_task_failures = {
+            str(row["task_id"]): row
+            for row in (failure_loader() if callable(failure_loader) else [])
+        }
 
-            def qa_accepts(row: dict) -> bool:
+        def qa_disposition(row: dict, target: Target) -> str:
+            if "qa_status" in row:
+                status = str(row.get("qa_status") or "").lower()
+                usability = str(row.get("qa_usability") or "").lower()
+                policy_version = str(row.get("qa_policy_version") or "")
+                has_qa = bool(status or usability or policy_version)
+            else:
                 qa = svc.adapter.get_qa_bundle(int(row["id"]))
-                if qa and (
-                    str(qa.get("status") or "").lower() == "fail"
-                    or str(qa.get("usability") or "").lower() == "unusable"
-                ):
-                    return False
-                # The read-noise gate changed from the original no-op bias
-                # policy. Re-evaluate an otherwise identical bias when its
-                # persisted decision predates the active policy.
-                if target.kind == "master_bias":
-                    expected = svc.diagnostics.policy_version_for(target.kind)
-                    if not qa or str(qa.get("policy_version") or "") != expected:
-                        return False
-                return True
+                status = str((qa or {}).get("status") or "").lower()
+                usability = str((qa or {}).get("usability") or "").lower()
+                policy_version = str((qa or {}).get("policy_version") or "")
+                has_qa = bool(qa)
+            expected_policy = str(svc.diagnostics.policy_version_for(target.kind) or "")
+            failed = status == "fail" or usability == "unusable"
+            if failed:
+                if has_qa and policy_version == expected_policy:
+                    return "terminal_qa_failure"
+                return "replan"
+            # The read-noise gate changed from the original no-op bias policy.
+            if target.kind == "master_bias" and (
+                not has_qa or policy_version != expected_policy
+            ):
+                return "replan"
+            return "usable"
 
-            for row in svc.adapter.list_all(kind=target.kind):
-                if row.get("amp_key") != scope_key(target.scope):
-                    continue
+        def rows_for(target: Target) -> List[dict]:
+            key = (target.kind, scope_key(target.scope))
+            if evidence_snapshot is not None:
+                return evidence_by_scope.get(key, [])
+            return [
+                row for row in svc.adapter.list_all(kind=target.kind)
+                if row.get("amp_key") == key[1]
+            ]
+
+        def already_has_inputs(target: Target) -> str:
+            if target.group is None:
+                return "missing"
+
+            matched_terminal = False
+            for row in rows_for(target):
                 registered_group_id = (row.get("metadata") or {}).get("calibration_group_id")
                 if registered_group_id == target.group.group_id:
-                    if qa_accepts(row):
-                        return True
+                    disposition = qa_disposition(row, target)
+                    if disposition == "usable":
+                        return "existing"
+                    matched_terminal |= disposition == "terminal_qa_failure"
                     continue
                 # Parent-only matching is a compatibility fallback for records
                 # predating group identities.  A record with a different group
@@ -156,22 +212,91 @@ class ReductionGraph:
                 if not target.group.raw_ids:
                     continue
                 wanted = list(target.group.raw_ids)
-                parents = row.get("parents") or []
+                parents = row.get("raw_parent_ids") or row.get("parents") or []
                 if isinstance(parents, str):
                     parents = [int(value) for value in parents.split(",") if value]
                 if sorted(int(value) for value in parents) == sorted(wanted):
-                    if qa_accepts(row):
-                        return True
+                    disposition = qa_disposition(row, target)
+                    if disposition == "usable":
+                        return "existing"
+                    matched_terminal |= disposition == "terminal_qa_failure"
                     continue
-            return False
+            return "terminal_qa_failure" if matched_terminal else "missing"
+
+        def target_center_of(target: Target) -> datetime | None:
+            if target.window is None:
+                return target.at_time
+            start, end = target.window.start, target.window.end
+            if start is not None and end is not None:
+                return start + (end - start) / 2
+            return start or end
+
+        def terminal_blocker(target: Target) -> Tuple[str, str] | None:
+            for parent in target.parent_groups:
+                if parent in terminal_groups:
+                    return parent
+            target_center = target_center_of(target)
+            for edge in self._incoming.get(target.kind, []):
+                if edge.policy != "qa_gate":
+                    continue
+                candidates = terminal_by_scope.get(
+                    (edge.src.kind, scope_key(target.scope)), []
+                )
+                for candidate in candidates:
+                    if target.window is not None and candidate.window is not None:
+                        target_start, target_end = target.window.start, target.window.end
+                        source_start, source_end = candidate.window.start, candidate.window.end
+                        if (
+                            target_start is not None and target_end is not None
+                            and source_start is not None and source_end is not None
+                            and source_start <= target_end and target_start <= source_end
+                        ):
+                            return (edge.src.kind, candidate.group.group_id)
+                    candidate_center = target_center_of(candidate)
+                    if target_center is None or candidate_center is None:
+                        return (edge.src.kind, candidate.group.group_id)
+                    if abs((candidate_center - target_center).total_seconds()) <= (
+                        max(0, int(edge.tolerance_days)) * 86400
+                    ):
+                        return (edge.src.kind, candidate.group.group_id)
+            return None
+
+        def mark_terminal(target: Target, reason: str) -> None:
+            report.terminal.append(target)
+            report.reasons[_tkey(target)] = reason
+            if target.group is not None:
+                terminal_groups.add((target.kind, target.group.group_id))
+            terminal_by_scope.setdefault(
+                (target.kind, scope_key(target.scope)), []
+            ).append(target)
 
         def emit(target: Target) -> None:
             key = (target.kind, scope_key(target.scope))
             available.setdefault(key, []).append(target)
-            if not force_replan and already_has_inputs(target):
-                report.existing.append(target)
-                report.reasons[_tkey(target)] = "already_registered_same_effective_inputs"
-                return
+            if not force_replan:
+                prior_failure = terminal_task_failures.get(target_node_id(target))
+                if prior_failure is not None:
+                    mark_terminal(
+                        target,
+                        "already_recorded_terminal_task_failure:"
+                        f"{prior_failure.get('error') or prior_failure.get('task_kind')}",
+                    )
+                    return
+                blocker = terminal_blocker(target)
+                if blocker is not None:
+                    mark_terminal(
+                        target,
+                        f"blocked_by_terminal_qa_failure:{blocker[0]}:{blocker[1]}",
+                    )
+                    return
+                disposition = already_has_inputs(target)
+                if disposition == "existing":
+                    report.existing.append(target)
+                    report.reasons[_tkey(target)] = "already_registered_same_effective_inputs"
+                    return
+                if disposition == "terminal_qa_failure":
+                    mark_terminal(target, "already_registered_terminal_qa_failure")
+                    return
             if force_replan:
                 report.reasons[_tkey(target)] = "forced_replan"
             planned.append(target)
@@ -184,17 +309,29 @@ class ReductionGraph:
                 when.end.strftime("%Y%m%d") if when.end else None,
             )
 
+        start_date, end_date = bounds()
+        requested_scopes = {scope_key(scope) for scope in scopes}
+        raw_grouping_by_scope: Dict[str, List[dict]] = {}
+        if any(bool(node.inputs_raw) and isinstance(node.cadence, PurposeCadence)
+               for node in self.nodes):
+            for row in db.list_calibration_grouping_rows_bulk(
+                db_path=raw_db_path, start_date=start_date, end_date=end_date,
+            ):
+                amp_key = str(row.get("amp_key") or "")
+                if amp_key in requested_scopes:
+                    raw_grouping_by_scope.setdefault(amp_key, []).append(row)
+
         for node in self.nodes:
             has_raw = bool(node.inputs_raw)
             has_up = bool(node.inputs_artifacts)
             if has_raw and isinstance(node.cadence, PurposeCadence):
                 from .cadence import resolve_calibration_groups
 
-                start_date, end_date = bounds()
                 for scope in scopes:
                     result = resolve_calibration_groups(
                         kind=node.kind, cadence=node.cadence, scope=scope, db_path=raw_db_path,
                         start_date=start_date, end_date=end_date,
+                        source_rows=raw_grouping_by_scope.get(scope_key(scope), ()),
                     )
                     report.exclusions.extend({"kind": node.kind, "zipcode": scope_key(scope), **item}
                                              for item in result.exclusions)
@@ -349,11 +486,13 @@ class ReductionGraph:
 
         report.planned = planned
         requesters: dict[tuple[str, str], list[str]] = {}
-        for target in [*report.planned, *report.existing]:
+        for target in [*report.planned, *report.existing, *report.terminal]:
             child = target.group.group_id if target.group else _tkey(target)
             for parent in target.parent_groups:
                 requesters.setdefault(parent, []).append(child)
-        for target in [*report.planned, *report.existing, *report.skipped]:
+        for target in [
+            *report.planned, *report.existing, *report.terminal, *report.skipped,
+        ]:
             if target.group is None:
                 continue
             group = target.group

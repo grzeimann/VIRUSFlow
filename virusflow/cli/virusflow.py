@@ -281,6 +281,84 @@ def resolve_progress_config(args: argparse.Namespace, configured=None) -> dict[s
         "max_retries": int(retries),
     }
 
+
+def _write_execution_report(stats: dict[str, Any], workdir: str | Path) -> Path:
+    """Persist terminal graph state, including complete task-error evidence."""
+
+    failed = int(stats.get("failed", 0))
+    blocked = int(stats.get("blocked", 0))
+    terminal_qa = int(stats.get("terminal_qa", 0))
+    report = {
+        "schema": "virusflow.execution.v1",
+        "outcome": (
+            "completed_with_task_errors" if failed
+            else "completed_with_terminal_qa" if terminal_qa
+            else "completed"
+        ),
+        "summary": {
+            "graph_reached_terminal_state": True,
+            "total": int(stats.get("total", 0)),
+            "succeeded": int(stats.get("succeeded", 0)),
+            "task_errors": failed,
+            "downstream_blocked": blocked,
+            "terminal_qa": terminal_qa,
+            "cached": int(stats.get("cached", 0)),
+            "skipped": int(stats.get("skipped", 0)),
+            "retried": int(stats.get("retried", 0)),
+            "elapsed_seconds": float(stats.get("elapsed_seconds", 0.0)),
+        },
+        "per_kind": stats.get("per_kind", {}),
+        # These records retain exception type, reason, and full traceback.
+        "task_errors": list(stats.get("failures", [])),
+        "blocked_tasks": list(stats.get("blocked_tasks", [])),
+    }
+    if stats.get("performance_files"):
+        report["performance_files"] = stats["performance_files"]
+    path = Path(workdir) / "execution_report.yml"
+    path.write_text(yaml.safe_dump(report, sort_keys=False))
+    return path
+
+
+def _print_execution_summary(stats: dict[str, Any], report_path: Path) -> None:
+    """Describe terminal graph completion without presenting task errors as a crash."""
+
+    total = int(stats.get("total", 0))
+    succeeded = int(stats.get("succeeded", 0))
+    failed = int(stats.get("failed", 0))
+    blocked = int(stats.get("blocked", 0))
+    cached = int(stats.get("cached", 0))
+    skipped = int(stats.get("skipped", 0))
+    terminal_qa = int(stats.get("terminal_qa", 0))
+    if failed:
+        print(
+            f"Calibration run completed: {succeeded}/{total} tasks succeeded."
+        )
+        print(
+            f"Recorded {failed} task error(s); {blocked} dependent task(s) "
+            "were not run."
+        )
+        print("Completed Products were retained and remain available.")
+        print(f"Detailed task errors and tracebacks: {report_path}")
+        print("Task error summary:")
+        for failure in list(stats.get("failures", []))[:5]:
+            print(
+                f"  - {failure.get('kind', '?')} "
+                f"{failure.get('id', '?')}: {failure.get('reason', '')}"
+            )
+        remaining = failed - min(failed, 5)
+        if remaining > 0:
+            print(f"  - ... {remaining} additional task error(s); see the report.")
+        return
+    print(f"Calibration run completed: {succeeded} task(s) executed successfully.")
+    print(f"Reused {cached} existing task result(s); {skipped} task(s) were not run.")
+    if terminal_qa:
+        print(
+            f"{terminal_qa} task(s) have recorded terminal QA outcomes; "
+            "use --force-replan to recompute them."
+        )
+    print(f"Execution report: {report_path}")
+
+
 def _run_planned(args: argparse.Namespace) -> None:
     from ..core.pathutils import ensure_dir
     from ..planning import (
@@ -345,9 +423,10 @@ def _run_planned(args: argparse.Namespace) -> None:
         db_path=args.db, raw_db_path=args.raw_db, scopes=scopes, when=when_win,
         force_replan=bool(getattr(args, "force_replan", False)),
     )
-    # Persist a simple planning report YAML alongside workdir
+    # Persist a compact JSON report.  Large calibration plans serialize much
+    # faster and occupy less space than the former human-oriented YAML dump.
     ensure_dir(args.workdir)
-    rep_path = Path(args.workdir) / "planning_report.yml"
+    rep_path = Path(args.workdir) / "planning_report.json"
     import json as _json
 
     def _tgt(t: object) -> dict:
@@ -380,8 +459,10 @@ def _run_planned(args: argparse.Namespace) -> None:
             return {"repr": repr(t)}
 
     rep = {
+        "schema": "virusflow.planning.v2",
         "planned": [_tgt(t) for t in report.planned],
         "existing": [_tgt(t) for t in report.existing],
+        "terminal": [_tgt(t) for t in report.terminal],
         "skipped": [_tgt(t) for t in report.skipped],
         "reasons": report.reasons,
         "cadence_groups": report.cadence_groups,
@@ -390,25 +471,51 @@ def _run_planned(args: argparse.Namespace) -> None:
         "summary": {
             "n_planned": len(report.planned),
             "n_existing": len(report.existing),
+            "n_terminal": len(report.terminal),
             "n_skipped": len(report.skipped),
             "n_scopes": len(scopes),
         },
     }
-    try:
-        import yaml as _yaml
-        rep_text = _yaml.safe_dump(rep, sort_keys=False)
-    except Exception:
-        rep_text = _json.dumps(rep, indent=2, sort_keys=True)
-    rep_path.write_text(rep_text)
+    with rep_path.open("w", encoding="utf-8") as stream:
+        _json.dump(
+            rep, stream, ensure_ascii=False, separators=(",", ":"), default=str,
+        )
     # Print concise summary to stdout
     try:
         s = rep.get("summary", {})
-        print(f"Planning summary: planned={s.get('n_planned', 0)} existing={s.get('n_existing', 0)} skipped={s.get('n_skipped', 0)} scopes={s.get('n_scopes', 0)}")
+        print(
+            f"Planning summary: planned={s.get('n_planned', 0)} "
+            f"existing={s.get('n_existing', 0)} terminal={s.get('n_terminal', 0)} "
+            f"skipped={s.get('n_skipped', 0)} scopes={s.get('n_scopes', 0)}"
+        )
     except Exception:
         pass
     print(f"Planning complete: wrote {rep_path}")
     # Automatic execution of planned calibrations unless --plan-only is passed
     if getattr(args, "plan_only", False):
+        return
+    # A completed plan should return before importing task implementations and
+    # the scientific stack.  Those imports can dominate a true no-op rerun
+    # (notably when Matplotlib must initialize its font cache).
+    if not report.planned:
+        stats = {
+            "total": len(report.existing) + len(report.skipped) + len(report.terminal),
+            "succeeded": 0,
+            "failed": 0,
+            "blocked": 0,
+            "cached": len(report.existing),
+            "skipped": len(report.skipped) + len(report.terminal),
+            "retried": 0,
+            "elapsed_seconds": 0.0,
+            "per_kind": {},
+            "failures": [],
+            "blocked_tasks": [],
+            "terminal_qa": len(report.terminal),
+        }
+        execution_report_path = _write_execution_report(stats, args.workdir)
+        _print_execution_summary(stats, execution_report_path)
+        if report.terminal and getattr(args, "strict_task_failures", False):
+            raise SystemExit(1)
         return
     # Ensure algorithms I/O knows which registry DB to use for tar member reads during execution
     try:
@@ -443,8 +550,32 @@ def _run_planned(args: argparse.Namespace) -> None:
         task_context_factory=_ctx_factory,
         target_adapter=_adapt_target,
     )
+    ensure_dir(args.workdir)
+    if not scheduled:
+        stats = {
+            "total": len(report.existing) + len(report.skipped) + len(report.terminal),
+            "succeeded": 0,
+            "failed": 0,
+            "blocked": 0,
+            "cached": len(report.existing),
+            "skipped": len(report.skipped) + len(report.terminal),
+            "retried": 0,
+            "elapsed_seconds": 0.0,
+            "per_kind": {},
+            "failures": [],
+            "blocked_tasks": [],
+            "terminal_qa": len(report.terminal),
+        }
+        execution_report_path = _write_execution_report(stats, args.workdir)
+        _print_execution_summary(stats, execution_report_path)
+        if report.terminal and getattr(args, "strict_task_failures", False):
+            raise SystemExit(1)
+        return
     # Submit to the planning-native executor without the deprecated graph shim.
-    from ..executors.planning_executor import PlanningExecutor as _PlanningExecutor
+    from ..executors.planning_executor import (
+        PlanningExecutor as _PlanningExecutor,
+        WorkflowExecutionError as _WorkflowExecutionError,
+    )
     progress_cfg = resolve_progress_config(args, cfg_obj)
     execp = _PlanningExecutor(
         max_workers=nworkers, debug=bool(args.debug_timing), **progress_cfg,
@@ -453,38 +584,34 @@ def _run_planned(args: argparse.Namespace) -> None:
     # Add tasks preserving dependencies
     for st in scheduled:
         execp.add_task(st.id, st.task, kind=st.kind, depends_on=st.depends_on)
-    for index, target in enumerate(report.existing):
-        execp.add_observed(
-            f"cached:{index}:{getattr(target, 'kind', 'target')}",
-            kind=getattr(target, "kind", "target"), state="cached", target=repr(target),
-        )
-    for index, target in enumerate(report.skipped):
-        execp.add_observed(
-            f"skipped:{index}:{getattr(target, 'kind', 'target')}",
-            kind=getattr(target, "kind", "target"), state="skipped", target=repr(target),
-        )
-    ensure_dir(args.workdir)
-    execp.run()
-    # Print executor summary if available
+    execution_error = None
     try:
-        stats = getattr(execp, "execution_stats", {}) or {}
-        total = int(stats.get("total", 0))
-        ok_n = int(stats.get("succeeded", 0))
-        fail_n = int(stats.get("failed", 0))
-        print(f"Run complete (planning-first default path): executed={total}, ok={ok_n}, failed={fail_n}")
-        if fail_n > 0:
-            # Show a few sample failures to aid debugging
-            fails = list(stats.get("failures", []))[:5]
-            for f in fails:
-                try:
-                    print(f" - Failed {f.get('kind','?')} node {f.get('id','?')}: {f.get('reason','')}")
-                except Exception:
-                    pass
-            print("Hint: re-run with --debug-timing for detailed progress and errors.")
-    except Exception:
-        print("Run complete (planning-first default path)")
-
-
+        execp.run()
+    except _WorkflowExecutionError as exc:
+        # The graph has reached terminal state and the executor has already
+        # retained every task traceback.  Present that as partial completion at
+        # the CLI boundary instead of emitting a misleading process traceback.
+        execution_error = exc
+    stats = getattr(execp, "execution_stats", {}) or {}
+    stats["total"] = (
+        len(scheduled) + len(report.existing)
+        + len(report.skipped) + len(report.terminal)
+    )
+    stats["cached"] = int(stats.get("cached", 0)) + len(report.existing)
+    stats["skipped"] = (
+        int(stats.get("skipped", 0)) + len(report.skipped) + len(report.terminal)
+    )
+    stats["terminal_qa"] = len(report.terminal)
+    execution_report_path = _write_execution_report(stats, args.workdir)
+    _print_execution_summary(stats, execution_report_path)
+    if execution_error is not None and isinstance(
+        execution_error.__cause__, (KeyboardInterrupt, SystemExit)
+    ):
+        raise SystemExit(130)
+    if (
+        int(stats.get("failed", 0)) or int(stats.get("terminal_qa", 0))
+    ) and getattr(args, "strict_task_failures", False):
+        raise SystemExit(1)
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -826,6 +953,10 @@ def build_parser() -> argparse.ArgumentParser:
     cal.add_argument("--start-date", dest="plan_start_date"); cal.add_argument("--end-date", dest="plan_end_date")
     cal.add_argument("--only-zipcodes"); cal.add_argument("--force-replan", action="store_true")
     cal.add_argument("--qa-yaml"); cal.add_argument("--debug-timing", action="store_true"); cal.add_argument("--debug-inputs", action="store_true")
+    cal.add_argument(
+        "--strict-task-failures", action="store_true",
+        help="Return status 1 after terminal graph completion when any task had an error",
+    )
     cal.set_defaults(func=cmd_run)
     exp = run.add_parser("exposure", help="Reduce one atomic science exposure")
     _add_science_run(exp); exp.add_argument("--exposure-id", required=True); exp.set_defaults(func=cmd_run_exposure)

@@ -12,5 +12,27 @@ from .models import (
     StorageRef,
     Validity,
 )
-from .service import ArtifactService
+from .service import (
+    ArtifactLoadError,
+    ArtifactPayloadEvictedError,
+    ArtifactPayloadMissingError,
+    ArtifactService,
+)
 from ..ontology.lifecycle import ArtifactLifecycle
+
+__all__ = [
+    "Artifact",
+    "ArtifactDescription",
+    "ArtifactLifecycle",
+    "ArtifactLoadError",
+    "ArtifactPayloadEvictedError",
+    "ArtifactPayloadMissingError",
+    "ArtifactRelation",
+    "ArtifactService",
+    "ConfigurationReference",
+    "DiagnosticRecord",
+    "Provenance",
+    "Scope",
+    "StorageRef",
+    "Validity",
+]

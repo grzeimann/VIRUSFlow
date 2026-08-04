@@ -271,6 +271,8 @@ CREATE TABLE IF NOT EXISTS date_tar_members (
 """
 
 ARTIFACT_SCHEMA = r"""
+PRAGMA journal_mode=WAL;
+
 CREATE TABLE IF NOT EXISTS artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT,
@@ -352,6 +354,8 @@ CREATE TABLE IF NOT EXISTS artifact_components (
     payload_bytes INTEGER NOT NULL DEFAULT 0,
     dtype TEXT,
     shape_json TEXT,
+    payload_state TEXT NOT NULL DEFAULT 'present',
+    eviction_json TEXT NOT NULL DEFAULT '{}',
     PRIMARY KEY(artifact_id, name),
     FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
 );
@@ -361,6 +365,15 @@ CREATE TABLE IF NOT EXISTS artifact_relations (
     child_id INTEGER,
     relation TEXT,
     PRIMARY KEY(parent_id, child_id, relation)
+);
+
+CREATE TABLE IF NOT EXISTS raw_artifact_relations (
+    raw_catalog TEXT NOT NULL DEFAULT '',
+    raw_id INTEGER NOT NULL,
+    child_id INTEGER NOT NULL,
+    relation TEXT NOT NULL DEFAULT 'derived_from',
+    PRIMARY KEY(raw_catalog, raw_id, child_id, relation),
+    FOREIGN KEY(child_id) REFERENCES artifacts(id)
 );
 
 CREATE TABLE IF NOT EXISTS qa_results (
@@ -454,6 +467,8 @@ ON artifact_scientific_metadata(observation_time);
 CREATE INDEX IF NOT EXISTS artifact_scientific_metadata_ambient_temperature
 ON artifact_scientific_metadata(ambient_temperature);
 CREATE INDEX IF NOT EXISTS artifact_relations_child ON artifact_relations(child_id);
+CREATE INDEX IF NOT EXISTS raw_artifact_relations_child
+ON raw_artifact_relations(child_id);
 """
 
 RAW_SCHEMA += r"""
@@ -485,6 +500,74 @@ def _init_schema(db_path: str, schema: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         with connect(resolved) as conn:
             conn.executescript(schema)
+            if "CREATE TABLE IF NOT EXISTS artifact_components" in schema:
+                columns = {
+                    str(row[1])
+                    for row in conn.execute(
+                        "PRAGMA table_info(artifact_components)"
+                    ).fetchall()
+                }
+                if "payload_state" not in columns:
+                    conn.execute(
+                        "ALTER TABLE artifact_components ADD COLUMN "
+                        "payload_state TEXT NOT NULL DEFAULT 'present'"
+                    )
+                if "eviction_json" not in columns:
+                    conn.execute(
+                        "ALTER TABLE artifact_components ADD COLUMN "
+                        "eviction_json TEXT NOT NULL DEFAULT '{}'"
+                    )
+                # Raw catalog row IDs and Artifact IDs occupy independent
+                # namespaces.  Older raw-producing calibration publications
+                # stored raw IDs in artifact_relations, allowing coincident
+                # integers to create false cross-Artifact lineage.  Move those
+                # known raw edges into the typed relation table once when an
+                # existing registry is upgraded.
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS registry_migrations ("
+                    "name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+                )
+                migration = "typed_raw_calibration_provenance_v1"
+                applied = conn.execute(
+                    "SELECT 1 FROM registry_migrations WHERE name=?", (migration,)
+                ).fetchone()
+                if applied is None:
+                    raw_algorithms = (
+                        "%algorithms.bias.step_bias%",
+                        "%algorithms.dark.step_dark%",
+                        "%algorithms.flat.step_flt%",
+                        "%algorithms.cmp.step_cmp%",
+                        "%algorithms.master_sci.build_master_sci%",
+                        "%algorithms.twi.step_twi%",
+                    )
+                    predicate = " OR ".join("p.algorithm LIKE ?" for _ in raw_algorithms)
+                    conn.execute(
+                        f"""
+                        INSERT OR IGNORE INTO raw_artifact_relations(
+                            raw_catalog, raw_id, child_id, relation
+                        )
+                        SELECT '', r.parent_id, r.child_id, r.relation
+                        FROM artifact_relations r
+                        JOIN provenance p ON p.artifact_id=r.child_id
+                        WHERE {predicate}
+                        """,
+                        raw_algorithms,
+                    )
+                    raw_children_sql = (
+                        "SELECT artifact_id FROM provenance p WHERE " + predicate
+                    )
+                    conn.execute(
+                        f"DELETE FROM dependencies WHERE child_id IN ({raw_children_sql})",
+                        raw_algorithms,
+                    )
+                    conn.execute(
+                        f"DELETE FROM artifact_relations WHERE child_id IN ({raw_children_sql})",
+                        raw_algorithms,
+                    )
+                    conn.execute(
+                        "INSERT INTO registry_migrations(name, applied_at) VALUES(?,?)",
+                        (migration, datetime.utcnow().isoformat()),
+                    )
         stat = path.stat()
         if not legacy_baseline_enabled():
             _INITIALIZED_DATABASES[cache_key] = (int(stat.st_dev), int(stat.st_ino))
@@ -1305,6 +1388,32 @@ def list_calibration_grouping_rows(
         return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
 
 
+def list_calibration_grouping_rows_bulk(
+    *, db_path: str, start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> List[dict]:
+    """Load all raw grouping evidence for one planning window in one query."""
+
+    sql = (
+        "SELECT rf.id AS raw_id, rf.exposure_id, lower(rf.frame_type) AS frame_type, "
+        "rf.amp_key, e.when_utc, d.exptime, d.pexptime, d.ambient_temperature, "
+        "d.object_name, d.qobject, d.lamp, d.observing_block, d.qprog "
+        "FROM raw_files rf JOIN exposures e ON e.id=rf.exposure_id "
+        "LEFT JOIN exposure_details d ON d.exposure_id=rf.exposure_id "
+        "WHERE rf.amp_key IS NOT NULL"
+    )
+    params: List[object] = []
+    if start_date:
+        sql += " AND substr(replace(e.when_utc,'-',''),1,8) >= ?"
+        params.append(_date8(start_date))
+    if end_date:
+        sql += " AND substr(replace(e.when_utc,'-',''),1,8) <= ?"
+        params.append(_date8(end_date))
+    sql += " ORDER BY rf.amp_key, rf.exposure_id, rf.id"
+    with connect(db_path) as conn:
+        return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+
+
 def save_artifact(artifact, prov, db_path: str = DEFAULT_DB_PATH) -> int:
     """Persist artifact and provenance rows with basic retry on SQLite lock.
 
@@ -1396,6 +1505,7 @@ def save_artifact_details(
     record: Dict[str, Any],
     components: Iterable[Dict[str, Any]],
     relations: Iterable[Dict[str, Any]],
+    raw_relations: Iterable[Dict[str, Any]] = (),
     db_path: str = DEFAULT_DB_PATH,
 ) -> None:
     """Persist canonical Artifact registry rows, components, relations, and state."""
@@ -1486,8 +1596,8 @@ def save_artifact_details(
                 INSERT INTO artifact_components(
                     artifact_id, name, model_type, path, payload_type,
                     storage_format, checksum, units, coordinates, metadata_json,
-                    payload_bytes, dtype, shape_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    payload_bytes, dtype, shape_json, payload_state, eviction_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(artifact_id, name) DO UPDATE SET
                     model_type=excluded.model_type,
                     path=excluded.path,
@@ -1499,7 +1609,9 @@ def save_artifact_details(
                     metadata_json=excluded.metadata_json,
                     payload_bytes=excluded.payload_bytes,
                     dtype=excluded.dtype,
-                    shape_json=excluded.shape_json
+                    shape_json=excluded.shape_json,
+                    payload_state=excluded.payload_state,
+                    eviction_json=excluded.eviction_json
                 """,
                 (
                     int(artifact_id),
@@ -1515,6 +1627,8 @@ def save_artifact_details(
                     int(component.get("payload_bytes") or 0),
                     component.get("dtype"),
                     json.dumps(component.get("shape") or []),
+                    component.get("payload_state") or "present",
+                    json.dumps(component.get("eviction") or {}, sort_keys=True, default=str),
                 ),
             )
         for relation in relations:
@@ -1527,6 +1641,20 @@ def save_artifact_details(
             conn.execute(
                 "INSERT OR IGNORE INTO artifact_relations(parent_id, child_id, relation) VALUES(?,?,?)",
                 (parent_id, int(artifact_id), relation_name),
+            )
+        for relation in raw_relations:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO raw_artifact_relations(
+                    raw_catalog, raw_id, child_id, relation
+                ) VALUES(?,?,?,?)
+                """,
+                (
+                    str(relation.get("raw_catalog") or ""),
+                    int(relation["raw_id"]),
+                    int(artifact_id),
+                    str(relation.get("relation") or "derived_from"),
+                ),
             )
 
 
@@ -1602,7 +1730,207 @@ def list_artifact_components(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -
                 row["shape"] = json.loads(row.pop("shape_json") or "[]")
             except Exception:
                 row["shape"] = []
+            try:
+                row["eviction"] = json.loads(row.pop("eviction_json") or "{}")
+            except Exception:
+                row["eviction"] = {}
         return out
+
+
+def set_artifact_component_payload_states(
+    artifact_id: int,
+    updates: Iterable[Dict[str, Any]],
+    *,
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """Atomically record component payload states and retained storage evidence."""
+
+    import json
+
+    normalized = list(updates)
+    allowed = {"present", "evicted_rebuildable", "missing_error"}
+    for update in normalized:
+        state = str(update.get("payload_state") or "")
+        if state not in allowed:
+            raise ValueError(f"invalid component payload state: {state}")
+    init_artifact_db(db_path)
+    with connect(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for update in normalized:
+                cursor = conn.execute(
+                    """
+                    UPDATE artifact_components
+                    SET payload_state=?, eviction_json=?
+                    WHERE artifact_id=? AND name=?
+                    """,
+                    (
+                        str(update["payload_state"]),
+                        json.dumps(
+                            update.get("eviction") or {}, sort_keys=True, default=str
+                        ),
+                        int(artifact_id),
+                        str(update["name"]),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise KeyError(
+                        f"artifact {artifact_id} has no component {update['name']!r}"
+                    )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+
+def list_artifact_descendants(
+    artifact_id: int,
+    db_path: str = DEFAULT_DB_PATH,
+    *,
+    kinds: Iterable[str] = (),
+) -> List[Dict[str, Any]]:
+    """Return bounded Artifact descendants with batched QA/payload evidence.
+
+    Artifact IDs must increase along a published lineage edge and calibration
+    lineage cannot cross hardware scope.  Both predicates protect traversal of
+    registries created before raw and Artifact provenance were separated.
+    """
+
+    init_artifact_db(db_path)
+    selected = tuple(dict.fromkeys(str(kind) for kind in kinds))
+    kind_filter = ""
+    if selected:
+        kind_filter = (
+            " WHERE COALESCE(record.canonical_kind, artifact.kind) IN ("
+            + ",".join("?" for _ in selected)
+            + ")"
+        )
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            WITH RECURSIVE root(amp_key) AS (
+                SELECT amp_key FROM artifacts WHERE id=?
+            ),
+            descendant_ids(id) AS (
+                SELECT relation.child_id
+                FROM artifact_relations relation
+                JOIN artifacts child ON child.id=relation.child_id
+                CROSS JOIN root
+                WHERE relation.parent_id=?
+                  AND relation.child_id > relation.parent_id
+                  AND child.amp_key IS root.amp_key
+                UNION
+                SELECT relation.child_id
+                FROM artifact_relations relation
+                JOIN descendant_ids parent ON relation.parent_id=parent.id
+                JOIN artifacts child ON child.id=relation.child_id
+                CROSS JOIN root
+                WHERE relation.child_id > relation.parent_id
+                  AND child.amp_key IS root.amp_key
+            ),
+            component_summary AS (
+                SELECT artifact_id,
+                       CASE MAX(
+                           CASE COALESCE(payload_state, 'present')
+                               WHEN 'missing_error' THEN 2
+                               WHEN 'evicted_rebuildable' THEN 1
+                               ELSE 0
+                           END
+                       )
+                           WHEN 2 THEN 'missing_error'
+                           WHEN 1 THEN 'evicted_rebuildable'
+                           ELSE 'present'
+                       END AS payload_state,
+                       group_concat(
+                           CASE WHEN COALESCE(payload_state, 'present')='present'
+                                THEN path END,
+                           char(31)
+                       ) AS present_paths
+                FROM artifact_components
+                GROUP BY artifact_id
+            )
+            SELECT artifact.id,
+                   COALESCE(record.canonical_kind, artifact.kind) AS kind,
+                   artifact.amp_key,
+                   COALESCE(record.state, 'active') AS state,
+                   COALESCE(decision.status, result.status) AS qa_status,
+                   decision.usability AS qa_usability,
+                   decision.policy_version AS qa_policy_version,
+                   COALESCE(component_summary.payload_state, 'present') AS payload_state,
+                   component_summary.present_paths
+            FROM descendant_ids descendant
+            JOIN artifacts artifact ON artifact.id=descendant.id
+            LEFT JOIN artifact_records record ON record.artifact_id=artifact.id
+            LEFT JOIN qa_decisions decision ON decision.artifact_id=artifact.id
+            LEFT JOIN qa_results result ON result.artifact_id=artifact.id
+            LEFT JOIN component_summary ON component_summary.artifact_id=artifact.id
+            {kind_filter}
+            ORDER BY artifact.id
+            """,
+            tuple([int(artifact_id), int(artifact_id), *selected]),
+        ).fetchall()
+    result = _rows_to_dicts(rows)
+    for row in result:
+        row["present_paths"] = [
+            value for value in str(row.get("present_paths") or "").split(chr(31))
+            if value
+        ]
+    return result
+
+
+def list_artifact_ancestors(
+    artifact_id: int,
+    db_path: str = DEFAULT_DB_PATH,
+    *,
+    kinds: Iterable[str] = (),
+) -> List[Dict[str, Any]]:
+    """Return scope-local, monotonically published Artifact ancestors."""
+
+    init_artifact_db(db_path)
+    selected = tuple(dict.fromkeys(str(kind) for kind in kinds))
+    kind_filter = ""
+    if selected:
+        kind_filter = (
+            " WHERE COALESCE(record.canonical_kind, artifact.kind) IN ("
+            + ",".join("?" for _ in selected)
+            + ")"
+        )
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""
+            WITH RECURSIVE root(amp_key) AS (
+                SELECT amp_key FROM artifacts WHERE id=?
+            ),
+            ancestor_ids(id) AS (
+                SELECT relation.parent_id
+                FROM artifact_relations relation
+                JOIN artifacts parent ON parent.id=relation.parent_id
+                CROSS JOIN root
+                WHERE relation.child_id=?
+                  AND relation.parent_id < relation.child_id
+                  AND parent.amp_key IS root.amp_key
+                UNION
+                SELECT relation.parent_id
+                FROM artifact_relations relation
+                JOIN ancestor_ids child ON relation.child_id=child.id
+                JOIN artifacts parent ON parent.id=relation.parent_id
+                CROSS JOIN root
+                WHERE relation.parent_id < relation.child_id
+                  AND parent.amp_key IS root.amp_key
+            )
+            SELECT artifact.id,
+                   COALESCE(record.canonical_kind, artifact.kind) AS kind,
+                   artifact.amp_key,
+                   COALESCE(record.state, 'active') AS state
+            FROM ancestor_ids ancestor
+            JOIN artifacts artifact ON artifact.id=ancestor.id
+            LEFT JOIN artifact_records record ON record.artifact_id=artifact.id
+            {kind_filter}
+            ORDER BY artifact.id
+            """,
+            tuple([int(artifact_id), int(artifact_id), *selected]),
+        ).fetchall()
+    return _rows_to_dicts(rows)
 
 
 def list_artifact_relations(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
@@ -1613,6 +1941,23 @@ def list_artifact_relations(artifact_id: int, db_path: str = DEFAULT_DB_PATH) ->
             (int(artifact_id),),
         ).fetchall()
         return _rows_to_dicts(rows)
+
+
+def list_raw_artifact_relations(
+    artifact_id: int, db_path: str = DEFAULT_DB_PATH
+) -> List[Dict[str, Any]]:
+    init_artifact_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT raw_catalog, raw_id, child_id, relation
+            FROM raw_artifact_relations
+            WHERE child_id=?
+            ORDER BY raw_catalog, raw_id, relation
+            """,
+            (int(artifact_id),),
+        ).fetchall()
+    return _rows_to_dicts(rows)
 
 
 def get_artifact(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict]:
@@ -1711,6 +2056,97 @@ def list_artifacts(
         return _rows_to_dicts(rows)
 
 
+def list_artifact_planning_evidence(
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    """Return the minimal Artifact and QA fields needed by the planner.
+
+    This intentionally avoids the per-Artifact detail and QA queries used by
+    interactive Artifact inspection.  Metadata and provenance parents are
+    decoded once so a planner can build an in-memory identity index.
+    """
+
+    import json
+
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT a.id, a.kind, a.amp_key, p.parents, p.created_at,
+                   raw_parents.ids AS raw_parents,
+                   r.metadata_json, COALESCE(r.state, 'active') AS state,
+                   COALESCE(d.status, q.status) AS qa_status,
+                   d.usability AS qa_usability,
+                   d.policy_version AS qa_policy_version
+            FROM artifacts a
+            LEFT JOIN provenance p ON p.artifact_id = a.id
+            LEFT JOIN artifact_records r ON r.artifact_id = a.id
+            LEFT JOIN qa_decisions d ON d.artifact_id = a.id
+            LEFT JOIN qa_results q ON q.artifact_id = a.id
+            LEFT JOIN (
+                SELECT child_id, group_concat(raw_id, ',') AS ids
+                FROM raw_artifact_relations
+                GROUP BY child_id
+            ) raw_parents ON raw_parents.child_id=a.id
+            ORDER BY p.created_at DESC, a.id DESC
+            """
+        ).fetchall()
+    evidence: List[Dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        try:
+            row["metadata"] = json.loads(row.pop("metadata_json") or "{}")
+        except (TypeError, ValueError):
+            row["metadata"] = {}
+        parents = row.get("parents") or []
+        if isinstance(parents, str):
+            parents = [int(value) for value in parents.split(",") if value]
+        row["parents"] = [int(value) for value in parents]
+        raw_parents = row.pop("raw_parents", None) or []
+        if isinstance(raw_parents, str):
+            raw_parents = [int(value) for value in raw_parents.split(",") if value]
+        row["raw_parent_ids"] = [int(value) for value in raw_parents]
+        evidence.append(row)
+    return evidence
+
+
+def list_latest_terminal_task_failures(
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    """Return task failures whose latest recorded attempt did not later succeed."""
+
+    import json
+
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            WITH ranked AS (
+                SELECT t.task_id, t.task_kind, t.target, t.status, t.attempt,
+                       t.timing_json, r.started_at, r.completed_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY t.task_id
+                           ORDER BY r.started_at DESC, t.attempt DESC
+                       ) AS recency
+                FROM performance_tasks t
+                JOIN performance_runs r ON r.run_id = t.run_id
+            )
+            SELECT task_id, task_kind, target, status, attempt, timing_json,
+                   started_at, completed_at
+            FROM ranked
+            WHERE recency = 1 AND status = 'failed'
+            """
+        ).fetchall()
+    failures: List[Dict[str, Any]] = []
+    for raw in rows:
+        row = dict(raw)
+        try:
+            timing = json.loads(row.pop("timing_json") or "{}")
+        except (TypeError, ValueError):
+            timing = {}
+        row["error"] = timing.get("error")
+        failures.append(row)
+    return failures
+
+
 def find_artifact_summaries(
     *,
     kind: Optional[str] = None,
@@ -1729,9 +2165,21 @@ def find_artifact_summaries(
     init_artifact_db(db_path)
     sql = """
         WITH component_names AS (
-            SELECT artifact_id, group_concat(name, char(31)) AS names
+            SELECT artifact_id, group_concat(name, char(31)) AS names,
+                   CASE MAX(
+                       CASE payload_state
+                           WHEN 'missing_error' THEN 2
+                           WHEN 'evicted_rebuildable' THEN 1
+                           ELSE 0
+                       END
+                   )
+                       WHEN 2 THEN 'missing_error'
+                       WHEN 1 THEN 'evicted_rebuildable'
+                       ELSE 'present'
+                   END AS payload_state
             FROM (
-                SELECT artifact_id, name
+                SELECT artifact_id, name,
+                       COALESCE(payload_state, 'present') AS payload_state
                 FROM artifact_components
                 ORDER BY artifact_id, name
             )
@@ -1772,6 +2220,7 @@ def find_artifact_summaries(
             sm.x_start,
             sm.y_start,
             component_names.names AS component_names,
+            component_names.payload_state AS payload_state,
             parent_ids.ids AS parent_ids
         FROM artifacts a
         JOIN artifact_records ar ON ar.artifact_id=a.id

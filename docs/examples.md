@@ -16,7 +16,7 @@ virusflow qa list --db ./run/registry.sqlite3 --kind master_bias
 virusflow qa list --db ./run/registry.sqlite3 --kind trace_map
 ```
 
-Inspect `planning_report.yml` before the second command. For a known unstable
+Inspect `planning_report.json` before the second command. For a known unstable
 dark period, a planning YAML override may set `master_dark.cadence.type` to
 `weekly`; explicit dark-time intervals and `master_sci` sufficiency examples
 are in [calibration cadence](calibration-cadence.md).
@@ -28,6 +28,19 @@ values above 4.5 electrons warn and remain degraded-but-usable, and values above
 6 electrons hard-fail as unusable. The failed bias Product remains queryable for
 engineering evidence, while its amplifier's downstream calibration branches are
 blocked before wavelength fitting.
+
+The calibration graph always runs to a terminal state when task-level errors
+can be isolated. In that case the command reports that the run completed with
+recorded task errors, retains completed Products, and writes full error messages,
+tracebacks, blocked-task reasons, and per-kind counts to
+`./run/artifacts/execution_report.yml`. This partial completion returns success
+by default because the graph itself finished. Batch or CI callers that require
+every task to succeed can add `--strict-task-failures`; the same report is
+written, but the command returns status 1 without printing a Python traceback.
+On a rerun, a current-policy hard QA result is reported as a terminal outcome
+instead of being recomputed automatically; its dependent targets remain not
+run. Use `--force-replan` only when those terminal results should be measured
+again.
 
 ## Single exposure
 

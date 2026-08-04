@@ -1,12 +1,14 @@
-from __future__ import annotations
-
 """Safe inventory and cleanup operations for scratch, cache, and legacy payloads."""
+
+from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import shutil
 from ..artifacts.migration import find_legacy_dense_artifacts
-from ..artifacts.service import ArtifactService
+from ..artifacts.retention import retention_rule
+from ..artifacts.service import ArtifactLoadError, ArtifactService
+from ..ontology.artifact_kinds import canonical_kind
 from ..ontology.lifecycle import ArtifactLifecycle
 
 
@@ -20,6 +22,7 @@ class CleanupReport:
     removed_bytes: int
     artifact_ids: tuple[int, ...] = ()
     paths: tuple[str, ...] = ()
+    refusals: tuple[str, ...] = ()
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -45,20 +48,50 @@ def cleanup_scratch(workdir: str | Path, *, execute: bool = False) -> CleanupRep
 
 def cleanup_cache(db_path: str, *, execute: bool = False) -> CleanupReport:
     service = ArtifactService(db_path)
-    rows = [
-        row for row in service.adapter.list_all()
-        if str(row.get("state") or "active") == "active"
-        and str(row.get("lifecycle") or "canonical") == ArtifactLifecycle.CACHE.value
-    ]
-    ids = tuple(int(row["id"]) for row in rows)
-    size = sum(int(row.get("payload_bytes") or 0) for row in rows)
+    candidates = []
+    for row in service.adapter.list_all():
+        if str(row.get("state") or "active") != "active":
+            continue
+        kind = canonical_kind(row.get("canonical_kind") or row.get("kind") or "")
+        rule = retention_rule(kind)
+        lifecycle = str(row.get("lifecycle") or ArtifactLifecycle.CANONICAL.value)
+        if rule is None and lifecycle != ArtifactLifecycle.CACHE.value:
+            continue
+        requested = set(rule.evictable_components) if rule is not None else None
+        components = service.adapter.list_components(int(row["id"]))
+        resident = [
+            component for component in components
+            if str(component.get("payload_state") or "present") == "present"
+            and (requested is None or str(component.get("name")) in requested)
+        ]
+        if resident:
+            candidates.append((row, resident))
+    ids = tuple(int(row["id"]) for row, _ in candidates)
+    size = sum(
+        int(component.get("payload_bytes") or 0)
+        for _, components in candidates
+        for component in components
+    )
     removed = 0
+    affected = 0
+    refusals = []
     if execute:
-        for artifact_id in ids:
-            removed += service.evict_payload(artifact_id, require_cache=True)
+        for row, _ in candidates:
+            artifact_id = int(row["id"])
+            try:
+                artifact_removed = service.evict_payload(artifact_id)
+            except (ValueError, ArtifactLoadError, OSError) as exc:
+                refusals.append(
+                    f"artifact_id={artifact_id} kind={row.get('kind')}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+            if artifact_removed:
+                affected += 1
+                removed += int(artifact_removed)
     return CleanupReport(
         "cache", not execute, len(ids), size,
-        len(ids) if execute else 0, removed, artifact_ids=ids,
+        affected, removed, artifact_ids=ids, refusals=tuple(refusals),
     )
 
 
@@ -89,7 +122,7 @@ def cleanup_legacy(
         for artifact_id in ids:
             service.adapter.set_state(artifact_id, "obsolete")
             if delete_payloads:
-                removed += service.evict_payload(artifact_id, require_cache=False)
+                removed += service._purge_payload(artifact_id)
                 service.adapter.set_state(artifact_id, "obsolete")
     return CleanupReport(
         "legacy", not deactivate, len(ids), size,

@@ -47,6 +47,8 @@ class ArtifactRequest:
     assumptions: List[str] = field(default_factory=list)
     revision: Optional[str] = None
     lifecycle: Optional[ArtifactLifecycle] = None
+    raw_parents: List[int] = field(default_factory=list)
+    raw_catalog: Optional[str] = None
 
     def component_names(self) -> List[str]:
         return list((self.components or {}).keys())

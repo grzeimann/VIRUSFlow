@@ -18,7 +18,7 @@ Redirected output defaults to a 30-second plain heartbeat. Reduce `--progress-in
 
 ## Failed or blocked workflow
 
-The first task with the root exception is `failed`; dependent nodes are `blocked`. The process exits nonzero. Inspect any intentionally retained failure scratch with `virusflow cleanup scratch --workdir PATH` before executing deletion.
+The first task with the root exception is recorded as a task error and dependent nodes are not run. Interactive calibration runs finish with a concise summary and retain full tracebacks in `execution_report.yml`; add `--strict-task-failures` when a nonzero batch status is required. A rerun treats current-policy hard QA results as terminal evidence rather than repeating them unless `--force-replan` is supplied. Inspect any intentionally retained failure scratch with `virusflow cleanup scratch --workdir PATH` before executing deletion.
 
 ## SQLite contention
 
@@ -26,7 +26,7 @@ The registry uses WAL, autocommit, and a busy timeout. Keep external transaction
 
 ## Storage unexpectedly large
 
-Run `virusflow storage report --db PATH --largest 20`, then dry-run `cleanup cache` and `cleanup legacy`. Normal production must not actively register reduced science images, scattered-light-evaluated CCD images, aperture-extracted spectra/variance, per-fiber sky predictions, or standalone sky-subtracted spectra. Never delete legacy payloads until representative validation has passed and reports are preserved.
+Run `virusflow storage report --db PATH --largest 20`, then dry-run `cleanup cache` and `cleanup legacy`. Calibration tasks normally release cacheable dense masters at their validated evidence stage. For a database created before stage eviction was enabled, `virusflow cleanup cache --db PATH --execute` safely backfills eligible evictions and reports candidates refused by QA or incomplete provenance. Normal production must not actively register reduced science images, scattered-light-evaluated CCD images, aperture-extracted spectra/variance, per-fiber sky predictions, or standalone sky-subtracted spectra. Never delete legacy payloads until representative validation has passed and reports are preserved.
 
 ## Matplotlib/font cache warnings
 

@@ -58,9 +58,19 @@ class RegistryAdapter:
             "algorithm": art.provenance.algorithm if art.provenance else "unknown",
             "params": p,
             "parents": [int(p) for p in (art.provenance.parents if art.provenance else [])],
+            "raw_parents": [
+                int(p) for p in (art.provenance.raw_parents if art.provenance else [])
+            ],
+            "raw_catalog": art.provenance.raw_catalog if art.provenance else None,
         }
         from ..artifacts.provenance import build_provenance
-        prov_row = build_provenance(algorithm=prov["algorithm"], params=prov["params"], parents=[str(p) for p in prov["parents"]])
+        prov_row = build_provenance(
+            algorithm=prov["algorithm"],
+            params=prov["params"],
+            parents=[str(p) for p in prov["parents"]],
+            raw_parents=[str(p) for p in prov["raw_parents"]],
+            raw_catalog=prov["raw_catalog"],
+        )
         artifact_id = db.save_artifact(legacy_like, prov_row, db_path=self.db_path)
         scope = art.scope
         relation_rows = []
@@ -75,6 +85,14 @@ class RegistryAdapter:
             if key not in seen:
                 relation_rows.append({"parent_id": key[0], "relation": key[1]})
                 seen.add(key)
+        raw_relation_rows = [
+            {
+                "raw_catalog": str(prov["raw_catalog"] or ""),
+                "raw_id": int(raw_id),
+                "relation": "derived_from",
+            }
+            for raw_id in prov["raw_parents"]
+        ]
         try:
             db.save_artifact_details(
                 artifact_id,
@@ -102,6 +120,7 @@ class RegistryAdapter:
                 },
                 components=list(components or []),
                 relations=relation_rows,
+                raw_relations=raw_relation_rows,
                 db_path=self.db_path,
             )
         except BaseException:
@@ -126,8 +145,34 @@ class RegistryAdapter:
     def list_components(self, artifact_id: int) -> List[dict]:
         return db.list_artifact_components(int(artifact_id), db_path=self.db_path)
 
+    def set_component_payload_states(
+        self, artifact_id: int, updates: Iterable[Dict]
+    ) -> None:
+        db.set_artifact_component_payload_states(
+            int(artifact_id), updates, db_path=self.db_path
+        )
+
+    def list_descendants(
+        self, artifact_id: int, *, kinds: Iterable[str] = ()
+    ) -> List[dict]:
+        return db.list_artifact_descendants(
+            int(artifact_id), db_path=self.db_path, kinds=kinds
+        )
+
+    def list_ancestors(
+        self, artifact_id: int, *, kinds: Iterable[str] = ()
+    ) -> List[dict]:
+        return db.list_artifact_ancestors(
+            int(artifact_id), db_path=self.db_path, kinds=kinds
+        )
+
     def list_relations(self, artifact_id: int) -> List[dict]:
         return db.list_artifact_relations(int(artifact_id), db_path=self.db_path)
+
+    def list_raw_relations(self, artifact_id: int) -> List[dict]:
+        return db.list_raw_artifact_relations(
+            int(artifact_id), db_path=self.db_path
+        )
 
     def get_scientific_metadata(self, artifact_id: int) -> Optional[dict]:
         return db.get_artifact_scientific_metadata(
@@ -163,6 +208,16 @@ class RegistryAdapter:
             if details:
                 row.update(details)
         return rows
+
+    def list_planning_evidence(self) -> List[dict]:
+        """Load the planner's complete Artifact/QA identity snapshot once."""
+
+        return db.list_artifact_planning_evidence(db_path=self.db_path)
+
+    def list_terminal_task_failures(self) -> List[dict]:
+        """Load latest persisted task failures for no-op rerun planning."""
+
+        return db.list_latest_terminal_task_failures(db_path=self.db_path)
 
     # --- Diagnostics ---
     def get_diagnostics(self, artifact_id: int) -> Optional[dict]:

@@ -195,6 +195,7 @@ def _make_group(
 def resolve_calibration_groups(
     *, kind: str, cadence: PurposeCadence, scope: Scope, db_path: str,
     start_date: str | None = None, end_date: str | None = None,
+    source_rows: Iterable[dict[str, Any]] | None = None,
 ) -> GroupingResult:
     """Resolve exact membership before planner deduplication."""
 
@@ -208,10 +209,17 @@ def resolve_calibration_groups(
         "master_hg": ("cmp", "hg"), "master_cd": ("cmp", "cd"),
         "master_sci": ("sci",),
     }.get(kind, tuple(options.get("frame_types", ())))
-    source = db.list_calibration_grouping_rows(
-        db_path=db_path, zipcode=scope.zipcode, frame_types=frame_types,
-        start_date=start_date, end_date=end_date,
-    )
+    if source_rows is None:
+        source = db.list_calibration_grouping_rows(
+            db_path=db_path, zipcode=scope.zipcode, frame_types=frame_types,
+            start_date=start_date, end_date=end_date,
+        )
+    else:
+        accepted_types = set(frame_types)
+        source = [
+            row for row in source_rows
+            if str(row.get("frame_type") or "").lower() in accepted_types
+        ]
     rows: list[dict[str, Any]] = []
     exclusions: list[dict[str, Any]] = []
     threshold = float(options.get("minimum_exposure_seconds", 300.0))

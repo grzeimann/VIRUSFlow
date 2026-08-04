@@ -50,6 +50,12 @@ dependency propagation therefore reports the bias as the failed root cause and
 the affected downstream products as blocked; the wavelength algorithm is not
 run and cannot obscure the earlier detector-health diagnosis.
 
+On later identical plans, a failed task recorded by the executor or a failed
+Artifact evaluated under the current QA policy is a terminal planning outcome.
+The planner retains it and marks dependent targets terminal without executing
+them again. `--force-replan` explicitly discards that terminal shortcut when a
+new measurement is intended.
+
 This is a temporary operational scientific disposition pending broader
 time-series validation. Elevated electronic read noise can arise from controller
 or preamplifier degradation, grounding or shielding changes, pickup, unstable
@@ -152,7 +158,7 @@ nodes:
 ```
 
 Run `virusflow run calibrations ... --plan-only` before execution. The emitted
-`planning_report.yml` includes exact members, inclusion/exclusion reasons,
+`planning_report.json` includes exact members, inclusion/exclusion reasons,
 exposure-time and temperature statistics, sufficiency, computation identity,
 applicability, lamp pairing/separation, deduplication, and downstream
 requesters.

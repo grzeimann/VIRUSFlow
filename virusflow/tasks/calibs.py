@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from typing import Dict, Iterable, Type
 
 import numpy as np
@@ -49,6 +50,9 @@ from ..ontology.artifact_kinds import kind_spec
 from ..persistence.policy import DefaultPersistencePolicy
 from ..publication.context import PublicationContext
 from ..publication.service import DefaultPublicationService
+
+
+logger = logging.getLogger(__name__)
 
 
 def _model_type(value) -> str:
@@ -109,10 +113,12 @@ class _CanonicalTask(CalibrationTask):
         result: AlgoResult,
         parent_ids: Iterable[int],
         *,
+        raw_parent_ids: Iterable[int] = (),
         configuration_refs=None,
         parameters=None,
     ):
         parent_ids = [int(value) for value in parent_ids]
+        raw_parent_ids = [int(value) for value in raw_parent_ids]
         spec = kind_spec(self.artifact_name)
         components = self._components(result)
         summaries = dict(result.scalars or {})
@@ -134,6 +140,10 @@ class _CanonicalTask(CalibrationTask):
             scientific_metadata=scientific_metadata,
             scope=Scope(zipcode=self.target.zipcode, physical_scope=spec.scope),
             parents=parent_ids,
+            raw_parents=raw_parent_ids,
+            raw_catalog=(
+                str(self.ctx.resolved_raw_db_path()) if raw_parent_ids else None
+            ),
             validity=self.target_validity(),
             configuration_refs=list(configuration_refs or self.configuration_references()),
             labels=["calibration", self.artifact_name],
@@ -154,6 +164,42 @@ class _CanonicalTask(CalibrationTask):
         )
         artifact = publisher.publish([request], context)[0]
         self.evaluate_qa(service, artifact, result)
+        # A validated terminal evidence Product is the earliest safe point to
+        # release dense rebuildable ancestors.  This follows only this
+        # Product's provenance chain; it is not a registry-wide cleanup pass.
+        try:
+            from ..performance import current_task_timing, phase
+
+            with phase("payload_retention"):
+                eviction = service.evict_payloads_triggered_by(int(artifact.id))
+            timing = current_task_timing()
+            if timing is not None:
+                timing.increment(
+                    "retention_candidates", int(eviction.get("candidate_count") or 0)
+                )
+                timing.increment(
+                    "retention_artifacts_evicted",
+                    len(eviction.get("evicted_artifact_ids") or []),
+                )
+                timing.increment(
+                    "retention_bytes_removed", int(eviction.get("removed_bytes") or 0)
+                )
+        except Exception:
+            logger.exception(
+                "Payload retention hook failed after publishing %s (artifact_id=%s); "
+                "the scientific Product remains valid",
+                artifact.kind,
+                artifact.id,
+            )
+        else:
+            for refusal in eviction["refused"]:
+                logger.warning(
+                    "Payload eviction deferred for %s (artifact_id=%s) after %s: %s",
+                    refusal["kind"],
+                    refusal["artifact_id"],
+                    artifact.kind,
+                    refusal["reason"],
+                )
         return artifact
 
 
@@ -192,7 +238,7 @@ class _RawCalibrationTask(_CanonicalTask):
         result.meta.update(aggregate_scientific_metadata(
             db.list_raw_scientific_metadata(parent_ids, db_path=self.ctx.resolved_raw_db_path())
         ))
-        artifact = self._publish(result, parent_ids)
+        artifact = self._publish(result, [], raw_parent_ids=parent_ids)
         return {self.artifact_name: artifact}
 
 
