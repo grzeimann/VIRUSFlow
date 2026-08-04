@@ -168,6 +168,9 @@ def test_exposure_selection_does_not_construct_missing_calibrations(monkeypatch,
         def __init__(self, path):
             self.adapter = self
 
+        def find(self, **kwargs):
+            return []
+
         def select_best(self, *, kind, scope, at_time, policy):
             nonlocal selections
             with state_lock:
@@ -201,6 +204,9 @@ def test_exposure_selection_falls_back_to_nearest_calibration(monkeypatch, tmp_p
         def __init__(self, path):
             self.adapter = self
 
+        def find(self, **kwargs):
+            return []
+
         def select_best(self, *, kind, scope, at_time, policy):
             policies.append(policy)
             return nearest if policy == "nearest" else None
@@ -217,7 +223,10 @@ def test_exposure_selection_falls_back_to_nearest_calibration(monkeypatch, tmp_p
 
     assert policies == ["latest_valid", "nearest"]
     assert available[zipcode.key()] == {"master_bias": nearest}
-    assert failures == {}
+    assert any(
+        "amp_to_amp_normalization: missing published calibration build" in message
+        for message in failures[zipcode.key()]
+    )
 
 
 def test_interrupted_partial_report_is_writable(tmp_path: Path):

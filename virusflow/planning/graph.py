@@ -20,6 +20,7 @@ import json
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..artifacts.models import Scope
+from ..ontology.scopes import PhysicalScope
 from ..artifacts.service import ArtifactService
 from ..registry import database as db
 
@@ -142,6 +143,14 @@ class ReductionGraph:
             zipcode = getattr(scope, "zipcode", None)
             return zipcode.key() if zipcode is not None else "__global__"
 
+        def optional_input(dst_kind: str, src_kind: str) -> bool:
+            return any(
+                edge.src.kind == src_kind
+                and edge.dst.kind == dst_kind
+                and edge.policy.startswith("optional_")
+                for edge in self.edges
+            )
+
         evidence_loader = getattr(svc.adapter, "list_planning_evidence", None)
         evidence_snapshot = evidence_loader() if callable(evidence_loader) else None
         evidence_by_scope: Dict[Tuple[str, str], List[dict]] = {}
@@ -184,7 +193,10 @@ class ReductionGraph:
         def rows_for(target: Target) -> List[dict]:
             key = (target.kind, scope_key(target.scope))
             if evidence_snapshot is not None:
-                return evidence_by_scope.get(key, [])
+                return evidence_by_scope.get(key, []) or (
+                    evidence_by_scope.get((target.kind, ""), [])
+                    if key[1] == "__global__" else []
+                )
             return [
                 row for row in svc.adapter.list_all(kind=target.kind)
                 if row.get("amp_key") == key[1]
@@ -396,6 +408,75 @@ class ReductionGraph:
                         emit(target)
                 continue
 
+            if (
+                node.cadence is None and has_up
+                and node.scope_mode == "calibration_build"
+            ):
+                upstream = (node.inputs_artifacts or [""])[0]
+                sources = [
+                    target
+                    for scope in scopes
+                    for target in available.get((upstream, scope_key(scope)), [])
+                    if target.group is not None
+                ]
+                builds: Dict[tuple, List[Target]] = {}
+                for source in sources:
+                    identity = tuple(source.group.exposure_ids) or (
+                        source.window.start.isoformat() if source.window and source.window.start else None,
+                        source.window.end.isoformat() if source.window and source.window.end else None,
+                    )
+                    builds.setdefault(identity, []).append(source)
+                for exposure_ids, members in sorted(builds.items(), key=lambda item: str(item[0])):
+                    members.sort(key=lambda target: scope_key(target.scope))
+                    parent_groups = tuple(
+                        (upstream, member.group.group_id) for member in members
+                    )
+                    amplifier_keys = [scope_key(member.scope) for member in members]
+                    identity = hashlib.sha256(json.dumps({
+                        "kind": node.kind,
+                        "parents": parent_groups,
+                        "amplifier_keys": amplifier_keys,
+                    }, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+                    timestamps = tuple(sorted({
+                        timestamp for member in members for timestamp in member.group.timestamps
+                    }))
+                    starts = [
+                        member.window.start for member in members
+                        if member.window is not None and member.window.start is not None
+                    ]
+                    ends = [
+                        member.window.end for member in members
+                        if member.window is not None and member.window.end is not None
+                    ]
+                    start = max(starts) if starts else timestamps[0]
+                    end = min(ends) if ends else timestamps[-1]
+                    group = CalibrationGroup(
+                        group_id=f"{node.kind}:build:{identity[:12]}",
+                        computation_id=identity,
+                        policy="coherent_calibration_build",
+                        raw_ids=(),
+                        exposure_ids=tuple(str(value) for value in exposure_ids if value),
+                        timestamps=timestamps,
+                        metadata={
+                            "parent_groups": list(parent_groups),
+                            "amplifier_keys": amplifier_keys,
+                            "calibration_build_id": identity,
+                            "coverage_count": len(amplifier_keys),
+                        },
+                        applicability={
+                            "start": start.isoformat(), "end": end.isoformat(),
+                            "selection_domain": "coherent_center_track_twilight_build",
+                        },
+                    )
+                    emit(Target(
+                        kind=node.kind,
+                        scope=Scope(zipcode=None, physical_scope=PhysicalScope.EXPOSURE),
+                        window=TemporalWindow(start, end),
+                        group=group,
+                        parent_groups=parent_groups,
+                    ))
+                continue
+
             if node.cadence is None and has_up:
                 for scope in scopes:
                     sources = available.get(((node.inputs_artifacts or [""])[0], scope_key(scope)), [])
@@ -413,6 +494,8 @@ class ReductionGraph:
                             choices = [candidate for candidate in available.get((upstream, scope_key(scope)), [])
                                        if candidate.group is not None]
                             if not choices:
+                                if optional_input(node.kind, upstream):
+                                    continue
                                 compatible = False
                                 break
                             choice = min(choices, key=lambda candidate: (
@@ -423,6 +506,44 @@ class ReductionGraph:
                             parents.append((upstream, choice.group.group_id))
                         if not compatible:
                             continue
+                        paired_keys = None
+                        if node.scope_mode == "physical_ccd_pair":
+                            zipcode = scope.zipcode
+                            partner_amp = {"LL": "LU", "LU": "LL", "RU": "RL", "RL": "RU"}[
+                                zipcode.amp
+                            ]
+                            partner_key = type(zipcode)(
+                                zipcode.ifuslot, zipcode.ifuid, zipcode.specid,
+                                partner_amp, zipcode.controller,
+                            ).key()
+                            paired_keys = sorted([scope_key(scope), partner_key])
+                            for upstream in node.inputs_artifacts or []:
+                                choices = [
+                                    candidate for candidate in available.get((upstream, partner_key), [])
+                                    if candidate.group is not None
+                                ]
+                                if not choices:
+                                    if optional_input(node.kind, upstream):
+                                        continue
+                                    compatible = False
+                                    break
+                                exact = [
+                                    candidate for candidate in choices
+                                    if tuple(candidate.group.exposure_ids)
+                                    == tuple(source.group.exposure_ids)
+                                ]
+                                pool = exact or choices
+                                choice = min(pool, key=lambda candidate: (
+                                    abs(((candidate.group.timestamps[0] +
+                                          (candidate.group.timestamps[-1] - candidate.group.timestamps[0]) / 2)
+                                         - center).total_seconds()),
+                                    candidate.group.group_id,
+                                ))
+                                parent = (upstream, choice.group.group_id)
+                                if parent not in parents:
+                                    parents.append(parent)
+                        if not compatible:
+                            continue
                         identity = hashlib.sha256(json.dumps({
                             "kind": node.kind, "parents": parents, "zipcode": scope_key(scope)
                         }, sort_keys=True).encode("utf-8")).hexdigest()[:24]
@@ -431,7 +552,10 @@ class ReductionGraph:
                             computation_id=identity, policy="derived_from_resolved_groups",
                             raw_ids=(), exposure_ids=source.group.exposure_ids,
                             timestamps=source.group.timestamps,
-                            metadata={"parent_groups": parents},
+                            metadata={
+                                "parent_groups": parents,
+                                "paired_amplifier_keys": paired_keys,
+                            },
                             applicability=dict(source.group.applicability),
                         )
                         emit(Target(

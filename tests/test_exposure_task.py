@@ -22,13 +22,14 @@ from virusflow.tasks.base import TaskContext
 from virusflow.tasks.exposure import ExposureTask
 
 
-def _publish(service, root, kind, zipcode, components, at):
+def _publish(service, root, kind, zipcode, components, at, *, parents=(), metadata=None):
     request = ArtifactRequest(
         kind=kind, components={
             name: LogicalComponent(name, "array1d" if np.asarray(value).ndim == 1 else "array2d", value)
             for name, value in components.items()
         },
         scope=Scope(zipcode=zipcode), validity=Validity(at, at, "fixture"),
+        parents=list(parents), metadata=dict(metadata or {}),
     )
     publication = DefaultPublicationService(svc=service, policy=DefaultPersistencePolicy(), base_dir=str(root))
     context = PublicationContext("fixture", "1", "fixture", "1", {}, [], {})
@@ -77,6 +78,7 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
                 (exposure_id, "sci", str(path), None, "filesystem", zipcode.key()),
             )
 
+    response_rows = []
     for zipcode in zipcodes:
         zero = np.zeros((1032, nx), dtype=np.float32)
         one = np.ones((1032, nx), dtype=np.float32)
@@ -103,13 +105,54 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
             "per_fiber_wavelength_residual_rms": np.zeros(trace.shape[0]),
         }, at)
         normalization = np.ones_like(amplifier_wavelength, dtype=np.float32)
-        _publish(service, tmp_path, "within_amp_fiber_normalization", zipcode, {
+        response_rows.append(_publish(service, tmp_path, "within_amp_fiber_normalization", zipcode, {
             "raw_ratio": normalization,
             "normalization": normalization,
             "valid_mask": np.ones_like(normalization, dtype=np.uint8),
             "common_twilight": np.full_like(normalization, 1000.0),
             "amplifier_twilight_level": np.asarray([1000.0], dtype=np.float32),
-        }, at)
+        }, at))
+    amp_build = _publish(
+        service, tmp_path, "amp_to_amp_normalization", None,
+        {
+            "amplifier_factors": np.ones(len(zipcodes), dtype=np.float32),
+            "amplifier_twilight_levels": np.full(len(zipcodes), 1000.0, dtype=np.float32),
+            "reference_level": np.asarray([1000.0], dtype=np.float32),
+            "amplifier_identity": np.asarray([
+                [int(item.ifuslot), int(item.ifuid), int(item.specid), index]
+                for index, item in enumerate(zipcodes)
+            ], dtype=np.int32),
+        },
+        at,
+        parents=[row.id for row in response_rows],
+        metadata={
+            "algorithm_metadata": {
+                "amplifier_keys": [item.key() for item in zipcodes],
+                "coverage_complete": True,
+                "calibration_build_id": "fixture-build",
+            }
+        },
+    )
+    # A newer partial build must not displace the coherent build that covers
+    # every amplifier in this science exposure.
+    _publish(
+        service, tmp_path, "amp_to_amp_normalization", None,
+        {
+            "amplifier_factors": np.ones(1, dtype=np.float32),
+            "amplifier_twilight_levels": np.asarray([1000.0], dtype=np.float32),
+            "reference_level": np.asarray([1000.0], dtype=np.float32),
+            "amplifier_identity": np.asarray([[60, 3, 206, 0]], dtype=np.int32),
+        },
+        at,
+        parents=[response_rows[0].id],
+        metadata={
+            "algorithm_metadata": {
+                "amplifier_keys": [zipcodes[0].key()],
+                "coverage_complete": True,
+                "calibration_build_id": "fixture-partial-build",
+            }
+        },
+    )
 
     config = ConfigurationService(root=Path.cwd())
     fplane, _ = config.resolve_fplane(Path.cwd() / "fplaneall.txt")
@@ -170,6 +213,9 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     normalization_rows = service.adapter.list_all(kind="within_amp_fiber_normalization")
     assert len(normalization_rows) == 4
     assert all(row["exposure_id"] is None for row in normalization_rows)
+    assert result["amp_to_amp_normalization"].id == amp_build.id
+    assert service.adapter.get_row(amp_build.id)["exposure_id"] is None
+    assert len(service.adapter.list_all(kind="amp_to_amp_normalization")) == 2
     assert result["calibrated_fiber_state"].flux.dtype == np.float32
     identity = result["calibrated_fiber_state"].fiber_identity
     assert identity.shape[0] == 4 * 112 - 1

@@ -165,13 +165,17 @@ def test_ldls_eviction_preserves_evidentiary_mask(tmp_path: Path):
     service, publisher = _fixture(tmp_path)
     ldls = _publish(publisher, "master_ldls")
     trace = _publish(publisher, "trace_map", parents=[ldls.id])
+    scatter = _publish(
+        publisher, "ccd_scattered_light_model", parents=[ldls.id, trace.id]
+    )
     spectrum = _publish(
-        publisher, "extracted_master_ldls_spectrum", parents=[ldls.id, trace.id]
+        publisher, "extracted_master_ldls_spectrum",
+        parents=[ldls.id, trace.id, scatter.id],
     )
     response = _publish(
         publisher, "within_amp_fiber_normalization", parents=[spectrum.id]
     )
-    _pass_qa(service, ldls, trace, spectrum, response)
+    _pass_qa(service, ldls, trace, scatter, spectrum, response)
 
     service.evict_payload(ldls.id)
 
@@ -208,14 +212,21 @@ def test_fiber_response_stage_evicts_only_dense_flat_payloads(tmp_path: Path):
     service, publisher = _fixture(tmp_path)
     ldls = _publish(publisher, "master_ldls")
     trace = _publish(publisher, "trace_map", parents=[ldls.id])
+    ldls_scatter = _publish(
+        publisher, "ccd_scattered_light_model", parents=[ldls.id, trace.id]
+    )
     ldls_spectrum = _publish(
-        publisher, "extracted_master_ldls_spectrum", parents=[ldls.id, trace.id]
+        publisher, "extracted_master_ldls_spectrum",
+        parents=[ldls.id, trace.id, ldls_scatter.id],
     )
     twilight = _publish(publisher, "master_twilight")
+    twilight_scatter = _publish(
+        publisher, "ccd_scattered_light_model", parents=[twilight.id, trace.id]
+    )
     twilight_spectrum = _publish(
         publisher,
         "extracted_master_twilight_spectrum",
-        parents=[twilight.id, trace.id],
+        parents=[twilight.id, trace.id, twilight_scatter.id],
     )
     response = _publish(
         publisher,
@@ -226,8 +237,10 @@ def test_fiber_response_stage_evicts_only_dense_flat_payloads(tmp_path: Path):
         service,
         ldls,
         trace,
+        ldls_scatter,
         ldls_spectrum,
         twilight,
+        twilight_scatter,
         twilight_spectrum,
         response,
     )
@@ -247,13 +260,14 @@ def test_fiber_response_stage_evicts_only_dense_flat_payloads(tmp_path: Path):
 def test_spectral_mask_stage_evicts_master_sci(tmp_path: Path):
     service, publisher = _fixture(tmp_path)
     science = _publish(publisher, "master_sci")
+    scatter = _publish(publisher, "ccd_scattered_light_model", parents=[science.id])
     spectrum = _publish(
-        publisher, "extracted_master_sci_spectrum", parents=[science.id]
+        publisher, "extracted_master_sci_spectrum", parents=[science.id, scatter.id]
     )
     mask = _publish(
         publisher, "fiber_wavelength_spectral_mask", parents=[spectrum.id]
     )
-    _pass_qa(service, science, spectrum, mask)
+    _pass_qa(service, science, scatter, spectrum, mask)
 
     report = service.evict_payloads_triggered_by(mask.id)
 

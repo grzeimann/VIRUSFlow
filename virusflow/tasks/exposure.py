@@ -23,9 +23,7 @@ from ..algorithms.exposure import CalibratedFiberState, apply_relative_response
 from ..algorithms.exposure_state import classify_mode_and_effective_time
 from ..algorithms.extraction import extract_fractional_aperture, validate_wavelength_rows
 from ..algorithms.response import (
-    NORMALIZATION_VERSION,
     RESPONSE_VERSION,
-    amplifier_normalization,
     baseline_relative_response,
     compact_fiber_response,
     measure_exposure_illumination,
@@ -54,7 +52,7 @@ from ..planning.targets import PhysicalCCDTarget
 AMP_CODE = {"LL": 0, "LU": 1, "RU": 2, "RL": 3}
 CALIBRATION_KINDS = (
     "master_bias", "master_dark", "master_ldls", "master_arc",
-    "trace_map", "wavelength_map", "within_amp_fiber_normalization",
+    "trace_map", "wavelength_map",
 )
 
 
@@ -154,6 +152,45 @@ class ExposureTask(_SciencePublisher):
         service = ArtifactService(self.ctx.db_path)
         available = {}
         failures = {}
+        requested_keys = {zipcode.key() for zipcode in zipcodes}
+        candidate_sets = [
+            service.adapter.find(
+                kind="amp_to_amp_normalization", zipcode=None, at_time=at, limit=None
+            ),
+            service.adapter.find(
+                kind="amp_to_amp_normalization", zipcode=None, at_time=None, limit=None
+            ),
+        ]
+        amp_normalization = None
+        response_by_key = {}
+        seen_builds = set()
+        for candidates in candidate_sets:
+            for candidate in candidates:
+                candidate_id = int(candidate["id"])
+                if candidate_id in seen_builds:
+                    continue
+                seen_builds.add(candidate_id)
+                if (
+                    candidate.get("amp_key") is not None
+                    or candidate.get("exposure_id") is not None
+                    or str(candidate.get("state") or "active") != "active"
+                ):
+                    continue
+                candidate_responses = {}
+                for parent_id in service.describe(candidate)["provenance"]["parents"]:
+                    row = service.adapter.get_row(int(parent_id))
+                    if (
+                        row is not None
+                        and row.get("kind") == "within_amp_fiber_normalization"
+                        and row.get("amp_key")
+                    ):
+                        candidate_responses[str(row["amp_key"])] = row
+                if requested_keys <= set(candidate_responses):
+                    amp_normalization = candidate
+                    response_by_key = candidate_responses
+                    break
+            if amp_normalization is not None:
+                break
         for zipcode in zipcodes:
             kinds = {}
             for kind in CALIBRATION_KINDS:
@@ -173,6 +210,21 @@ class ExposureTask(_SciencePublisher):
                     )
                     continue
                 kinds[kind] = existing
+            response = response_by_key.get(zipcode.key())
+            if response is None:
+                failures.setdefault(zipcode.key(), []).append(
+                    "within_amp_fiber_normalization: absent from selected coherent "
+                    "amp_to_amp_normalization calibration build; run 'virusflow run calibrations' first"
+                )
+            else:
+                kinds["within_amp_fiber_normalization"] = response
+            if amp_normalization is None:
+                failures.setdefault(zipcode.key(), []).append(
+                    "amp_to_amp_normalization: missing published calibration build; "
+                    "run 'virusflow run calibrations' first"
+                )
+            else:
+                kinds["amp_to_amp_normalization"] = amp_normalization
             available[zipcode.key()] = kinds
         return available, failures
 
@@ -281,7 +333,10 @@ class ExposureTask(_SciencePublisher):
         calibration, failures = self._ensure_calibrations(zipcodes, at)
         complete_calibration_keys = {
             key for key, kinds in calibration.items()
-            if all(kind in kinds for kind in CALIBRATION_KINDS)
+            if all(kind in kinds for kind in (
+                *CALIBRATION_KINDS,
+                "within_amp_fiber_normalization", "amp_to_amp_normalization",
+            ))
         }
         if not complete_calibration_keys:
             raise RuntimeError(self._no_extractable_message(
@@ -378,30 +433,10 @@ class ExposureTask(_SciencePublisher):
                         service.load_component(normalization_row, "valid_mask")["data"],
                         dtype=np.uint8,
                     )
-                    try:
-                        twilight_level = float(np.asarray(
-                            service.load_component(
-                                normalization_row, "amplifier_twilight_level"
-                            )["data"]
-                        ).ravel()[0])
-                    except (KeyError, FileNotFoundError, ValueError):
-                        # Compatibility for pre-LDLS/twilight-factorization
-                        # Products.  New calibration Tasks always persist the
-                        # explicit scalar used by the amplifier comparison.
-                        twilight_level = float(np.nanmedian(
-                            service.load_component(
-                                normalization_row, "common_twilight"
-                            )["data"]
-                        ))
                     spectrum_shape = extraction.get_array("spectrum").shape
                     if within.shape != spectrum_shape or normalization_valid.shape != spectrum_shape:
                         failures.setdefault(zipcode.key(), []).append(
                             "fiber normalization or validity shape does not match extracted spectrum"
-                        )
-                        continue
-                    if not np.isfinite(twilight_level) or twilight_level <= 0.0:
-                        failures.setdefault(zipcode.key(), []).append(
-                            "fiber normalization has no finite positive twilight anchor"
                         )
                         continue
                     wave_row = calibration[zipcode.key()]["wavelength_map"]
@@ -439,7 +474,6 @@ class ExposureTask(_SciencePublisher):
                         "within": within,
                         "wavelength": wavelength,
                         "valid_wavelength_rows": valid_wavelength_rows,
-                        "twilight_level": twilight_level,
                         "parent_ids": within_amp_parents,
                         "normalization_valid": normalization_valid,
                     }
@@ -447,36 +481,47 @@ class ExposureTask(_SciencePublisher):
         ordered_keys = sorted(amp_results)
         if not ordered_keys:
             raise RuntimeError(self._no_extractable_message(exposure_id, failures))
-        levels = np.asarray([amp_results[key]["twilight_level"] for key in ordered_keys], dtype=float)
-        amp_normalization_result = amplifier_normalization(levels)
-        amp_factors = amp_normalization_result.get_array("amplifier_factors")
-        reference_level = amp_normalization_result.scalars["reference_level"]
-        amp_identity = np.asarray([
-            [int(amp_results[key]["zipcode"].ifuslot), int(amp_results[key]["zipcode"].specid), AMP_CODE[amp_results[key]["zipcode"].amp]]
+        amp_rows = {
+            int(calibration[key]["amp_to_amp_normalization"]["id"]):
+            calibration[key]["amp_to_amp_normalization"]
             for key in ordered_keys
-        ], dtype=np.int32)
-        exposure_scope = Scope(zipcode=None, exposure_id=exposure_id, physical_scope=PhysicalScope.EXPOSURE)
-        amp_artifact = self._request(
-            kind="amp_to_amp_normalization", scope=exposure_scope,
-            components={
-                "amplifier_factors": _component("amplifier_factors", amp_factors, "1", "none"),
-                "amplifier_twilight_levels": _component("amplifier_twilight_levels", levels, "electron", "none"),
-                "reference_level": _component("reference_level", np.asarray([reference_level]), "electron", "none"),
-                "amplifier_identity": _component("amplifier_identity", amp_identity, "1", "none"),
-            },
-            parents=sorted({parent for item in amp_results.values() for parent in item["parent_ids"]}),
-            summaries={
-                "amplifier_count": len(ordered_keys),
-                "factor_median": float(np.nanmedian(amp_factors)),
-                "factor_robust_sigma": float(1.4826 * np.nanmedian(np.abs(amp_factors - np.nanmedian(amp_factors)))),
-            },
-            refs=exposure_refs, assumptions=["Center-track twilight is uniform across the exposure."],
-            algorithm="virusflow.algorithms.response.amplifier_normalization", version=NORMALIZATION_VERSION,
+        }
+        if len(amp_rows) != 1:
+            raise RuntimeError(
+                "selected within-amplifier responses do not share one coherent "
+                "amp_to_amp_normalization calibration build"
+            )
+        amp_row = next(iter(amp_rows.values()))
+        amp_artifact_id = int(amp_row["id"])
+        amp_description = service.describe(amp_row)
+        amplifier_keys = list(
+            (amp_description["summary"].get("algorithm_metadata") or {}).get(
+                "amplifier_keys"
+            ) or []
         )
+        stored_factors = np.asarray(
+            service.load_component(amp_row, "amplifier_factors")["data"], dtype=np.float32
+        )
+        if len(amplifier_keys) != stored_factors.size:
+            raise RuntimeError(
+                "selected amp_to_amp_normalization coverage metadata does not match its factors"
+            )
+        factor_by_key = dict(zip(amplifier_keys, stored_factors))
+        missing_factors = [key for key in ordered_keys if key not in factor_by_key]
+        if missing_factors:
+            raise RuntimeError(
+                "selected amp_to_amp_normalization does not cover extracted amplifiers: "
+                + ", ".join(missing_factors)
+            )
+        amp_factors = np.asarray([factor_by_key[key] for key in ordered_keys], dtype=np.float32)
+        if not np.all(np.isfinite(amp_factors) & (amp_factors > 0.0)):
+            raise RuntimeError("selected calibration amplifier factors must be finite and positive")
+        exposure_scope = Scope(zipcode=None, exposure_id=exposure_id, physical_scope=PhysicalScope.EXPOSURE)
+        amp_artifact = service.get(amp_artifact_id)
 
         frame = self._assemble_global_fiber_frame(
             ordered_keys=ordered_keys, amp_results=amp_results, amp_factors=amp_factors,
-            amp_artifact_id=int(amp_artifact.id), fplane=fplane,
+            amp_artifact_id=amp_artifact_id, fplane=fplane,
             fiber_offsets_by_ifuid=fiber_offsets_by_ifuid, failures=failures,
             exposure_id=exposure_id,
         )
@@ -737,7 +782,8 @@ class ExposureTask(_SciencePublisher):
                 "knot_count": int(response_model.wavelength_knots.shape[1]),
             },
             metadata={
-                "composition": ["baseline_relative_response", "within_amplifier_fiber_normalization", "amplifier_normalization", "exposure_illumination_correction"],
+                "composition": ["baseline_relative_response", "within_amplifier_fiber_normalization", "calibration_build_amp_to_amp_normalization", "exposure_illumination_correction"],
+                "calibration_build_amp_to_amp_artifact_id": amp_artifact_id,
                 "interpolation": "linear_in_wavelength",
             },
             refs=exposure_refs, algorithm="virusflow.algorithms.response.compact_fiber_response", version=RESPONSE_VERSION,

@@ -38,6 +38,7 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
     - extracted_master_ldls_spectrum: derived from master_ldls + trace_map
     - extracted_master_twilight_spectrum: derived from master_twilight + trace_map
     - within_amp_fiber_normalization: LDLS-fine response anchored by twilight
+    - amp_to_amp_normalization: coherent calibration-build amplifier scale
     - fiber_wavelength_spectral_mask: derived from extracted spectra + wavelength_map
     - master_bias: hard QA gate for every other raw calibration branch
 
@@ -124,7 +125,7 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         task_cls=_TaskPlaceholder,
         inputs_raw=None,
         inputs_artifacts=["master_sci", "trace_map"],
-        scope_mode="per_zipcode",
+        scope_mode="physical_ccd_pair",
         cadence=None,
     )
     master_ldls_spectrum = TaskSpec(
@@ -132,7 +133,7 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         task_cls=_TaskPlaceholder,
         inputs_raw=None,
         inputs_artifacts=["master_ldls", "trace_map"],
-        scope_mode="per_zipcode",
+        scope_mode="physical_ccd_pair",
         cadence=None,
     )
     master_twilight_spectrum = TaskSpec(
@@ -140,7 +141,7 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         task_cls=_TaskPlaceholder,
         inputs_raw=None,
         inputs_artifacts=["master_twilight", "trace_map"],
-        scope_mode="per_zipcode",
+        scope_mode="physical_ccd_pair",
         cadence=None,
     )
     amplifier_fiber_response = TaskSpec(
@@ -151,8 +152,17 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
             "extracted_master_twilight_spectrum",
             "extracted_master_ldls_spectrum",
             "wavelength_map",
+            "extracted_master_sci_spectrum",
         ],
-        scope_mode="per_zipcode",
+        scope_mode="physical_ccd_pair",
+        cadence=None,
+    )
+    calibration_amp_normalization = TaskSpec(
+        kind="amp_to_amp_normalization",
+        task_cls=_TaskPlaceholder,
+        inputs_raw=None,
+        inputs_artifacts=["within_amp_fiber_normalization"],
+        scope_mode="calibration_build",
         cadence=None,
     )
     master_sci_mask = TaskSpec(
@@ -167,7 +177,7 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
     nodes = [
         bias, dark, flat, hg, cd, arc, twilight, master_sci, trace, wave,
         master_ldls_spectrum, master_twilight_spectrum, master_sci_spectrum,
-        amplifier_fiber_response, master_sci_mask,
+        amplifier_fiber_response, calibration_amp_normalization, master_sci_mask,
     ]
 
     # Edges (base)
@@ -190,6 +200,11 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         Edge(src=bias, dst=master_twilight_spectrum, policy="qa_gate", tolerance_days=1),
         Edge(src=bias, dst=amplifier_fiber_response, policy="qa_gate", tolerance_days=1),
         Edge(src=bias, dst=master_sci_mask, policy="qa_gate", tolerance_days=1),
+        # Reusable response illumination is detector corrected with the same
+        # implemented bias + scaled-dark-residual convention as science data.
+        Edge(src=dark, dst=flat, policy="nearest_valid", tolerance_days=90),
+        Edge(src=dark, dst=twilight, policy="nearest_valid", tolerance_days=90),
+        Edge(src=dark, dst=master_sci, policy="nearest_valid", tolerance_days=90),
         Edge(src=flat, dst=trace, policy="latest_valid", tolerance_days=90),
         Edge(src=hg, dst=arc, policy="nearest_valid", tolerance_days=1),
         Edge(src=cd, dst=arc, policy="nearest_valid", tolerance_days=1),
@@ -204,6 +219,8 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         Edge(src=master_twilight_spectrum, dst=amplifier_fiber_response, policy="exact_parent_group", tolerance_days=0),
         Edge(src=master_ldls_spectrum, dst=amplifier_fiber_response, policy="nearest_valid", tolerance_days=90),
         Edge(src=wave, dst=amplifier_fiber_response, policy="nearest_valid", tolerance_days=90),
+        Edge(src=master_sci_spectrum, dst=amplifier_fiber_response, policy="optional_nearest_valid", tolerance_days=90),
+        Edge(src=amplifier_fiber_response, dst=calibration_amp_normalization, policy="coherent_calibration_build", tolerance_days=0),
         Edge(src=master_sci_spectrum, dst=master_sci_mask, policy="exact_parent_group", tolerance_days=0),
         Edge(src=wave, dst=master_sci_mask, policy="latest_valid", tolerance_days=90),
     ]

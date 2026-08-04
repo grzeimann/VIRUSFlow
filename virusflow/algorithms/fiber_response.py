@@ -12,7 +12,7 @@ from ..core.algo_result import AlgoResult
 from .utils.masks import build_model_spectra
 
 
-FIBER_RESPONSE_VERSION = "ldls-fine-twilight-anchor-1.0"
+FIBER_RESPONSE_VERSION = "ldls-fine-twilight-anchor-1.1"
 
 
 def _safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
@@ -191,6 +191,8 @@ def fit_within_amplifier_response(
             "large_scale_anchor": "master_twilight",
             "twilight_reference_mode": "robust_common_fiber_spectrum",
             "science_role": "validation_only" if science is not None else "not_available",
-            "scattered_light_treatment": "not_applied_to_calibration_master_spectra",
+            "scattered_light_treatment": (
+                "paired_physical_ccd_gap_model_subtracted_before_extraction"
+            ),
         },
     )

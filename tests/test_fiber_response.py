@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from virusflow.algorithms.fiber_response import fit_within_amplifier_response
+from virusflow.algorithms.calibration_detector import correct_response_calibration_frames
 
 
 def _calibration_spectra():
@@ -79,3 +80,30 @@ def test_fiber_response_rejects_incompatible_calibration_shapes():
     ldls, twilight, _, wavelength, _ = _calibration_spectra()
     with np.testing.assert_raises_regex(ValueError, "matching 2D arrays"):
         fit_within_amplifier_response(ldls[:, :-1], twilight, wavelength)
+
+
+def test_response_calibration_detector_correction_matches_science_convention():
+    images = np.asarray([np.full((2, 3), 150.0), np.full((2, 3), 180.0)])
+    variance = np.full_like(images, 4.0)
+    bias = np.full((2, 3), 10.0)
+    dark = np.full((2, 3), 14.0)
+    bias_scatter = np.full((2, 3), 2.0)
+    dark_mask = np.zeros((2, 3), dtype=np.uint8)
+    dark_mask[0, 1] = 1
+
+    result = correct_response_calibration_frames(
+        images,
+        variance,
+        [20.0, 40.0],
+        master_bias=bias,
+        master_bias_scatter=bias_scatter,
+        master_dark=dark,
+        dark_pixel_mask=dark_mask,
+        dark_reference_exposure_time=20.0,
+    )
+
+    np.testing.assert_allclose(result.get_array("corrected_images")[0], 136.0)
+    np.testing.assert_allclose(result.get_array("corrected_images")[1], 162.0)
+    np.testing.assert_allclose(result.get_array("corrected_variances"), 8.0)
+    assert np.all(result.get_array("pixel_masks")[:, 0, 1] == 1)
+    np.testing.assert_allclose(result.get_array("dark_scales"), [1.0, 2.0])

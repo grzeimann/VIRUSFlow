@@ -30,13 +30,18 @@ CACHEABLE_CALIBRATION_PAYLOADS: dict[str, PayloadRetentionRule] = {
     ),
     "master_twilight": PayloadRetentionRule(
         ("master_twilight",),
-        ("extracted_master_twilight_spectrum", "within_amp_fiber_normalization"),
+        (
+            "ccd_scattered_light_model",
+            "extracted_master_twilight_spectrum",
+            "within_amp_fiber_normalization",
+        ),
         "within_amp_fiber_normalization",
     ),
     "master_ldls": PayloadRetentionRule(
         ("master_ldls",),
         (
             "trace_map",
+            "ccd_scattered_light_model",
             "extracted_master_ldls_spectrum",
             "within_amp_fiber_normalization",
         ),
@@ -44,7 +49,11 @@ CACHEABLE_CALIBRATION_PAYLOADS: dict[str, PayloadRetentionRule] = {
     ),
     "master_sci": PayloadRetentionRule(
         ("master_sci",),
-        ("extracted_master_sci_spectrum", "fiber_wavelength_spectral_mask"),
+        (
+            "ccd_scattered_light_model",
+            "extracted_master_sci_spectrum",
+            "fiber_wavelength_spectral_mask",
+        ),
         "fiber_wavelength_spectral_mask",
     ),
 }

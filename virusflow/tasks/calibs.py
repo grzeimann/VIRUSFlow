@@ -15,10 +15,19 @@ from ..algorithms.trace import fit_fiber_traces
 from ..algorithms.twi import step_twi
 from ..algorithms.master_sci import build_master_sci
 from ..algorithms.fiber_response import fit_within_amplifier_response
+from ..algorithms.calibration_detector import correct_response_calibration_frames
 from ..algorithms.master_spectrum import extract_master_spectrum
 from ..algorithms.master_sci_mask import build_master_sci_spectral_mask
+from ..algorithms.physical_ccd import (
+    ALGORITHM_VERSION as SCATTER_ALGORITHM_VERSION,
+    TRANSFORM_VERSION,
+    assemble_physical_ccd,
+    compact_scattered_light_payload,
+    fit_gap_scattered_light,
+)
+from ..algorithms.response import NORMALIZATION_VERSION, amplifier_normalization
 from ..algorithms.wave import fit_wavelength_solution
-from ..artifacts import ArtifactService, Scope
+from ..artifacts import ArtifactService, Scope, Validity
 from ..artifacts.models import ConfigurationReference
 from ..artifacts.requests import ArtifactRequest, LogicalComponent
 from ..config.defaults import (
@@ -41,6 +50,7 @@ from ..contracts.result import (
     FiberWavelengthSpectralMaskResultContract,
 )
 from ..core.algo_result import AlgoResult, ensure_algo_result
+from ..core.identity import parse_zipcode_key
 from ..core.scientific_metadata import (
     SCIENTIFIC_METADATA_FIELDS,
     aggregate_scientific_metadata,
@@ -53,6 +63,45 @@ from ..publication.service import DefaultPublicationService
 
 
 logger = logging.getLogger(__name__)
+
+
+AMP_CODE = {"LL": 0, "LU": 1, "RU": 2, "RL": 3}
+
+
+def _artifact_id(row) -> int:
+    return int(row.id) if hasattr(row, "id") else int(row["id"])
+
+
+def _dependency_artifacts(inputs, kind: str) -> list:
+    """Return all direct scheduled dependency outputs of one Artifact kind."""
+
+    found = []
+    for value in (inputs or {}).values():
+        if not isinstance(value, dict):
+            continue
+        artifact = value.get(kind)
+        if artifact is not None:
+            found.append(artifact)
+    return found
+
+
+def _planned_parent_rows(service, target, kind: str) -> list[dict]:
+    """Resolve registry-cached parents by the planner's exact group identity."""
+
+    group_ids = {
+        str(group_id)
+        for parent_kind, group_id in (
+            (getattr(target, "group_metadata", None) or {}).get("parent_groups", ())
+        )
+        if parent_kind == kind
+    }
+    if not group_ids:
+        return []
+    return [
+        row for row in service.adapter.list_all(kind=kind)
+        if str((row.get("metadata") or {}).get("calibration_group_id")) in group_ids
+        and str(row.get("state") or "active") == "active"
+    ]
 
 
 def _model_type(value) -> str:
@@ -145,7 +194,10 @@ class _CanonicalTask(CalibrationTask):
                 str(self.ctx.resolved_raw_db_path()) if raw_parent_ids else None
             ),
             validity=self.target_validity(),
-            configuration_refs=list(configuration_refs or self.configuration_references()),
+            configuration_refs=list(
+                self.configuration_references()
+                if configuration_refs is None else configuration_refs
+            ),
             labels=["calibration", self.artifact_name],
         )
         service = ArtifactService(self.ctx.db_path)
@@ -205,6 +257,7 @@ class _CanonicalTask(CalibrationTask):
 
 class _RawCalibrationTask(_CanonicalTask):
     combine_method = "unspecified"
+    apply_response_detector_corrections = False
 
     def validate_scientific_result(self, result: AlgoResult) -> None:
         return None
@@ -215,6 +268,41 @@ class _RawCalibrationTask(_CanonicalTask):
         self._require_target()
         raw_inputs, parent_ids = self.query_inputs()
         arrays = self.load_reduced_inputs(raw_inputs)
+        calibration_parent_ids = []
+        correction_result = None
+        if self.apply_response_detector_corrections:
+            service = ArtifactService(self.ctx.db_path)
+            bias_row = self._dependency(inputs, "master_bias") or self._resolve_artifact(
+                "master_bias", required=True
+            )
+            dark_row = self._dependency(inputs, "master_dark") or self._resolve_artifact(
+                "master_dark", required=True
+            )
+            bias_id, dark_id = _artifact_id(bias_row), _artifact_id(dark_row)
+            dark_summary = service.describe(dark_id)["summary"]
+            reference_seconds = float(
+                dark_summary.get("reference_exposure_time_seconds") or 0.0
+            )
+            correction_result = correct_response_calibration_frames(
+                np.stack([np.asarray(item["data"]) for item in arrays]),
+                np.stack([np.asarray(item["variance"]) for item in arrays]),
+                np.asarray([
+                    float(item["header"].get("EXPTIME") or 0.0) for item in arrays
+                ]),
+                master_bias=service.load_component(bias_id, "master")["data"],
+                master_bias_scatter=service.load_component(
+                    bias_id, "per_pixel_bias_scatter"
+                )["data"],
+                master_dark=service.load_component(dark_id, "master_dark")["data"],
+                dark_pixel_mask=service.load_component(dark_id, "dark_pixel_mask")["data"],
+                dark_reference_exposure_time=reference_seconds,
+            )
+            for index, item in enumerate(arrays):
+                item["data"] = correction_result.get_array("corrected_images")[index]
+                item["variance"] = correction_result.get_array("corrected_variances")[index]
+                item["error"] = np.sqrt(item["variance"], dtype=np.float32)
+                item["pixel_mask"] = correction_result.get_array("pixel_masks")[index]
+            calibration_parent_ids = [bias_id, dark_id]
         timing = current_task_timing()
         if timing is not None:
             timing.increment("frame_count", len(arrays))
@@ -229,6 +317,26 @@ class _RawCalibrationTask(_CanonicalTask):
             result = ensure_algo_result(
                 self.algorithm(raw_inputs=arrays, params=self._params()), kind=self.result_kind
             )
+        if self.artifact_name == "master_dark":
+            exposure_times = np.asarray([
+                float(item["header"].get("EXPTIME") or 0.0) for item in arrays
+            ])
+            positive = exposure_times[np.isfinite(exposure_times) & (exposure_times > 0.0)]
+            if positive.size == 0:
+                raise RuntimeError("master_dark inputs require a positive EXPTIME")
+            result.scalars["reference_exposure_time_seconds"] = float(np.median(positive))
+            result.meta["bias_convention"] = "included_in_electron_master"
+        if correction_result is not None:
+            result.meta.update(correction_result.meta)
+            result.meta.update({
+                "detector_correction_bias_artifact_id": calibration_parent_ids[0],
+                "detector_correction_dark_artifact_id": calibration_parent_ids[1],
+                "scattered_light_treatment": "physical_ccd_before_master_spectrum_extraction",
+            })
+            result.scalars.update({
+                key: value for key, value in correction_result.scalars.items()
+                if key != "frame_count"
+            })
         report = self.result_contract().validate(result)
         if not report.ok:
             raise ValueError(f"{self.__class__.__name__} result contract: {'; '.join(report.errors)}")
@@ -238,7 +346,9 @@ class _RawCalibrationTask(_CanonicalTask):
         result.meta.update(aggregate_scientific_metadata(
             db.list_raw_scientific_metadata(parent_ids, db_path=self.ctx.resolved_raw_db_path())
         ))
-        artifact = self._publish(result, [], raw_parent_ids=parent_ids)
+        artifact = self._publish(
+            result, calibration_parent_ids, raw_parent_ids=parent_ids
+        )
         return {self.artifact_name: artifact}
 
 
@@ -279,6 +389,7 @@ class FlatTask(_RawCalibrationTask):
     result_contract = FlatResultContract
     component_map = {"master_flat": "master_ldls", "flat_response_mask": "flat_response_mask"}
     combine_method = "chunked fixed-center biweight_location"
+    apply_response_detector_corrections = True
 
 class CmpTask(_RawCalibrationTask):
     name = "cmp"
@@ -347,6 +458,7 @@ class MasterSciTask(_RawCalibrationTask):
     result_contract = MasterSciResultContract
     component_map = {"master_sci": "master_sci"}
     combine_method = "chunked fixed-center biweight_location"
+    apply_response_detector_corrections = True
 
     def validate_scientific_result(self, result: AlgoResult) -> None:
         metadata = getattr(self.target, "group_metadata", None) or {}
@@ -389,22 +501,206 @@ class _ExtractedMasterSpectrumTask(_CanonicalTask):
     def run(self, inputs):
         self._require_target()
         service = ArtifactService(self.ctx.db_path)
-        master_row = self._dependency(inputs, self.master_kind) or self._resolve_artifact(
-            self.master_kind, required=True
+        zipcode = self.target.zipcode
+        pair = {"LL": ("left", "LL", "LU"), "LU": ("left", "LL", "LU"),
+                "RU": ("right", "RU", "RL"), "RL": ("right", "RU", "RL")}
+        side, lower_amp, upper_amp = pair[zipcode.amp]
+        lower_zipcode = type(zipcode)(
+            zipcode.ifuslot, zipcode.ifuid, zipcode.specid, lower_amp, zipcode.controller
         )
-        trace_row = self._dependency(inputs, "trace_map") or self._resolve_artifact(
-            "trace_map", required=True
+        upper_zipcode = type(zipcode)(
+            zipcode.ifuslot, zipcode.ifuid, zipcode.specid, upper_amp, zipcode.controller
         )
-        master_id = int(master_row.id) if hasattr(master_row, "id") else int(master_row["id"])
-        trace_id = int(trace_row.id) if hasattr(trace_row, "id") else int(trace_row["id"])
+
+        def rows_for(kind: str) -> dict[str, dict]:
+            rows = {}
+            for artifact in _dependency_artifacts(inputs, kind):
+                row = service.adapter.get_row(_artifact_id(artifact))
+                if row is not None and row.get("amp_key"):
+                    rows[str(row["amp_key"])] = row
+            for row in _planned_parent_rows(service, self.target, kind):
+                if row.get("amp_key"):
+                    rows.setdefault(str(row["amp_key"]), row)
+            return rows
+
+        master_rows = rows_for(self.master_kind)
+        trace_rows = rows_for("trace_map")
+        for required_zipcode in (lower_zipcode, upper_zipcode):
+            key = required_zipcode.key()
+            if key not in master_rows:
+                row = None
+                if not _planned_parent_rows(service, self.target, self.master_kind):
+                    row = service.select_best(
+                        kind=self.master_kind, scope=Scope(zipcode=required_zipcode),
+                        at_time=self._target_mid_time(), policy="latest_valid",
+                    ) or service.select_best(
+                        kind=self.master_kind, scope=Scope(zipcode=required_zipcode),
+                        at_time=self._target_mid_time(), policy="nearest",
+                    )
+                if row is not None:
+                    master_rows[key] = row
+            if key not in trace_rows:
+                row = None
+                if not _planned_parent_rows(service, self.target, "trace_map"):
+                    row = service.select_best(
+                        kind="trace_map", scope=Scope(zipcode=required_zipcode),
+                        at_time=self._target_mid_time(), policy="latest_valid",
+                    ) or service.select_best(
+                        kind="trace_map", scope=Scope(zipcode=required_zipcode),
+                        at_time=self._target_mid_time(), policy="nearest",
+                    )
+                if row is not None:
+                    trace_rows[key] = row
+        missing = [
+            f"{kind}:{key}" for kind, mapping in (
+                (self.master_kind, master_rows), ("trace_map", trace_rows)
+            ) for key in (lower_zipcode.key(), upper_zipcode.key()) if key not in mapping
+        ]
+        if missing:
+            raise RuntimeError(
+                f"{self.__class__.__name__} requires a complete physical-CCD pair: "
+                + ", ".join(missing)
+            )
+
+        lower_master_row, upper_master_row = (
+            master_rows[lower_zipcode.key()], master_rows[upper_zipcode.key()]
+        )
+        lower_trace_row, upper_trace_row = (
+            trace_rows[lower_zipcode.key()], trace_rows[upper_zipcode.key()]
+        )
+        lower_master_id, upper_master_id = (
+            _artifact_id(lower_master_row), _artifact_id(upper_master_row)
+        )
+        lower_trace_id, upper_trace_id = (
+            _artifact_id(lower_trace_row), _artifact_id(upper_trace_row)
+        )
+        lower_image = np.asarray(
+            service.load_component(lower_master_id, self.master_kind)["data"], dtype=np.float32
+        )
+        upper_image = np.asarray(
+            service.load_component(upper_master_id, self.master_kind)["data"], dtype=np.float32
+        )
+
+        def detector_mask(master_row, image) -> np.ndarray:
+            mask = (~np.isfinite(image)).astype(np.uint8)
+            if self.master_kind == "master_ldls":
+                mask |= np.asarray(
+                    service.load_component(master_row, "flat_response_mask")["data"],
+                    dtype=np.uint8,
+                )
+            for parent_id in service.describe(master_row)["provenance"]["parents"]:
+                parent = service.adapter.get_row(int(parent_id))
+                if parent is not None and parent.get("kind") == "master_dark":
+                    mask |= np.asarray(
+                        service.load_component(parent, "dark_pixel_mask")["data"],
+                        dtype=np.uint8,
+                    )
+            return mask
+
+        lower_mask = detector_mask(lower_master_row, lower_image)
+        upper_mask = detector_mask(upper_master_row, upper_image)
+        assembly = assemble_physical_ccd(
+            lower_image, upper_image, side=side, lower_amp=lower_amp, upper_amp=upper_amp,
+            lower_variance=np.zeros_like(lower_image, dtype=np.float32),
+            upper_variance=np.zeros_like(upper_image, dtype=np.float32),
+            lower_mask=lower_mask, upper_mask=upper_mask,
+        )
+        scatter = fit_gap_scattered_light(
+            assembly,
+            service.load_component(lower_trace_id, "fiber_trace_map")["data"],
+            service.load_component(upper_trace_id, "fiber_trace_map")["data"],
+            **{key: value for key, value in self._params().items() if key in {
+                "core_exclusion_pixels", "minimum_group_gap_pixels",
+                "holdout_chunk_period", "sigma_clip", "iterations",
+            }},
+        )
+        compact = compact_scattered_light_payload(scatter)
+        coordinate = kind_spec("ccd_scattered_light_model").coordinates.value
+        scatter_request = ArtifactRequest(
+            kind="ccd_scattered_light_model",
+            components={
+                name: LogicalComponent(
+                    name=name,
+                    model_type=_model_type(compact[name]),
+                    value=compact[name],
+                    units=(
+                        "electron" if name in {"model_parameters", "residual_sample_values"}
+                        else "1"
+                    ),
+                    coordinates=coordinate,
+                )
+                for name in kind_spec("ccd_scattered_light_model").required_components
+            },
+            summaries=dict(scatter.scalars),
+            metadata={
+                "calibration_group_id": getattr(self.target, "group_id", None),
+                "calibration_group": getattr(self.target, "group_metadata", None),
+                "calibration_input_kind": self.master_kind,
+                "participating_amplifiers": [lower_zipcode.key(), upper_zipcode.key()],
+                "algorithm_metadata": dict(scatter.meta),
+            },
+            scientific_metadata=aggregate_scientific_metadata([
+                service.get_scientific_metadata(lower_master_id),
+                service.get_scientific_metadata(upper_master_id),
+            ]),
+            # Retain one amplifier-addressable projection of the jointly fitted
+            # CCD model so existing scope-local lineage/retention queries can
+            # audit either participating dense master without duplicating the
+            # numerical fit.
+            scope=Scope(zipcode=zipcode, physical_scope=kind_spec(
+                "ccd_scattered_light_model"
+            ).scope),
+            parents=sorted({
+                lower_master_id, upper_master_id, lower_trace_id, upper_trace_id
+            }),
+            validity=self.target_validity(),
+            configuration_refs=[ConfigurationReference(
+                "ccd_transform", TRANSFORM_VERSION, f"{zipcode.specid}:{side}", "verified"
+            )],
+            labels=["calibration", "response", self.master_kind, "scattered_light"],
+            assumptions=["The summed scattered-light field is smooth across the physical CCD."],
+        )
+        publisher = DefaultPublicationService(
+            svc=service, policy=DefaultPersistencePolicy(), base_dir=self.ctx.workdir
+        )
+        scatter_artifact = publisher.publish([scatter_request], PublicationContext(
+            task_name=f"{self.name}_physical_ccd_scatter",
+            task_version=self.version,
+            algorithm_name="virusflow.algorithms.physical_ccd.fit_gap_scattered_light",
+            algorithm_version=SCATTER_ALGORITHM_VERSION,
+            parameters=dict(self.params or {}), parent_ids=[], timings={},
+        ))[0]
+        self.evaluate_qa(service, scatter_artifact, scatter)
+
+        physical_image = np.asarray(
+            scatter.get_array("scatter_subtracted_image"), dtype=np.float32
+        )
+        physical_mask = np.asarray(assembly.get_array("pixel_mask"), dtype=np.uint8)
+        half = physical_image.shape[0] // 2
+        if zipcode.amp in {"LL", "RU"}:
+            master_image = physical_image[:half]
+            pixel_mask = physical_mask[:half]
+            trace_row = lower_trace_row
+        else:
+            master_image = physical_image[half:][::-1]
+            pixel_mask = physical_mask[half:][::-1]
+            trace_row = upper_trace_row
+        master_row = master_rows[zipcode.key()]
+        master_id, trace_id = _artifact_id(master_row), _artifact_id(trace_row)
         params = dict(MASTER_SCI_EXTRACTION_CONFIGURATION.value)
         params.update(self._params())
         result = extract_master_spectrum(
-            service.load_component(master_id, self.master_kind)["data"],
+            master_image,
             service.load_component(trace_id, "fiber_trace_map")["data"],
             result_kind=self.artifact_name,
             aperture_width=float(params["aperture_width"]),
+            pixel_mask=pixel_mask,
         )
+        result.meta.update({
+            "scattered_light_treatment": "paired_physical_ccd_gap_model_subtracted",
+            "scattered_light_artifact_id": int(scatter_artifact.id),
+            "participating_amplifiers": [lower_zipcode.key(), upper_zipcode.key()],
+        })
         result.meta.update(service.get_scientific_metadata(master_id))
         report = self.result_contract().validate(result)
         if not report.ok:
@@ -419,9 +715,13 @@ class _ExtractedMasterSpectrumTask(_CanonicalTask):
             MASTER_SCI_EXTRACTION_CONFIGURATION.evidence_state,
         )]
         artifact = self._publish(
-            result, [master_id, trace_id], configuration_refs=refs, parameters=params
+            result, [master_id, trace_id, int(scatter_artifact.id)],
+            configuration_refs=refs, parameters=params
         )
-        return {self.artifact_name: artifact}
+        return {
+            self.artifact_name: artifact,
+            "ccd_scattered_light_model": scatter_artifact,
+        }
 
 
 class ExtractedMasterSciSpectrumTask(_ExtractedMasterSpectrumTask):
@@ -485,13 +785,49 @@ class AmplifierFiberResponseTask(_CanonicalTask):
         service = ArtifactService(self.ctx.db_path)
 
         def required(kind: str):
-            row = self._dependency(inputs, kind) or self._resolve_artifact(kind, required=True)
+            row = None
+            for candidate in _dependency_artifacts(inputs, kind):
+                candidate_row = service.adapter.get_row(_artifact_id(candidate))
+                if candidate_row is not None and candidate_row.get("amp_key") == self.target.zipcode.key():
+                    row = candidate_row
+                    break
+            if row is None:
+                row = next((
+                    candidate for candidate in _planned_parent_rows(
+                        service, self.target, kind
+                    )
+                    if candidate.get("amp_key") == self.target.zipcode.key()
+                ), None)
+            if row is None and not _planned_parent_rows(service, self.target, kind):
+                row = self._resolve_artifact(kind, required=True)
+            if row is None:
+                raise RuntimeError(
+                    f"{self.__class__.__name__} cannot resolve planned {kind} "
+                    f"for zipcode={self.target.zipcode.key()}"
+                )
             return row, int(row.id) if hasattr(row, "id") else int(row["id"])
 
         ldls_row, ldls_id = required("extracted_master_ldls_spectrum")
         twilight_row, twilight_id = required("extracted_master_twilight_spectrum")
         wavelength_row, wavelength_id = required("wavelength_map")
-        science_row = self._dependency(inputs, "extracted_master_sci_spectrum")
+        science_row = None
+        for candidate in _dependency_artifacts(
+            inputs, "extracted_master_sci_spectrum"
+        ):
+            candidate_row = service.adapter.get_row(_artifact_id(candidate))
+            if (
+                candidate_row is not None
+                and candidate_row.get("amp_key") == self.target.zipcode.key()
+            ):
+                science_row = candidate_row
+                break
+        if science_row is None:
+            science_row = next((
+                candidate for candidate in _planned_parent_rows(
+                    service, self.target, "extracted_master_sci_spectrum"
+                )
+                if candidate.get("amp_key") == self.target.zipcode.key()
+            ), None)
         science_id = None
         science_spectrum = None
         if science_row is not None:
@@ -521,6 +857,121 @@ class AmplifierFiberResponseTask(_CanonicalTask):
         if science_id is not None:
             parent_ids.append(science_id)
         artifact = self._publish(result, parent_ids, parameters=params)
+        return {self.artifact_name: artifact}
+
+
+class CalibrationAmpNormalizationTask(_CanonicalTask):
+    """Place one coherent calibration build on a common amplifier scale."""
+
+    name = "calibration_amp_normalization"
+    version = "v1"
+    artifact_name = "amp_to_amp_normalization"
+    algorithm_name = "virusflow.algorithms.response.amplifier_normalization"
+    result_kind = "amplifier_normalization"
+    component_map = {
+        "amplifier_factors": "amplifier_factors",
+        "amplifier_twilight_levels": "amplifier_twilight_levels",
+        "reference_level": "reference_level",
+        "amplifier_identity": "amplifier_identity",
+    }
+    component_units = {
+        "amplifier_factors": "1",
+        "amplifier_twilight_levels": "electron",
+        "reference_level": "electron",
+        "amplifier_identity": "1",
+    }
+
+    def run(self, inputs):
+        self._require_target()
+        service = ArtifactService(self.ctx.db_path)
+        rows = []
+        seen = set()
+        for artifact in _dependency_artifacts(inputs, "within_amp_fiber_normalization"):
+            artifact_id = _artifact_id(artifact)
+            if artifact_id in seen:
+                continue
+            row = service.adapter.get_row(artifact_id)
+            if row is not None and row.get("amp_key"):
+                rows.append(row)
+                seen.add(artifact_id)
+        # A coherent build may combine newly scheduled responses with responses
+        # already present in the registry.  Existing parents have no executor
+        # result, so recover only the exact planned calibration-group identities.
+        planned_rows = _planned_parent_rows(
+            service, self.target, "within_amp_fiber_normalization"
+        )
+        if planned_rows:
+            for row in planned_rows:
+                if int(row["id"]) in seen or not row.get("amp_key"):
+                    continue
+                rows.append(row)
+                seen.add(int(row["id"]))
+        rows.sort(key=lambda row: str(row["amp_key"]))
+        if not rows:
+            raise RuntimeError("CalibrationAmpNormalizationTask requires amplifier response Products")
+        amplifier_keys = [str(row["amp_key"]) for row in rows]
+        configured_keys = sorted(
+            str(value) for value in (
+                (getattr(self.target, "group_metadata", None) or {}).get("amplifier_keys")
+                or amplifier_keys
+            )
+        )
+        if amplifier_keys != configured_keys:
+            raise RuntimeError(
+                "calibration-build response coverage differs from the planned coherent amplifier set"
+            )
+        levels = np.asarray([
+            float(np.asarray(service.load_component(
+                row, "amplifier_twilight_level"
+            )["data"]).ravel()[0])
+            for row in rows
+        ], dtype=np.float32)
+        normalized = amplifier_normalization(levels)
+        factors = normalized.get_array("amplifier_factors")
+        if not np.all(np.isfinite(factors) & (factors > 0.0)):
+            raise RuntimeError("calibration-build amplifier normalization is not finite and positive")
+        identities = []
+        for key in amplifier_keys:
+            zipcode = parse_zipcode_key(key)
+            identities.append([
+                int(zipcode.ifuslot), int(zipcode.ifuid), int(zipcode.specid),
+                AMP_CODE[zipcode.amp],
+            ])
+        build_metadata = getattr(self.target, "group_metadata", None) or {}
+        result = AlgoResult(
+            kind=self.result_kind,
+            version=NORMALIZATION_VERSION,
+            arrays={
+                "amplifier_factors": np.asarray(factors, dtype=np.float32),
+                "amplifier_twilight_levels": levels,
+                "reference_level": np.asarray(
+                    [normalized.scalars["reference_level"]], dtype=np.float32
+                ),
+                "amplifier_identity": np.asarray(identities, dtype=np.int32),
+            },
+            scalars={
+                "amplifier_count": len(rows),
+                "reference_level": float(normalized.scalars["reference_level"]),
+                "factor_median": float(np.nanmedian(factors)),
+                "factor_robust_sigma": float(
+                    1.4826 * np.nanmedian(np.abs(factors - np.nanmedian(factors)))
+                ),
+            },
+            meta={
+                "calibration_build_id": build_metadata.get("calibration_build_id"),
+                "amplifier_keys": amplifier_keys,
+                "coverage_complete": True,
+                "illumination_reference": "center_track_master_twilight",
+                "normalization_assumption": "uniform_center_track_twilight",
+            },
+        )
+        result.meta.update(aggregate_scientific_metadata([
+            service.get_scientific_metadata(int(row["id"])) for row in rows
+        ]))
+        artifact = self._publish(
+            result, [int(row["id"]) for row in rows],
+            configuration_refs=[], parameters=self._params()
+        )
         return {self.artifact_name: artifact}
 
 
@@ -618,6 +1069,7 @@ class TwiTask(_RawCalibrationTask):
     result_contract = TwiResultContract
     component_map = {"master_twilight": "master_twilight"}
     combine_method = "chunked fixed-center biweight_location"
+    apply_response_detector_corrections = True
 
 class TraceTask(_CanonicalTask):
     name = "trace"

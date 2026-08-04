@@ -83,7 +83,15 @@ def test_planning_scheduler_executor_smoke(tmp_path: Path, monkeypatch):
     class _SyntheticRawLoader:
         def load(self, path, tar_member=None):
             img = _np.zeros((16, 16), dtype=float)
-            return RawFrameData(img, {"GAIN": 1.0, "RDNOISE": 3.0, "CCDPOS": "L", "CCDHALF": "L"}, path, tar_member)
+            return RawFrameData(
+                img,
+                {
+                    "GAIN": 1.0, "RDNOISE": 3.0, "EXPTIME": 360.0,
+                    "CCDPOS": "L", "CCDHALF": "L",
+                },
+                path,
+                tar_member,
+            )
 
 
     # Schedule only the planned targets and execute

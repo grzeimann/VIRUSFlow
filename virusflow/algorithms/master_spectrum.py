@@ -17,6 +17,7 @@ def extract_master_spectrum(
     *,
     result_kind: str,
     aperture_width: float = 5.0,
+    pixel_mask: np.ndarray | None = None,
 ) -> AlgoResult:
     """Apply the canonical fractional aperture to one master image.
 
@@ -33,6 +34,7 @@ def extract_master_spectrum(
         image,
         np.zeros_like(image, dtype=float),
         trace,
+        pixel_mask=pixel_mask,
         width=float(aperture_width),
     )
     spectrum = np.asarray(extraction.get_array("spectrum"), dtype=np.float32)
@@ -62,5 +64,6 @@ def extract_master_spectrum(
             "fractional_boundary_weighting": True,
             "output_scale_convention": "integrated_aperture_counts",
             "spectral_coordinate": "detector_column",
+            "pixel_mask_applied": pixel_mask is not None,
         },
     )

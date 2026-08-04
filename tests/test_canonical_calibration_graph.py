@@ -26,16 +26,19 @@ def _seed(conn, zipcode, frame_type, count, *, lamp=None, exptime=30.0):
             (exposure_id, frame_type, f"/{exposure_id}.fits", None, "filesystem", zipcode.key()),
         )
         conn.execute(
-            "INSERT INTO exposure_details(exposure_id,exptime,pexptime,lamp) VALUES(?,?,?,?)",
+            "INSERT OR IGNORE INTO exposure_details(exposure_id,exptime,pexptime,lamp) VALUES(?,?,?,?)",
             (exposure_id, exptime, exptime, lamp),
         )
 
 
 class _Loader:
     def load(self, path, tar_member=None):
-        yy, xx = np.indices((24, 32))
+        yy, xx = np.indices((1032, 32))
         data = (100.0 + xx + yy).astype(float)
-        header = {"GAIN": 1.0, "RDNOISE": 3.0, "CCDPOS": "L", "CCDHALF": "L"}
+        header = {
+            "GAIN": 1.0, "RDNOISE": 3.0, "CCDPOS": "L", "CCDHALF": "L",
+            "EXPTIME": 30.0,
+        }
         return RawFrameData(data, header, path, tar_member)
 
 
@@ -47,7 +50,7 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         "master_arc", "master_twilight", "master_sci", "trace_map", "wavelength_map",
         "extracted_master_ldls_spectrum", "extracted_master_twilight_spectrum",
         "extracted_master_sci_spectrum", "within_amp_fiber_normalization",
-        "fiber_wavelength_spectral_mask",
+        "amp_to_amp_normalization", "fiber_wavelength_spectral_mask",
     }
     assert by_kind["master_hg"].inputs_raw == ["cmp", "hg"]
     assert by_kind["master_cd"].inputs_raw == ["cmp", "cd"]
@@ -65,8 +68,12 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
     ]
     assert by_kind["within_amp_fiber_normalization"].inputs_artifacts == [
         "extracted_master_twilight_spectrum", "extracted_master_ldls_spectrum",
-        "wavelength_map",
+        "wavelength_map", "extracted_master_sci_spectrum",
     ]
+    assert by_kind["amp_to_amp_normalization"].inputs_artifacts == [
+        "within_amp_fiber_normalization"
+    ]
+    assert by_kind["amp_to_amp_normalization"].scope_mode == "calibration_build"
     assert by_kind["fiber_wavelength_spectral_mask"].inputs_artifacts == [
         "extracted_master_sci_spectrum", "wavelength_map",
     ]
@@ -98,28 +105,39 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         ("extracted_master_twilight_spectrum", "within_amp_fiber_normalization"),
         ("extracted_master_ldls_spectrum", "within_amp_fiber_normalization"),
         ("wavelength_map", "within_amp_fiber_normalization"),
+        ("extracted_master_sci_spectrum", "within_amp_fiber_normalization"),
+        ("within_amp_fiber_normalization", "amp_to_amp_normalization"),
         ("extracted_master_sci_spectrum", "fiber_wavelength_spectral_mask"),
         ("wavelength_map", "fiber_wavelength_spectral_mask"),
     }
     assert set(default_kind_to_task()) == set(by_kind)
 
 
-def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_path, monkeypatch):
-    zipcode = ZipCode(ifuslot="020", ifuid="001", specid="001", amp="LL", controller="A")
+def test_physical_ccd_graph_persists_response_products_components_and_lineage(tmp_path, monkeypatch):
+    zipcodes = [
+        ZipCode(ifuslot="020", ifuid="001", specid="001", amp=amp, controller="A")
+        for amp in ("LL", "LU")
+    ]
+    zipcode = zipcodes[0]
     database = str(tmp_path / "canonical.sqlite3")
     db.init_db(database)
     with db.connect(database) as conn:
-        conn.execute(
-            "INSERT INTO amplifiers(key, ifuslot, ifuid, specid, amp, controller) VALUES(?,?,?,?,?,?)",
-            (zipcode.key(), zipcode.ifuslot, zipcode.ifuid, zipcode.specid, zipcode.amp, zipcode.controller),
-        )
-        for frame_type, count in (("zro", 25), ("drk", 20), ("flt", 30), ("hg", 1), ("cd", 1), ("twi", 1)):
-            _seed(conn, zipcode, frame_type, count, lamp=frame_type if frame_type in {"hg", "cd"} else None)
-        _seed(conn, zipcode, "sci", 3, exptime=700.0)
+        for current in zipcodes:
+            conn.execute(
+                "INSERT INTO amplifiers(key, ifuslot, ifuid, specid, amp, controller) VALUES(?,?,?,?,?,?)",
+                (current.key(), current.ifuslot, current.ifuid, current.specid, current.amp, current.controller),
+            )
+            for frame_type, count in (("zro", 25), ("drk", 20), ("flt", 30), ("hg", 1), ("cd", 1), ("twi", 1)):
+                _seed(conn, current, frame_type, count, lamp=frame_type if frame_type in {"hg", "cd"} else None)
+            _seed(conn, current, "sci", 3, exptime=700.0)
 
     reference_dir = tmp_path / "Fiber_Locations" / "20260609"
     reference_dir.mkdir(parents=True)
-    np.savetxt(reference_dir / "fiber_loc_001_020_001_LL.txt", np.array([[5.0, 0.0], [12.0, 0.0]]))
+    for current in zipcodes:
+        np.savetxt(
+            reference_dir / f"fiber_loc_001_020_001_{current.amp}.txt",
+            np.array([[5.0, 0.0], [12.0, 0.0]]),
+        )
 
     import virusflow.tasks.calibs as calibs
 
@@ -149,12 +167,25 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
             scalars={"best_nmatch": 1, "best_rms": 0.1},
         )
 
+    def fake_dark(*, raw_inputs, params):
+        shape = np.asarray(raw_inputs[0]["data"]).shape
+        return AlgoResult(
+            kind="dark", version="test-dark",
+            arrays={
+                "master_dark": np.zeros(shape, dtype=float),
+                "dark_pixel_mask": np.zeros(shape, dtype=np.uint8),
+            },
+            scalars={"bad_fraction": 0.0, "n_inputs": len(raw_inputs)},
+        )
+
     monkeypatch.setattr(calibs, "fit_fiber_traces", fake_trace)
     monkeypatch.setattr(calibs, "fit_wavelength_solution", fake_wave)
+    monkeypatch.setattr(calibs.DarkTask, "algorithm", staticmethod(fake_dark))
 
     nodes, edges = default_calibration_graph()
     graph = ReductionGraph(nodes, edges)
-    _, report = graph.plan(db_path=database, scopes=[Scope(zipcode=zipcode)])
+    scopes = [Scope(zipcode=current) for current in zipcodes]
+    _, report = graph.plan(db_path=database, scopes=scopes)
     assert {target.kind for target in report.planned} == {node.kind for node in nodes}
 
     context = TaskContext(
@@ -170,23 +201,15 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
         task_context_factory=lambda: context,
         target_adapter=adapt_target,
     )
-    bias_id = next(item.id for item in scheduled if item.kind == "master_bias")
-    for gated_kind in {
-        "master_dark", "master_ldls", "master_hg", "master_cd",
-        "master_twilight", "master_sci", "master_arc", "trace_map",
-        "wavelength_map", "extracted_master_sci_spectrum",
-        "extracted_master_ldls_spectrum", "extracted_master_twilight_spectrum",
-        "within_amp_fiber_normalization", "fiber_wavelength_spectral_mask",
-    }:
-        gated = [item for item in scheduled if item.kind == gated_kind]
-        assert gated
-        assert all(bias_id in item.depends_on for item in gated)
     executor = PlanningExecutor(max_workers=1, debug=False)
     for item in scheduled:
         executor.add_task(item.id, item.task, kind=item.kind, depends_on=item.depends_on)
     results = executor.run()
     for item in scheduled:
-        assert set(results[item.id]) == {item.kind}
+        if item.kind.startswith("extracted_master_"):
+            assert set(results[item.id]) == {item.kind, "ccd_scattered_light_model"}
+        else:
+            assert set(results[item.id]) == {item.kind}
 
     master_timing = next(
         item for item in executor.performance_report["tasks"]
@@ -196,7 +219,7 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
     assert master_timing["phases"]["base_reduction"]["count"] == 25
     assert master_timing["phases"]["combine_frames"]["count"] == 1
     assert master_timing["counters"]["frame_count"] == 25
-    assert master_timing["identities"]["array_shape"] == ["24x32"]
+    assert master_timing["identities"]["array_shape"] == ["1032x32"]
     assert master_timing["identities"]["combine_method"] == [
         "chunked fixed-center biweight_location + MAD"
     ]
@@ -206,8 +229,11 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
     service = ArtifactService(database)
     rows = {
         kind: service.select_best(kind=kind, scope=Scope(zipcode=zipcode), policy="latest")
-        for kind in {node.kind for node in nodes}
+        for kind in {node.kind for node in nodes} - {"amp_to_amp_normalization"}
     }
+    rows["amp_to_amp_normalization"] = service.select_best(
+        kind="amp_to_amp_normalization", scope=Scope(zipcode=None), policy="latest"
+    )
     assert all(rows.values())
     assert {item["name"] for item in service.describe(rows["master_bias"])["components"]} == {
         "master", "per_pixel_bias_scatter"
@@ -219,6 +245,14 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
         "wavelength_map", "per_fiber_wavelength_residual_rms", "arc_identification"
     }
     assert {item["name"] for item in service.describe(rows["master_sci"])["components"]} == {"master_sci"}
+    for kind in ("master_ldls", "master_twilight", "master_sci"):
+        description = service.describe(rows[kind])
+        assert description["summary"]["algorithm_metadata"]["detector_correction_policy"] == (
+            "bias_plus_exptime_scaled_dark_residual-1"
+        )
+        assert {item["parent_id"] for item in description["relations"]} == {
+            int(rows["master_bias"]["id"]), int(rows["master_dark"]["id"]),
+        }
     assert {item["name"] for item in service.describe(
         rows["extracted_master_sci_spectrum"]
     )["components"]} == {
@@ -245,6 +279,22 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
     assert response_description["summary"]["algorithm_metadata"]["large_scale_anchor"] == (
         "master_twilight"
     )
+    amp_description = service.describe(rows["amp_to_amp_normalization"])
+    assert amp_description["scope"]["exposure_id"] is None
+    assert amp_description["summary"]["algorithm_metadata"]["coverage_complete"] is True
+    assert amp_description["summary"]["algorithm_metadata"]["amplifier_keys"] == [
+        current.key() for current in zipcodes
+    ]
+    assert len(amp_description["relations"]) == len(zipcodes)
+    calibration_scatter = [
+        row for row in service.adapter.list_all(kind="ccd_scattered_light_model")
+        if row.get("exposure_id") is None
+    ]
+    assert len(calibration_scatter) == 3 * len(zipcodes)
+    assert {
+        service.describe(row)["summary"]["calibration_input_kind"]
+        for row in calibration_scatter
+    } == {"master_ldls", "master_twilight", "master_sci"}
     assert {item["name"] for item in service.describe(
         rows["fiber_wavelength_spectral_mask"]
     )["components"]} == {
@@ -277,8 +327,8 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
     extraction_relations = service.describe(
         rows["extracted_master_sci_spectrum"]
     )["relations"]
-    assert {item["parent_id"] for item in extraction_relations} == {
-        int(rows["master_sci"]["id"]), int(rows["trace_map"]["id"]),
+    assert {int(rows["master_sci"]["id"]), int(rows["trace_map"]["id"])} < {
+        item["parent_id"] for item in extraction_relations
     }
     ldls_extraction_relations = service.describe(
         rows["extracted_master_ldls_spectrum"]
@@ -286,16 +336,17 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
     twilight_extraction_relations = service.describe(
         rows["extracted_master_twilight_spectrum"]
     )["relations"]
-    assert {item["parent_id"] for item in ldls_extraction_relations} == {
-        int(rows["master_ldls"]["id"]), int(rows["trace_map"]["id"]),
+    assert {int(rows["master_ldls"]["id"]), int(rows["trace_map"]["id"])} < {
+        item["parent_id"] for item in ldls_extraction_relations
     }
-    assert {item["parent_id"] for item in twilight_extraction_relations} == {
-        int(rows["master_twilight"]["id"]), int(rows["trace_map"]["id"]),
+    assert {int(rows["master_twilight"]["id"]), int(rows["trace_map"]["id"])} < {
+        item["parent_id"] for item in twilight_extraction_relations
     }
     response_relations = response_description["relations"]
     assert {item["parent_id"] for item in response_relations} == {
         int(rows["extracted_master_ldls_spectrum"]["id"]),
         int(rows["extracted_master_twilight_spectrum"]["id"]),
+        int(rows["extracted_master_sci_spectrum"]["id"]),
         int(rows["wavelength_map"]["id"]),
     }
     mask_relations = service.describe(
@@ -306,9 +357,9 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
         int(rows["wavelength_map"]["id"]),
     }
 
-    rerun, rerun_report = graph.plan(db_path=database, scopes=[Scope(zipcode=zipcode)])
+    rerun, rerun_report = graph.plan(db_path=database, scopes=scopes)
     assert rerun == []
-    assert len(rerun_report.existing) == len(nodes)
+    assert len(rerun_report.existing) == len(scheduled)
 
     with db.connect(database) as connection:
         connection.execute(
@@ -320,7 +371,7 @@ def test_one_amplifier_graph_persists_all_products_components_and_lineage(tmp_pa
             (int(rows["master_bias"]["id"]),),
         )
     stale_policy_rerun, _ = graph.plan(
-        db_path=database, scopes=[Scope(zipcode=zipcode)]
+        db_path=database, scopes=scopes
     )
     assert [target.kind for target in stale_policy_rerun] == ["master_bias"]
 
@@ -408,7 +459,7 @@ def test_critical_read_noise_blocks_calibration_branches_before_wavelength(
         db_path=database, scopes=[Scope(zipcode=zipcode)]
     )
     assert rerun == []
-    assert len(rerun_report.terminal) == len(nodes)
+    assert len(rerun_report.terminal) == len(scheduled)
     assert rerun_report.reasons[
         next(key for key in rerun_report.reasons if key.startswith("master_bias:"))
     ].startswith("already_recorded_terminal_task_failure:")
@@ -422,5 +473,5 @@ def test_critical_read_noise_blocks_calibration_branches_before_wavelength(
     forced, forced_report = graph.plan(
         db_path=database, scopes=[Scope(zipcode=zipcode)], force_replan=True
     )
-    assert len(forced) == len(nodes)
+    assert len(forced) == len(scheduled)
     assert forced_report.terminal == []

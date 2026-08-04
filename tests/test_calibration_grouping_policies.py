@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from virusflow.artifacts import Scope
+from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
 from virusflow.core.identity import ZipCode
 from virusflow.planning.cadence import pair_lamp_groups, resolve_calibration_groups
 from virusflow.planning.targets import PurposeCadence
@@ -13,6 +14,9 @@ from virusflow.registry import database as db
 from virusflow.tasks.base import TaskContext
 from virusflow.tasks.calibs import MasterSciTask
 from virusflow.artifacts import ArtifactService
+from virusflow.persistence.policy import DefaultPersistencePolicy
+from virusflow.publication.context import PublicationContext
+from virusflow.publication.service import DefaultPublicationService
 import numpy as np
 
 
@@ -188,12 +192,43 @@ def test_master_sci_canonical_task_publication_loading_and_float32(tmp_path):
             index = float(path.rsplit("/", 1)[-1].split(".", 1)[0])
             yy, xx = np.indices((24, 32))
             data = 1000.0 + xx + yy + index
-            header = {"GAIN": 1.0, "RDNOISE": 3.0, "CCDPOS": "L", "CCDHALF": "L"}
+            header = {
+                "GAIN": 1.0, "RDNOISE": 3.0, "EXPTIME": 600.0,
+                "CCDPOS": "L", "CCDHALF": "L",
+            }
             return RawFrameData(data, header, path, tar_member)
 
     context = TaskContext(path, str(tmp_path / "products"), {"raw_frame_loader": Loader()})
-    artifact = MasterSciTask(context, target=adapt_target(target)).run({})["master_sci"]
     service = ArtifactService(path)
+    publisher = DefaultPublicationService(
+        svc=service, policy=DefaultPersistencePolicy(), base_dir=context.workdir,
+    )
+    shape = (24, 32)
+    bias = publisher.publish([ArtifactRequest(
+        kind="master_bias",
+        components={
+            "master": LogicalComponent("master", "array2d", np.zeros(shape)),
+            "per_pixel_bias_scatter": LogicalComponent(
+                "per_pixel_bias_scatter", "array2d", np.ones(shape),
+            ),
+        },
+        scope=Scope(ZIP),
+    )], PublicationContext("fixture", "1", "fixture", "1", {}, [], {}))[0]
+    dark = publisher.publish([ArtifactRequest(
+        kind="master_dark",
+        components={
+            "master_dark": LogicalComponent("master_dark", "array2d", np.zeros(shape)),
+            "dark_pixel_mask": LogicalComponent(
+                "dark_pixel_mask", "array2d", np.zeros(shape, dtype=np.uint8),
+            ),
+        },
+        summaries={"reference_exposure_time_seconds": 600.0},
+        scope=Scope(ZIP),
+    )], PublicationContext("fixture", "1", "fixture", "1", {}, [], {}))[0]
+    artifact = MasterSciTask(context, target=adapt_target(target)).run({
+        "bias": {"master_bias": bias},
+        "dark": {"master_dark": dark},
+    })["master_sci"]
     description = service.describe(artifact.id)
     assert {item["name"] for item in description["components"]} == {"master_sci"}
     assert service.get(artifact.id).metadata["calibration_group"]["sufficiency"]["sufficient"] is True
