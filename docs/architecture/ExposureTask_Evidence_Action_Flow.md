@@ -35,7 +35,7 @@ bias scatter to the variance, and extends the mask.
 
 ```text
 dark_residual = master_dark - master_bias
-dark_scale    = science_EXPTIME / dark_EXPTIME, or 1
+dark_scale    = science_EXPTIME / master_dark.reference_exposure_time_seconds
 
 calibrated_image =
     oriented_image
@@ -105,8 +105,8 @@ flowchart TB
         SDetector[["Run-local: oriented image<br/>detector variance + nonfinite mask"]]:::state
 
         EBias["Evidence: master_bias<br/>master + per_pixel_bias_scatter"]:::evidence
-        EDark["Evidence: master_dark<br/>master_dark + dark_pixel_mask"]:::evidence
-        EDarkTime["Evidence: first same-day raw dark EXPTIME<br/>and science EXPTIME"]:::evidence
+        EDark["Evidence: selected master_dark<br/>array + dark_pixel_mask + required<br/>reference time and bias convention"]:::evidence
+        EDarkTime["Evidence: science EXPTIME"]:::evidence
         ELDLS["Evidence: master_ldls.flat_response_mask"]:::evidence
         ACalibrate(["Action: dark_residual = dark - bias<br/>image -= bias + scale × dark_residual<br/>variance += bias_scatter²<br/>mask |= dark + LDLS + nonfinite"]):::action
         SReduced[["Run-local: ReducedAmplifierState<br/>image + variance + mask + header<br/>parents: raw, bias, dark, LDLS"]]:::state
@@ -374,9 +374,11 @@ cancel algebraically in the image:
 image - bias - (dark - bias) = image - dark
 ```
 
-The bias-scatter variance is still added. The dark exposure used to calculate
-`dark_scale` comes from the first same-day raw dark row for that ZipCode, not
-from a component or metadata field of the selected `master_dark` Artifact.
+The bias-scatter variance is still added. The denominator used to calculate
+`dark_scale` is the required reference exposure time of the selected
+`master_dark` Artifact. The shared science/response detector-correction
+algorithm also requires that Product's included-bias convention; no ambient raw
+dark is loaded during application.
 
 ### 3. The seven-kind calibration gate is stricter than numerical use
 
@@ -555,7 +557,7 @@ status before continuing with extraction.
 | **KEEP** | Atomic Exposure scope, calibration-time LDLS/twilight response evidence, complete ZipCode discovery, physical-CCD paired scatter fitting, explicit astrometry fallback, per-fiber wavelength exclusions, and partial-amplifier completion |
 | **ADAPT** | Retain complete fiber hardware identity and determine whether optional Master Science residual QA should be a planned dependency rather than an explicitly injected one |
 | **REFACTOR** | Move array arithmetic still embedded in `ExposureTask.run()`—illumination estimation, response application, mask construction, and several validations—behind pure algorithm contracts while preserving results |
-| **RESEARCH** | Validate the mandatory-but-unused `master_arc` gate, the raw-dark source of dark exposure time, and the intended future application of non-identity baseline response |
+| **RESEARCH** | Validate the mandatory-but-unused `master_arc` gate and the intended future application of non-identity baseline response |
 
 These dispositions compare the implemented flow with the repository's
 ontology-first and evidence-preservation guidance; they do not change the

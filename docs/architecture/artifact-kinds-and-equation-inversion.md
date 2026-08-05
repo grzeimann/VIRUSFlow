@@ -91,6 +91,16 @@ while an amplifier-addressable compact projection of the jointly fitted model
 and residual samples is retained. Extraction validity and effective aperture
 evidence are retained with each spectrum.
 
+Dark application is now Product-local. Every publishable `master_dark` requires
+`reference_exposure_time_seconds` and
+`bias_convention="included_in_electron_master"`. Dark construction enforces one
+common positive input exposure time for that electron-valued representation.
+Science and response-calibration consumers both use the selected Product's
+state in the shared detector-correction algorithm; neither looks up a
+representative raw dark at application time. The retained dark mask is merged
+into the detector mask and follows extraction. No retained dark-uncertainty
+plane exists yet, so there is no dark-model variance available to propagate.
+
 `within_amp_fiber_normalization` is fitted at calibration time from those
 corrected spectra. A calibration-build task then compares every sibling
 twilight anchor in one coherent center-track build and retains one
@@ -132,25 +142,25 @@ coefficients. Dense parents remain rebuildable only from raw data and the
 versioned algorithms; the compact descendants preserve the evidence needed to
 audit the inference, not a lossless reconstruction of the dense illumination.
 
-### Horizon 2: Product-local physical dark state
+### Horizon 2: measured baseline instrumental response
 
-The next bounded goal is to remove the remaining ambient raw-catalog dependency
-from dark scaling and make the selected `master_dark` Product sufficient for
-every consumer. Choose and enforce one explicit representation:
+The next bounded goal is to replace the provisional identity
+`baseline_relative_response` with a measured, versioned relative instrumental
+response while preserving the existing factor separation:
 
 ```text
-selected master_dark
-  -> required Product-local bias convention and input/reference exposure-time evidence
-  -> either convert to electron / second or reproducibly derive that rate
-  -> science and calibration consumers use the same selected Product-local state
-  -> propagate the available dark uncertainty and mask through extraction
-  -> no representative raw-dark lookup during application
+retained historical or standard-source response evidence
+  -> fit baseline_relative_response for a stated instrument epoch
+  -> retain wavelength grid, response, validity, uncertainty, and fit lineage
+  -> select and apply that Product to sky-subtracted fiber measurements
+  -> propagate its diagonal uncertainty into the calibrated variance
+  -> remove the identity-response placeholder from normal production
 ```
 
-This horizon keeps `master_bias` and `master_dark` permanently retained and is
-bounded to the physical dark contract, consumer migration, and uncertainty
-hand-off. It does not introduce measured spectrophotometric response,
-atmospheric correction, or a source-domain reconstruction.
+This horizon uses the already registered instrument-epoch Product and is
+bounded to relative instrumental response. It does not fold exposure
+illumination into the baseline, infer atmospheric transmission or absolute
+scale, model PSF/DAR coupling, or reconstruct a source-domain field.
 
 ### Horizon 3: long-term physical inversion
 
@@ -170,7 +180,7 @@ surface brightness.
 |---|---|---|---|
 | $D_{e,p}$ | `oriented_detector_image`; raw records live in the separate raw catalog | Raw science and calibration arrays are overscan-corrected, oriented, and converted to electrons in memory. | There is no permanently registered raw-detector Artifact; raw-file identity and headers are provenance instead. |
 | $B_{e,p}$ | `master_bias`, `overscan_model`, `overscan_corrected_image`, `bias_stability` | A robust amplifier master is retained and subtracted from science and reusable response-calibration inputs; row overscan is applied in memory and long-term bias summaries are analytic. | The exposure-specific overscan prediction is not retained as its own Product. |
-| $t_e d_p$ | `master_dark`, `effective_exposure_time` | Science and reusable LDLS/twilight/master-science inputs subtract an exposure-time-scaled `(master_dark - master_bias)` residual and merge the dark mask where extraction consumes it. New dark Products record a representative exposure time and bias convention; the calibration-response path consumes that record. | The registered master remains in electrons rather than electrons per second, and the science path still recovers its scale from an ambient raw-dark lookup instead of the selected Product; dark-model uncertainty is not propagated. |
+| $t_e d_p$ | `master_dark`, `effective_exposure_time` | The electron-valued, bias-included master requires a Product-local reference exposure time and bias convention. Dark construction requires a common positive input exposure time. Science and reusable LDLS/twilight/master-science inputs use the same selected-Product state to subtract an exposure-time-scaled `(master_dark - master_bias)` residual and merge its mask through extraction. | The retained master is not the preferred smooth dark-rate state in electrons per second, hot pixels are represented only by the current empirical mask, and no dark-model uncertainty component is available for variance propagation. |
 | $L_{e,p}$ | `ccd_scattered_light_model`, `scatter_subtracted_image`, `candidate_scattered_light_model` | Compact gap-constrained surfaces and residual samples are retained for science exposures and for each paired response-master extraction; evaluated corrected CCD images remain in memory. | The baseline is an empirical smooth gap surface, not the forward fiber-wing/crosstalk component; science and each calibration illumination are fitted independently rather than sharing a learned wing kernel. |
 | $P_{e,f,p}(\lambda)$ | `trace_map`, `aperture_extracted_spectrum`; retained master spectra carry exact compact aperture and validity evidence | Trace geometry guides the same exact fractional five-pixel top-hat aperture for science and response calibrations, with detector masks applied to retained master spectra. Calibration spectra retain the start row, contributing-row bit mask, boundary weights, effective width, and validity needed to reconstruct that aperture operator exactly. | There is no registered empirical fiber-profile or 2D PSF/LSF Product, so $P$ is approximated by aperture geometry rather than inferred as a detector profile; science-exposure aperture evidence remains run-local. |
 | $\lambda_p$ | `master_hg`, `master_cd`, `master_arc`, `wavelength_map` | Separate lamp masters are composed, identified, fitted, and interpolated into per-fiber wavelength rows. The Product requires candidate and accepted-line evidence, seed status and coefficients, interpolation/extrapolation flags, residuals, and exact applied-mask indices. Invalid or non-increasing rows are excluded. | Barycentric correction and an observation-frame wavelength Product are absent. Identification is still the current sparse seed-row heuristic rather than a globally constrained physical dispersion model with formal line-association probabilities. |
@@ -186,30 +196,25 @@ surface brightness.
 | $N_{e,p}$ and propagated uncertainty | `read_noise`, `detector_variance`, `pixel_mask`, `extracted_variance`, final variance/mask planes | Read noise plus non-negative Poisson variance is propagated through science extraction with exact weights. Bias scatter is added to the corrected response-frame variance state, while dark/LDLS masks condition response-master extraction; retained master spectra preserve the exact compact aperture/mask validity needed to audit which detector samples contributed. | The robust calibration combine and retained master-spectrum extraction do not yet carry response-frame variance forward. Standalone noise kinds are not published, and dark, sky, response, wavelength, astrometric, systematic, and covariance contributions remain incomplete. |
 | $t_e$ and exposure/observation state | `exposure_mode_classification`, `effective_exposure_time`, `exposure_completion_manifest`, observation/dither kinds | The code preserves primary/parallel classification, the applied exposure-time policy, amplifier coverage, membership, offsets, and per-exposure state. | These Products condition the inverse and its applicability; they do not themselves estimate an optical term. |
 
-## Dark-state representation is a blocking physical ambiguity
+## Product-local dark state and remaining physical gap
 
 `master_bias` and `master_dark` are retained calibration Products and should
 remain retained. They are not members of the cacheable dense-master policy.
 The current `master_dark` payload is an electron-valued dense master that still
-contains bias. Newly produced Products record a representative input exposure
-time and `bias_convention="included_in_electron_master"`, and reusable response
-calibration consumes that Product-local summary when scaling
-`(master_dark - master_bias)`. Science exposure processing still obtains its
-reference time from a representative ambient raw-dark catalog row instead of
-the selected Product, however, and the Artifact contract does not yet require
-the new fields for every readable revision.
+contains bias. Its Artifact contract now requires a finite positive
+`reference_exposure_time_seconds` and the explicit
+`bias_convention="included_in_electron_master"`; its producer accepts only
+inputs sharing that exposure time. This makes `(master_dark - master_bias) /
+reference_exposure_time_seconds` reproducible from the selected Product for
+both science and reusable response-calibration consumers. Exact raw parents
+remain lineage evidence, but are not application-time inputs.
 
-The representation must become physically explicit in one of two forms:
-
-- a dark-rate state in electrons per second, with the input exposure times and
-  normalization convention retained; or
-- a dense electron-valued master with a required, Product-local reference
-  exposure time and an explicit statement of whether bias is included.
-
-Either form makes the scaling to $t_e d_p$ reproducible from the selected
-Product and its lineage across every consumer. The new summaries are a partial
-migration; an electron-valued array that any consumer still scales through an
-ambient raw-catalog lookup is not a sufficient physical contract.
+This completes the repository's existing representation rather than claiming
+the preferred physical model from the dark-current knowledge note. A future
+dark revision should normalize compatible bias-subtracted inputs into a smooth
+electron-per-second state, separate unstable hot-pixel evidence, and retain a
+dark uncertainty component. Until that evidence exists, the current mask is
+propagated but dark-model variance cannot be.
 
 ## Complete registered-kind inventory
 
@@ -225,7 +230,7 @@ published. `ArtifactService` rejects permanent publication of every S kind.
 | Kind | Scope / lifecycle | Scientific layer and equation role | Current support |
 |---|---|---|---|
 | `master_bias` | amplifier / C | Inferred calibration evidence for $B_{e,p}$; includes the master and per-pixel scatter. | Production calibration Product; master payload is permanently retained. |
-| `master_dark` | amplifier / C | Inferred evidence used to predict $t_e d_p$; includes a dense master and dark-pixel mask. | Production calibration Product; permanently retained. New revisions summarize representative input exposure time and included-bias convention, which response calibration consumes, but the contract does not require those fields and science still uses an ambient raw-dark lookup. |
+| `master_dark` | amplifier / C | Inferred evidence used to predict $t_e d_p$; includes a dense electron master and dark-pixel mask. | Production calibration Product; permanently retained. Publication requires its reference exposure time and included-bias convention, construction requires one common positive input exposure time, and both science and response calibration consume only that selected Product-local state. No dark uncertainty component is currently produced. |
 | `read_noise` | amplifier / C | Measurement constraining the stochastic term $N_{e,p}$. | Run-local/embedded as detector and master-bias summaries plus QA; no standalone publisher. |
 | `gain` | amplifier / C | Configuration-like conversion from ADU to electrons, required before noise calculation. | Run-local/embedded from the header with a 0.85 electron/ADU fallback; no standalone publisher. |
 | `pixel_mask` | pixel / C | Detector-defect evidence conditioning which $D_{e,p}$ values enter the inverse. | Run-local/embedded by combining dark, LDLS, and non-finite masks. Response-master spectra retain exact compact aperture/sample validity, and wavelength maps retain the applied detector-mask indices and mask-parent lineage; no standalone pixel-mask Product or time-aware defect model is published. |
@@ -302,6 +307,11 @@ published. `ArtifactService` rejects permanent publication of every S kind.
 
 ### Dense calibration masters
 
+`master_bias` and `master_dark` are permanently retained and are outside the
+dense-component release policy. For `master_dark`, that retention includes the
+dense electron master, dark-pixel mask, required reference exposure time and
+bias convention, registry record, raw-parent lineage, and checksums.
+
 The implemented retention service treats only the dense payload components of
 `master_hg`, `master_cd`, `master_arc`, `master_twilight`, `master_ldls`, and
 `master_sci` as rebuildable. It keeps their registry records, provenance, QA,
@@ -358,7 +368,8 @@ The current code supports a scientifically traceable detector-to-fiber
 reduction in which:
 
 - bias, a scaled dark residual, and a physical-CCD scattered-light estimate are
-  removed;
+  removed, with dark scaling derived only from the selected `master_dark`'s
+  required Product-local scaling state;
 - detector variance and masks are propagated through a fractional aperture;
 - trace and wavelength geometry are selected with explicit calibration
   provenance and retained sample, line, residual, interpolation, and applied-mask
@@ -385,26 +396,25 @@ aperture loss.
 
 ## Implementation priorities supported by this crosswalk
 
-1. **Complete the Product-local dark-representation migration.** Choose either
-   a retained dark-rate state in electrons per second or make the dense-master
-   reference time and included-bias convention contract-required. Make every
-   consumer use only the selected Product-local state, propagate the available
-   dark uncertainty and mask, and remove application-time representative
-   raw-dark lookup. Keep both `master_bias` and `master_dark` retained.
-2. **Add measured instrumental and atmospheric response.** Replace the
-   provisional identity baseline with measured response states and make the
-   atmospheric term explicit before claiming spectrophotometric source flux.
+1. **Implement the measured relative-response Horizon 2.** Replace the
+   provisional identity baseline with a selected, measured instrument-epoch
+   `baseline_relative_response`, retain its fit evidence and uncertainty, and
+   apply it without hiding exposure illumination or atmospheric terms.
+2. **Make atmospheric and absolute response explicit.** Add measured states for
+   atmospheric transmission and absolute scale before claiming
+   spectrophotometric source flux.
 3. **Develop profile, PSF, DAR, and coupling models.** Measure the operators
    currently approximated by the fixed aperture and positional geometry.
    Introduce an Artifact kind only for evidence or evaluated states that meet
    the retention rule above; versioned model specifications may remain outside
    the Artifact vocabulary.
 4. **Expand uncertainty propagation and define the eventual source-domain
-   result.** Add the missing dark, sky, response, wavelength, astrometric,
-   coupling, systematic, and covariance terms, then state precisely what
-   estimate of $S^{\mathrm{source}}(\theta,\lambda)$ the eventual result
-   represents. Until then, keep describing the current terminal Product as
-   calibrated fiber measurements.
+   result.** Add a physical dark-rate/uncertainty model and the missing sky,
+   response, wavelength, astrometric, coupling, systematic, and covariance
+   terms, then state precisely what estimate of
+   $S^{\mathrm{source}}(\theta,\lambda)$ the eventual result represents. Until
+   then, keep describing the current terminal Product as calibrated fiber
+   measurements.
 
 ## Maintenance rule
 

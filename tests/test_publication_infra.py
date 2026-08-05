@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import numpy as np
+import pytest
 
 from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
 from virusflow.artifacts.models import Scope
@@ -11,6 +12,34 @@ from virusflow.publication.context import PublicationContext
 from virusflow.publication.service import DefaultPublicationService
 from virusflow.persistence.policy import DefaultPersistencePolicy
 from virusflow.registry.database import init_db
+
+
+def test_master_dark_publication_requires_product_local_scaling_state(tmp_path: Path):
+    db_path = str(tmp_path / "vf.sqlite")
+    init_db(db_path)
+    publisher = DefaultPublicationService(
+        svc=ArtifactService(db_path),
+        policy=DefaultPersistencePolicy(),
+        base_dir=str(tmp_path),
+    )
+    data = np.ones((2, 3), dtype=float)
+    request = ArtifactRequest(
+        kind="master_dark",
+        components={
+            "master_dark": LogicalComponent("master_dark", "array2d", data),
+            "dark_pixel_mask": LogicalComponent(
+                "dark_pixel_mask", "array2d", np.zeros_like(data, dtype=np.uint8)
+            ),
+        },
+        scope=Scope(zipcode=None),
+    )
+    context = PublicationContext("dark", "v3", "dark", "dark-1.1", {}, [], {})
+
+    with pytest.raises(
+        ValueError,
+        match="reference_exposure_time_seconds, bias_convention",
+    ):
+        publisher.publish([request], context)
 
 
 def test_publication_roundtrip_master_bias(tmp_path: Path):

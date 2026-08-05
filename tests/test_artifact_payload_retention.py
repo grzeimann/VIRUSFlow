@@ -58,6 +58,14 @@ def _publish(publisher, kind: str, *, parents=(), zipcode=ZIPCODE):
         name: {} if name == "algorithm_metadata" else "test"
         for name in contract.required_metadata
     }
+    summaries = {
+        name: (
+            600.0 if name == "reference_exposure_time_seconds"
+            else "included_in_electron_master" if name == "bias_convention"
+            else 1.0
+        )
+        for name in contract.required_summaries
+    }
     request = ArtifactRequest(
         kind=kind,
         components={
@@ -68,6 +76,7 @@ def _publish(publisher, kind: str, *, parents=(), zipcode=ZIPCODE):
         validity=Validity(datetime(2026, 6, 9), datetime(2026, 6, 10)),
         parents=list(parents),
         metadata=metadata,
+        summaries=summaries,
     )
     context = PublicationContext(
         "retention-test", "1", "retention-test", "1", {}, list(parents), {}

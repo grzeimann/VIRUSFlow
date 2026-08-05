@@ -55,7 +55,9 @@ class BiasResultContract(_BaseSimpleContract):
 
 class DarkResultContract(_BaseSimpleContract):
     required_arrays = ["master_dark"]
-    required_scalars = ["bad_fraction"]
+    required_scalars = [
+        "bad_fraction", "reference_exposure_time_seconds", "bias_convention",
+    ]
 
 
 class FlatResultContract(_BaseSimpleContract):

@@ -15,7 +15,10 @@ from ..algorithms.trace import fit_fiber_traces
 from ..algorithms.twi import step_twi
 from ..algorithms.master_sci import build_master_sci
 from ..algorithms.fiber_response import fit_within_amplifier_response
-from ..algorithms.calibration_detector import correct_response_calibration_frames
+from ..algorithms.calibration_detector import (
+    DARK_BIAS_CONVENTION,
+    correct_response_calibration_frames,
+)
 from ..algorithms.master_spectrum import extract_master_spectrum
 from ..algorithms.master_sci_mask import build_master_sci_spectral_mask
 from ..algorithms.physical_ccd import (
@@ -97,11 +100,9 @@ def _planned_parent_rows(service, target, kind: str) -> list[dict]:
     }
     if not group_ids:
         return []
-    return [
-        row for row in service.adapter.list_all(kind=kind)
-        if str((row.get("metadata") or {}).get("calibration_group_id")) in group_ids
-        and str(row.get("state") or "active") == "active"
-    ]
+    return service.adapter.find_by_calibration_groups(
+        kind=kind, calibration_group_ids=group_ids, state="active"
+    )
 
 
 def _model_type(value) -> str:
@@ -283,6 +284,7 @@ class _RawCalibrationTask(_CanonicalTask):
             reference_seconds = float(
                 dark_summary.get("reference_exposure_time_seconds") or 0.0
             )
+            bias_convention = dark_summary.get("bias_convention")
             correction_result = correct_response_calibration_frames(
                 np.stack([np.asarray(item["data"]) for item in arrays]),
                 np.stack([np.asarray(item["variance"]) for item in arrays]),
@@ -296,6 +298,7 @@ class _RawCalibrationTask(_CanonicalTask):
                 master_dark=service.load_component(dark_id, "master_dark")["data"],
                 dark_pixel_mask=service.load_component(dark_id, "dark_pixel_mask")["data"],
                 dark_reference_exposure_time=reference_seconds,
+                dark_bias_convention=bias_convention,
             )
             for index, item in enumerate(arrays):
                 item["data"] = correction_result.get_array("corrected_images")[index]
@@ -322,10 +325,15 @@ class _RawCalibrationTask(_CanonicalTask):
                 float(item["header"].get("EXPTIME") or 0.0) for item in arrays
             ])
             positive = exposure_times[np.isfinite(exposure_times) & (exposure_times > 0.0)]
-            if positive.size == 0:
+            if positive.size != exposure_times.size:
                 raise RuntimeError("master_dark inputs require a positive EXPTIME")
-            result.scalars["reference_exposure_time_seconds"] = float(np.median(positive))
-            result.meta["bias_convention"] = "included_in_electron_master"
+            reference_seconds = float(np.median(positive))
+            if not np.allclose(positive, reference_seconds, rtol=0.0, atol=1e-6):
+                raise RuntimeError(
+                    "electron-valued master_dark inputs require one common EXPTIME"
+                )
+            result.scalars["reference_exposure_time_seconds"] = reference_seconds
+            result.scalars["bias_convention"] = DARK_BIAS_CONVENTION
         if correction_result is not None:
             result.meta.update(correction_result.meta)
             result.meta.update({
@@ -367,7 +375,7 @@ class BiasTask(_RawCalibrationTask):
 
 class DarkTask(_RawCalibrationTask):
     name = "dark"
-    version = "v2"
+    version = "v3"
     frame_type = "drk"
     artifact_name = "master_dark"
     algorithm = staticmethod(step_dark)
@@ -520,13 +528,22 @@ class _ExtractedMasterSpectrumTask(_CanonicalTask):
             zipcode.ifuslot, zipcode.ifuid, zipcode.specid, upper_amp, zipcode.controller
         )
 
+        planned_rows_by_kind = {}
+
+        def planned_rows_for(kind: str) -> list[dict]:
+            if kind not in planned_rows_by_kind:
+                planned_rows_by_kind[kind] = _planned_parent_rows(
+                    service, self.target, kind
+                )
+            return planned_rows_by_kind[kind]
+
         def rows_for(kind: str) -> dict[str, dict]:
             rows = {}
             for artifact in _dependency_artifacts(inputs, kind):
                 row = service.adapter.get_row(_artifact_id(artifact))
                 if row is not None and row.get("amp_key"):
                     rows[str(row["amp_key"])] = row
-            for row in _planned_parent_rows(service, self.target, kind):
+            for row in planned_rows_for(kind):
                 if row.get("amp_key"):
                     rows.setdefault(str(row["amp_key"]), row)
             return rows
@@ -537,7 +554,7 @@ class _ExtractedMasterSpectrumTask(_CanonicalTask):
             key = required_zipcode.key()
             if key not in master_rows:
                 row = None
-                if not _planned_parent_rows(service, self.target, self.master_kind):
+                if not planned_rows_for(self.master_kind):
                     row = service.select_best(
                         kind=self.master_kind, scope=Scope(zipcode=required_zipcode),
                         at_time=self._target_mid_time(), policy="latest_valid",
@@ -549,7 +566,7 @@ class _ExtractedMasterSpectrumTask(_CanonicalTask):
                     master_rows[key] = row
             if key not in trace_rows:
                 row = None
-                if not _planned_parent_rows(service, self.target, "trace_map"):
+                if not planned_rows_for("trace_map"):
                     row = service.select_best(
                         kind="trace_map", scope=Scope(zipcode=required_zipcode),
                         at_time=self._target_mid_time(), policy="latest_valid",

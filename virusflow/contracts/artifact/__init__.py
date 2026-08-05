@@ -24,6 +24,7 @@ class ArtifactContractSpec:
     components: List[LogicalComponentSpec] = field(default_factory=list)
     optional_components: List[LogicalComponentSpec] = field(default_factory=list)
     summaries: List[str] = field(default_factory=list)  # logical summary field names
+    required_summaries: List[str] = field(default_factory=list)
     required_metadata: List[str] = field(default_factory=list)
     applicability: Optional[str] = None  # free-form description of when applicable
     validity_semantics: Optional[str] = None  # e.g., time/science window rules (descriptive)
@@ -68,7 +69,15 @@ class MasterDarkContract:
                 LogicalComponentSpec(name="dark_pixel_mask", model_type="array2d", required=True),
             ],
             optional_components=[],
-            summaries=["bad_fraction"],
+            summaries=[
+                "bad_fraction",
+                "reference_exposure_time_seconds",
+                "bias_convention",
+            ],
+            required_summaries=[
+                "reference_exposure_time_seconds",
+                "bias_convention",
+            ],
             required_metadata=[],
             applicability="Dark calibration products",
             validity_semantics="Valid for instrument zipcode and date window",

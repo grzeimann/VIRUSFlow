@@ -203,11 +203,30 @@ class RegistryAdapter:
 
     def list_all(self, *, kind: Optional[str] = None) -> List[dict]:
         rows = db.list_artifacts(kind=kind, db_path=self.db_path)
+        details_by_id = db.get_artifact_details_many(
+            (int(row["id"]) for row in rows), db_path=self.db_path
+        )
         for row in rows:
-            details = db.get_artifact_details(int(row["id"]), db_path=self.db_path)
+            details = details_by_id.get(int(row["id"]))
             if details:
                 row.update(details)
         return rows
+
+    def find_by_calibration_groups(
+        self,
+        *,
+        kind: str,
+        calibration_group_ids: Iterable[str],
+        state: str = "active",
+    ) -> List[dict]:
+        """Resolve exact planner-group parents without a whole-kind scan."""
+
+        return db.find_artifacts_by_calibration_groups(
+            kind=canonical_kind(kind),
+            calibration_group_ids=calibration_group_ids,
+            state=state,
+            db_path=self.db_path,
+        )
 
     def list_planning_evidence(self) -> List[dict]:
         """Load the planner's complete Artifact/QA identity snapshot once."""

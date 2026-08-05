@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Iterable, List, Protocol, Dict
 
 from ..artifacts.models import Artifact
@@ -116,6 +117,33 @@ class DefaultPublicationService:
             raise ValueError(
                 f"Missing required metadata for kind={req.kind}: {', '.join(missing_metadata)}"
             )
+        missing_summaries = [
+            name for name in spec.required_summaries
+            if req.summaries.get(name) is None
+        ]
+        if missing_summaries:
+            raise ValueError(
+                f"Missing required summaries for kind={req.kind}: "
+                + ", ".join(missing_summaries)
+            )
+        if spec.kind == "master_dark" and not missing_summaries:
+            try:
+                reference_seconds = float(
+                    req.summaries["reference_exposure_time_seconds"]
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "master_dark reference_exposure_time_seconds must be finite and positive"
+                ) from exc
+            if not math.isfinite(reference_seconds) or reference_seconds <= 0.0:
+                raise ValueError(
+                    "master_dark reference_exposure_time_seconds must be finite and positive"
+                )
+            if req.summaries["bias_convention"] != "included_in_electron_master":
+                raise ValueError(
+                    "master_dark bias_convention must be "
+                    "'included_in_electron_master'"
+                )
         # Model type checks (best-effort)
         for c in (spec.components or []):
             rc = req.get_component(c.name)

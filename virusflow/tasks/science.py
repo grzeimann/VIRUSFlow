@@ -9,6 +9,7 @@ from typing import Iterable
 import numpy as np
 
 from .base import Task
+from ..algorithms.calibration_detector import correct_response_calibration_frames
 from ..algorithms.ccd import reduce_amplifier_array
 from ..algorithms.physical_ccd import (
     ALGORITHM_VERSION,
@@ -84,7 +85,7 @@ class _SciencePublisher(Task):
 
 class ReducedScienceAmplifierTask(_SciencePublisher):
     name = "reduced_science_amplifier"
-    version = "v1"
+    version = "v2"
 
     def run(self, inputs):
         from ..io import RawFrameLoader
@@ -112,7 +113,8 @@ class ReducedScienceAmplifierTask(_SciencePublisher):
         calibration_parents = []
         calibration_policy = "overscan_orientation_gain_only"
         science_exptime = float(frame.header.get("EXPTIME") or 0.0)
-        dark_exptime = None
+        dark_reference_exposure_time = None
+        dark_bias_convention = None
         dark_scale = 0.0
         if bool(self.params.get("apply_calibrations", True)):
             cal_scope = Scope(zipcode=zipcode)
@@ -143,20 +145,28 @@ class ReducedScienceAmplifierTask(_SciencePublisher):
                 service.load_component(bias_id, "per_pixel_bias_scatter")["data"], dtype=np.float32
             )
             dark = np.asarray(service.load_component(dark_id, "master_dark")["data"], dtype=np.float32)
-            dark_rows = db.list_raw_files_scoped(
-                frame_type="drk", start_date=exposure_id[:8], end_date=exposure_id[:8],
-                zipcode=zipcode, db_path=self.ctx.resolved_raw_db_path(),
+            dark_summary = service.describe(dark_id)["summary"]
+            dark_reference_exposure_time = float(
+                dark_summary.get("reference_exposure_time_seconds") or 0.0
             )
-            dark_exptime = None
-            if dark_rows:
-                dark_raw = dark_rows[0][1]
-                dark_frame = (loader or RawFrameLoader()).load_ref(dark_raw)
-                dark_exptime = float(dark_frame.header.get("EXPTIME") or 0.0)
-            dark_scale = science_exptime / dark_exptime if science_exptime > 0 and dark_exptime and dark_exptime > 0 else 1.0
-            dark_residual = dark - bias
-            image = image - bias - np.float32(dark_scale) * dark_residual
-            variance = variance + np.square(bias_scatter, dtype=np.float32)
-            mask |= np.asarray(service.load_component(dark_id, "dark_pixel_mask")["data"], dtype=np.uint8)
+            dark_bias_convention = dark_summary.get("bias_convention")
+            correction = correct_response_calibration_frames(
+                image[None, :, :],
+                variance[None, :, :],
+                [science_exptime],
+                master_bias=bias,
+                master_bias_scatter=bias_scatter,
+                master_dark=dark,
+                dark_pixel_mask=service.load_component(
+                    dark_id, "dark_pixel_mask"
+                )["data"],
+                dark_reference_exposure_time=dark_reference_exposure_time,
+                dark_bias_convention=dark_bias_convention,
+            )
+            image = correction.get_array("corrected_images")[0]
+            variance = correction.get_array("corrected_variances")[0]
+            mask |= correction.get_array("pixel_masks")[0]
+            dark_scale = float(correction.get_array("dark_scales")[0])
             calibration_parents.extend([bias_id, dark_id])
             if ldls_row is not None:
                 ldls_id = artifact_id(ldls_row)
@@ -171,7 +181,10 @@ class ReducedScienceAmplifierTask(_SciencePublisher):
             "gain": float(reduced.scalars["gain"]),
             "read_noise": float(reduced.scalars["read_noise"]),
             "science_exptime": science_exptime,
-            "dark_exptime": float(dark_exptime or 0.0),
+            "dark_reference_exposure_time_seconds": float(
+                dark_reference_exposure_time or 0.0
+            ),
+            "dark_bias_convention": dark_bias_convention,
             "dark_scale": float(dark_scale),
             "calibration_policy": calibration_policy,
         }

@@ -102,6 +102,7 @@ def test_response_calibration_detector_correction_matches_science_convention():
         master_dark=dark,
         dark_pixel_mask=dark_mask,
         dark_reference_exposure_time=20.0,
+        dark_bias_convention="included_in_electron_master",
     )
 
     np.testing.assert_allclose(result.get_array("corrected_images")[0], 136.0)

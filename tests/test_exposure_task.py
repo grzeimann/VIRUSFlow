@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 from astropy.io import fits
@@ -20,9 +21,13 @@ from virusflow.publication.service import DefaultPublicationService
 from virusflow.registry import database as db
 from virusflow.tasks.base import TaskContext
 from virusflow.tasks.exposure import ExposureTask
+from virusflow.tasks.science import ReducedScienceAmplifierTask
 
 
-def _publish(service, root, kind, zipcode, components, at, *, parents=(), metadata=None):
+def _publish(
+    service, root, kind, zipcode, components, at, *,
+    parents=(), metadata=None, summaries=None,
+):
     request = ArtifactRequest(
         kind=kind, components={
             name: LogicalComponent(name, "array1d" if np.asarray(value).ndim == 1 else "array2d", value)
@@ -30,6 +35,7 @@ def _publish(service, root, kind, zipcode, components, at, *, parents=(), metada
         },
         scope=Scope(zipcode=zipcode), validity=Validity(at, at, "fixture"),
         parents=list(parents), metadata=dict(metadata or {}),
+        summaries=dict(summaries or {}),
     )
     publication = DefaultPublicationService(svc=service, policy=DefaultPersistencePolicy(), base_dir=str(root))
     context = PublicationContext("fixture", "1", "fixture", "1", {}, [], {})
@@ -39,6 +45,64 @@ def _publish(service, root, kind, zipcode, components, at, *, parents=(), metada
 def _traces(nx):
     positions = np.concatenate((20 + 7 * np.arange(38), 330 + 7 * np.arange(37), 640 + 7 * np.arange(37)))
     return np.broadcast_to(positions[:, None], (112, nx)).copy()
+
+
+def test_science_dark_scaling_uses_selected_product_without_raw_dark_lookup(tmp_path: Path):
+    database = tmp_path / "registry.sqlite3"
+    db.init_db(str(database))
+    service = ArtifactService(str(database))
+    exposure_id = "20260609T031649.6"
+    at = datetime.strptime(exposure_id, "%Y%m%dT%H%M%S.%f")
+    zipcode = ZipCode("060", "003", "206", "LL", "S/N 0039")
+    path = tmp_path / "science.fits"
+    header = fits.Header({
+        "IFUSLOT": 60, "IFUID": "003", "SPECID": 206,
+        "CCDPOS": "L", "CCDHALF": "L", "AMPNAME": "XX",
+        "CONTID": "S/N 0039", "GAIN": 1.0, "RDNOISE": 2.0,
+        "EXPTIME": 40.0,
+    })
+    fits.PrimaryHDU(np.full((4, 4), 100.0), header=header).writeto(path)
+    with db.connect(str(database)) as connection:
+        connection.execute(
+            "INSERT INTO exposures(id, when_utc, frame_type) VALUES(?,?,?)",
+            (exposure_id, "20260609", "sci"),
+        )
+        connection.execute(
+            "INSERT INTO raw_files(exposure_id,frame_type,path,tar_member,storage_backend,amp_key) "
+            "VALUES(?,?,?,?,?,?)",
+            (exposure_id, "sci", str(path), None, "filesystem", zipcode.key()),
+        )
+
+    bias = np.full((4, 4), 10.0, dtype=np.float32)
+    dark = np.full((4, 4), 14.0, dtype=np.float32)
+    bias_product = _publish(
+        service, tmp_path, "master_bias", zipcode,
+        {"master": bias, "per_pixel_bias_scatter": np.full_like(bias, 2.0)}, at,
+    )
+    dark_mask = np.zeros_like(dark, dtype=np.uint8)
+    dark_mask[1, 2] = 1
+    dark_product = _publish(
+        service, tmp_path, "master_dark", zipcode,
+        {"master_dark": dark, "dark_pixel_mask": dark_mask}, at,
+        summaries={
+            "reference_exposure_time_seconds": 20.0,
+            "bias_convention": "included_in_electron_master",
+        },
+    )
+
+    state = ReducedScienceAmplifierTask(
+        TaskContext(str(database), str(tmp_path / "artifacts")),
+        target=SimpleNamespace(zipcode=zipcode, exposure_id=exposure_id),
+    ).run({"master_bias": bias_product, "master_dark": dark_product})[
+        "reduced_science_state"
+    ]
+
+    np.testing.assert_allclose(state.image, 82.0)
+    np.testing.assert_allclose(state.variance, 108.0)
+    assert state.pixel_mask[1, 2] == 1
+    assert state.summaries["dark_reference_exposure_time_seconds"] == 20.0
+    assert state.summaries["dark_bias_convention"] == "included_in_electron_master"
+    assert state.summaries["dark_scale"] == 2.0
 
 
 def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catalog_astrometry(tmp_path: Path):
@@ -86,7 +150,14 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
         for y in trace[:, 0].astype(int):
             twilight[y, :] += 1000.0
         _publish(service, tmp_path, "master_bias", zipcode, {"master": zero, "per_pixel_bias_scatter": one}, at)
-        _publish(service, tmp_path, "master_dark", zipcode, {"master_dark": zero, "dark_pixel_mask": zero.astype(np.uint8)}, at)
+        _publish(
+            service, tmp_path, "master_dark", zipcode,
+            {"master_dark": zero, "dark_pixel_mask": zero.astype(np.uint8)}, at,
+            summaries={
+                "reference_exposure_time_seconds": 600.0,
+                "bias_convention": "included_in_electron_master",
+            },
+        )
         _publish(service, tmp_path, "master_ldls", zipcode, {"master_ldls": twilight, "flat_response_mask": zero.astype(np.uint8)}, at)
         _publish(service, tmp_path, "master_arc", zipcode, {"master_arc": one}, at)
         _publish(service, tmp_path, "master_twilight", zipcode, {"master_twilight": twilight}, at)

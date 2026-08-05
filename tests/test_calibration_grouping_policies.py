@@ -222,7 +222,10 @@ def test_master_sci_canonical_task_publication_loading_and_float32(tmp_path):
                 "dark_pixel_mask", "array2d", np.zeros(shape, dtype=np.uint8),
             ),
         },
-        summaries={"reference_exposure_time_seconds": 600.0},
+        summaries={
+            "reference_exposure_time_seconds": 600.0,
+            "bias_convention": "included_in_electron_master",
+        },
         scope=Scope(ZIP),
     )], PublicationContext("fixture", "1", "fixture", "1", {}, [], {}))[0]
     artifact = MasterSciTask(context, target=adapt_target(target)).run({

@@ -1,4 +1,4 @@
-"""Detector/additive correction for reusable response-calibration inputs."""
+"""Shared detector/additive correction for science and calibration inputs."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ import numpy as np
 from ..core.algo_result import AlgoResult
 
 
-ALGORITHM_VERSION = "response-calibration-detector-1.0"
+ALGORITHM_VERSION = "response-calibration-detector-1.1"
+DARK_BIAS_CONVENTION = "included_in_electron_master"
 
 
 def correct_response_calibration_frames(
@@ -20,13 +21,14 @@ def correct_response_calibration_frames(
     master_dark,
     dark_pixel_mask,
     dark_reference_exposure_time: float,
+    dark_bias_convention: str,
 ) -> AlgoResult:
-    """Apply the science-path bias and scaled dark-residual convention.
+    """Apply the shared science/response bias and dark correction.
 
-    The retained dark representation currently includes bias, so the additive
-    dark prediction is ``master_bias + scale * (master_dark-master_bias)``.
-    This routine deliberately mirrors the implemented science correction until
-    the dark Product is migrated to an explicit rate representation.
+    The retained dark representation includes bias, so the additive dark
+    prediction is ``master_bias + scale * (master_dark-master_bias)``.  Its
+    reference exposure time and bias convention must come from the selected
+    ``master_dark`` Product.
     """
 
     data = np.asarray(images, dtype=np.float32)
@@ -37,6 +39,7 @@ def correct_response_calibration_frames(
     dark = np.asarray(master_dark, dtype=np.float32)
     dark_mask = np.asarray(dark_pixel_mask, dtype=np.uint8)
     reference = float(dark_reference_exposure_time)
+    convention = str(dark_bias_convention)
     if data.ndim != 3 or variance.shape != data.shape:
         raise ValueError("response calibration images and variances must be shape-matched stacks")
     if times.shape != (data.shape[0],):
@@ -45,6 +48,11 @@ def correct_response_calibration_frames(
         raise ValueError("response calibration detector Products must match the input image shape")
     if not np.isfinite(reference) or reference <= 0.0:
         raise ValueError("master_dark requires a finite positive reference exposure time")
+    if convention != DARK_BIAS_CONVENTION:
+        raise ValueError(
+            "master_dark requires bias_convention="
+            f"{DARK_BIAS_CONVENTION!r}; received {convention!r}"
+        )
     if np.any(~np.isfinite(times)) or np.any(times <= 0.0):
         raise ValueError("response calibration exposure times must be finite and positive")
 
@@ -72,8 +80,12 @@ def correct_response_calibration_frames(
         meta={
             "detector_correction_policy": "bias_plus_exptime_scaled_dark_residual-1",
             "dark_representation": "electron_master_including_bias",
+            "dark_bias_convention": convention,
         },
     )
 
 
-__all__ = ["ALGORITHM_VERSION", "correct_response_calibration_frames"]
+__all__ = [
+    "ALGORITHM_VERSION", "DARK_BIAS_CONVENTION",
+    "correct_response_calibration_frames",
+]

@@ -1676,6 +1676,40 @@ def get_artifact_details(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Op
         return out
 
 
+def get_artifact_details_many(
+    artifact_ids: Iterable[int], db_path: str = DEFAULT_DB_PATH
+) -> Dict[int, Dict[str, Any]]:
+    """Load canonical detail rows for many Artifacts in one database query."""
+
+    import json
+
+    wanted = tuple(dict.fromkeys(int(value) for value in artifact_ids))
+    if not wanted:
+        return {}
+    init_artifact_db(db_path)
+    placeholders = ",".join("?" for _ in wanted)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"SELECT * FROM artifact_records WHERE artifact_id IN ({placeholders})",
+            wanted,
+        ).fetchall()
+    details = {}
+    for raw in rows:
+        row = dict(raw)
+        for column in (
+            "units_json", "coordinates_json", "configuration_refs_json", "metadata_json"
+        ):
+            key = column.removesuffix("_json")
+            try:
+                row[key] = json.loads(
+                    row.pop(column) or ("[]" if key == "configuration_refs" else "{}")
+                )
+            except Exception:
+                row[key] = [] if key == "configuration_refs" else {}
+        details[int(row["artifact_id"])] = row
+    return details
+
+
 def get_artifact_scientific_metadata(
     artifact_id: int, db_path: str = DEFAULT_DB_PATH
 ) -> Optional[Dict[str, Any]]:
@@ -2054,6 +2088,52 @@ def list_artifacts(
             params.append(int(limit))
         rows = conn.execute(sql, tuple(params)).fetchall()
         return _rows_to_dicts(rows)
+
+
+def find_artifacts_by_calibration_groups(
+    *,
+    kind: str,
+    calibration_group_ids: Iterable[str],
+    state: str = "active",
+    db_path: str = DEFAULT_DB_PATH,
+) -> List[Dict[str, Any]]:
+    """Return Artifact rows for exact planner group identities in one query.
+
+    Calibration group identity is canonical metadata stored on
+    ``artifact_records``.  Filtering it in SQL avoids loading every Artifact of
+    a kind and then opening a new database connection for each detail row.
+    """
+
+    import json
+
+    group_ids = tuple(dict.fromkeys(str(value) for value in calibration_group_ids))
+    if not group_ids:
+        return []
+    placeholders = ",".join("?" for _ in group_ids)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT a.*, p.software_version, p.git_commit, p.algorithm, "
+            "p.parameters_hash, p.created_at, p.parents, "
+            "q.status AS qa_status, q.metrics_json AS qa_metrics_json, "
+            "r.metadata_json, COALESCE(r.state, 'active') AS state "
+            "FROM artifacts a "
+            "JOIN artifact_records r ON r.artifact_id = a.id "
+            "LEFT JOIN provenance p ON p.artifact_id = a.id "
+            "LEFT JOIN qa_results q ON q.artifact_id = a.id "
+            "WHERE COALESCE(r.canonical_kind, a.kind) = ? "
+            "AND COALESCE(r.state, 'active') = ? "
+            "AND CAST(json_extract(r.metadata_json, '$.calibration_group_id') AS TEXT) "
+            f"IN ({placeholders}) "
+            "ORDER BY p.created_at DESC NULLS LAST, a.id DESC",
+            (str(kind), str(state), *group_ids),
+        ).fetchall()
+    artifacts = _rows_to_dicts(rows)
+    for row in artifacts:
+        try:
+            row["metadata"] = json.loads(row.pop("metadata_json") or "{}")
+        except (TypeError, ValueError):
+            row["metadata"] = {}
+    return artifacts
 
 
 def list_artifact_planning_evidence(
