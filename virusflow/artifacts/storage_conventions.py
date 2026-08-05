@@ -9,8 +9,8 @@ from .requests import LogicalComponent
 
 FLUX_SCALE = 1.0e-17
 VARIANCE_SCALE = FLUX_SCALE ** 2
-FLUX_BUNIT = "1e-17 erg s-1 cm-2 Angstrom-1"
-VARIANCE_BUNIT = "(1e-17 erg s-1 cm-2 Angstrom-1)^2"
+FLUX_BUNIT = "1e-17 response-corrected electron"
+VARIANCE_BUNIT = "(1e-17 response-corrected electron)^2"
 
 ASTROMETRIC_KINDS = frozenset(
     {

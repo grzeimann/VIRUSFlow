@@ -109,7 +109,8 @@ def test_observation_task_preserves_atomic_exposures_registration_coverage_and_q
     stored_flux = service.load_component(result["calibrated_fiber_observation"].id, "flux")
     assert stored_flux["data"].dtype == np.float32
     assert np.nanmedian(stored_flux["stored_data"]) == 2.0
-    assert stored_flux["header"]["BUNIT"].startswith("1e-17")
+    assert stored_flux["header"]["BUNIT"] == "1e-17 response-corrected electron"
+    assert final["summary"]["absolute_flux_calibration"] is False
     assert len(service.query_observation(target.observation_id)) == 9
     assert len(service.query_dither_set(target.dither_set_id)) == 9
     assert len(service.query_observation_set([target.observation_id], kind="observation_summary")) == 1

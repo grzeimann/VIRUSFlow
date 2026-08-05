@@ -66,7 +66,9 @@ raw D(e,p)
   -> divide calibration-time within-amplifier and amp-to-amp factors
   -> solve exposure astrometry and fiber sky coordinates
   -> select sky fibers, fit common sky, predict and subtract sky
-  -> apply exposure illumination factor                           [run-local]
+  -> select one instrument-epoch empirical effective baseline
+  -> apply that baseline once and separate exposure illumination/transparency
+                                                                  [run-local]
   -> pass calibrated exposure state to observation assembly       [run-local]
   -> concatenate a complete dither sequence as
      calibrated_fiber_observation                                 [retained]
@@ -111,6 +113,37 @@ refit either factor from science data. It still materializes the
 exposure-scoped `fiber_response_model` because exposure illumination remains an
 exposure-specific factor.
 
+The selected `baseline_relative_response` is now a non-unity empirical payload
+imported from the legacy Remedy `throughput / normalization` curves. The two
+legacy curves are import inputs only: production retains wavelength, effective
+response, uncertainty state, and mask in one independently selectable Product,
+not separate throughput and normalization response layers. The imported curve
+has no supplied uncertainty, so its uncertainty array is `NaN` with an explicit
+`uncertainty_unavailable` mask bit. The application code propagates statistical
+variance through the response-square divisor and adds a baseline-uncertainty
+term whenever a later selected Product supplies finite uncertainty.
+
+This baseline is method-dependent. Its metadata identifies Remedy's five-pixel
+fractional aperture average, trace-centered aperture without a fitted detector
+PSF, gap-sampled smooth scattered-light subtraction, and
+LDLS/twilight/master-science fiber-normalization convention, plus the current
+provisional VIRUSFlow application configuration. Remedy's guider mirror
+illumination and transparency measurements remain exposure-specific rather
+than baseline components. A finite positive header transparency is divided once
+as its own gray exposure factor; because no transparency uncertainty is
+available, it is treated as fixed in the current conditional variance. This is
+not a wavelength-dependent atmospheric-extinction correction. The exact
+curve-producing release and instrument-
+epoch dates were not recovered. Atmospheric extinction was not separately
+removed during the legacy derivation, so the Product is an empirical effective
+response with provisional atmospheric content, not an isolated
+$T^{\mathrm{instrument}}$. A newer valid Product supersedes it by selection;
+response Products are alternatives, never accumulated correction layers.
+Selection requires an exact match to the recorded extraction, PSF-treatment,
+contribution-correction, and response-convention algorithm versions. A method
+version change therefore refuses the bundled seed until a compatible baseline
+is regenerated and published with a new identity.
+
 The dense-calibration release boundary is likewise part of the implemented
 inverse. Trace Products retain their discrete sample-validity state, fit
 residuals, per-fiber sample counts, and reference-interpolated flags.
@@ -142,25 +175,27 @@ coefficients. Dense parents remain rebuildable only from raw data and the
 versioned algorithms; the compact descendants preserve the evidence needed to
 audit the inference, not a lossless reconstruction of the dense illumination.
 
-### Horizon 2: measured baseline instrumental response
+### Horizon 2: method-matched baseline regeneration and atmospheric separation
 
-The next bounded goal is to replace the provisional identity
-`baseline_relative_response` with a measured, versioned relative instrumental
-response while preserving the existing factor separation:
+The next bounded goal is to supersede the imported Remedy seed with baselines
+measured under fully identified current reduction methods and to separate the
+atmospheric color term:
 
 ```text
-retained historical or standard-source response evidence
-  -> fit baseline_relative_response for a stated instrument epoch
-  -> retain wavelength grid, response, validity, uncertainty, and fit lineage
-  -> select and apply that Product to sky-subtracted fiber measurements
-  -> propagate its diagonal uncertainty into the calibrated variance
-  -> remove the identity-response placeholder from normal production
+retained standard-source measurements plus observing-condition evidence
+  -> reduce them with one stated extraction, PSF, contribution-correction,
+     and calibration configuration
+  -> estimate atmospheric extinction separately from the effective response
+  -> fit a method- and epoch-matched baseline with finite uncertainty and mask
+  -> validate it against held-out standards and the imported Remedy seed
+  -> publish a new version that supersedes, rather than multiplies, the seed
+  -> require regeneration when any named method or calibration identity changes
 ```
 
-This horizon uses the already registered instrument-epoch Product and is
-bounded to relative instrumental response. It does not fold exposure
-illumination into the baseline, infer atmospheric transmission or absolute
-scale, model PSF/DAR coupling, or reconstruct a source-domain field.
+This horizon remains bounded to a relative response and a separable atmospheric
+extinction estimate. It does not fold exposure illumination or transparency
+measurements into the baseline, establish an absolute scale, solve source
+capture or PSF/DAR coupling, or reconstruct a source-domain field.
 
 ### Horizon 3: long-term physical inversion
 
@@ -187,8 +222,8 @@ surface brightness.
 | $R^{\mathrm{pixel}}_p$ | `master_ldls`, `pixel_mask` | LDLS residuals supply a flat-response defect mask. Dark/LDLS masks condition response extraction and wavelength-input interpolation; the wavelength Product retains exact applied-mask indices and parent identity. | The science image is not divided by a pixel-sensitivity map. `master_ldls` is intentionally not treated as a pure pixel flat, and there is no standalone time-aware defect Product. |
 | $R^{\mathrm{fiber}}_{e,f}(\lambda)$ | `within_amp_fiber_normalization`, `fiber_normalization`, `fiber_response_model` | The retained calibration-time within-amplifier Product combines scatter-corrected LDLS fine structure with scatter-corrected twilight broad and residual structure and requires that factorization, wavelength grid, validity, and amplifier anchor as payload evidence. `ExposureTask` selects the exact Product named by the group response and divides by it in memory. | `fiber_normalization` has no current producer. The implemented normalization is an empirical illumination/response combination, not a uniquely identified intrinsic fiber throughput. |
 | $R^{\mathrm{amp}}_{e,a}$ | `amp_to_amp_normalization`, `fiber_response_model` | One calibration-build Product compares all sibling center-track twilight anchors, retains complete amplifier keys and factors, and is selected and applied before global science-fiber assembly. | The uniform center-track twilight assumption remains explicit and unvalidated as a general illumination model; the build Product is relative, not an absolute throughput scale. |
-| $T^{\mathrm{instrument}}_e(\lambda)$ | `baseline_relative_response`, `fiber_response_model`, `final_exposure_response` | The exposure-scoped compact model links the selected calibration-build within-amplifier and amp-to-amp factors, the exposure illumination factor, and an explicit provisional identity baseline. | No measured wavelength-dependent spectrophotometric response or absolute throughput scale is applied. `final_exposure_response` is scratch-only and superseded. |
-| $T^{\mathrm{atmosphere}}_e(\theta,\lambda)$ | No dedicated registered kind | Transparency-like header values can appear in observation state metadata. | Extinction, clouds, and telluric transmission are not modeled or divided out. |
+| $T^{\mathrm{instrument}}_e(\lambda)$ | `baseline_relative_response`, `fiber_response_model`, `final_exposure_response` | One selected instrument-epoch `baseline_relative_response` is interpolated and divided exactly once after sky subtraction; exposure illumination remains a separate factor. The initial non-unity Product is the legacy Remedy empirical `throughput / normalization` effective response, with wavelength, response, unknown-uncertainty markers, mask, provenance, method identity, and applicability. | The imported baseline may contain atmospheric extinction, its exact legacy epoch and method release are not recovered, and it is not isolated instrumental throughput or absolute calibration. `final_exposure_response` is scratch-only and superseded. |
+| $T^{\mathrm{atmosphere}}_e(\theta,\lambda)$ | No dedicated registered kind | A finite positive header transparency is retained in exposure state and divided once as a separate gray factor, never as part of the baseline. | Its uncertainty is unavailable, and wavelength-dependent extinction, clouds, and telluric transmission are not modeled; this is not an atmospheric correction. |
 | $\mathcal{M}_e(\theta)$ | `initial_astrometry`, `source_detection_catalog`, `catalog_match_table`, `final_astrometry`, `fiber_sky_coordinates` | Header TAN geometry is retained and a catalog shift/rotation fit is attempted; failed catalog refinement falls back to header astrometry with degraded QA. | The current fit is simpler than the full spatial model and does not supply formal mapping uncertainty as a separate Product. |
 | PSF, $\Delta\theta_e^{\mathrm{DAR}}(\lambda)$, and $C_{e,f}$ | Astrometry and dither Products provide partial geometry only | Fiber focal-plane and sky coordinates, nominal/refined dither offsets, and footprint coverage are retained. | There is no PSF, DAR, aperture-coupling, or spatial reconstruction Product, so source-to-fiber coupling is not inverted. |
 | $F^{\mathrm{sky}}_{e,f}(\lambda)$ | `sky_fiber_mask`, `sky_model`, `fiber_sky_prediction`, `sky_subtracted_spectrum`, `candidate_sky_model` | A supersampled common incident sky is fitted at exposure scope, with per-fiber illumination coefficients, then integrated onto each native fiber grid and subtracted in memory. | The baseline assumes one incident sky spectrum, has no accepted fiber-specific LSF, and does not propagate sky-model covariance into final variance. |
@@ -278,10 +313,10 @@ published. `ArtifactService` rejects permanent publication of every S kind.
 | `sky_model` | exposure / M | Fitted latent common $F^{\mathrm{sky}}$ model with variance, sample counts, and fiber coefficients. | Production exposure model Product. |
 | `fiber_sky_prediction` | fiber / S | Evaluated $F^{\mathrm{sky}}_{e,f}(\lambda)$ on each native fiber grid. | Scratch-only; computed inside sky subtraction. |
 | `sky_subtracted_spectrum` | fiber / S | Inverse intermediate estimating source-plus-residual counts after removing sky. | Scratch-only; computed in memory. |
-| `baseline_relative_response` | instrument epoch / C | Reference state intended to constrain $T^{\mathrm{instrument}}(\lambda)$. | Production exposure path publishes an identity curve marked provisional and degraded. |
+| `baseline_relative_response` | instrument epoch / C | Independently selectable empirical effective-response state with wavelength, response, uncertainty, mask, units, provenance, method identity, and applicability. | The imported Remedy `throughput / normalization` seed is provisional, has unknown uncertainty and possible atmospheric content, and is superseded by selecting a later measured baseline rather than composing response layers. |
 | `exposure_illumination_correction` | exposure / C | Exposure-specific empirical fiber/amplifier factor derived from selected sky fibers. | Production exposure Product; used both as sky-model coefficients and the final numerical response division. |
 | `final_exposure_response` | exposure / S | Intended dense evaluated combination of response factors. | Scratch-only, superseded legacy kind; not produced by the current path. |
-| `fiber_response_model` | exposure / M | Compact evaluated state linking selected calibration-build within-amplifier knots and amplifier factors with exposure illumination. | Production exposure model Product. `ExposureTask` materializes it from mutually coherent calibration parents without refitting those factors; it cites the provisional baseline and does not encode accepted absolute or atmospheric calibration. |
+| `fiber_response_model` | exposure / M | Compact evaluated state linking selected calibration-build within-amplifier knots and amplifier factors with exposure illumination. | Production exposure model Product. `ExposureTask` materializes it from mutually coherent calibration parents without refitting those factors; it links the independently selected baseline, which is applied separately exactly once, and does not encode absolute or atmospheric calibration. |
 | `calibrated_fiber_observation` | observation / C | Current terminal inverse result: concatenated native-grid fiber flux, variance, mask, wavelength, identity, and position for the member exposures. | Production observation Product only when the dither assignment is complete and every member has a run-local calibrated state. It is not a coadd or spatial reconstruction. |
 
 ### Operational context, QA, and analytics
@@ -377,6 +412,10 @@ reduction in which:
 - empirical within-amplifier, amplifier-to-amplifier, and exposure illumination
   factors are applied, with the first two selected from one coherent calibration
   response build rather than refitted from the science exposure;
+- one independently selected, non-unity empirical baseline effective response is
+  divided exactly once, with baseline, exposure illumination, and measured gray
+  transparency retained as separate factors and finite response uncertainty
+  propagated when available;
 - dense Hg, Cd, arc, LDLS, twilight, and optional master-science components may
   be released only after QA-valid descendants preserve all currently required
   compact evidence with verified checksums;
@@ -387,22 +426,24 @@ reduction in which:
 - a complete observation can be published as positioned, sky-subtracted fiber
   spectra with diagonal variance and masks.
 
-The current code does **not** yet support the stronger claim that
-`calibrated_fiber_observation` is an absolutely spectrophotometric or
+The current code labels the terminal spectral planes as response-corrected
+electrons rather than physical flux. It does **not** support the stronger claim
+that `calibrated_fiber_observation` is an absolutely spectrophotometric or
 atmosphere-corrected measurement of intrinsic source surface brightness. The
-configured flux scale and unit label do not by themselves invert
-$T^{\mathrm{instrument}}$, $T^{\mathrm{atmosphere}}$, PSF/DAR coupling, or
+effective Remedy baseline does not separately invert
+$T^{\mathrm{instrument}}$ and $T^{\mathrm{atmosphere}}$, PSF/DAR coupling, or
 aperture loss.
 
 ## Implementation priorities supported by this crosswalk
 
-1. **Implement the measured relative-response Horizon 2.** Replace the
-   provisional identity baseline with a selected, measured instrument-epoch
-   `baseline_relative_response`, retain its fit evidence and uncertainty, and
-   apply it without hiding exposure illumination or atmospheric terms.
-2. **Make atmospheric and absolute response explicit.** Add measured states for
-   atmospheric transmission and absolute scale before claiming
-   spectrophotometric source flux.
+1. **Regenerate method-matched measured baselines and separate atmosphere.**
+   Reduce retained standard-source evidence under fully identified extraction,
+   PSF, contribution-correction, and calibration configurations; estimate the
+   atmospheric color term separately; retain finite uncertainty and validation;
+   and supersede the imported Remedy Product without composing response layers.
+2. **Make transparency and absolute response explicit.** Keep exposure
+   transparency separate from both the baseline and illumination, and add an
+   absolute scale only before claiming spectrophotometric source flux.
 3. **Develop profile, PSF, DAR, and coupling models.** Measure the operators
    currently approximated by the fixed aperture and positional geometry.
    Introduce an Artifact kind only for evidence or evaluated states that meet

@@ -38,6 +38,18 @@ def test_clean_cli_exposes_real_commands_and_retires_plan_stubs(tmp_path: Path):
     assert args.run_cmd == "observation"
     assert args.progress is None
     assert args.nworkers is None
+    baseline_args = parser.parse_args([
+        "run", "exposure", "--exposure-id", "20260609T031649.6",
+        "--baseline-response-file", str(tmp_path / "baseline.txt"),
+    ])
+    assert baseline_args.baseline_response_file == str(tmp_path / "baseline.txt")
+    assert baseline_args.baseline_response_artifact_id is None
+    with pytest.raises(SystemExit):
+        parser.parse_args([
+            "run", "exposure", "--exposure-id", "20260609T031649.6",
+            "--baseline-response-file", str(tmp_path / "baseline.txt"),
+            "--baseline-response-artifact-id", "17",
+        ])
     exposure_args = parser.parse_args([
         "exposures", "--requested-target", "Target_Name",
         "--requested-program", "P001", "--observing-mode", "parallel",

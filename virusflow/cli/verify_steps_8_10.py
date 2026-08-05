@@ -448,7 +448,7 @@ def _write_report(
         "",
         *[f"- {item}" for item in validation['limitations']],
         "",
-        "The identity relative response and provisional dither geometry remain explicit degraded/configurable policies; this report does not claim an accepted physical LSF model or propagated sky/response covariance.",
+        "The imported Remedy effective response and provisional dither geometry remain explicit degraded/configurable policies; this report does not claim atmospheric correction, absolute flux calibration, an isolated instrumental throughput, an accepted physical LSF model, or propagated sky/response covariance.",
     ]
     markdown_path = output_dir / "validation_report.md"
     markdown_path.write_text("\n".join(report) + "\n")
@@ -754,7 +754,7 @@ def main(argv: list[str] | None = None) -> int:
         "checks": checks,
         "limitations": [
             "Peak scratch usage is not sampled because the accepted exposure path currently materializes its temporary states in memory.",
-            "The production baseline relative response is provisional unity.",
+            "The production baseline is a provisional empirical Remedy effective response with possible atmospheric content and unknown imported uncertainty.",
             "No accepted physical LSF model is available.",
             "Sky/response covariance is not propagated.",
             "095+004+426+RU+S/N 0048 has zero-valued comparison arrays and no wavelength-dependent extraction.",

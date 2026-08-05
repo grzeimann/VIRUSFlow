@@ -88,10 +88,58 @@ ASTROMETRY_CONFIGURATION = VersionedConfiguration(
 
 BASELINE_RESPONSE_CONFIGURATION = VersionedConfiguration(
     kind="baseline_relative_response",
-    version="unity-reference-1",
-    value={"model": "unity", "normalization": "relative"},
+    version="remedy-effective-response-1.0",
+    identity="legacy-remedy-effective-response",
+    value={
+        "file": "data/baseline_relative_response_remedy_1.txt",
+        "response_definition": "throughput / normalization",
+        "instrument_epoch": "legacy-remedy-reference-epoch-unspecified",
+        "derivation_method": {
+            "extraction": (
+                "Remedy get_spectra npix=5 fractional aperture average "
+                "(weighted sum divided by five)"
+            ),
+            "psf_treatment": (
+                "no fitted detector PSF in fiber extraction; "
+                "trace-centered fractional aperture"
+            ),
+            "contribution_correction": (
+                "Remedy get_powerlaw gap-sampled smooth scattered-light "
+                "subtraction before extraction"
+            ),
+            "calibration_convention": (
+                "Remedy LDLS/twilight/master-science fiber normalization followed by "
+                "throughput / normalization effective response"
+            ),
+            "legacy_code": (
+                "grzeimann/Remedy quick_reduction.py blob fe58dc801dee1ebe2f92adfc05aec88cdae70e2a; "
+                "fiber_utils.py blob e64b0e0a0d8f5f631b8279b83ed6d2f3db89232b"
+            ),
+        },
+        "application_configuration": {
+            "extraction": "fractional-aperture-5px-1",
+            "psf_treatment": "fixed top-hat aperture; no fitted PSF/LSF",
+            "contribution_correction": (
+                "physical-CCD gap-scatter subtraction plus calibration-build fiber normalization"
+            ),
+            "calibration_convention": (
+                "within-amplifier and amp-to-amp factors applied before one baseline division"
+            ),
+            "algorithm_versions": {
+                "extraction": "fractional-sum-aperture-1.0",
+                "psf_treatment": "none-fixed-aperture-1",
+                "contribution_correction": "physical-ccd-gap-polynomial-1.0",
+                "calibration_convention": "relative-response-factorized-3.0",
+            },
+        },
+        "atmospheric_content": "possibly present; atmospheric extinction was not separately removed",
+        "separate_exposure_measurements": (
+            "Remedy guider mirror illumination and transparency were exposure-specific "
+            "and are not baseline components"
+        ),
+    },
     evidence_state="provisional",
-    source="No historical response curve was supplied; explicit identity baseline",
+    source="Imported legacy Remedy throughput.txt and normalization.txt as one effective response",
 )
 
 WAVELENGTH_INPUT_MASK_CONFIGURATION = VersionedConfiguration(

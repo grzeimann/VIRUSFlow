@@ -21,7 +21,12 @@ from ..algorithms.astrometry import (
 from ..algorithms.completion import build_completion_coverage
 from ..algorithms.exposure import CalibratedFiberState, apply_relative_response
 from ..algorithms.exposure_state import classify_mode_and_effective_time
-from ..algorithms.extraction import extract_fractional_aperture, validate_wavelength_rows
+from ..algorithms.extraction import (
+    EXTRACTION_VERSION,
+    extract_fractional_aperture,
+    validate_wavelength_rows,
+)
+from ..algorithms.physical_ccd import ALGORITHM_VERSION as CONTRIBUTION_CORRECTION_VERSION
 from ..algorithms.response import (
     RESPONSE_VERSION,
     baseline_relative_response,
@@ -86,7 +91,7 @@ class GlobalFiberFrame:
 
 class ExposureTask(_SciencePublisher):
     name = "full_exposure"
-    version = "v1"
+    version = "v2"
 
     @staticmethod
     def _no_extractable_message(exposure_id: str, failures: dict, *, reason: str | None = None) -> str:
@@ -227,6 +232,152 @@ class ExposureTask(_SciencePublisher):
                 kinds["amp_to_amp_normalization"] = amp_normalization
             available[zipcode.key()] = kinds
         return available, failures
+
+    @staticmethod
+    def _baseline_application_versions() -> dict[str, str]:
+        return {
+            "extraction": EXTRACTION_VERSION,
+            "psf_treatment": "none-fixed-aperture-1",
+            "contribution_correction": CONTRIBUTION_CORRECTION_VERSION,
+            "calibration_convention": RESPONSE_VERSION,
+        }
+
+    @classmethod
+    def _complete_baseline_candidates(cls, service, at: datetime) -> list[dict]:
+        required = {"wavelength", "response", "uncertainty", "mask"}
+        candidates = service.adapter.find(
+            kind="baseline_relative_response", zipcode=None, at_time=at, limit=None
+        )
+        complete = []
+        for row in candidates:
+            if str(row.get("state") or "active") != "active":
+                continue
+            description = service.describe(row)
+            names = {
+                component["name"]
+                for component in description["components"]
+                if component.get("payload_state", "present") == "present"
+            }
+            applicability = description["summary"].get("applicability") or {}
+            if (
+                required <= names
+                and applicability.get("algorithm_versions")
+                == cls._baseline_application_versions()
+            ):
+                complete.append(row)
+        return complete
+
+    def _select_or_import_baseline(self, service, config, at: datetime):
+        """Select one baseline Product, importing the bundled Remedy seed once."""
+
+        configured_id = self.ctx.config.get("baseline_response_artifact_id")
+        if configured_id is not None:
+            row = service.adapter.get_row(int(configured_id))
+            if row is None or row.get("kind") != "baseline_relative_response":
+                raise RuntimeError(
+                    f"Configured baseline_response_artifact_id={configured_id} is not a baseline response"
+                )
+            if int(row["id"]) not in {
+                int(candidate["id"]) for candidate in self._complete_baseline_candidates(service, at)
+            }:
+                raise RuntimeError(
+                    "Configured baseline response is incomplete, inactive, inapplicable in time, "
+                    "or incompatible with the current extraction/correction methods"
+                )
+            return service.get(int(row["id"]))
+
+        configured_path = self.ctx.config.get("baseline_response_path")
+        if configured_path is None:
+            candidates = self._complete_baseline_candidates(service, at)
+            if candidates:
+                # Registry ordering is newest first.  A later measured baseline
+                # therefore supersedes the imported seed instead of multiplying
+                # another response layer onto it.
+                return service.get(int(candidates[0]["id"]))
+
+        payload, reference = config.resolve_baseline_response(configured_path)
+        configured_versions = BASELINE_RESPONSE_CONFIGURATION.value[
+            "application_configuration"
+        ]["algorithm_versions"]
+        current_versions = self._baseline_application_versions()
+        if configured_versions != current_versions:
+            raise RuntimeError(
+                "The bundled baseline is incompatible with the current extraction/correction "
+                "methods; regenerate and version a method-matched baseline"
+            )
+        baseline = baseline_relative_response(
+            payload["wavelength"], payload["response"], payload["uncertainty"], payload["mask"],
+            version=reference.version,
+        )
+        config_value = BASELINE_RESPONSE_CONFIGURATION.value
+        metadata = {
+            "evidence_state": BASELINE_RESPONSE_CONFIGURATION.evidence_state,
+            "payload_version": reference.version,
+            "response_object": "empirical_effective_relative_response",
+            "response_definition": config_value["response_definition"],
+            "instrument_epoch": config_value["instrument_epoch"],
+            "derivation_method_identity": {
+                "name": BASELINE_RESPONSE_CONFIGURATION.identity,
+                **config_value["derivation_method"],
+            },
+            "applicability": {
+                **config_value["application_configuration"],
+                "wavelength_min_angstrom": float(baseline.get_array("wavelength")[0]),
+                "wavelength_max_angstrom": float(baseline.get_array("wavelength")[-1]),
+                "selection": "independent baseline Product; apply exactly once after sky subtraction",
+            },
+            "atmospheric_content": config_value["atmospheric_content"],
+            "separate_exposure_measurements": config_value["separate_exposure_measurements"],
+            "atmospheric_correction_applied": False,
+            "isolated_instrumental_throughput": False,
+            "absolute_flux_calibration": False,
+            "uncertainty_state": "not supplied by legacy curves; NaN with mask bit 2",
+            "mask_bits": {"1": "response invalid", "2": "response uncertainty unavailable"},
+            "source_payload_name": payload["source_name"],
+            "source_payload_sha256": payload["source_sha256"],
+            "legacy_input_provenance": {
+                "throughput_sha256": "6a6715e048dbc7d8ef709f371b2bdf2b0f7bf0fc2c063134b184d9494c9f141a",
+                "normalization_sha256": "c8c3eee4b89e1a688e9c438e451b5e63d8c961e860cb00c0e40ab4cdd0770c23",
+                "retention": "inputs used only to create this payload; not response components",
+            },
+        }
+        request = ArtifactRequest(
+            kind="baseline_relative_response",
+            role="calibration",
+            components={
+                "wavelength": _component(
+                    "wavelength", baseline.get_array("wavelength"), "Angstrom", "wavelength_angstrom"
+                ),
+                "response": _component(
+                    "response", baseline.get_array("response"), "1", "wavelength_angstrom"
+                ),
+                "uncertainty": _component(
+                    "uncertainty", baseline.get_array("uncertainty"), "1", "wavelength_angstrom",
+                    convention="standard_deviation",
+                ),
+                "mask": _mask_component(
+                    "mask", baseline.get_array("mask"), "1", "wavelength_angstrom",
+                    bit_1="response_invalid", bit_2="uncertainty_unavailable",
+                ),
+            },
+            summaries=dict(baseline.scalars),
+            metadata=metadata,
+            scope=Scope(zipcode=None, physical_scope=PhysicalScope.INSTRUMENT_EPOCH),
+            validity=Validity(None, None, "legacy_remedy_instrument_epoch_unspecified"),
+            configuration_refs=[reference],
+            assumptions=[
+                "Atmospheric extinction was not separately removed from the legacy response.",
+                "The exact observing epoch and release that produced the supplied legacy curves were not recovered.",
+                "No absolute flux scale or isolated instrumental throughput is asserted.",
+            ],
+        )
+        artifact = self._publish(
+            request,
+            algorithm_name="virusflow.algorithms.response.baseline_relative_response",
+            algorithm_version=reference.version,
+        )
+        self._qa(artifact, request.summaries, status="warn", usability="degraded")
+        return artifact
 
     @staticmethod
     def _amp_from_physical(array, amp: str):
@@ -748,19 +899,32 @@ class ExposureTask(_SciencePublisher):
         sky_subtracted = sky_subtraction.get_array("sky_subtracted")
         residual_sigma = sky_subtraction.scalars["residual_robust_sigma"]
 
-        baseline = baseline_relative_response(sky_wave, version=BASELINE_RESPONSE_CONFIGURATION.version)
-        baseline_response = baseline.get_array("response")
-        baseline_artifact = self._request(
-            kind="baseline_relative_response",
-            scope=Scope(zipcode=None, physical_scope=PhysicalScope.INSTRUMENT_EPOCH),
-            components={
-                "wavelength": _component("wavelength", sky_wave, "Angstrom", "wavelength_angstrom"),
-                "response": _component("response", baseline_response, "1", "wavelength_angstrom"),
-            },
-            summaries={"response_median": baseline.scalars["response_median"]}, metadata={"evidence_state": BASELINE_RESPONSE_CONFIGURATION.evidence_state},
-            refs=exposure_refs, assumptions=["No historical relative-response curve was supplied; identity is explicit and provisional."],
-            algorithm="virusflow.algorithms.response.baseline_relative_response", version=BASELINE_RESPONSE_CONFIGURATION.version,
-            status="warn", usability="degraded",
+        baseline_artifact = self._select_or_import_baseline(service, config, at)
+        baseline_artifact_id = int(baseline_artifact.id)
+        baseline_wavelength = np.asarray(
+            service.load_component(baseline_artifact_id, "wavelength")["data"], dtype=np.float32
+        )
+        baseline_response = np.asarray(
+            service.load_component(baseline_artifact_id, "response")["data"], dtype=np.float32
+        )
+        baseline_uncertainty = np.asarray(
+            service.load_component(baseline_artifact_id, "uncertainty")["data"], dtype=np.float32
+        )
+        baseline_mask = np.asarray(
+            service.load_component(baseline_artifact_id, "mask")["data"], dtype=np.uint16
+        )
+        baseline_description = service.describe(baseline_artifact_id)
+        baseline_metadata = baseline_description["summary"]
+        baseline_relative_response(
+            baseline_wavelength,
+            baseline_response,
+            baseline_uncertainty,
+            baseline_mask,
+            version=str(
+                baseline_metadata.get("payload_version")
+                or baseline_metadata.get("_algorithm_version")
+                or "selected-baseline"
+            ),
         )
         response_model = compact_fiber_response(
             wavelength, within_response, amp_factors, fiber_illumination,
@@ -782,14 +946,36 @@ class ExposureTask(_SciencePublisher):
                 "knot_count": int(response_model.wavelength_knots.shape[1]),
             },
             metadata={
-                "composition": ["baseline_relative_response", "within_amplifier_fiber_normalization", "calibration_build_amp_to_amp_normalization", "exposure_illumination_correction"],
+                "composition": ["within_amplifier_fiber_normalization", "calibration_build_amp_to_amp_normalization", "exposure_illumination_correction"],
+                "baseline_relative_response_artifact_id": int(baseline_artifact.id),
+                "baseline_application": "selected independently and applied once after sky subtraction",
                 "calibration_build_amp_to_amp_artifact_id": amp_artifact_id,
                 "interpolation": "linear_in_wavelength",
             },
             refs=exposure_refs, algorithm="virusflow.algorithms.response.compact_fiber_response", version=RESPONSE_VERSION,
             status="warn", usability="degraded",
         )
-        response_application = apply_relative_response(sky_subtracted, spectrum_variance, wavelength, valid_fraction, fiber_illumination)
+        header_transparency = header.get("TRANSPAR")
+        try:
+            header_transparency = float(header_transparency)
+        except (TypeError, ValueError):
+            header_transparency = None
+        if header_transparency is not None and (
+            not np.isfinite(header_transparency) or header_transparency <= 0.0
+        ):
+            header_transparency = None
+        response_application = apply_relative_response(
+            sky_subtracted,
+            spectrum_variance,
+            wavelength,
+            valid_fraction,
+            baseline_wavelength=baseline_wavelength,
+            baseline_response=baseline_response,
+            baseline_uncertainty=baseline_uncertainty,
+            baseline_mask=baseline_mask,
+            fiber_illumination=fiber_illumination,
+            exposure_transparency=header_transparency,
+        )
         calibrated_flux = response_application.get_array("calibrated_flux")
         calibrated_variance = response_application.get_array("calibrated_variance")
         final_mask = response_application.get_array("mask")
@@ -810,8 +996,25 @@ class ExposureTask(_SciencePublisher):
                 "sky_residual_robust_sigma": residual_sigma,
                 "sky_evaluator_version": SKY_VERSION,
                 "pixel_integration": sky_model.integration_method,
-                "response_evidence_state": BASELINE_RESPONSE_CONFIGURATION.evidence_state,
-                "variance_terms": "extracted_statistical_only; sky-model and response-model covariance not yet added",
+                "response_evidence_state": baseline_metadata.get("evidence_state", "unknown"),
+                "baseline_relative_response_artifact_id": int(baseline_artifact.id),
+                "baseline_applied_count": response_application.scalars["baseline_applied_count"],
+                "exposure_illumination_applied_count": response_application.scalars["illumination_applied_count"],
+                "exposure_transparency_measurement": header_transparency,
+                "exposure_transparency_application": (
+                    "applied once as a separate gray factor"
+                    if header_transparency is not None
+                    else "not available; no transparency factor applied"
+                ),
+                "absolute_flux_calibration": False,
+                "atmospheric_correction_applied": False,
+                "isolated_instrumental_throughput": False,
+                "variance_terms": (
+                    "extracted statistical variance divided by response squared; measured baseline "
+                    "uncertainty added where available; imported Remedy uncertainty is unknown; "
+                    "transparency is treated as fixed because its uncertainty is unavailable; "
+                    "sky-model covariance not yet added"
+                ),
                 "wavelength_fiber_exclusions": wavelength_fiber_exclusions,
             },
         )

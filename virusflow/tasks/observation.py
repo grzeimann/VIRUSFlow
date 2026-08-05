@@ -21,7 +21,7 @@ from ..algorithms.observation import (
 from ..artifacts import ArtifactService, Scope, Validity
 from ..artifacts.models import ConfigurationReference
 from ..artifacts.requests import ArtifactRequest
-from ..artifacts.storage_conventions import scaled_flux_component, scaled_variance_component
+from ..artifacts.storage_conventions import FLUX_SCALE, scaled_flux_component, scaled_variance_component
 from ..config import ConfigurationService
 from ..config.defaults import DITHER_POLICY
 from ..core.exposure_metadata import interpret_virus_exposure_header
@@ -485,7 +485,10 @@ class ObservationTask(_SciencePublisher):
                     "member_exposure_ids": list(exposure_ids),
                     "spectral_planes": ["flux", "variance", "mask"],
                     "wavelength_sampling": "per_fiber_native_bin_centers",
-                    "flux_scale": 1e-17,
+                    "flux_scale": FLUX_SCALE,
+                    "calibration_state": "relative empirical effective response only",
+                    "absolute_flux_calibration": False,
+                    "atmospheric_correction_applied": False,
                     "uncertainty_convention": "variance",
                     "model_artifact_ids_by_exposure": {
                         state.exposure_id: list(state.model_artifact_ids) for state in ordered_states

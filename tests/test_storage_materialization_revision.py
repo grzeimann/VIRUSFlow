@@ -247,6 +247,8 @@ def test_concurrent_publication_is_idempotent_and_leaves_no_registry_shells(tmp_
         components={
             "wavelength": LogicalComponent("wavelength", "array1d", np.linspace(3500, 5500, 32)),
             "response": LogicalComponent("response", "array1d", np.ones(32)),
+            "uncertainty": LogicalComponent("uncertainty", "array1d", np.full(32, 0.01)),
+            "mask": LogicalComponent("mask", "mask", np.zeros(32, dtype=np.uint8)),
         },
     )
     barrier = Barrier(2)

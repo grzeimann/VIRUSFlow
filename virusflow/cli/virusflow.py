@@ -644,6 +644,12 @@ def _science_context(args: argparse.Namespace):
         "fplane_path": str(root / "fplaneall.txt"),
         "preserve_failed_scratch": bool(getattr(args, "preserve_failed_scratch", False)),
     }
+    baseline_path = getattr(args, "baseline_response_file", None)
+    baseline_artifact_id = getattr(args, "baseline_response_artifact_id", None)
+    if baseline_path is not None:
+        cfg["baseline_response_path"] = str(Path(baseline_path).resolve())
+    if baseline_artifact_id is not None:
+        cfg["baseline_response_artifact_id"] = int(baseline_artifact_id)
     return TaskContext(str(args.db), str(Path(args.workdir).resolve()), cfg, raw_db_path=str(args.raw_db))
 
 
@@ -922,6 +928,15 @@ def _add_science_run(parser: argparse.ArgumentParser) -> None:
     _add_progress(parser)
     parser.add_argument("--workdir", default=os.environ.get("VIRUSFLOW_WORKDIR", str(Path.cwd() / "work")))
     parser.add_argument("--configuration-root", default=os.environ.get("VIRUSFLOW_CONFIG_ROOT", str(Path.cwd())))
+    baseline = parser.add_mutually_exclusive_group()
+    baseline.add_argument(
+        "--baseline-response-file",
+        help="Select and import one four-column baseline_relative_response payload",
+    )
+    baseline.add_argument(
+        "--baseline-response-artifact-id", type=int,
+        help="Select one existing baseline_relative_response Product by Artifact ID",
+    )
     parser.add_argument("--preserve-failed-scratch", action="store_true")
 
 

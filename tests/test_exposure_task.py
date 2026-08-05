@@ -128,6 +128,7 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
                 "IFUSLOT": 60, "IFUID": "003", "SPECID": 206,
                 "CCDPOS": zipcode.amp[0], "CCDHALF": zipcode.amp[1], "AMPNAME": "XX", "CONTID": "S/N 0039",
                 "GAIN": 1.0, "RDNOISE": 2.0, "EXPTIME": 67.4, "PEXPTIME": 75.5,
+                "TRANSPAR": 0.8,
                 "OBJECT": "WD1327-083_052_E", "QOBJECT": "WD1327-083",
                 "QRA": "13:30:13.64", "QDEC": "-08:34:29.47", "QPROG": "SCIENCE-1",
                 "PARANGLE": 180.0, "OBSID": 6,
@@ -307,6 +308,20 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     assert service.adapter.get_row(amp_build.id)["exposure_id"] is None
     assert len(service.adapter.list_all(kind="amp_to_amp_normalization")) == 2
     assert result["calibrated_fiber_state"].flux.dtype == np.float32
+    baseline = service.describe(result["baseline_relative_response"].id)
+    baseline_components = {component["name"] for component in baseline["components"]}
+    assert baseline_components == {"wavelength", "response", "uncertainty", "mask"}
+    assert baseline["summary"]["response_definition"] == "throughput / normalization"
+    assert baseline["summary"]["absolute_flux_calibration"] is False
+    assert baseline["summary"]["atmospheric_correction_applied"] is False
+    assert baseline["summary"]["isolated_instrumental_throughput"] is False
+    state_metadata = result["calibrated_fiber_state"].metadata
+    assert state_metadata["baseline_applied_count"] == 1
+    assert state_metadata["exposure_illumination_applied_count"] == 1
+    assert state_metadata["exposure_transparency_measurement"] == 0.8
+    assert state_metadata["exposure_transparency_application"] == (
+        "applied once as a separate gray factor"
+    )
     identity = result["calibrated_fiber_state"].fiber_identity
     assert identity.shape[0] == 4 * 112 - 1
     assert not np.any((identity[:, 4] == 0) & (identity[:, 1] == 7))
@@ -354,3 +369,64 @@ def test_exposure_without_calibrations_fails_before_publishing_empty_products(tm
         ExposureTask(context, target=ExposureTarget(exposure_id, at)).run({})
 
     assert ArtifactService(str(database)).adapter.list_all() == []
+
+
+def test_later_complete_baseline_supersedes_import_without_composition(tmp_path: Path):
+    database = tmp_path / "registry.sqlite3"
+    db.init_db(str(database))
+    service = ArtifactService(str(database))
+    at = datetime(2026, 6, 9)
+    context = TaskContext(str(database), str(tmp_path / "artifacts"), {})
+    task = ExposureTask(context, target=ExposureTarget("20260609T000000.0", at))
+    config = ConfigurationService()
+
+    imported = task._select_or_import_baseline(service, config, at)
+    later = _publish(
+        service,
+        tmp_path,
+        "baseline_relative_response",
+        None,
+        {
+            "wavelength": np.asarray([3500.0, 5500.0]),
+            "response": np.asarray([0.5, 0.6]),
+            "uncertainty": np.asarray([0.01, 0.02]),
+            "mask": np.zeros(2, dtype=np.uint8),
+        },
+        at,
+        metadata={
+            "derivation_method_identity": {"extraction": "later measured baseline"},
+            "applicability": {
+                "instrument_epoch": "later measured epoch",
+                "algorithm_versions": task._baseline_application_versions(),
+            },
+        },
+    )
+    incompatible = _publish(
+        service,
+        tmp_path,
+        "baseline_relative_response",
+        None,
+        {
+            "wavelength": np.asarray([3500.0, 5500.0]),
+            "response": np.asarray([0.7, 0.8]),
+            "uncertainty": np.asarray([0.01, 0.02]),
+            "mask": np.zeros(2, dtype=np.uint8),
+        },
+        at,
+        metadata={
+            "derivation_method_identity": {"extraction": "incompatible future method"},
+            "applicability": {
+                "instrument_epoch": "later measured epoch",
+                "algorithm_versions": {
+                    **task._baseline_application_versions(),
+                    "extraction": "future-extraction-2.0",
+                },
+            },
+        },
+    )
+
+    selected = task._select_or_import_baseline(service, config, at)
+    assert selected.id == later.id
+    assert selected.id != imported.id
+    assert selected.id != incompatible.id
+    assert len(service.adapter.list_all(kind="baseline_relative_response")) == 3

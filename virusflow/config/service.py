@@ -116,6 +116,50 @@ class ConfigurationService:
             identity=str(selected.name), evidence_state="verified",
         )
 
+    def resolve_baseline_response(
+        self, path: str | Path | None = None
+    ) -> tuple[dict[str, object], ConfigurationReference]:
+        """Load one selectable, versioned baseline-response payload.
+
+        The production payload contains only the effective response and its
+        wavelength, uncertainty, and mask.  The two legacy Remedy curves used
+        to create the initial payload are deliberately not exposed here.
+        """
+
+        config = BASELINE_RESPONSE_CONFIGURATION
+        selected = (
+            Path(path)
+            if path is not None
+            else Path(__file__).resolve().parent / str(config.value["file"])
+        )
+        if not selected.is_file():
+            raise FileNotFoundError(f"Baseline relative-response file not found: {selected}")
+        data = np.asarray(np.loadtxt(selected, comments="#"), dtype=float)
+        if data.ndim != 2 or data.shape[1] != 4:
+            raise ValueError(
+                f"Baseline response {selected} must have four columns: "
+                "wavelength, response, uncertainty, mask"
+            )
+        wavelength, response, uncertainty, mask_values = data.T
+        if not np.all(np.isfinite(mask_values)) or not np.all(mask_values == np.floor(mask_values)):
+            raise ValueError(f"Baseline response {selected} has a non-integral mask")
+        digest = hashlib.sha256(selected.read_bytes()).hexdigest()
+        payload = {
+            "wavelength": wavelength.astype(np.float32),
+            "response": response.astype(np.float32),
+            "uncertainty": uncertainty.astype(np.float32),
+            "mask": mask_values.astype(np.uint16),
+            "source_path": str(selected),
+            "source_name": selected.name,
+            "source_sha256": digest,
+        }
+        return payload, ConfigurationReference(
+            kind=config.kind,
+            version=config.version,
+            identity=config.identity or selected.name,
+            evidence_state=config.evidence_state,
+        )
+
     def _corrected_fiber_position_table(self, ifuid: str) -> tuple[np.ndarray, str]:
         config = FIBER_GEOMETRY_CONFIGURATION
         values = config.value
@@ -219,5 +263,5 @@ class ConfigurationService:
             ConfigurationReference(
                 config.kind, config.version, identity="exposure-baseline", evidence_state=config.evidence_state
             )
-            for config in (ASTROMETRY_CONFIGURATION, BASELINE_RESPONSE_CONFIGURATION)
+            for config in (ASTROMETRY_CONFIGURATION,)
         ]

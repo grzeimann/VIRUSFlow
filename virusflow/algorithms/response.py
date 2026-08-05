@@ -11,7 +11,7 @@ from ..core.algo_result import AlgoResult
 
 
 NORMALIZATION_VERSION = "twilight-within-and-amplifier-1.0"
-RESPONSE_VERSION = "relative-response-factorized-2.0"
+RESPONSE_VERSION = "relative-response-factorized-3.0"
 
 
 @dataclass(frozen=True)
@@ -155,14 +155,41 @@ def measure_exposure_illumination(broadband_flux, sky_mask, amp_indices, amplifi
     )
 
 
-def baseline_relative_response(wavelength, *, version: str) -> AlgoResult:
-    """Explicit provisional identity response used until a measured curve exists."""
+def baseline_relative_response(
+    wavelength, response, uncertainty, mask, *, version: str
+) -> AlgoResult:
+    """Validate one empirical baseline effective-response payload."""
 
-    wave = np.asarray(wavelength)
-    response = np.ones(wave.shape, dtype=np.float32)
+    wave = np.asarray(wavelength, dtype=float)
+    response = np.asarray(response, dtype=float)
+    uncertainty = np.asarray(uncertainty, dtype=float)
+    mask = np.asarray(mask)
+    if wave.ndim != 1 or not (
+        response.shape == uncertainty.shape == mask.shape == wave.shape
+    ):
+        raise ValueError("baseline wavelength, response, uncertainty, and mask must be matched 1D arrays")
+    if wave.size < 2 or not np.all(np.isfinite(wave)) or not np.all(np.diff(wave) > 0.0):
+        raise ValueError("baseline wavelength must be finite and strictly increasing")
+    if mask.dtype.kind not in "uib" or np.any(mask < 0):
+        raise ValueError("baseline mask must contain non-negative integral values")
+    response_valid = (mask.astype(np.uint16) & 1) == 0
+    if np.any(response_valid & (~np.isfinite(response) | (response <= 0.0))):
+        raise ValueError("unmasked baseline response samples must be finite and positive")
+    uncertainty_unknown = (mask.astype(np.uint16) & 2) != 0
+    if np.any(~uncertainty_unknown & (~np.isfinite(uncertainty) | (uncertainty < 0.0))):
+        raise ValueError("known baseline uncertainties must be finite and non-negative")
     return AlgoResult(
         kind="baseline_relative_response",
         version=version,
-        arrays={"wavelength": wave, "response": response},
-        scalars={"response_median": 1.0},
+        arrays={
+            "wavelength": wave.astype(np.float32),
+            "response": response.astype(np.float32),
+            "uncertainty": uncertainty.astype(np.float32),
+            "mask": mask.astype(np.uint16),
+        },
+        scalars={
+            "response_median": float(np.nanmedian(response[response_valid])),
+            "valid_fraction": float(np.mean(response_valid)),
+            "uncertainty_unknown_fraction": float(np.mean(uncertainty_unknown)),
+        },
     )

@@ -7,8 +7,14 @@ import numpy as np
 
 from virusflow.algorithms.astrometry import fit_catalog_astrometry, tan_fiber_coordinates
 from virusflow.algorithms.exposure_state import classify_mode_and_effective_time
+from virusflow.algorithms.exposure import apply_relative_response
 from virusflow.algorithms.extraction import extract_fractional_aperture, fractional_aperture_geometry
-from virusflow.algorithms.response import amplifier_normalization, within_amplifier_normalization
+from virusflow.algorithms.response import (
+    amplifier_normalization,
+    baseline_relative_response,
+    within_amplifier_normalization,
+)
+from virusflow.config import ConfigurationService
 from virusflow.algorithms.sky import oversampled_incident_sky, select_sky_fibers
 from virusflow.io.catalogs import PanSTARRSCSVProvider
 from virusflow.algorithms.fiber import get_spectra as legacy_get_spectra
@@ -79,6 +85,71 @@ def test_normalization_stays_decomposed_and_multiplies_exactly():
     final = within * amp_factor[1]
     np.testing.assert_allclose(final, within)
     assert common.shape == x.shape
+
+
+def test_imported_remedy_baseline_is_one_effective_masked_payload():
+    payload, reference = ConfigurationService().resolve_baseline_response()
+    result = baseline_relative_response(
+        payload["wavelength"], payload["response"], payload["uncertainty"], payload["mask"],
+        version=reference.version,
+    )
+    assert reference.version == "remedy-effective-response-1.0"
+    assert result.get_array("wavelength").shape == (1036,)
+    np.testing.assert_allclose(
+        result.get_array("response")[[0, -1]],
+        [0.03436521490375231, 0.1264653423239429],
+    )
+    assert np.all(np.isnan(result.get_array("uncertainty")))
+    assert np.all(result.get_array("mask") == 2)
+    assert set(result.arrays) == {"wavelength", "response", "uncertainty", "mask"}
+
+
+def test_baseline_and_illumination_apply_once_with_response_uncertainty_variance():
+    wavelength = np.asarray([[4000.0, 4100.0]])
+    spectrum = np.asarray([[20.0, 40.0]])
+    variance = np.asarray([[9.0, 16.0]])
+    result = apply_relative_response(
+        spectrum,
+        variance,
+        wavelength,
+        np.ones_like(spectrum),
+        baseline_wavelength=np.asarray([4000.0, 4100.0]),
+        baseline_response=np.asarray([2.0, 4.0]),
+        baseline_uncertainty=np.asarray([0.2, 0.4]),
+        baseline_mask=np.zeros(2, dtype=np.uint8),
+        fiber_illumination=np.asarray([0.5]),
+        exposure_transparency=0.8,
+    )
+    np.testing.assert_allclose(result.get_array("calibrated_flux"), [[25.0, 25.0]])
+    expected_statistical = variance / np.square([[0.8, 1.6]])
+    expected_response_term = np.square(
+        spectrum * [[0.2, 0.4]]
+        / (np.asarray([[0.5, 0.5]]) * 0.8 * np.square([[2.0, 4.0]]))
+    )
+    np.testing.assert_allclose(result.get_array("statistical_variance"), expected_statistical)
+    np.testing.assert_allclose(
+        result.get_array("calibrated_variance"), expected_statistical + expected_response_term
+    )
+    assert result.scalars["baseline_applied_count"] == 1
+    assert result.scalars["illumination_applied_count"] == 1
+    assert result.scalars["transparency_measurement_present"] is True
+    np.testing.assert_allclose(result.get_array("transparency_factor"), 0.8)
+
+
+def test_unknown_imported_response_uncertainty_does_not_invent_variance():
+    result = apply_relative_response(
+        [[10.0]], [[4.0]], [[4000.0]], [[1.0]],
+        baseline_wavelength=[3900.0, 4100.0],
+        baseline_response=[2.0, 2.0],
+        baseline_uncertainty=[np.nan, np.nan],
+        baseline_mask=np.asarray([2, 2], dtype=np.uint8),
+        fiber_illumination=[1.0],
+    )
+    np.testing.assert_allclose(result.get_array("calibrated_flux"), [[5.0]])
+    np.testing.assert_allclose(result.get_array("calibrated_variance"), [[1.0]])
+    assert np.isnan(result.get_array("evaluated_baseline_uncertainty")[0, 0])
+    assert result.get_array("evaluated_baseline_mask")[0, 0] & 2
+    assert result.get_array("mask")[0, 0] == 0
 
 
 def test_header_tan_projection_and_effective_time_policy():
