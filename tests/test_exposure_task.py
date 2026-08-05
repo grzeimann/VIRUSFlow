@@ -117,6 +117,10 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     zipcodes = [ZipCode("060", "003", "206", amp, "S/N 0039") for amp in ("LL", "LU", "RU", "RL")]
     with db.connect(str(database)) as connection:
         connection.execute("INSERT INTO exposures(id, when_utc, frame_type) VALUES(?,?,?)", (exposure_id, "20260609", "sci"))
+        connection.execute(
+            "INSERT INTO exposure_details(exposure_id,airmass) VALUES(?,?)",
+            (exposure_id, 1.22),
+        )
         for zipcode in zipcodes:
             oriented = np.full((1032, nx), 20.0, dtype=np.float32)
             for y in trace[[5, 45, 80, 105], 0].astype(int):
@@ -128,7 +132,7 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
                 "IFUSLOT": 60, "IFUID": "003", "SPECID": 206,
                 "CCDPOS": zipcode.amp[0], "CCDHALF": zipcode.amp[1], "AMPNAME": "XX", "CONTID": "S/N 0039",
                 "GAIN": 1.0, "RDNOISE": 2.0, "EXPTIME": 67.4, "PEXPTIME": 75.5,
-                "TRANSPAR": 0.8,
+                "AIRMASS": 1.22, "TRANSPAR": 0.8,
                 "OBJECT": "WD1327-083_052_E", "QOBJECT": "WD1327-083",
                 "QRA": "13:30:13.64", "QDEC": "-08:34:29.47", "QPROG": "SCIENCE-1",
                 "PARANGLE": 180.0, "OBSID": 6,
@@ -285,6 +289,7 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     assert mode["virus_primary"] is True and mode["q_metadata_complete"] is True
     scientific = service.get_scientific_metadata(result["final_astrometry"].id)
     assert scientific["observation_time"] == at
+    assert scientific["airmass"] == 1.22
     assert {
         field: scientific[field]
         for field in ("rho_start", "theta_start", "phi_start", "x_start", "y_start")
@@ -312,7 +317,11 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     baseline_components = {component["name"] for component in baseline["components"]}
     assert baseline_components == {"wavelength", "response", "uncertainty", "mask"}
     assert baseline["summary"]["response_definition"] == "throughput / normalization"
-    assert baseline["summary"]["atmospheric_content"] == "absorbed_unknown"
+    assert baseline["summary"]["atmospheric_content"] == "removed_with_model"
+    assert baseline["summary"]["construction_extinction_model"] == "mcdonald_extinction.dat"
+    assert baseline["summary"]["construction_airmass"] == 1.22
+    assert baseline["summary"]["construction_airmass_basis"] == "HET fixed altitude"
+    assert baseline["summary"]["source_baseline"] == "legacy Remedy throughput / normalization"
     assert baseline["summary"]["absolute_flux_calibration"] is False
     assert baseline["summary"]["atmospheric_correction_applied"] is False
     assert baseline["summary"]["isolated_instrumental_throughput"] is False
@@ -323,14 +332,23 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     assert state_metadata["exposure_transparency_application"] == (
         "applied once as a separate gray factor"
     )
-    assert state_metadata["atmospheric_extinction_applied_count"] == 0
-    assert state_metadata["atmospheric_extinction_model_artifact_id"] is None
-    assert state_metadata["atmospheric_correction_applied"] is False
-    assert "atmospheric_extinction_model" not in result
+    assert state_metadata["atmospheric_extinction_applied_count"] == 1
+    assert state_metadata["atmospheric_extinction_model_artifact_id"] == result[
+        "atmospheric_extinction_model"
+    ].id
+    assert state_metadata["exposure_airmass_measurement"] == 1.22
+    assert state_metadata["applied_airmass"] == 1.22
+    assert state_metadata["atmospheric_correction_applied"] is True
     response_state = service.describe(result["fiber_response_model"].id)["summary"]
-    assert response_state["baseline_atmospheric_content"] == "absorbed_unknown"
-    assert response_state["atmospheric_extinction_model_artifact_id"] is None
-    assert response_state["exposure_airmass"] is None
+    assert response_state["baseline_atmospheric_content"] == "removed_with_model"
+    assert response_state["atmospheric_extinction_model_artifact_id"] == result[
+        "atmospheric_extinction_model"
+    ].id
+    assert response_state["exposure_airmass"] == 1.22
+    assert response_state["applied_airmass"] == 1.22
+    assert response_state["exposure_airmass_source"] == (
+        "canonical raw scientific metadata AIRMASS"
+    )
     assert response_state["gray_factors"] == {
         "fiber_illumination_artifact_id": result["exposure_illumination_correction"].id,
         "transparency": 0.8,

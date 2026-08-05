@@ -55,7 +55,7 @@ def test_scan_populates_only_the_raw_database(tmp_path: Path):
     data_root.mkdir()
     _write_raw(
         data_root / "20260501T010000.0_074LL_sci.fits",
-        OBJECT="Target_082_W", QOBJECT="Target",
+        OBJECT="Target_082_W", QOBJECT="Target", AIRMASS=1.22,
     )
     raw_db = tmp_path / "raw.sqlite3"
     artifact_db = tmp_path / "artifact.sqlite3"
@@ -67,6 +67,15 @@ def test_scan_populates_only_the_raw_database(tmp_path: Path):
     assert raw_db.exists()
     rows = db.list_raw_files(db_path=str(raw_db))
     assert len(rows) == 1
+    raw_id = db.list_raw_file_rows(
+        "20260501T010000.0", db_path=str(raw_db)
+    )[0][0]
+    assert db.list_raw_scientific_metadata(
+        [raw_id], db_path=str(raw_db)
+    )[0]["airmass"] == 1.22
+    assert db.get_exposure_metadata(
+        "20260501T010000.0", db_path=str(raw_db)
+    )["airmass"] == 1.22
 
     svc = ArtifactService(str(artifact_db))
     assert svc.select_best(kind="master_bias", scope=Scope(zipcode=None)) is None

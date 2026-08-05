@@ -57,7 +57,10 @@ from ..config.defaults import (
     BASELINE_RESPONSE_CONFIGURATION,
     EFFECTIVE_EXPOSURE_POLICY,
 )
-from ..core.scientific_metadata import scientific_metadata_from_header
+from ..core.scientific_metadata import (
+    normalize_scientific_metadata,
+    scientific_metadata_from_header,
+)
 from ..io import PanSTARRSCSVProvider, RawFrameLoader
 from ..ontology.scopes import PhysicalScope
 from ..planning.targets import PhysicalCCDTarget
@@ -314,6 +317,18 @@ class ExposureTask(_SciencePublisher):
         configured_path = self.ctx.config.get("baseline_response_path")
         if configured_path is None:
             candidates = self._complete_baseline_candidates(service, at)
+            current_candidates = []
+            for candidate in candidates:
+                summary = service.describe(candidate)["summary"]
+                method = summary.get("derivation_method_identity") or {}
+                obsolete_bundled_default = (
+                    method.get("name") == BASELINE_RESPONSE_CONFIGURATION.identity
+                    and summary.get("payload_version")
+                    != BASELINE_RESPONSE_CONFIGURATION.version
+                )
+                if not obsolete_bundled_default:
+                    current_candidates.append(candidate)
+            candidates = current_candidates
             if candidates:
                 # Registry ordering is newest first.  A later measured baseline
                 # therefore supersedes the imported seed instead of multiplying
@@ -352,6 +367,10 @@ class ExposureTask(_SciencePublisher):
                 "selection": "independent baseline Product; apply exactly once after sky subtraction",
             },
             "atmospheric_content": config_value["atmospheric_content"],
+            "construction_extinction_model": config_value["construction_extinction_model"],
+            "construction_airmass": config_value["construction_airmass"],
+            "construction_airmass_basis": config_value["construction_airmass_basis"],
+            "source_baseline": config_value["source_baseline"],
             "atmospheric_separation": config_value["atmospheric_separation"],
             "separate_exposure_measurements": config_value["separate_exposure_measurements"],
             "atmospheric_correction_applied": False,
@@ -392,7 +411,7 @@ class ExposureTask(_SciencePublisher):
             validity=Validity(None, None, "legacy_remedy_instrument_epoch_unspecified"),
             configuration_refs=[reference],
             assumptions=[
-                "Atmospheric extinction was not separately removed from the legacy response.",
+                "McDonald mean extinction was removed from the legacy effective response at airmass 1.22.",
                 "The exact observing epoch and release that produced the supplied legacy curves were not recovered.",
                 "No absolute flux scale or isolated instrumental throughput is asserted.",
             ],
@@ -629,6 +648,12 @@ class ExposureTask(_SciencePublisher):
         representative = (loader or RawFrameLoader()).load_ref(raw_rows[0])
         header = representative.header
         self._exposure_scientific_metadata = scientific_metadata_from_header(header)
+        scanned_exposure_metadata = db.get_exposure_metadata(
+            exposure_id, db_path=self.ctx.resolved_raw_db_path()
+        ) or {}
+        self._exposure_scientific_metadata["airmass"] = normalize_scientific_metadata(
+            {"airmass": scanned_exposure_metadata.get("airmass")}
+        )["airmass"]
         service = ArtifactService(self.ctx.db_path)
         config_root = self.ctx.config.get("configuration_root") if isinstance(self.ctx.config, dict) else None
         config = ConfigurationService(root=config_root)
@@ -1100,7 +1125,7 @@ class ExposureTask(_SciencePublisher):
                 return None
             return value if np.isfinite(value) and value > 0.0 else None
 
-        header_airmass = positive_header_float("AIRMASS")
+        exposure_airmass = self._exposure_scientific_metadata["airmass"]
         header_transparency = positive_header_float("TRANSPAR")
         header_mirror_illumination = positive_header_float("MILLUM")
         header_seeing = positive_header_float("SEEING")
@@ -1122,10 +1147,10 @@ class ExposureTask(_SciencePublisher):
                     "a separate wavelength-dependent extinction correction is forbidden"
                 )
         else:
-            if header_airmass is None:
+            if exposure_airmass is None or exposure_airmass <= 0.0:
                 raise RuntimeError(
                     "The selected atmosphere-separated baseline requires explicit positive "
-                    "AIRMASS exposure metadata; no default airmass is substituted"
+                    "AIRMASS in canonical raw scientific metadata; no default airmass is substituted"
                 )
             separation = baseline_metadata.get("atmospheric_separation") or {}
             required_extinction_identity = separation.get("extinction_model_identity")
@@ -1173,7 +1198,7 @@ class ExposureTask(_SciencePublisher):
                 extinction_coefficient,
                 extinction_uncertainty,
                 extinction_mask,
-                airmass=header_airmass,
+                airmass=exposure_airmass,
                 range_policy=str(self.params.get("extinction_range_policy", "mask")),
             )
 
@@ -1218,8 +1243,12 @@ class ExposureTask(_SciencePublisher):
                     int(extinction_artifact.id) if extinction_artifact is not None else None
                 ),
                 "atmospheric_extinction_model_identity": selected_extinction_identity,
-                "exposure_airmass": header_airmass,
+                "exposure_airmass": exposure_airmass,
                 "exposure_airmass_units": "1",
+                "exposure_airmass_source": "canonical raw scientific metadata AIRMASS",
+                "applied_airmass": (
+                    exposure_airmass if extinction_evaluation is not None else None
+                ),
                 "gray_factors": {
                     "fiber_illumination_artifact_id": int(illumination_artifact.id),
                     "transparency": header_transparency,
@@ -1302,8 +1331,12 @@ class ExposureTask(_SciencePublisher):
                 ),
                 "seeing_measurement": header_seeing,
                 "seeing_application": "retained separately; not applied as a response factor",
-                "exposure_airmass_measurement": header_airmass,
+                "exposure_airmass_measurement": exposure_airmass,
                 "exposure_airmass_units": "1",
+                "exposure_airmass_source": "canonical raw scientific metadata AIRMASS",
+                "applied_airmass": (
+                    exposure_airmass if extinction_evaluation is not None else None
+                ),
                 "atmospheric_extinction_model_artifact_id": (
                     int(extinction_artifact.id) if extinction_artifact is not None else None
                 ),

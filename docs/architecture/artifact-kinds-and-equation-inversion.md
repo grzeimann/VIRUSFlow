@@ -68,7 +68,7 @@ raw D(e,p)
   -> select sky fibers, fit common sky, predict and subtract sky
   -> select one instrument-epoch empirical effective baseline
   -> if baseline atmospheric_content = removed_with_model:
-       require explicit AIRMASS and apply one selected extinction model
+       require canonical scanned exposure AIRMASS and apply one selected extinction model
   -> apply baseline once; keep extinction, fiber illumination, mirror
      illumination, gray transparency, and seeing as distinct states
                                                                   [run-local]
@@ -116,8 +116,14 @@ refit either factor from science data. It still materializes the
 exposure-scoped `fiber_response_model` because exposure illumination remains an
 exposure-specific factor.
 
-The default selected `baseline_relative_response` is a non-unity empirical payload
-imported from the legacy Remedy `throughput / normalization` curves. The two
+The default selected `baseline_relative_response` is a non-unity,
+atmosphere-separated empirical payload constructed from the legacy Remedy
+`throughput / normalization` curves. At every retained wavelength its response
+is the prior effective response multiplied by
+$10^{0.4k(\lambda)1.22}$, using the existing linear interpolation of
+`mcdonald_extinction.dat`. The explicit construction airmass 1.22 is based on
+HET's fixed altitude. The wavelength grid, unavailable-uncertainty state, mask,
+and Remedy response-method identity are unchanged. The two
 legacy curves are import inputs only: production retains wavelength, effective
 response, uncertainty state, and mask in one independently selectable Product,
 not separate throughput and normalization response layers. The imported curve
@@ -126,7 +132,7 @@ has no supplied uncertainty, so its uncertainty array is `NaN` with an explicit
 variance through the response-square divisor and adds a baseline-uncertainty
 term whenever a later selected Product supplies finite uncertainty.
 
-This legacy baseline is method-dependent. Its metadata identifies Remedy's five-pixel
+This baseline remains method-dependent. Its metadata identifies Remedy's five-pixel
 fractional aperture average, trace-centered aperture without a fitted detector
 PSF, gap-sampled smooth scattered-light subtraction, and
 LDLS/twilight/master-science fiber-normalization convention, plus the current
@@ -137,21 +143,22 @@ as its own gray exposure factor; because no transparency uncertainty is
 available, it is treated as fixed in the current conditional variance. This is
 not a wavelength-dependent atmospheric-extinction correction. The exact
 curve-producing release and instrument-
-epoch dates were not recovered. Its convention is therefore
-`atmospheric_content="absorbed_unknown"`: atmospheric extinction was not
-separately removed during the legacy derivation, and the effective calibration
-airmass cannot be reconstructed from current evidence. The Product is an
-atmosphere-contaminated empirical effective response, not an isolated
-$T^{\mathrm{instrument}}$. No separate wavelength-dependent extinction factor
-is permitted with this convention, so its numerical application is unchanged.
-A newer valid Product supersedes it by selection;
+epoch dates were not recovered. The selected Product now declares
+`atmospheric_content="removed_with_model"` and retains
+`construction_extinction_model="mcdonald_extinction.dat"`,
+`construction_airmass=1.22`, `construction_airmass_basis="HET fixed altitude"`,
+and `source_baseline="legacy Remedy throughput / normalization"`. It is an
+atmosphere-separated empirical response under that explicit construction
+assumption, not an absolute throughput measurement. At exposure airmass 1.22,
+the separately applied McDonald correction algebraically reproduces the prior
+Remedy result. A newer valid Product supersedes it by selection;
 response Products are alternatives, never accumulated correction layers.
 Selection requires an exact match to the recorded extraction, PSF-treatment,
 contribution-correction, and response-convention algorithm versions. A method
 version change therefore refuses the bundled seed until a compatible baseline
 is regenerated and published with a new identity.
 
-The second implemented convention is
+The selected implemented convention is
 `atmospheric_content="removed_with_model"`. Such a baseline represents the
 instrument and named reduction-method response, and must retain both the
 extinction-model identity and calibration-exposure airmasses used to remove
@@ -166,7 +173,11 @@ $$T_{\mathrm{atmosphere}}(\lambda,X)=10^{-0.4 k(\lambda)X},$$
 and the response application multiplies the baseline- and gray-corrected
 spectrum by $10^{0.4 k(\lambda)X}$. It linearly interpolates only inside the
 model range; outside samples are masked by default or may be configured to fail.
-No airmass default is supplied. Finite coefficient uncertainty is propagated
+`AIRMASS` is scanned into the raw exposure/header database as numeric scientific
+metadata and retained with exposure Products and observation exposure state.
+Atmospheric application reads that canonical field; no airmass default is
+supplied. The applied value is retained in response provenance and terminal
+output metadata. Finite coefficient uncertainty is propagated
 through the analytic correction derivative; the imported McDonald table has no
 uncertainty, so that omission remains explicit.
 
@@ -208,11 +219,12 @@ coefficients. Dense parents remain rebuildable only from raw data and the
 versioned algorithms; the compact descendants preserve the evidence needed to
 audit the inference, not a lossless reconstruction of the dense illumination.
 
-### Horizon 2: construct and validate the first atmosphere-separated baseline
+### Horizon 2: directly remeasure and validate the atmosphere-separated baseline
 
-The next bounded goal is to use the implemented convention and extinction
-application to publish the first evidence-backed baseline that can supersede
-the atmosphere-contaminated Remedy seed:
+The transformed default establishes the atmosphere-separated convention but is
+not a direct remeasurement. The next bounded goal is to replace its fixed-altitude
+construction assumption with an evidence-backed, directly measured and validated
+baseline:
 
 ```text
 retained standard-source measurements plus observing-condition evidence
@@ -224,8 +236,8 @@ retained standard-source measurements plus observing-condition evidence
      prevent those color terms from entering the response
   -> fit an epoch- and method-matched baseline with finite uncertainty and mask
   -> validate transfer across held-out standards, IFUs, and track positions
-  -> publish atmospheric_content=removed_with_model so it supersedes rather
-     than multiplies the Remedy seed
+  -> publish atmospheric_content=removed_with_model so the directly measured
+     Product supersedes rather than multiplies the transformed Remedy baseline
 ```
 
 This horizon remains bounded to a relative instrument-and-reduction-method
@@ -258,14 +270,14 @@ surface brightness.
 | $R^{\mathrm{pixel}}_p$ | `master_ldls`, `pixel_mask` | LDLS residuals supply a flat-response defect mask. Dark/LDLS masks condition response extraction and wavelength-input interpolation; the wavelength Product retains exact applied-mask indices and parent identity. | The science image is not divided by a pixel-sensitivity map. `master_ldls` is intentionally not treated as a pure pixel flat, and there is no standalone time-aware defect Product. |
 | $R^{\mathrm{fiber}}_{e,f}(\lambda)$ | `within_amp_fiber_normalization`, `fiber_normalization`, `fiber_response_model` | The retained calibration-time within-amplifier Product combines scatter-corrected LDLS fine structure with scatter-corrected twilight broad and residual structure and requires that factorization, wavelength grid, validity, and amplifier anchor as payload evidence. `ExposureTask` selects the exact Product named by the group response and divides by it in memory. | `fiber_normalization` has no current producer. The implemented normalization is an empirical illumination/response combination, not a uniquely identified intrinsic fiber throughput. |
 | $R^{\mathrm{amp}}_{e,a}$ | `amp_to_amp_normalization`, `fiber_response_model` | One calibration-build Product compares all sibling center-track twilight anchors, retains complete amplifier keys and factors, and is selected and applied before global science-fiber assembly. | The uniform center-track twilight assumption remains explicit and unvalidated as a general illumination model; the build Product is relative, not an absolute throughput scale. |
-| $T^{\mathrm{instrument}}_e(\lambda)$ | `baseline_relative_response`, `fiber_response_model`, `final_exposure_response` | One selected instrument-epoch `baseline_relative_response` is interpolated and divided exactly once after sky subtraction. The default Remedy Product has `atmospheric_content=absorbed_unknown`; a future `removed_with_model` Product instead represents instrument plus named reduction-method response and carries the extinction identity and calibration airmasses used during construction. | The imported baseline remains atmosphere-contaminated because its calibration airmass is unknown. No atmosphere-separated measured baseline has yet been published, and neither convention establishes absolute throughput. `final_exposure_response` is scratch-only and superseded. |
-| $T^{\mathrm{atmosphere}}_e(\theta,\lambda)$ | `atmospheric_extinction_model`; exposure airmass and evaluated factors are retained in response-state metadata | The McDonald model retains $k(\lambda)$ in mag/airmass. With a compatible `removed_with_model` baseline and explicit header `AIRMASS=X`, the code multiplies by $10^{0.4k(\lambda)X}$ once, propagates finite model uncertainty, and masks or fails outside the model range. Gray transparency, mirror illumination, fiber illumination, and seeing remain separate. | The default Remedy path forbids this correction. The McDonald uncertainty is unavailable, airmass uncertainty is not propagated, and variable chromatic clouds, telluric absorption, and directional dependence are not modeled. |
+| $T^{\mathrm{instrument}}_e(\lambda)$ | `baseline_relative_response`, `fiber_response_model`, `final_exposure_response` | One selected instrument-epoch `baseline_relative_response` is interpolated and divided exactly once after sky subtraction. The default Remedy-derived Product is atmosphere-separated with the McDonald model at construction airmass 1.22 and retains that model, fixed-altitude basis, source baseline, and unchanged method identity. | This provisional transformation is not a direct response remeasurement, neither convention establishes absolute throughput, and `final_exposure_response` is scratch-only and superseded. |
+| $T^{\mathrm{atmosphere}}_e(\theta,\lambda)$ | `atmospheric_extinction_model`; exposure airmass and evaluated factors are retained in response-state metadata | The McDonald model retains $k(\lambda)$ in mag/airmass. With the selected `removed_with_model` baseline and canonical scanned `AIRMASS=X`, the code multiplies by $10^{0.4k(\lambda)X}$ once, propagates finite model uncertainty, and masks or fails outside the model range. Exposure airmass is retained as scientific conditioning metadata and the applied value is recorded in response and output provenance. | The McDonald uncertainty is unavailable, airmass uncertainty is not propagated, and variable chromatic clouds, telluric absorption, and directional dependence are not modeled. |
 | $\mathcal{M}_e(\theta)$ | `initial_astrometry`, `source_detection_catalog`, `catalog_match_table`, `final_astrometry`, `fiber_sky_coordinates` | Header TAN geometry is retained and a catalog shift/rotation fit is attempted; failed catalog refinement falls back to header astrometry with degraded QA. | The current fit is simpler than the full spatial model and does not supply formal mapping uncertainty as a separate Product. |
 | PSF, $\Delta\theta_e^{\mathrm{DAR}}(\lambda)$, and $C_{e,f}$ | Astrometry and dither Products provide partial geometry only | Fiber focal-plane and sky coordinates, nominal/refined dither offsets, and footprint coverage are retained. | There is no PSF, DAR, aperture-coupling, or spatial reconstruction Product, so source-to-fiber coupling is not inverted. |
 | $F^{\mathrm{sky}}_{e,f}(\lambda)$ | `sky_fiber_mask`, `sky_model`, `fiber_sky_prediction`, `sky_subtracted_spectrum`, `candidate_sky_model` | A supersampled common incident sky is fitted at exposure scope, with per-fiber illumination coefficients, then integrated onto each native fiber grid and subtracted in memory. | The baseline assumes one incident sky spectrum, has no accepted fiber-specific LSF, and does not propagate sky-model covariance into final variance. |
-| $S^{\mathrm{source}}_e(\theta,\lambda)$ | `source_detection_catalog`, `calibrated_fiber_observation` | Source detections support astrometry; a complete observation retains sky-subtracted, response-normalized fiber samples with positions, wavelength, variance, masks, and the response convention. Compatible atmosphere-separated baselines can additionally produce above-atmosphere relative samples. | The default Remedy result remains atmosphere-contaminated. The Product concatenates exposures rather than coadding or reconstructing them and is not corrected for PSF/DAR coupling or absolute throughput. |
+| $S^{\mathrm{source}}_e(\theta,\lambda)$ | `source_detection_catalog`, `calibrated_fiber_observation` | Source detections support astrometry; a complete observation retains extinction-corrected, sky-subtracted, response-normalized relative fiber samples with positions, wavelength, variance, masks, response convention, and applied airmass by exposure. | The Product concatenates exposures rather than coadding or reconstructing them and is not corrected for PSF/DAR coupling or absolute throughput. |
 | $N_{e,p}$ and propagated uncertainty | `read_noise`, `detector_variance`, `pixel_mask`, `extracted_variance`, final variance/mask planes | Read noise plus non-negative Poisson variance is propagated through science extraction with exact weights. Bias scatter is added to the corrected response-frame variance state, while dark/LDLS masks condition response-master extraction; retained master spectra preserve the exact compact aperture/mask validity needed to audit which detector samples contributed. | The robust calibration combine and retained master-spectrum extraction do not yet carry response-frame variance forward. Standalone noise kinds are not published, and dark, sky, response, wavelength, astrometric, systematic, and covariance contributions remain incomplete. |
-| $t_e$ and exposure/observation state | `exposure_mode_classification`, `effective_exposure_time`, `exposure_completion_manifest`, observation/dither kinds | The code preserves primary/parallel classification, the applied exposure-time policy, amplifier coverage, membership, offsets, and per-exposure state. | These Products condition the inverse and its applicability; they do not themselves estimate an optical term. |
+| $t_e$ and exposure/observation state | `exposure_mode_classification`, `effective_exposure_time`, `exposure_completion_manifest`, observation/dither kinds | The code preserves primary/parallel classification, the applied exposure-time policy, canonical exposure airmass, amplifier coverage, membership, offsets, and per-exposure state. | These Products condition the inverse and its applicability; they do not themselves estimate an optical term. |
 
 ## Product-local dark state and remaining physical gap
 
@@ -349,12 +361,12 @@ published. `ArtifactService` rejects permanent publication of every S kind.
 | `sky_model` | exposure / M | Fitted latent common $F^{\mathrm{sky}}$ model with variance, sample counts, and fiber coefficients. | Production exposure model Product. |
 | `fiber_sky_prediction` | fiber / S | Evaluated $F^{\mathrm{sky}}_{e,f}(\lambda)$ on each native fiber grid. | Scratch-only; computed inside sky subtraction. |
 | `sky_subtracted_spectrum` | fiber / S | Inverse intermediate estimating source-plus-residual counts after removing sky. | Scratch-only; computed in memory. |
-| `baseline_relative_response` | instrument epoch / C | Independently selectable empirical response state with wavelength, response, uncertainty, mask, units, provenance, method identity, applicability, and an atmospheric-content convention. | The imported Remedy `throughput / normalization` seed is `absorbed_unknown`, with unknown uncertainty and atmospheric contamination. A later `removed_with_model` baseline must identify its construction extinction model and calibration airmasses and supersedes rather than composes with the seed. |
-| `atmospheric_extinction_model` | instrument epoch / M | Selectable site extinction coefficient $k(\lambda)$ with wavelength, mag/airmass coefficient, uncertainty, mask, units, site, provenance, and applicability. | The default McDonald Product is imported on demand only for a compatible atmosphere-separated baseline. It has unavailable uncertainty, is linearly interpolated without extrapolation, and is never applied with the Remedy seed. |
+| `baseline_relative_response` | instrument epoch / C | Independently selectable empirical response state with wavelength, response, uncertainty, mask, units, provenance, method identity, applicability, and an atmospheric-content convention. | The selected Remedy-derived `throughput / normalization` payload is `removed_with_model`: McDonald extinction is removed at construction airmass 1.22 on the HET fixed-altitude basis. Its wavelength, uncertainty, mask, and method identity are preserved; direct remeasurement and validation remain the next Horizon 2 goal. |
+| `atmospheric_extinction_model` | instrument epoch / M | Selectable site extinction coefficient $k(\lambda)$ with wavelength, mag/airmass coefficient, uncertainty, mask, units, site, provenance, and applicability. | The default McDonald Product is imported for the selected atmosphere-separated baseline. It has unavailable uncertainty and is linearly interpolated without extrapolation. |
 | `exposure_illumination_correction` | exposure / C | Exposure-specific empirical fiber/amplifier factor derived from selected sky fibers. | Production exposure Product; used both as sky-model coefficients and the final numerical response division. |
 | `final_exposure_response` | exposure / S | Intended dense evaluated combination of response factors. | Scratch-only, superseded legacy kind; not produced by the current path. |
-| `fiber_response_model` | exposure / M | Compact evaluated state linking selected calibration-build within-amplifier knots and amplifier factors with exposure illumination. | Production exposure model Product. It links the independently selected baseline and, only for `removed_with_model`, the selected extinction Product; metadata records airmass and separate gray factors. It does not encode absolute calibration. |
-| `calibrated_fiber_observation` | observation / C | Current terminal inverse result: concatenated native-grid fiber flux, variance, mask, wavelength, identity, and position for the member exposures. | Production observation Product only when the dither assignment is complete and every member has a run-local calibrated state. It is not a coadd or spatial reconstruction. |
+| `fiber_response_model` | exposure / M | Compact evaluated state linking selected calibration-build within-amplifier knots and amplifier factors with exposure illumination. | Production exposure model Product. It links the independently selected baseline and selected extinction Product; metadata records the canonical and applied airmass and separate gray factors. It does not encode absolute calibration. |
+| `calibrated_fiber_observation` | observation / C | Current terminal inverse result: concatenated native-grid fiber flux, variance, mask, wavelength, identity, and position for the member exposures. | Production extinction-corrected relative Product only when the dither assignment is complete and every member has a run-local calibrated state. Applied airmass is retained per exposure. It is not a coadd, spatial reconstruction, or absolute flux calibration. |
 
 ### Operational context, QA, and analytics
 
@@ -368,7 +380,7 @@ published. `ArtifactService` rejects permanent publication of every S kind.
 | `exposure_mode_classification` | exposure / C | Operational state selecting the exposure-time policy and interpretation of $t_e$. | Production exposure Product. |
 | `effective_exposure_time` | exposure / C | Evaluated $t_e$ under the primary/parallel shutter policy. | Production exposure Product retaining source header fields and policy version. |
 | `exposure_completion_manifest` | exposure / C | Coverage and failure evidence defining where the inverse was actually evaluated. | Production exposure Product; records amplifier and excluded-wavelength-fiber coverage. |
-| `observation_exposure_state` | exposure / C | Per-exposure seeing, transparency proxy, response summary, astrometry, and coverage context. | Production observation-assembly Product; preserves atomic exposure state. |
+| `observation_exposure_state` | exposure / C | Per-exposure seeing, transparency proxy, airmass, response summary, astrometry, and coverage context. | Production observation-assembly Product; preserves atomic exposure state including airmass as scientific conditioning metadata. |
 | `observation_membership` | observation / C | Evidence defining which exposure measurements belong together. | Production observation Product. |
 | `dither_assignment` | dither set / C | Nominal sequence and assignment evidence used to relate fiber samples spatially. | Production observation Product; primary observations use the configured nominal pattern and parallel observations use no dither. |
 | `dither_registration` | dither set / C | Evaluated nominal/refined relative offsets and residuals. | Production observation Product with nominal fallback where catalog-refined astrometry is unavailable. |
@@ -453,8 +465,8 @@ reduction in which:
   divided exactly once, with baseline, exposure illumination, and measured gray
   transparency retained as separate factors and finite response uncertainty
   propagated when available;
-- a compatible `removed_with_model` baseline conditionally activates one
-  retained wavelength-dependent McDonald extinction model at explicit exposure
+- the selected `removed_with_model` baseline activates one retained
+  wavelength-dependent McDonald extinction model at canonical scanned exposure
   airmass, with no extrapolation and finite coefficient uncertainty propagated;
 - dense Hg, Cd, arc, LDLS, twilight, and optional master-science components may
   be released only after QA-valid descendants preserve all currently required
@@ -467,24 +479,23 @@ reduction in which:
   spectra with diagonal variance and masks.
 
 The current code labels the terminal spectral planes as response-corrected
-electrons rather than physical flux. The default Remedy result is not
-atmosphere-corrected: its `absorbed_unknown` convention forbids a separate
-extinction layer and does not separately invert $T^{\mathrm{instrument}}$ and
-$T^{\mathrm{atmosphere}}$. A compatible future `removed_with_model` baseline
-can produce an above-atmosphere relative spectrum using the selected mean
-extinction curve, but this still does **not** support the stronger claim that
+electrons rather than physical flux. The selected atmosphere-separated default
+produces an extinction-corrected relative spectrum using the McDonald mean
+extinction curve and canonical exposure airmass. The construction transform is
+provisional and not a direct remeasurement, and the output still does **not**
+support the stronger claim that
 `calibrated_fiber_observation` is an absolutely spectrophotometric measurement
 of intrinsic source surface brightness. PSF/DAR coupling, aperture loss,
 variable chromatic transparency, and absolute scale remain unresolved.
 
 ## Implementation priorities supported by this crosswalk
 
-1. **Construct the first validated atmosphere-separated measured baseline.**
+1. **Directly remeasure and validate the atmosphere-separated baseline.**
    Reduce retained primary-standard evidence with explicit calibration
    airmasses and the selected extinction Product under fully identified
    extraction, PSF, source-capture, contribution-correction, and calibration
    configurations. Retain finite uncertainty and held-out validation, then
-   supersede the imported Remedy Product without composing response layers.
+   supersede the transformed Remedy baseline without composing response layers.
 2. **Measure chromatic atmospheric variability and absolute response.** Keep
    gray transparency separate from the mean extinction curve, add uncertainty
    for airmass and atmospheric coefficients, model departures from the mean

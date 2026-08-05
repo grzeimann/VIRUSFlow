@@ -7,6 +7,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 SCIENTIFIC_METADATA_FIELDS = (
     "observation_time",
+    "airmass",
     "ambient_temperature",
     "humidity",
     "pressure",
@@ -29,6 +30,7 @@ TRACKER_FIELDS = (
 
 _HEADER_KEYWORDS = {
     "observation_time": ("DATE",),
+    "airmass": ("AIRMASS",),
     "ambient_temperature": ("AMBTEMP", "AMBIENT", "TAMBIENT", "TEMPAMB", "OUTTEMP"),
     "humidity": ("HUMIDITY",),
     "pressure": ("PRESSURE",),
@@ -42,6 +44,7 @@ _HEADER_KEYWORDS = {
 }
 
 _FLOAT_FIELDS = {
+    "airmass",
     "ambient_temperature",
     "humidity",
     "pressure",
@@ -156,8 +159,9 @@ def aggregate_scientific_metadata(
         values = {record[field] for record in normalized if record[field] is not None}
         result[field] = next(iter(values)) if len(values) == 1 else None
 
-    # A representative or averaged tracker position is not meaningful for
-    # multi-frame base calibration composites.
+    # A representative or averaged exposure airmass or tracker position is not
+    # meaningful for multi-frame base calibration composites.
+    result["airmass"] = None
     for field in TRACKER_FIELDS:
         result[field] = None
     return result

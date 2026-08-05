@@ -8,6 +8,7 @@ from astropy.io import fits
 
 from virusflow.artifacts import ArtifactService, Scope, Validity
 from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
+from virusflow.config.defaults import DITHER_POLICY
 from virusflow.persistence.policy import DefaultPersistencePolicy
 from virusflow.planning.targets import ObservationTarget
 from virusflow.publication.context import PublicationContext
@@ -40,7 +41,7 @@ def test_observation_task_preserves_atomic_exposures_registration_coverage_and_q
     service = ArtifactService(str(database))
     exposure_ids = ("20260609T031649.6", "20260609T031859.3", "20260609T032112.2")
     dec0 = -8.5
-    nominal = np.asarray([[0.0, 0.0], [1.27, 0.73], [0.0, 1.46]])
+    nominal = np.asarray(DITHER_POLICY.nominal_pattern_arcsec, dtype=float)
     calibrated_states = []
     for index, exposure_id in enumerate(exposure_ids):
         path = tmp_path / f"{exposure_id}.fits"
@@ -48,11 +49,16 @@ def test_observation_task_preserves_atomic_exposures_registration_coverage_and_q
             "IFUSLOT": 60, "IFUID": "003", "SPECID": 206, "CCDPOS": "L", "CCDHALF": "L",
             "AMPNAME": "XX", "CONTID": "S/N 0039", "OBJECT": "target", "OBSID": 6,
             "QRA": "13:30:00", "QDEC": "-08:30:00", "PARANGLE": 180.0, "EXPTIME": 67.4,
+            "AIRMASS": 1.22 + 0.01 * index,
             "SEEING": 1.5 + 0.1 * index, "TRANSPAR": 0.9 - 0.05 * index,
         })
         fits.PrimaryHDU(np.ones((4, 4), dtype=np.float32), header=header).writeto(path)
         with db.connect(str(database)) as connection:
             connection.execute("INSERT INTO exposures(id,when_utc,frame_type) VALUES(?,?,?)", (exposure_id, exposure_id, "sci"))
+            connection.execute(
+                "INSERT INTO exposure_details(exposure_id,airmass) VALUES(?,?)",
+                (exposure_id, 1.22 + 0.01 * index),
+            )
             connection.execute(
                 "INSERT OR IGNORE INTO amplifiers(key,ifuslot,ifuid,specid,amp,controller) VALUES(?,?,?,?,?,?)",
                 ("060+003+206+LL+S/N 0039", "060", "003", "206", "LL", "S/N 0039"),
@@ -87,7 +93,16 @@ def test_observation_task_preserves_atomic_exposures_registration_coverage_and_q
             sky_coordinates=np.asarray([[202.5, -8.5], [202.5001, -8.5001]], dtype=np.float64),
             focal_plane_coordinates=np.asarray([[0, 0], [1, 1]], dtype=np.float32),
             model_artifact_ids=(int(astrometry_product.id),),
-            metadata={"fixture": True},
+            metadata={
+                "fixture": True,
+                "baseline_atmospheric_content": "removed_with_model",
+                "atmospheric_extinction_model_identity": (
+                    "mcdonald-observatory-mean-extinction"
+                ),
+                "atmospheric_correction_applied": True,
+                "exposure_airmass_measurement": 1.22 + 0.01 * index,
+                "applied_airmass": 1.22 + 0.01 * index,
+            },
         ))
 
     context = TaskContext(str(database), str(tmp_path / "artifacts"), {
@@ -111,6 +126,19 @@ def test_observation_task_preserves_atomic_exposures_registration_coverage_and_q
     assert np.nanmedian(stored_flux["stored_data"]) == 2.0
     assert stored_flux["header"]["BUNIT"] == "1e-17 response-corrected electron"
     assert final["summary"]["absolute_flux_calibration"] is False
+    assert final["summary"]["calibration_state"] == "extinction-corrected relative response"
+    assert final["summary"]["airmass_by_exposure"] == {
+        exposure_id: 1.22 + 0.01 * index
+        for index, exposure_id in enumerate(exposure_ids)
+    }
+    assert final["summary"]["applied_airmass_by_exposure"] == final["summary"][
+        "airmass_by_exposure"
+    ]
+    retained_state = service.describe(result["exposure_states"][0].id)["summary"]
+    assert retained_state["airmass"] == 1.22
+    state_values = service.load_component(result["exposure_states"][0].id, "state")["data"]
+    assert np.isclose(state_values[6], 1.22)
+    assert service.get_scientific_metadata(result["exposure_states"][0].id)["airmass"] == 1.22
     assert len(service.query_observation(target.observation_id)) == 9
     assert len(service.query_dither_set(target.dither_set_id)) == 9
     assert len(service.query_observation_set([target.observation_id], kind="observation_summary")) == 1

@@ -25,6 +25,10 @@ from ..artifacts.storage_conventions import FLUX_SCALE, scaled_flux_component, s
 from ..config import ConfigurationService
 from ..config.defaults import DITHER_POLICY
 from ..core.exposure_metadata import interpret_virus_exposure_header
+from ..core.scientific_metadata import (
+    normalize_scientific_metadata,
+    scientific_metadata_from_header,
+)
 from ..io import RawFrameLoader
 from ..ontology.scopes import PhysicalScope
 
@@ -55,6 +59,7 @@ class ObservationTask(_SciencePublisher):
         metadata: dict | None = None,
         refs=(),
         assumptions=(),
+        scientific_metadata: dict | None = None,
         status: str = "pass",
         usability: str = "usable",
     ):
@@ -70,6 +75,7 @@ class ObservationTask(_SciencePublisher):
             validity=Validity(min(times), max(times), "observation_membership"),
             configuration_refs=list(refs),
             assumptions=list(assumptions),
+            scientific_metadata=dict(scientific_metadata or {}),
         )
         artifact = self._publish(
             request,
@@ -139,6 +145,14 @@ class ObservationTask(_SciencePublisher):
                 raise RuntimeError(f"Observation member has no real science input: {exposure_id}")
             representative = (loader or RawFrameLoader()).load_ref(raw_rows[0][1])
             header = representative.header
+            exposure_scientific_metadata = scientific_metadata_from_header(header)
+            scanned_exposure_metadata = db.get_exposure_metadata(
+                exposure_id, db_path=self.ctx.resolved_raw_db_path()
+            ) or {}
+            exposure_scientific_metadata["airmass"] = normalize_scientific_metadata(
+                {"airmass": scanned_exposure_metadata.get("airmass")}
+            )["airmass"]
+            exposure_airmass = exposure_scientific_metadata["airmass"]
             exposure_context = interpret_virus_exposure_header(header, frame_type="sci")
             exposure_contexts.append(exposure_context)
             when = _instant(exposure_id)
@@ -181,7 +195,7 @@ class ObservationTask(_SciencePublisher):
             transparency = _header_float(header, "TRANSPAR", "TRANSP", "THROUGHP")
             state = np.asarray([
                 seeing, transparency, response_median, effective_seconds,
-                raw_amp_count, raw_ifu_count,
+                raw_amp_count, raw_ifu_count, exposure_airmass,
             ], dtype=float)
             coverage_summary = np.asarray([raw_amp_count, reduced_count, extracted_count, failed_count], dtype=float)
             parent_ids = [int(raw_rows[0][0])]
@@ -215,13 +229,19 @@ class ObservationTask(_SciencePublisher):
                     "pointing_evidence": pointing_evidence,
                     "header_state": {name: header.get(name) for name in (
                         "OBJECT", "QOBJECT", "QRA", "QDEC", "QPROG", "OBSID",
-                        "EXPTIME", "PEXPTIME", "SEEING", "IQ", "TRANSPAR", "TRANSP",
+                        "EXPTIME", "PEXPTIME", "AIRMASS", "SEEING", "IQ", "TRANSPAR", "TRANSP",
                     )},
+                    "airmass": exposure_airmass,
+                    "airmass_source": "canonical raw scientific metadata AIRMASS",
                     "exposure_context": exposure_context.as_dict(),
-                    "state_columns": ["seeing", "transparency", "response_median", "effective_seconds", "raw_amplifiers", "raw_ifuslots"],
+                    "state_columns": [
+                        "seeing", "transparency", "response_median", "effective_seconds",
+                        "raw_amplifiers", "raw_ifuslots", "airmass",
+                    ],
                     "coverage_columns": ["raw", "reduced", "extracted", "failed_or_missing"],
                 },
                 refs=refs,
+                scientific_metadata=exposure_scientific_metadata,
                 status="pass" if completion is not None and failed_count == 0 else "warn",
                 usability="usable" if completion is not None and failed_count == 0 else "degraded",
             )
@@ -231,6 +251,7 @@ class ObservationTask(_SciencePublisher):
             state_metadata.append({
                 "exposure_id": exposure_id,
                 "astrometry_source": astrometry_source,
+                "airmass": exposure_airmass,
                 "exposure_context": exposure_context.as_dict(),
             })
 
@@ -437,6 +458,10 @@ class ObservationTask(_SciencePublisher):
         }
         if assignment.complete and all(exposure_id in calibrated_states for exposure_id in exposure_ids):
             ordered_states = [calibrated_states[exposure_id] for exposure_id in exposure_ids]
+            all_atmospheric_corrected = all(
+                bool(state.metadata.get("atmospheric_correction_applied", False))
+                for state in ordered_states
+            )
             final_arrays = combine_calibrated_fiber_states(ordered_states)
             final_parents = {
                 int(observation_artifact.id), int(membership_artifact.id), int(registration_artifact.id),
@@ -486,12 +511,13 @@ class ObservationTask(_SciencePublisher):
                     "spectral_planes": ["flux", "variance", "mask"],
                     "wavelength_sampling": "per_fiber_native_bin_centers",
                     "flux_scale": FLUX_SCALE,
-                    "calibration_state": "relative empirical effective response only",
-                    "absolute_flux_calibration": False,
-                    "atmospheric_correction_applied": all(
-                        bool(state.metadata.get("atmospheric_correction_applied", False))
-                        for state in ordered_states
+                    "calibration_state": (
+                        "extinction-corrected relative response"
+                        if all_atmospheric_corrected
+                        else "relative empirical effective response only"
                     ),
+                    "absolute_flux_calibration": False,
+                    "atmospheric_correction_applied": all_atmospheric_corrected,
                     "response_convention_by_exposure": {
                         state.exposure_id: state.metadata.get(
                             "baseline_atmospheric_content", "unknown"
@@ -506,6 +532,10 @@ class ObservationTask(_SciencePublisher):
                     },
                     "airmass_by_exposure": {
                         state.exposure_id: state.metadata.get("exposure_airmass_measurement")
+                        for state in ordered_states
+                    },
+                    "applied_airmass_by_exposure": {
+                        state.exposure_id: state.metadata.get("applied_airmass")
                         for state in ordered_states
                     },
                     "uncertainty_convention": "variance",

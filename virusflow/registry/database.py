@@ -179,6 +179,7 @@ CREATE TABLE IF NOT EXISTS exposure_details (
     qra TEXT,
     qdec TEXT,
     exptime REAL,           -- commanded/raw EXPTIME, seconds
+    airmass REAL,
     ambient_temperature REAL,
     object_name TEXT,       -- legacy OBJECT-or-QOBJECT field; retained for compatibility
     virus_object TEXT,      -- raw VIRUS OBJECT operational label
@@ -215,6 +216,7 @@ CREATE TABLE IF NOT EXISTS raw_files (
     storage_backend TEXT,
     amp_key TEXT,
     observation_time TIMESTAMP,
+    airmass REAL,
     ambient_temperature REAL,
     humidity REAL,
     pressure REAL,
@@ -327,6 +329,7 @@ CREATE TABLE IF NOT EXISTS artifact_records (
 CREATE TABLE IF NOT EXISTS artifact_scientific_metadata (
     artifact_id INTEGER PRIMARY KEY,
     observation_time TIMESTAMP,
+    airmass REAL,
     ambient_temperature REAL,
     humidity REAL,
     pressure REAL,
@@ -1032,15 +1035,16 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
             """
             INSERT INTO raw_files(
                 exposure_id, frame_type, path, tar_member, outer_tar_member, storage_backend, amp_key,
-                observation_time, ambient_temperature, humidity, pressure,
+                observation_time, airmass, ambient_temperature, humidity, pressure,
                 program_id, object, rho_start, theta_start, phi_start, x_start, y_start
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(exposure_id, frame_type, path, tar_member) DO UPDATE SET
                 outer_tar_member=excluded.outer_tar_member,
                 storage_backend=excluded.storage_backend,
                 amp_key=excluded.amp_key,
                 observation_time=excluded.observation_time,
+                airmass=excluded.airmass,
                 ambient_temperature=excluded.ambient_temperature,
                 humidity=excluded.humidity,
                 pressure=excluded.pressure,
@@ -1069,12 +1073,12 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
                 """
                 INSERT INTO exposure_details(
                     exposure_id, tar_path, expnum, qobject, qprog, pexptime, date, qra, qdec,
-                    exptime, ambient_temperature, object_name, virus_object, requested_target,
+                    exptime, airmass, ambient_temperature, object_name, virus_object, requested_target,
                     requested_target_source, requested_ifuslot, het_track, observing_mode,
                     virus_primary, q_metadata_expected, q_metadata_complete,
                     object_qobject_consistent, lamp, observing_block
                 )
-                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(exposure_id) DO UPDATE SET
                     tar_path=COALESCE(exposure_details.tar_path, excluded.tar_path),
                     expnum=COALESCE(exposure_details.expnum, excluded.expnum),
@@ -1085,6 +1089,7 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
                     qra=COALESCE(exposure_details.qra, excluded.qra),
                     qdec=COALESCE(exposure_details.qdec, excluded.qdec),
                     exptime=COALESCE(exposure_details.exptime, excluded.exptime),
+                    airmass=COALESCE(exposure_details.airmass, excluded.airmass),
                     ambient_temperature=COALESCE(exposure_details.ambient_temperature, excluded.ambient_temperature),
                     object_name=COALESCE(exposure_details.object_name, excluded.object_name),
                     virus_object=COALESCE(exposure_details.virus_object, excluded.virus_object),
@@ -1111,6 +1116,7 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
                     hdr_fields.get("qra"),
                     hdr_fields.get("qdec"),
                     _optional_float(hdr_fields.get("exptime")),
+                    _optional_float(hdr_fields.get("airmass")),
                     _optional_float(hdr_fields.get("ambient_temperature")),
                     hdr_fields.get("object_name"),
                     hdr_fields.get("virus_object"),
@@ -1569,11 +1575,12 @@ def save_artifact_details(
         conn.execute(
             """
             INSERT INTO artifact_scientific_metadata(
-                artifact_id, observation_time, ambient_temperature, humidity, pressure,
+                artifact_id, observation_time, airmass, ambient_temperature, humidity, pressure,
                 program_id, object, rho_start, theta_start, phi_start, x_start, y_start
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(artifact_id) DO UPDATE SET
                 observation_time=excluded.observation_time,
+                airmass=excluded.airmass,
                 ambient_temperature=excluded.ambient_temperature,
                 humidity=excluded.humidity,
                 pressure=excluded.pressure,
@@ -2289,6 +2296,7 @@ def find_artifact_summaries(
             COALESCE(qd.status, qr.status) AS qa_status,
             qd.usability,
             sm.observation_time,
+            sm.airmass,
             sm.ambient_temperature,
             sm.humidity,
             sm.pressure,

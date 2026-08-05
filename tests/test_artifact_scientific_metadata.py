@@ -69,6 +69,7 @@ def test_raw_ingestion_normalizes_all_scientific_header_fields(tmp_path: Path):
         "SPECID": "001",
         "CONTID": "A",
         "DATE": "2026-07-24T01:00:00.250000",
+        "AIRMASS": 1.22,
         "AMBTEMP": 12.5,
         "HUMIDITY": 43.2,
         "PRESSURE": 798.4,
@@ -87,6 +88,7 @@ def test_raw_ingestion_normalizes_all_scientific_header_fields(tmp_path: Path):
     )[0][0]
     values = db.list_raw_scientific_metadata([raw_id], db_path=str(database))[0]
     assert values["observation_time"] == "2026-07-24T01:00:00.250000"
+    assert values["airmass"] == 1.22
     assert values["ambient_temperature"] == 12.5
     assert values["humidity"] == 43.2
     assert values["pressure"] == 798.4
@@ -95,6 +97,10 @@ def test_raw_ingestion_normalizes_all_scientific_header_fields(tmp_path: Path):
     assert [values[field] for field in (
         "rho_start", "theta_start", "phi_start", "x_start", "y_start"
     )] == [1.0, 2.0, 3.0, 4.0, 5.0]
+    exposure = db.get_exposure_metadata(
+        "20260724T010000.0", db_path=str(database)
+    )
+    assert exposure["airmass"] == 1.22
 
     invalid_path = tmp_path / "20260724T020000.0_020LL_sci.fits"
     invalid_header = fits.Header({
@@ -102,6 +108,7 @@ def test_raw_ingestion_normalizes_all_scientific_header_fields(tmp_path: Path):
         "SPECID": "001",
         "CONTID": "A",
         "DATE": "not-a-time",
+        "AIRMASS": "bad",
         "AMBTEMP": "bad",
         "HUMIDITY": "nan",
         "PRESSURE": "inf",
@@ -121,7 +128,7 @@ def test_raw_ingestion_normalizes_all_scientific_header_fields(tmp_path: Path):
         [invalid_id], db_path=str(database)
     )[0]
     assert all(invalid[field] is None for field in (
-        "observation_time", "ambient_temperature", "humidity", "pressure",
+        "observation_time", "airmass", "ambient_temperature", "humidity", "pressure",
         "program_id", "object", "rho_start", "theta_start", "phi_start",
         "x_start", "y_start",
     ))
@@ -131,6 +138,7 @@ def test_composite_aggregation_means_consensus_conflicts_and_null_tracker():
     common = aggregate_scientific_metadata([
         {
             "observation_time": "2026-07-24T01:00:00",
+            "airmass": 1.22,
             "ambient_temperature": 10.0,
             "humidity": 40.0,
             "pressure": 790.0,
@@ -140,6 +148,7 @@ def test_composite_aggregation_means_consensus_conflicts_and_null_tracker():
         },
         {
             "observation_time": "2026-07-24T03:00:00",
+            "airmass": 1.22,
             "ambient_temperature": float("nan"),
             "humidity": 44.0,
             "pressure": 798.0,
@@ -149,13 +158,14 @@ def test_composite_aggregation_means_consensus_conflicts_and_null_tracker():
         },
     ])
     assert common["observation_time"] == datetime(2026, 7, 24, 2)
+    assert common["airmass"] is None
     assert common["ambient_temperature"] == 10.0
     assert common["humidity"] == 42.0
     assert common["pressure"] == 794.0
     assert common["program_id"] == "P1"
     assert common["object"] == "LDLS"
     assert all(common[field] is None for field in (
-        "rho_start", "theta_start", "phi_start", "x_start", "y_start"
+        "airmass", "rho_start", "theta_start", "phi_start", "x_start", "y_start"
     ))
 
     conflicting = aggregate_scientific_metadata([
@@ -510,7 +520,7 @@ def test_lightweight_bulk_query_filters_in_database_without_n_plus_one(
         }
     assert scientific_count == artifact_count
     assert {
-        "artifact_id", "observation_time", "ambient_temperature", "humidity",
+        "artifact_id", "observation_time", "airmass", "ambient_temperature", "humidity",
         "pressure", "program_id", "object", "rho_start", "theta_start",
         "phi_start", "x_start", "y_start",
     } <= columns

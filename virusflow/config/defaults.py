@@ -88,7 +88,7 @@ ASTROMETRY_CONFIGURATION = VersionedConfiguration(
 
 BASELINE_RESPONSE_CONFIGURATION = VersionedConfiguration(
     kind="baseline_relative_response",
-    version="remedy-effective-response-1.0",
+    version="remedy-effective-response-atmosphere-separated-1.0",
     identity="legacy-remedy-effective-response",
     value={
         "file": "data/baseline_relative_response_remedy_1.txt",
@@ -132,14 +132,17 @@ BASELINE_RESPONSE_CONFIGURATION = VersionedConfiguration(
                 "calibration_convention": "relative-response-factorized-3.0",
             },
         },
-        "atmospheric_content": "absorbed_unknown",
+        "atmospheric_content": "removed_with_model",
+        "construction_extinction_model": "mcdonald_extinction.dat",
+        "construction_airmass": 1.22,
+        "construction_airmass_basis": "HET fixed altitude",
+        "source_baseline": "legacy Remedy throughput / normalization",
         "atmospheric_separation": {
-            "extinction_model_identity": None,
-            "calibration_exposure_airmasses": [],
-            "reason": (
-                "legacy effective calibration airmass was not recovered; "
-                "no numerical atmosphere separation was attempted"
-            ),
+            "extinction_model_identity": "mcdonald-observatory-mean-extinction",
+            "calibration_exposure_airmasses": [1.22],
+            "construction_extinction_model": "mcdonald_extinction.dat",
+            "construction_airmass_basis": "HET fixed altitude",
+            "source_baseline": "legacy Remedy throughput / normalization",
         },
         "separate_exposure_measurements": (
             "Remedy guider mirror illumination and transparency were exposure-specific "
@@ -147,7 +150,10 @@ BASELINE_RESPONSE_CONFIGURATION = VersionedConfiguration(
         ),
     },
     evidence_state="provisional",
-    source="Imported legacy Remedy throughput.txt and normalization.txt as one effective response",
+    source=(
+        "Legacy Remedy throughput / normalization with McDonald mean extinction "
+        "removed at HET fixed-altitude airmass 1.22"
+    ),
 )
 
 ATMOSPHERIC_EXTINCTION_CONFIGURATION = VersionedConfiguration(

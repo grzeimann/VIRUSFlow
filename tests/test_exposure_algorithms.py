@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import sys
 from types import SimpleNamespace
 
@@ -89,21 +90,84 @@ def test_normalization_stays_decomposed_and_multiplies_exactly():
     assert common.shape == x.shape
 
 
-def test_imported_remedy_baseline_is_one_effective_masked_payload():
+def test_default_baseline_removes_mcdonald_extinction_at_construction_airmass():
     payload, reference = ConfigurationService().resolve_baseline_response()
+    stored = np.loadtxt(payload["source_path"], comments="#")
     result = baseline_relative_response(
         payload["wavelength"], payload["response"], payload["uncertainty"], payload["mask"],
         version=reference.version,
     )
-    assert reference.version == "remedy-effective-response-1.0"
-    assert result.get_array("wavelength").shape == (1036,)
-    np.testing.assert_allclose(
-        result.get_array("response")[[0, -1]],
-        [0.03436521490375231, 0.1264653423239429],
+    extinction, _ = ConfigurationService().resolve_atmospheric_extinction()
+    evaluation = evaluate_atmospheric_extinction(
+        stored[:, 0],
+        extinction["wavelength"],
+        extinction["extinction_coefficient"],
+        extinction["uncertainty"],
+        extinction["mask"],
+        airmass=1.22,
     )
+    factor = evaluation.get_array("correction_factor")
+    legacy_response = stored[:, 1] / factor
+    legacy_digest = hashlib.sha256(
+        ("\n".join(format(value, ".15g") for value in legacy_response) + "\n").encode()
+    ).hexdigest()
+
+    assert reference.version == "remedy-effective-response-atmosphere-separated-1.0"
+    assert result.get_array("wavelength").shape == (1036,)
+    assert legacy_digest == "73cd0673cca8103c6b1fcc25c7cf59b96804ab3e76fd4110a400dc3adf050d1f"
+    np.testing.assert_allclose(
+        stored[:, 1] / legacy_response,
+        10.0 ** (0.4 * evaluation.get_array("extinction_coefficient") * 1.22),
+        rtol=2e-15,
+    )
+    np.testing.assert_allclose(result.get_array("response"), stored[:, 1], rtol=1e-7)
     assert np.all(np.isnan(result.get_array("uncertainty")))
     assert np.all(result.get_array("mask") == 2)
     assert set(result.arrays) == {"wavelength", "response", "uncertainty", "mask"}
+
+
+def test_airmass_122_atmosphere_separated_response_reproduces_legacy_remedy_result():
+    baseline, _ = ConfigurationService().resolve_baseline_response()
+    extinction, _ = ConfigurationService().resolve_atmospheric_extinction()
+    evaluation = evaluate_atmospheric_extinction(
+        baseline["wavelength"],
+        extinction["wavelength"],
+        extinction["extinction_coefficient"],
+        extinction["uncertainty"],
+        extinction["mask"],
+        airmass=1.22,
+    )
+    correction = evaluation.get_array("correction_factor")
+    legacy_response = np.asarray(baseline["response"], dtype=float) / correction
+    shape = (1, legacy_response.size)
+    common = {
+        "sky_subtracted": np.ones(shape),
+        "spectrum_variance": np.ones(shape),
+        "wavelength": np.asarray(baseline["wavelength"])[None, :],
+        "valid_fraction": np.ones(shape),
+        "baseline_wavelength": baseline["wavelength"],
+        "baseline_uncertainty": baseline["uncertainty"],
+        "baseline_mask": baseline["mask"],
+        "fiber_illumination": [1.0],
+    }
+    previous = apply_relative_response(
+        **common,
+        baseline_response=legacy_response,
+        baseline_atmospheric_content="absorbed_unknown",
+    )
+    current = apply_relative_response(
+        **common,
+        baseline_response=baseline["response"],
+        baseline_atmospheric_content="removed_with_model",
+        extinction_correction=correction,
+        extinction_uncertainty=evaluation.get_array("correction_uncertainty"),
+        extinction_mask=evaluation.get_array("mask"),
+    )
+    np.testing.assert_allclose(
+        current.get_array("calibrated_flux"),
+        previous.get_array("calibrated_flux"),
+        rtol=2e-7,
+    )
 
 
 def test_baseline_and_illumination_apply_once_with_response_uncertainty_variance():
