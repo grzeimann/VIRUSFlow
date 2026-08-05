@@ -64,11 +64,23 @@ class FlatResultContract(_BaseSimpleContract):
 
 
 class TraceResultContract(_BaseSimpleContract):
-    required_arrays = ["fiber_trace_map", "trace_sample_columns", "sampled_trace_positions", "per_fiber_trace_residual_rms"]
+    required_arrays = [
+        "fiber_trace_map", "trace_sample_columns", "sampled_trace_positions",
+        "per_fiber_trace_residual_rms", "trace_sample_valid_mask",
+        "trace_fit_residuals", "per_fiber_valid_sample_count",
+        "trace_interpolated_fiber_mask",
+    ]
 
 
 class WaveResultContract(_BaseSimpleContract):
-    required_arrays = ["wavelength_map", "per_fiber_wavelength_residual_rms"]
+    required_arrays = [
+        "wavelength_map", "per_fiber_wavelength_residual_rms",
+        "arc_identification", "arc_candidate_evidence", "arc_line_evidence",
+        "seed_region_attempted_mask", "seed_region_success_mask",
+        "seed_region_failure_code", "seed_fit_coefficients",
+        "interpolated_fiber_mask", "extrapolated_fiber_mask",
+        "input_mask_indices", "input_mask_shape",
+    ]
 
 class CmpResultContract(_BaseSimpleContract):
     required_arrays = ["master_comparison_lamp"]
@@ -85,7 +97,8 @@ class MasterSciResultContract(_BaseSimpleContract):
 class ExtractedMasterSpectrumResultContract(_BaseSimpleContract):
     required_arrays = [
         "spectrum", "valid_pixel_fraction", "effective_aperture_width",
-        "extraction_valid",
+        "extraction_valid", "aperture_start_row", "aperture_first_weight",
+        "aperture_last_weight", "aperture_sample_mask_bits",
     ]
     required_scalars = ["fiber_count", "valid_sample_fraction"]
 
