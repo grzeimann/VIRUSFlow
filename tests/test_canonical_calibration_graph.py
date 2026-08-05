@@ -150,6 +150,10 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
                 "trace_sample_columns": np.array([4.0, 16.0, 28.0]),
                 "sampled_trace_positions": np.array([[6.0, 6.0, 6.0], [14.0, 14.0, 14.0]]),
                 "per_fiber_trace_residual_rms": np.array([0.0, 0.0]),
+                "trace_sample_valid_mask": np.ones((2, 3), dtype=np.uint8),
+                "trace_fit_residuals": np.zeros((2, 3), dtype=float),
+                "per_fiber_valid_sample_count": np.full(2, 3, dtype=np.int16),
+                "trace_interpolated_fiber_mask": np.zeros(2, dtype=np.uint8),
             },
         )
 
@@ -163,6 +167,20 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
                 ).copy(),
                 "per_fiber_wavelength_residual_rms": np.array([0.1, 0.2]),
                 "arc_identification": np.array([[100.0, 4358.3, 4358.4, 0.1, 0.05, 0.0]]),
+                "arc_candidate_evidence": np.array(
+                    [[0.0, 100.0, 10.0, 1.0, 4358.3, 0.1, 0.05]]
+                ),
+                "arc_line_evidence": np.array(
+                    [[0.0, 100.0, 4358.3, 4358.4, 0.1, 0.05, 0.0]]
+                ),
+                "seed_region_attempted_mask": np.ones(2, dtype=np.uint8),
+                "seed_region_success_mask": np.ones(2, dtype=np.uint8),
+                "seed_region_failure_code": np.ones(2, dtype=np.uint8),
+                "seed_fit_coefficients": np.ones((2, 5), dtype=float),
+                "interpolated_fiber_mask": np.zeros(2, dtype=np.uint8),
+                "extrapolated_fiber_mask": np.zeros(2, dtype=np.uint8),
+                "input_mask_indices": np.empty(0, dtype=np.int32),
+                "input_mask_shape": np.asarray([1032, trace.shape[1]], dtype=np.int32),
             },
             scalars={"best_nmatch": 1, "best_rms": 0.1},
         )
@@ -239,10 +257,18 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
         "master", "per_pixel_bias_scatter"
     }
     assert {item["name"] for item in service.describe(rows["trace_map"])["components"]} == {
-        "fiber_trace_map", "trace_sample_columns", "sampled_trace_positions", "per_fiber_trace_residual_rms"
+        "fiber_trace_map", "trace_sample_columns", "sampled_trace_positions",
+        "per_fiber_trace_residual_rms", "trace_sample_valid_mask",
+        "trace_fit_residuals", "per_fiber_valid_sample_count",
+        "trace_interpolated_fiber_mask",
     }
     assert {item["name"] for item in service.describe(rows["wavelength_map"])["components"]} == {
-        "wavelength_map", "per_fiber_wavelength_residual_rms", "arc_identification"
+        "wavelength_map", "per_fiber_wavelength_residual_rms", "arc_identification",
+        "arc_candidate_evidence", "arc_line_evidence",
+        "seed_region_attempted_mask", "seed_region_success_mask",
+        "seed_region_failure_code", "seed_fit_coefficients",
+        "interpolated_fiber_mask", "extrapolated_fiber_mask",
+        "input_mask_indices", "input_mask_shape",
     }
     assert {item["name"] for item in service.describe(rows["master_sci"])["components"]} == {"master_sci"}
     for kind in ("master_ldls", "master_twilight", "master_sci"):
@@ -257,14 +283,16 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
         rows["extracted_master_sci_spectrum"]
     )["components"]} == {
         "spectrum", "valid_pixel_fraction", "effective_aperture_width",
-        "extraction_valid",
+        "extraction_valid", "aperture_start_row", "aperture_first_weight",
+        "aperture_last_weight", "aperture_sample_mask_bits",
     }
     for kind in (
         "extracted_master_ldls_spectrum", "extracted_master_twilight_spectrum",
     ):
         assert {item["name"] for item in service.describe(rows[kind])["components"]} == {
             "spectrum", "valid_pixel_fraction", "effective_aperture_width",
-            "extraction_valid",
+            "extraction_valid", "aperture_start_row", "aperture_first_weight",
+            "aperture_last_weight", "aperture_sample_mask_bits",
         }
     response_description = service.describe(rows["within_amp_fiber_normalization"])
     assert {item["name"] for item in response_description["components"]} >= {
@@ -322,7 +350,8 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
     wave_relations = service.describe(rows["wavelength_map"])["relations"]
     assert {item["parent_id"] for item in trace_relations} == {int(rows["master_ldls"]["id"])}
     assert {item["parent_id"] for item in wave_relations} == {
-        int(rows["master_arc"]["id"]), int(rows["trace_map"]["id"])
+        int(rows["master_arc"]["id"]), int(rows["trace_map"]["id"]),
+        int(rows["master_ldls"]["id"]), int(rows["master_dark"]["id"]),
     }
     extraction_relations = service.describe(
         rows["extracted_master_sci_spectrum"]

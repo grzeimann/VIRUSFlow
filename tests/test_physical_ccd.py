@@ -141,6 +141,20 @@ def test_physical_ccd_task_publishes_compact_model_and_keeps_evaluation_in_memor
                 "per_fiber_trace_residual_rms": LogicalComponent(
                     "per_fiber_trace_residual_rms", "array1d", np.zeros(trace.shape[0])
                 ),
+                "trace_sample_valid_mask": LogicalComponent(
+                    "trace_sample_valid_mask", "array2d",
+                    np.ones((trace.shape[0], 2), dtype=np.uint8),
+                ),
+                "trace_fit_residuals": LogicalComponent(
+                    "trace_fit_residuals", "array2d", np.zeros((trace.shape[0], 2))
+                ),
+                "per_fiber_valid_sample_count": LogicalComponent(
+                    "per_fiber_valid_sample_count", "array1d", np.full(trace.shape[0], 2)
+                ),
+                "trace_interpolated_fiber_mask": LogicalComponent(
+                    "trace_interpolated_fiber_mask", "array1d",
+                    np.zeros(trace.shape[0], dtype=np.uint8),
+                ),
             },
         )).id)
 

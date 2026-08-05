@@ -138,6 +138,14 @@ def test_trace_hardware_exception_and_sample_residual_outputs(monkeypatch):
     )
     assert result.get_array("trace_sample_columns").tolist() == [1.0, 4.0, 7.0]
     assert np.all(np.isfinite(result.get_array("per_fiber_trace_residual_rms")))
+    np.testing.assert_array_equal(
+        result.get_array("per_fiber_valid_sample_count"), [3, 3]
+    )
+    np.testing.assert_allclose(
+        result.get_array("trace_fit_residuals"),
+        [[0.0, 0.2, -0.2], [0.0, 0.1, -0.1]],
+    )
+    assert not np.any(result.get_array("trace_interpolated_fiber_mask"))
     legacy_shape = fit_fiber_traces(
         [],
         {
@@ -180,6 +188,31 @@ def test_arc_matching_rejection_recovery_and_residual_evidence(monkeypatch):
     )
     assert result.get_array("per_fiber_wavelength_residual_rms").tolist() == [0.1, 0.2]
     assert result.get_array("arc_identification").shape == (1, 6)
+
+
+def test_wavelength_solution_retains_seed_candidate_and_surface_state():
+    spectrum = np.zeros(1032)
+    line_pixels = ((np.asarray(REFERENCE_ARC_WAVELENGTHS) - 3500.0) / 2.0).astype(int)
+    spectrum[line_pixels] = 100.0
+    spectrum[np.clip(line_pixels - 1, 0, 1031)] = 30.0
+    spectrum[np.clip(line_pixels + 1, 0, 1031)] = 30.0
+    spectra = np.broadcast_to(spectrum, (64, spectrum.size)).copy()
+    trace = np.broadcast_to(
+        (50.0 + 7.0 * np.arange(64))[:, None], spectra.shape
+    ).copy()
+
+    result = fit_wavelength_solution(
+        comparison_lamp_fiber_spectra=spectra,
+        fiber_trace_map=trace,
+    )
+
+    assert result.get_array("wavelength_map").shape == spectra.shape
+    assert result.get_array("seed_region_attempted_mask").sum() >= 7
+    assert result.get_array("seed_region_success_mask").sum() >= 7
+    assert result.get_array("arc_candidate_evidence").shape[1] == 7
+    assert result.get_array("arc_line_evidence").shape[1] == 7
+    assert np.any(result.get_array("interpolated_fiber_mask"))
+    assert result.get_array("seed_fit_coefficients").shape == (64, 5)
 
 
 def test_wave_failure_preserves_scientific_reason_before_publication():

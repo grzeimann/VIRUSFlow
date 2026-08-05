@@ -271,6 +271,10 @@ def test_trace_and_wavelength_inherit_their_measurement_evidence_state(
                 "trace_sample_columns": np.asarray([0.0, nx - 1.0]),
                 "sampled_trace_positions": np.asarray([[5.0, 5.0], [10.0, 10.0]]),
                 "per_fiber_trace_residual_rms": np.zeros(2),
+                "trace_sample_valid_mask": np.ones((2, 2), dtype=np.uint8),
+                "trace_fit_residuals": np.zeros((2, 2)),
+                "per_fiber_valid_sample_count": np.full(2, 2),
+                "trace_interpolated_fiber_mask": np.zeros(2, dtype=np.uint8),
             },
         )
 
@@ -327,6 +331,20 @@ def test_trace_and_wavelength_inherit_their_measurement_evidence_state(
                 "arc_identification": np.asarray(
                     [[1.0, 4358.3, 4358.4, 0.1, 0.05, 0.0]]
                 ),
+                "arc_candidate_evidence": np.asarray(
+                    [[0.0, 1.0, 100.0, 1.0, 4358.3, 0.1, 0.05]]
+                ),
+                "arc_line_evidence": np.asarray(
+                    [[0.0, 1.0, 4358.3, 4358.4, 0.1, 0.05, 0.0]]
+                ),
+                "seed_region_attempted_mask": np.asarray([1], dtype=np.uint8),
+                "seed_region_success_mask": np.asarray([1], dtype=np.uint8),
+                "seed_region_failure_code": np.asarray([0], dtype=np.uint8),
+                "seed_fit_coefficients": np.asarray([[3500.0, 100.0]]),
+                "interpolated_fiber_mask": np.zeros(2, dtype=np.uint8),
+                "extrapolated_fiber_mask": np.zeros(2, dtype=np.uint8),
+                "input_mask_indices": np.asarray([], dtype=np.int32),
+                "input_mask_shape": np.asarray([0, 0], dtype=np.int32),
             },
             scalars={"best_nmatch": 1, "best_rms": 0.1},
         )
@@ -379,6 +397,10 @@ def test_lightweight_bulk_query_filters_in_database_without_n_plus_one(
                 "trace_sample_columns": np.asarray([0.0, 3.0]),
                 "sampled_trace_positions": np.ones((2, 2)),
                 "per_fiber_trace_residual_rms": np.zeros(2),
+                "trace_sample_valid_mask": np.ones((2, 2), dtype=np.uint8),
+                "trace_fit_residuals": np.zeros((2, 2)),
+                "per_fiber_valid_sample_count": np.full(2, 2),
+                "trace_interpolated_fiber_mask": np.zeros(2, dtype=np.uint8),
             },
             parents=[base.id],
             scientific_metadata={
@@ -458,6 +480,10 @@ def test_lightweight_bulk_query_filters_in_database_without_n_plus_one(
         "trace_sample_columns",
         "sampled_trace_positions",
         "per_fiber_trace_residual_rms",
+        "trace_sample_valid_mask",
+        "trace_fit_residuals",
+        "per_fiber_valid_sample_count",
+        "trace_interpolated_fiber_mask",
     }
     artifact_selects = [
         event for event in timing.database_queries

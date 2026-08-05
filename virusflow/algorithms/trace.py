@@ -28,7 +28,7 @@ from sklearn.linear_model import HuberRegressor
 from ..artifacts.io_fits import read_array_fits
 
 # Algorithm version string for this module
-ALGO_VERSION = "trace-1.0"
+ALGO_VERSION = "trace-1.1"
 
 # Input item type accepted by fit_fiber_traces (kept for interface symmetry)
 TraceInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
@@ -362,29 +362,36 @@ def fit_fiber_traces(
     except Exception as e:
         raise RuntimeError(f"fit_fiber_traces failed to compute trace via _get_trace: {e}") from e
 
-    # Compute per-fiber robust dispersion between sampled chunk traces and the modeled trace2d at xchunks
-    # Use MAD-based standard deviation (astropy.stats.mad_std) for robustness to outliers.
-    try:
-        nfib, nch = Trace_samples.shape
-        xidx = np.clip(np.round(np.asarray(xchunks, dtype=float)).astype(int), 0, nx - 1)
-        rms_fibers = np.full((nfib,), np.nan, dtype=float)
-        for i in range(nfib):
-            ts = np.asarray(Trace_samples[i, :], dtype=float)
-            sel = np.isfinite(ts) & (ts > 0)
-            if np.count_nonzero(sel) >= 2:
-                model = trace_2d[i, xidx[sel]]
-                diff = ts[sel] - model
-                # Robust sigma via MAD; ignore NaNs in diff just in case
-                val = mad_std(diff, ignore_nan=True)
-                try:
-                    val = float(val)
-                except Exception:
-                    val = np.nan
-                if np.isfinite(val):
-                    rms_fibers[i] = val
-    except Exception:
-        # If anything goes wrong, leave rms_fibers as None
-        rms_fibers = None
+    # Preserve the discrete-to-model residual state used by trace QA.  These
+    # compact arrays are the non-reconstructable evidence needed before the
+    # dense LDLS illumination payload may be released.
+    nfib, _ = Trace_samples.shape
+    xidx = np.clip(
+        np.round(np.asarray(xchunks, dtype=float)).astype(int), 0, nx - 1
+    )
+    samples = np.asarray(Trace_samples, dtype=float)
+    modeled_samples = np.asarray(trace_2d[:, xidx], dtype=float)
+    sample_valid = (
+        np.isfinite(samples) & (samples > 0.0) & np.isfinite(modeled_samples)
+    )
+    fit_residuals = np.where(sample_valid, samples - modeled_samples, np.nan)
+    valid_counts = np.count_nonzero(sample_valid, axis=1).astype(np.int16)
+    rms_fibers = np.full((nfib,), np.nan, dtype=float)
+    for i in range(nfib):
+        if valid_counts[i] < 2:
+            continue
+        value = mad_std(fit_residuals[i, sample_valid[i]], ignore_nan=True)
+        try:
+            value = float(value)
+        except Exception:
+            value = np.nan
+        if np.isfinite(value):
+            rms_fibers[i] = value
+    reference_interpolated = np.zeros((nfib,), dtype=np.uint8)
+    if np.asarray(ref).ndim == 2 and np.asarray(ref).shape[0] == nfib:
+        reference_interpolated = (
+            np.asarray(ref)[:, 1] != 0.0
+        ).astype(np.uint8)
 
     # Build storage-neutral AlgoResult (no persistence here)
     scalars = {"trace_len": int(nx) if nx is not None else int(trace_2d.shape[1])}
@@ -393,6 +400,10 @@ def fit_fiber_traces(
         version=ALGO_VERSION,
         meta={
             "trace_map_shape": list(trace_2d.shape),
+            "trace_model": "per_fiber_degree_at_most_4_huber_polynomial",
+            "trace_sample_state": (
+                "measured_active_fibers_or_reference_offset_for_configured_dead_fibers"
+            ),
         },
         scalars=scalars,
         arrays={
@@ -400,5 +411,9 @@ def fit_fiber_traces(
             "per_fiber_trace_residual_rms": rms_fibers,
             "trace_sample_columns": np.asarray(xchunks, dtype=float) if xchunks is not None else None,
             "sampled_trace_positions": Trace_samples,
+            "trace_sample_valid_mask": sample_valid.astype(np.uint8),
+            "trace_fit_residuals": fit_residuals.astype(np.float32),
+            "per_fiber_valid_sample_count": valid_counts,
+            "trace_interpolated_fiber_mask": reference_interpolated,
         },
     )

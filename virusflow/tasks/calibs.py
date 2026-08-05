@@ -490,12 +490,20 @@ class _ExtractedMasterSpectrumTask(_CanonicalTask):
         "valid_pixel_fraction": "valid_pixel_fraction",
         "effective_aperture_width": "effective_aperture_width",
         "extraction_valid": "extraction_valid",
+        "aperture_start_row": "aperture_start_row",
+        "aperture_first_weight": "aperture_first_weight",
+        "aperture_last_weight": "aperture_last_weight",
+        "aperture_sample_mask_bits": "aperture_sample_mask_bits",
     }
     component_units = {
         "spectrum": "electron",
         "valid_pixel_fraction": "1",
         "effective_aperture_width": "pixel",
         "extraction_valid": "1",
+        "aperture_start_row": "pixel",
+        "aperture_first_weight": "1",
+        "aperture_last_weight": "1",
+        "aperture_sample_mask_bits": "1",
     }
 
     def run(self, inputs):
@@ -1085,6 +1093,20 @@ class TraceTask(_CanonicalTask):
         "trace_sample_columns": "trace_sample_columns",
         "sampled_trace_positions": "sampled_trace_positions",
         "per_fiber_trace_residual_rms": "per_fiber_trace_residual_rms",
+        "trace_sample_valid_mask": "trace_sample_valid_mask",
+        "trace_fit_residuals": "trace_fit_residuals",
+        "per_fiber_valid_sample_count": "per_fiber_valid_sample_count",
+        "trace_interpolated_fiber_mask": "trace_interpolated_fiber_mask",
+    }
+    component_units = {
+        "fiber_trace_map": "pixel",
+        "trace_sample_columns": "pixel",
+        "sampled_trace_positions": "pixel",
+        "per_fiber_trace_residual_rms": "pixel",
+        "trace_sample_valid_mask": "1",
+        "trace_fit_residuals": "pixel",
+        "per_fiber_valid_sample_count": "1",
+        "trace_interpolated_fiber_mask": "1",
     }
 
     def run(self, inputs):
@@ -1128,6 +1150,31 @@ class WaveTask(_CanonicalTask):
         "wavelength_map": "wavelength_map",
         "per_fiber_wavelength_residual_rms": "per_fiber_wavelength_residual_rms",
         "arc_identification": "arc_identification",
+        "arc_candidate_evidence": "arc_candidate_evidence",
+        "arc_line_evidence": "arc_line_evidence",
+        "seed_region_attempted_mask": "seed_region_attempted_mask",
+        "seed_region_success_mask": "seed_region_success_mask",
+        "seed_region_failure_code": "seed_region_failure_code",
+        "seed_fit_coefficients": "seed_fit_coefficients",
+        "interpolated_fiber_mask": "interpolated_fiber_mask",
+        "extrapolated_fiber_mask": "extrapolated_fiber_mask",
+        "input_mask_indices": "input_mask_indices",
+        "input_mask_shape": "input_mask_shape",
+    }
+    component_units = {
+        "wavelength_map": "Angstrom",
+        "per_fiber_wavelength_residual_rms": "Angstrom",
+        "arc_identification": "1",
+        "arc_candidate_evidence": "1",
+        "arc_line_evidence": "1",
+        "seed_region_attempted_mask": "1",
+        "seed_region_success_mask": "1",
+        "seed_region_failure_code": "1",
+        "seed_fit_coefficients": "1",
+        "interpolated_fiber_mask": "1",
+        "extrapolated_fiber_mask": "1",
+        "input_mask_indices": "1",
+        "input_mask_shape": "1",
     }
 
     @staticmethod
@@ -1149,6 +1196,7 @@ class WaveTask(_CanonicalTask):
 
         mask = None
         masks = []
+        mask_parent_ids = []
         mask_facts = {"flat_mask_fraction": 0.0, "dark_mask_fraction": 0.0, "flat_mask_applied": 0}
         mask_policy = WAVELENGTH_INPUT_MASK_CONFIGURATION
         for kind, component in (("master_ldls", "flat_response_mask"), ("master_dark", "dark_pixel_mask")):
@@ -1156,15 +1204,20 @@ class WaveTask(_CanonicalTask):
             if row is not None:
                 try:
                     candidate = np.asarray(service.load_component(row, component)["data"], dtype=bool)
+                    if candidate.shape != arc.shape:
+                        continue
+                    candidate_id = int(row.id) if hasattr(row, "id") else int(row["id"])
                     fraction = float(candidate.mean())
                     if kind == "master_ldls":
                         mask_facts["flat_mask_fraction"] = fraction
                         if fraction <= float(mask_policy.value["maximum_flat_mask_fraction"]):
                             masks.append(candidate)
+                            mask_parent_ids.append(candidate_id)
                             mask_facts["flat_mask_applied"] = 1
                     else:
                         mask_facts["dark_mask_fraction"] = fraction
                         masks.append(candidate)
+                        mask_parent_ids.append(candidate_id)
                 except KeyError:
                     pass
         if masks:
@@ -1181,6 +1234,7 @@ class WaveTask(_CanonicalTask):
             npix_extract=int(algorithm_params.get("npix_extract", 5)),
             res_lim=float(algorithm_params.get("res_lim", 1.0)),
             order=int(algorithm_params.get("order", 4)),
+            input_pixel_mask=mask,
             params={**algorithm_params, "mask_applied": bool(mask is not None), **mask_facts},
         )
         result = ensure_algo_result(result, kind="wave")
@@ -1198,6 +1252,7 @@ class WaveTask(_CanonicalTask):
             mask_policy.kind, mask_policy.version, self.target.zipcode.key(), mask_policy.evidence_state
         )]
         artifact = self._publish(
-            result, [arc_id, trace_id], configuration_refs=refs
+            result, sorted({arc_id, trace_id, *mask_parent_ids}),
+            configuration_refs=refs,
         )
         return {self.artifact_name: artifact}

@@ -4,6 +4,8 @@ import numpy as np
 
 from virusflow.algorithms.fiber_response import fit_within_amplifier_response
 from virusflow.algorithms.calibration_detector import correct_response_calibration_frames
+from virusflow.algorithms.extraction import extract_fractional_aperture
+from virusflow.algorithms.master_spectrum import extract_master_spectrum
 
 
 def _calibration_spectra():
@@ -107,3 +109,31 @@ def test_response_calibration_detector_correction_matches_science_convention():
     np.testing.assert_allclose(result.get_array("corrected_variances"), 8.0)
     assert np.all(result.get_array("pixel_masks")[:, 0, 1] == 1)
     np.testing.assert_allclose(result.get_array("dark_scales"), [1.0, 2.0])
+
+
+def test_master_spectrum_retains_compact_exact_aperture_evidence():
+    image = np.arange(48, dtype=float).reshape(8, 6)
+    trace = np.asarray([[3.2, 3.4, 3.6, 3.8, 4.0, 4.2]])
+    pixel_mask = np.zeros_like(image, dtype=np.uint8)
+    pixel_mask[2, 1] = 1
+    retained = extract_master_spectrum(
+        image, trace, result_kind="extracted_master_ldls_spectrum",
+        pixel_mask=pixel_mask,
+    )
+    direct = extract_fractional_aperture(
+        image, np.zeros_like(image), trace, pixel_mask=pixel_mask, width=5.0,
+    )
+
+    direct_weights = direct.get_array("fractional_weights")
+    bits = retained.get_array("aperture_sample_mask_bits")
+    reconstructed = np.zeros_like(direct_weights)
+    for index in range(direct_weights.shape[-1]):
+        reconstructed[..., index] = (bits & (1 << index)) != 0
+    reconstructed[..., 0] *= retained.get_array("aperture_first_weight")
+    reconstructed[..., -1] *= retained.get_array("aperture_last_weight")
+
+    np.testing.assert_array_equal(
+        retained.get_array("aperture_start_row"),
+        direct.get_array("aperture_start_row"),
+    )
+    np.testing.assert_allclose(reconstructed, direct_weights)

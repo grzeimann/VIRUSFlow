@@ -128,6 +128,22 @@ def test_eviction_requires_validated_downstream_products(tmp_path: Path):
     assert service.payload_status(arc.id) == "present"
 
 
+def test_eviction_requires_verified_component_complete_descendant_evidence(
+    tmp_path: Path,
+):
+    service, arc, wave = _validated_arc_chain(tmp_path)
+    line_evidence = next(
+        component for component in service.describe(wave.id)["components"]
+        if component["name"] == "arc_line_evidence"
+    )
+    Path(line_evidence["path"]).write_bytes(b"not the registered evidence")
+
+    with pytest.raises(ValueError, match="unverifiable payload evidence"):
+        service.evict_payload(arc.id)
+
+    assert service.payload_status(arc.id) == "present"
+
+
 def test_intentional_eviction_retains_registry_evidence_and_is_discoverable(
     tmp_path: Path,
 ):

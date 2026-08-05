@@ -55,25 +55,57 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
     "extracted_master_sci_spectrum": _spec(
         "extracted_master_sci_spectrum", PhysicalScope.FIBER, Unit.ELECTRON.value,
         CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
-        ("spectrum", "valid_pixel_fraction", "effective_aperture_width", "extraction_valid"),
+        (
+            "spectrum", "valid_pixel_fraction", "effective_aperture_width",
+            "extraction_valid", "aperture_start_row", "aperture_first_weight",
+            "aperture_last_weight", "aperture_sample_mask_bits",
+        ),
     ),
     "extracted_master_ldls_spectrum": _spec(
         "extracted_master_ldls_spectrum", PhysicalScope.FIBER, Unit.ELECTRON.value,
         CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
-        ("spectrum", "valid_pixel_fraction", "effective_aperture_width", "extraction_valid"),
+        (
+            "spectrum", "valid_pixel_fraction", "effective_aperture_width",
+            "extraction_valid", "aperture_start_row", "aperture_first_weight",
+            "aperture_last_weight", "aperture_sample_mask_bits",
+        ),
     ),
     "extracted_master_twilight_spectrum": _spec(
         "extracted_master_twilight_spectrum", PhysicalScope.FIBER, Unit.ELECTRON.value,
         CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
-        ("spectrum", "valid_pixel_fraction", "effective_aperture_width", "extraction_valid"),
+        (
+            "spectrum", "valid_pixel_fraction", "effective_aperture_width",
+            "extraction_valid", "aperture_start_row", "aperture_first_weight",
+            "aperture_last_weight", "aperture_sample_mask_bits",
+        ),
     ),
     "fiber_wavelength_spectral_mask": _spec(
         "fiber_wavelength_spectral_mask", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value,
         CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
         ("mask", "spectral_model", "normalization", "good_wavelength_solution"),
     ),
-    "trace_map": _spec("trace_map", PhysicalScope.AMPLIFIER, Unit.PIXEL.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("fiber_trace_map", "trace_sample_columns", "sampled_trace_positions", "per_fiber_trace_residual_rms")),
-    "wavelength_map": _spec("wavelength_map", PhysicalScope.AMPLIFIER, Unit.ANGSTROM.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("wavelength_map", "per_fiber_wavelength_residual_rms"), ("arc_identification",)),
+    "trace_map": _spec(
+        "trace_map", PhysicalScope.AMPLIFIER, Unit.PIXEL.value,
+        CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
+        (
+            "fiber_trace_map", "trace_sample_columns", "sampled_trace_positions",
+            "per_fiber_trace_residual_rms", "trace_sample_valid_mask",
+            "trace_fit_residuals", "per_fiber_valid_sample_count",
+            "trace_interpolated_fiber_mask",
+        ),
+    ),
+    "wavelength_map": _spec(
+        "wavelength_map", PhysicalScope.AMPLIFIER, Unit.ANGSTROM.value,
+        CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
+        (
+            "wavelength_map", "per_fiber_wavelength_residual_rms",
+            "arc_identification", "arc_candidate_evidence", "arc_line_evidence",
+            "seed_region_attempted_mask", "seed_region_success_mask",
+            "seed_region_failure_code", "seed_fit_coefficients",
+            "interpolated_fiber_mask", "extrapolated_fiber_mask",
+            "input_mask_indices", "input_mask_shape",
+        ),
+    ),
     "read_noise": _spec("read_noise", PhysicalScope.AMPLIFIER, Unit.ELECTRON.value, CoordinateConvention.NONE, ("read_noise",)),
     "gain": _spec("gain", PhysicalScope.AMPLIFIER, "electron / adu", CoordinateConvention.NONE, ("gain",)),
     "pixel_mask": _spec("pixel_mask", PhysicalScope.PIXEL, Unit.DIMENSIONLESS.value, CoordinateConvention.ORIENTED_AMPLIFIER, ("mask",)),
@@ -106,12 +138,13 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
     "within_amp_fiber_normalization": _spec(
         "within_amp_fiber_normalization", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value,
         CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
-        ("raw_ratio", "normalization", "valid_mask", "common_twilight"),
         (
+            "raw_ratio", "normalization", "valid_mask", "common_twilight",
             "ftf_ldls", "twilight_broad_correction",
             "twilight_residual_correction", "wavelength",
-            "amplifier_twilight_level", "science_residual_per_fiber",
+            "amplifier_twilight_level",
         ),
+        ("science_residual_per_fiber",),
     ),
     "amp_to_amp_normalization": _spec(
         "amp_to_amp_normalization", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value,

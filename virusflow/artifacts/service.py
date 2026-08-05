@@ -1163,6 +1163,7 @@ class ArtifactService:
         )
         valid_by_kind: dict[str, list[int]] = {}
         invalid_by_kind: dict[str, list[int]] = {}
+        invalid_reasons: dict[str, list[str]] = {}
         for descendant in descendants:
             kind = canonical_kind(descendant.get("kind") or "")
             if kind not in required:
@@ -1171,21 +1172,42 @@ class ArtifactService:
                 continue
             try:
                 self._require_validated(descendant, label=f"descendant {kind}")
-                payload_state = str(descendant.get("payload_state") or "present")
-                missing_present_paths = [
-                    path for path in (descendant.get("present_paths") or [])
-                    if not Path(str(path)).is_file()
-                ]
-                if payload_state == "missing_error" or missing_present_paths:
-                    raise ValueError(f"descendant {kind} has missing payload evidence")
-            except ValueError:
+                required_components = set(kind_spec(kind).required_components)
+                components = {
+                    str(component.get("name")): component
+                    for component in self.adapter.list_components(int(descendant["id"]))
+                }
+                missing_components = sorted(required_components - set(components))
+                if missing_components:
+                    raise ValueError(
+                        f"descendant {kind} lacks required evidence components "
+                        f"{missing_components}"
+                    )
+                for component_name in sorted(required_components):
+                    component = components[component_name]
+                    state = str(component.get("payload_state") or "present")
+                    path = Path(str(component.get("path") or ""))
+                    checksum = str(component.get("checksum") or "")
+                    if state != "present" or not path.is_file():
+                        raise ValueError(
+                            f"descendant {kind} component {component_name!r} "
+                            "has missing payload evidence"
+                        )
+                    if not checksum or _sha256(path) != checksum:
+                        raise ValueError(
+                            f"descendant {kind} component {component_name!r} "
+                            "has unverifiable payload evidence"
+                        )
+            except ValueError as exc:
                 invalid_by_kind.setdefault(kind, []).append(int(descendant["id"]))
+                invalid_reasons.setdefault(kind, []).append(str(exc))
             else:
                 valid_by_kind.setdefault(kind, []).append(int(descendant["id"]))
         missing = sorted(required - set(valid_by_kind))
         if missing:
             details = ", ".join(
-                f"{kind} (invalid IDs {invalid_by_kind.get(kind, [])})"
+                f"{kind} (invalid IDs {invalid_by_kind.get(kind, [])}; "
+                f"reasons {invalid_reasons.get(kind, [])})"
                 for kind in missing
             )
             raise ValueError(

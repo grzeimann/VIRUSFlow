@@ -96,6 +96,10 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
             "trace_sample_columns": sample_columns,
             "sampled_trace_positions": trace[:, [0, nx - 1]],
             "per_fiber_trace_residual_rms": np.zeros(trace.shape[0]),
+            "trace_sample_valid_mask": np.ones((trace.shape[0], 2), dtype=np.uint8),
+            "trace_fit_residuals": np.zeros((trace.shape[0], 2)),
+            "per_fiber_valid_sample_count": np.full(trace.shape[0], 2),
+            "trace_interpolated_fiber_mask": np.zeros(trace.shape[0], dtype=np.uint8),
         }, at)
         amplifier_wavelength = wavelength.copy()
         if zipcode.amp == "LL":
@@ -103,6 +107,17 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
         _publish(service, tmp_path, "wavelength_map", zipcode, {
             "wavelength_map": amplifier_wavelength,
             "per_fiber_wavelength_residual_rms": np.zeros(trace.shape[0]),
+            "arc_identification": np.asarray([[0.0, 3500.0, 3500.0, 0.0, 0.0, 0.0]]),
+            "arc_candidate_evidence": np.asarray([[0.0, 0.0, 1.0, 1.0, 3500.0, 0.0, 0.0]]),
+            "arc_line_evidence": np.asarray([[0.0, 0.0, 3500.0, 3500.0, 0.0, 0.0, 0.0]]),
+            "seed_region_attempted_mask": np.ones(1, dtype=np.uint8),
+            "seed_region_success_mask": np.ones(1, dtype=np.uint8),
+            "seed_region_failure_code": np.zeros(1, dtype=np.uint8),
+            "seed_fit_coefficients": np.asarray([[3500.0, 1.0]]),
+            "interpolated_fiber_mask": np.zeros(trace.shape[0], dtype=np.uint8),
+            "extrapolated_fiber_mask": np.zeros(trace.shape[0], dtype=np.uint8),
+            "input_mask_indices": np.asarray([], dtype=np.int32),
+            "input_mask_shape": np.asarray([1032, nx], dtype=np.int32),
         }, at)
         normalization = np.ones_like(amplifier_wavelength, dtype=np.float32)
         response_rows.append(_publish(service, tmp_path, "within_amp_fiber_normalization", zipcode, {
@@ -110,6 +125,10 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
             "normalization": normalization,
             "valid_mask": np.ones_like(normalization, dtype=np.uint8),
             "common_twilight": np.full_like(normalization, 1000.0),
+            "ftf_ldls": normalization,
+            "twilight_broad_correction": normalization,
+            "twilight_residual_correction": normalization,
+            "wavelength": amplifier_wavelength,
             "amplifier_twilight_level": np.asarray([1000.0], dtype=np.float32),
         }, at))
     amp_build = _publish(

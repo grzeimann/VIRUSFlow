@@ -8,7 +8,7 @@ from ..core.algo_result import AlgoResult
 from .extraction import extract_fractional_aperture
 
 
-ALGO_VERSION = "master-fractional-aperture-1.0"
+ALGO_VERSION = "master-fractional-aperture-1.1"
 
 
 def extract_master_spectrum(
@@ -39,6 +39,14 @@ def extract_master_spectrum(
     )
     spectrum = np.asarray(extraction.get_array("spectrum"), dtype=np.float32)
     valid = np.asarray(extraction.get_array("extraction_valid"), dtype=np.uint8)
+    weights = np.asarray(extraction.get_array("fractional_weights"), dtype=np.float32)
+    if weights.shape[-1] > 8:
+        raise ValueError(
+            "compact aperture sample evidence supports at most eight detector rows"
+        )
+    sample_mask_bits = np.zeros(weights.shape[:-1], dtype=np.uint8)
+    for index in range(weights.shape[-1]):
+        sample_mask_bits |= ((weights[..., index] > 0.0).astype(np.uint8) << index)
     return AlgoResult(
         kind=str(result_kind),
         version=ALGO_VERSION,
@@ -51,6 +59,12 @@ def extract_master_spectrum(
                 extraction.get_array("effective_aperture_width"), dtype=np.float32
             ),
             "extraction_valid": valid,
+            "aperture_start_row": np.asarray(
+                extraction.get_array("aperture_start_row"), dtype=np.int16
+            ),
+            "aperture_first_weight": weights[..., 0],
+            "aperture_last_weight": weights[..., -1],
+            "aperture_sample_mask_bits": sample_mask_bits,
         },
         scalars={
             "fiber_count": int(spectrum.shape[0]),
@@ -65,5 +79,9 @@ def extract_master_spectrum(
             "output_scale_convention": "integrated_aperture_counts",
             "spectral_coordinate": "detector_column",
             "pixel_mask_applied": pixel_mask is not None,
+            "aperture_sample_mask_encoding": (
+                "bit_i_is_one_when_detector_row_start_plus_i_contributed"
+            ),
+            "aperture_sample_count": int(weights.shape[-1]),
         },
     )
