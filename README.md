@@ -2,7 +2,7 @@
 
 VIRUSFlow is an alpha-quality, artifact-driven calibration, reduction, QA, analysis, and validation system for the VIRUS spectrograph. It preserves exposures as atomic measurements, groups real registry-derived members into observations, and records immutable products with provenance and lifecycle state.
 
-The currently supported production path covers calibration graphs, complete science exposures, and complete-observation fiber products corrected by a provisional empirical Remedy effective-response baseline. Cube reconstruction, a physical LSF model, full covariance propagation, atmospheric correction, isolated instrumental throughput, and absolute flux calibration are not yet available.
+The currently supported production path covers calibration graphs, complete science exposures, and complete-observation fiber products corrected by a provisional empirical Remedy effective-response baseline. That default baseline remains atmosphere-contaminated and does not receive a second extinction correction; a separately measured compatible baseline can instead select the retained McDonald wavelength-dependent extinction model at explicit exposure airmass. Cube reconstruction, a physical LSF model, full covariance propagation, variable-atmosphere modeling, isolated instrumental throughput, and absolute flux calibration are not yet available.
 
 ## Installation
 

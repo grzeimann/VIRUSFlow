@@ -650,6 +650,12 @@ def _science_context(args: argparse.Namespace):
         cfg["baseline_response_path"] = str(Path(baseline_path).resolve())
     if baseline_artifact_id is not None:
         cfg["baseline_response_artifact_id"] = int(baseline_artifact_id)
+    extinction_path = getattr(args, "atmospheric_extinction_file", None)
+    extinction_artifact_id = getattr(args, "atmospheric_extinction_artifact_id", None)
+    if extinction_path is not None:
+        cfg["atmospheric_extinction_path"] = str(Path(extinction_path).resolve())
+    if extinction_artifact_id is not None:
+        cfg["atmospheric_extinction_artifact_id"] = int(extinction_artifact_id)
     return TaskContext(str(args.db), str(Path(args.workdir).resolve()), cfg, raw_db_path=str(args.raw_db))
 
 
@@ -936,6 +942,15 @@ def _add_science_run(parser: argparse.ArgumentParser) -> None:
     baseline.add_argument(
         "--baseline-response-artifact-id", type=int,
         help="Select one existing baseline_relative_response Product by Artifact ID",
+    )
+    extinction = parser.add_mutually_exclusive_group()
+    extinction.add_argument(
+        "--atmospheric-extinction-file",
+        help="Select and import one two- or four-column atmospheric_extinction_model payload",
+    )
+    extinction.add_argument(
+        "--atmospheric-extinction-artifact-id", type=int,
+        help="Select one existing atmospheric_extinction_model Product by Artifact ID",
     )
     parser.add_argument("--preserve-failed-scratch", action="store_true")
 

@@ -44,6 +44,12 @@ def test_clean_cli_exposes_real_commands_and_retires_plan_stubs(tmp_path: Path):
     ])
     assert baseline_args.baseline_response_file == str(tmp_path / "baseline.txt")
     assert baseline_args.baseline_response_artifact_id is None
+    extinction_args = parser.parse_args([
+        "run", "exposure", "--exposure-id", "20260609T031649.6",
+        "--atmospheric-extinction-artifact-id", "23",
+    ])
+    assert extinction_args.atmospheric_extinction_artifact_id == 23
+    assert extinction_args.atmospheric_extinction_file is None
     with pytest.raises(SystemExit):
         parser.parse_args([
             "run", "exposure", "--exposure-id", "20260609T031649.6",

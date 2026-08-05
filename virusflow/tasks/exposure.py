@@ -18,6 +18,11 @@ from ..algorithms.astrometry import (
     parse_header_pointing,
     tan_fiber_coordinates,
 )
+from ..algorithms.atmosphere import (
+    EXTINCTION_VERSION,
+    atmospheric_extinction_model,
+    evaluate_atmospheric_extinction,
+)
 from ..algorithms.completion import build_completion_coverage
 from ..algorithms.exposure import CalibratedFiberState, apply_relative_response
 from ..algorithms.exposure_state import classify_mode_and_effective_time
@@ -47,7 +52,11 @@ from ..artifacts import ArtifactService, Scope, Validity
 from ..artifacts.requests import ArtifactRequest, LogicalComponent
 from ..artifacts.storage_conventions import FLUX_SCALE, VARIANCE_SCALE
 from ..config import ConfigurationService
-from ..config.defaults import BASELINE_RESPONSE_CONFIGURATION, EFFECTIVE_EXPOSURE_POLICY
+from ..config.defaults import (
+    ATMOSPHERIC_EXTINCTION_CONFIGURATION,
+    BASELINE_RESPONSE_CONFIGURATION,
+    EFFECTIVE_EXPOSURE_POLICY,
+)
 from ..core.scientific_metadata import scientific_metadata_from_header
 from ..io import PanSTARRSCSVProvider, RawFrameLoader
 from ..ontology.scopes import PhysicalScope
@@ -91,7 +100,7 @@ class GlobalFiberFrame:
 
 class ExposureTask(_SciencePublisher):
     name = "full_exposure"
-    version = "v2"
+    version = "v3"
 
     @staticmethod
     def _no_extractable_message(exposure_id: str, failures: dict, *, reason: str | None = None) -> str:
@@ -259,10 +268,26 @@ class ExposureTask(_SciencePublisher):
                 if component.get("payload_state", "present") == "present"
             }
             applicability = description["summary"].get("applicability") or {}
+            atmospheric_content = description["summary"].get("atmospheric_content")
+            separation = description["summary"].get("atmospheric_separation") or {}
+            calibration_airmasses = separation.get("calibration_exposure_airmasses") or []
+            try:
+                valid_calibration_airmasses = bool(calibration_airmasses) and all(
+                    np.isfinite(float(value)) and float(value) > 0.0
+                    for value in calibration_airmasses
+                )
+            except (TypeError, ValueError, OverflowError):
+                valid_calibration_airmasses = False
+            convention_complete = atmospheric_content == "absorbed_unknown" or (
+                atmospheric_content == "removed_with_model"
+                and bool(separation.get("extinction_model_identity"))
+                and valid_calibration_airmasses
+            )
             if (
                 required <= names
                 and applicability.get("algorithm_versions")
                 == cls._baseline_application_versions()
+                and convention_complete
             ):
                 complete.append(row)
         return complete
@@ -327,6 +352,7 @@ class ExposureTask(_SciencePublisher):
                 "selection": "independent baseline Product; apply exactly once after sky subtraction",
             },
             "atmospheric_content": config_value["atmospheric_content"],
+            "atmospheric_separation": config_value["atmospheric_separation"],
             "separate_exposure_measurements": config_value["separate_exposure_measurements"],
             "atmospheric_correction_applied": False,
             "isolated_instrumental_throughput": False,
@@ -375,6 +401,140 @@ class ExposureTask(_SciencePublisher):
             request,
             algorithm_name="virusflow.algorithms.response.baseline_relative_response",
             algorithm_version=reference.version,
+        )
+        self._qa(artifact, request.summaries, status="warn", usability="degraded")
+        return artifact
+
+    @staticmethod
+    def _complete_extinction_candidates(service, at: datetime, identity: str) -> list[dict]:
+        required = {"wavelength", "extinction_coefficient", "uncertainty", "mask"}
+        rows = service.adapter.find(
+            kind="atmospheric_extinction_model", zipcode=None, at_time=at, limit=None
+        )
+        complete = []
+        for row in rows:
+            if str(row.get("state") or "active") != "active":
+                continue
+            description = service.describe(row)
+            components = {
+                component["name"]
+                for component in description["components"]
+                if component.get("payload_state", "present") == "present"
+            }
+            if (
+                required <= components
+                and description["summary"].get("model_identity") == identity
+            ):
+                complete.append(row)
+        return complete
+
+    def _select_or_import_extinction_model(
+        self, service, config, at: datetime, *, required_identity: str
+    ):
+        """Select one site extinction model or import the bundled McDonald model."""
+
+        configured_id = self.ctx.config.get("atmospheric_extinction_artifact_id")
+        if configured_id is not None:
+            row = service.adapter.get_row(int(configured_id))
+            if row is None or row.get("kind") != "atmospheric_extinction_model":
+                raise RuntimeError(
+                    f"Configured atmospheric_extinction_artifact_id={configured_id} "
+                    "is not an atmospheric-extinction model"
+                )
+            acceptable = {
+                int(candidate["id"])
+                for candidate in self._complete_extinction_candidates(
+                    service, at, required_identity
+                )
+            }
+            if int(row["id"]) not in acceptable:
+                raise RuntimeError(
+                    "Configured atmospheric-extinction model is incomplete, inactive, "
+                    "inapplicable in time, or does not match the baseline model identity"
+                )
+            return service.get(int(row["id"]))
+
+        configured_path = self.ctx.config.get("atmospheric_extinction_path")
+        if configured_path is None:
+            candidates = self._complete_extinction_candidates(service, at, required_identity)
+            if candidates:
+                return service.get(int(candidates[0]["id"]))
+
+        payload, reference = config.resolve_atmospheric_extinction(configured_path)
+        if reference.identity != required_identity:
+            raise RuntimeError(
+                f"Baseline requires extinction model {required_identity!r}, but the selectable "
+                f"configuration provides {reference.identity!r}"
+            )
+        model = atmospheric_extinction_model(
+            payload["wavelength"],
+            payload["extinction_coefficient"],
+            payload["uncertainty"],
+            payload["mask"],
+            version=reference.version,
+        )
+        values = ATMOSPHERIC_EXTINCTION_CONFIGURATION.value
+        metadata = {
+            "evidence_state": ATMOSPHERIC_EXTINCTION_CONFIGURATION.evidence_state,
+            "payload_version": reference.version,
+            "model_identity": reference.identity,
+            "coefficient_definition": values["coefficient_definition"],
+            "coefficient_units": values["coefficient_units"],
+            "site": values["site"],
+            "applicability": {
+                "wavelength_min_angstrom": model.scalars["wavelength_min_angstrom"],
+                "wavelength_max_angstrom": model.scalars["wavelength_max_angstrom"],
+                "site": values["site"],
+                "interpolation": values["interpolation"],
+            },
+            "uncertainty_state": values["uncertainty_state"],
+            "mask_bits": {
+                "1": "coefficient invalid or outside valid range",
+                "2": "coefficient uncertainty unavailable",
+            },
+            "source_payload_name": payload["source_name"],
+            "source_payload_sha256": payload["source_sha256"],
+            "input_source_sha256": (
+                "d6e41b8bab5185d375371cf70a4288e240527c5890e150e3d93f25e8803c5810"
+            ),
+        }
+        request = ArtifactRequest(
+            kind="atmospheric_extinction_model",
+            role="calibration",
+            components={
+                "wavelength": _component(
+                    "wavelength", model.get_array("wavelength"), "Angstrom",
+                    "wavelength_angstrom",
+                ),
+                "extinction_coefficient": _component(
+                    "extinction_coefficient", model.get_array("extinction_coefficient"),
+                    "mag / airmass", "wavelength_angstrom",
+                ),
+                "uncertainty": _component(
+                    "uncertainty", model.get_array("uncertainty"),
+                    "mag / airmass", "wavelength_angstrom",
+                    convention="standard_deviation",
+                ),
+                "mask": _mask_component(
+                    "mask", model.get_array("mask"), "1", "wavelength_angstrom",
+                    bit_1="coefficient_invalid", bit_2="uncertainty_unavailable",
+                ),
+            },
+            summaries=dict(model.scalars),
+            metadata=metadata,
+            scope=Scope(zipcode=None, physical_scope=PhysicalScope.INSTRUMENT_EPOCH),
+            validity=Validity(None, None, "mcdonald_observatory_site_model"),
+            configuration_refs=[reference],
+            assumptions=[
+                "The tabulated coefficient is interpreted as magnitudes per airmass.",
+                "No coefficient uncertainty was supplied with the imported model.",
+                "The model is not extrapolated beyond its retained wavelength range.",
+            ],
+        )
+        artifact = self._publish(
+            request,
+            algorithm_name="virusflow.algorithms.atmosphere.atmospheric_extinction_model",
+            algorithm_version=EXTINCTION_VERSION,
         )
         self._qa(artifact, request.summaries, status="warn", usability="degraded")
         return artifact
@@ -926,10 +1086,109 @@ class ExposureTask(_SciencePublisher):
                 or "selected-baseline"
             ),
         )
+        baseline_convention = baseline_metadata.get("atmospheric_content")
+        if baseline_convention not in {"absorbed_unknown", "removed_with_model"}:
+            raise RuntimeError(
+                "Selected baseline does not declare a supported atmospheric_content convention"
+            )
+
+        def positive_header_float(keyword):
+            value = header.get(keyword)
+            try:
+                value = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return value if np.isfinite(value) and value > 0.0 else None
+
+        header_airmass = positive_header_float("AIRMASS")
+        header_transparency = positive_header_float("TRANSPAR")
+        header_mirror_illumination = positive_header_float("MILLUM")
+        header_seeing = positive_header_float("SEEING")
+
+        extinction_artifact = None
+        extinction_evaluation = None
+        selected_extinction_identity = None
+        explicitly_selected_extinction = any(
+            self.ctx.config.get(key) is not None
+            for key in (
+                "atmospheric_extinction_path",
+                "atmospheric_extinction_artifact_id",
+            )
+        )
+        if baseline_convention == "absorbed_unknown":
+            if explicitly_selected_extinction:
+                raise RuntimeError(
+                    "The selected baseline has atmospheric_content=absorbed_unknown; "
+                    "a separate wavelength-dependent extinction correction is forbidden"
+                )
+        else:
+            if header_airmass is None:
+                raise RuntimeError(
+                    "The selected atmosphere-separated baseline requires explicit positive "
+                    "AIRMASS exposure metadata; no default airmass is substituted"
+                )
+            separation = baseline_metadata.get("atmospheric_separation") or {}
+            required_extinction_identity = separation.get("extinction_model_identity")
+            if not required_extinction_identity:
+                raise RuntimeError(
+                    "Atmosphere-separated baseline is missing its extinction-model identity"
+                )
+            extinction_artifact = self._select_or_import_extinction_model(
+                service,
+                config,
+                at,
+                required_identity=str(required_extinction_identity),
+            )
+            extinction_id = int(extinction_artifact.id)
+            extinction_description = service.describe(extinction_id)
+            extinction_metadata = extinction_description["summary"]
+            selected_extinction_identity = extinction_metadata.get("model_identity")
+            extinction_wavelength = np.asarray(
+                service.load_component(extinction_id, "wavelength")["data"], dtype=np.float32
+            )
+            extinction_coefficient = np.asarray(
+                service.load_component(extinction_id, "extinction_coefficient")["data"],
+                dtype=np.float32,
+            )
+            extinction_uncertainty = np.asarray(
+                service.load_component(extinction_id, "uncertainty")["data"], dtype=np.float32
+            )
+            extinction_mask = np.asarray(
+                service.load_component(extinction_id, "mask")["data"], dtype=np.uint16
+            )
+            atmospheric_extinction_model(
+                extinction_wavelength,
+                extinction_coefficient,
+                extinction_uncertainty,
+                extinction_mask,
+                version=str(
+                    extinction_metadata.get("payload_version")
+                    or extinction_metadata.get("_algorithm_version")
+                    or "selected-extinction-model"
+                ),
+            )
+            extinction_evaluation = evaluate_atmospheric_extinction(
+                wavelength,
+                extinction_wavelength,
+                extinction_coefficient,
+                extinction_uncertainty,
+                extinction_mask,
+                airmass=header_airmass,
+                range_policy=str(self.params.get("extinction_range_policy", "mask")),
+            )
+
         response_model = compact_fiber_response(
             wavelength, within_response, amp_factors, fiber_illumination,
             fiber_identity, knot_stride=int(self.params.get("response_knot_stride", 16)),
         )
+        response_parents = [
+            int(baseline_artifact.id),
+            int(illumination_artifact.id),
+            int(amp_artifact.id),
+            *sorted(set(normalization_parent_ids)),
+        ]
+        if extinction_artifact is not None:
+            response_parents.append(int(extinction_artifact.id))
         response_artifact = self._request(
             kind="fiber_response_model", scope=exposure_scope,
             components={
@@ -939,31 +1198,45 @@ class ExposureTask(_SciencePublisher):
                 "illumination_factors": _component("illumination_factors", fiber_illumination, "1", "none"),
                 "fiber_identity": _component("fiber_identity", fiber_identity, "1", "none"),
             },
-            parents=[int(baseline_artifact.id), int(illumination_artifact.id), int(amp_artifact.id), *sorted(set(normalization_parent_ids))],
+            parents=response_parents,
             summaries={
                 "response_median": float(np.nanmedian(fiber_illumination)),
                 "response_outlier_fraction": float(np.mean(np.abs(fiber_illumination - np.nanmedian(fiber_illumination)) > 5 * np.nanstd(fiber_illumination))),
                 "knot_count": int(response_model.wavelength_knots.shape[1]),
             },
             metadata={
-                "composition": ["within_amplifier_fiber_normalization", "calibration_build_amp_to_amp_normalization", "exposure_illumination_correction"],
+                "composition": [
+                    "within_amplifier_fiber_normalization",
+                    "calibration_build_amp_to_amp_normalization",
+                    "exposure_illumination_correction",
+                    *(["atmospheric_extinction_model"] if extinction_artifact else []),
+                ],
                 "baseline_relative_response_artifact_id": int(baseline_artifact.id),
                 "baseline_application": "selected independently and applied once after sky subtraction",
+                "baseline_atmospheric_content": baseline_convention,
+                "atmospheric_extinction_model_artifact_id": (
+                    int(extinction_artifact.id) if extinction_artifact is not None else None
+                ),
+                "atmospheric_extinction_model_identity": selected_extinction_identity,
+                "exposure_airmass": header_airmass,
+                "exposure_airmass_units": "1",
+                "gray_factors": {
+                    "fiber_illumination_artifact_id": int(illumination_artifact.id),
+                    "transparency": header_transparency,
+                    "mirror_illumination": header_mirror_illumination,
+                },
+                "gray_factor_uncertainty": {
+                    "transparency": "unavailable",
+                    "mirror_illumination": "unavailable",
+                },
+                "seeing_measurement": header_seeing,
+                "seeing_application": "retained separately; not a response factor",
                 "calibration_build_amp_to_amp_artifact_id": amp_artifact_id,
                 "interpolation": "linear_in_wavelength",
             },
             refs=exposure_refs, algorithm="virusflow.algorithms.response.compact_fiber_response", version=RESPONSE_VERSION,
             status="warn", usability="degraded",
         )
-        header_transparency = header.get("TRANSPAR")
-        try:
-            header_transparency = float(header_transparency)
-        except (TypeError, ValueError):
-            header_transparency = None
-        if header_transparency is not None and (
-            not np.isfinite(header_transparency) or header_transparency <= 0.0
-        ):
-            header_transparency = None
         response_application = apply_relative_response(
             sky_subtracted,
             spectrum_variance,
@@ -975,6 +1248,20 @@ class ExposureTask(_SciencePublisher):
             baseline_mask=baseline_mask,
             fiber_illumination=fiber_illumination,
             exposure_transparency=header_transparency,
+            mirror_illumination=header_mirror_illumination,
+            baseline_atmospheric_content=baseline_convention,
+            extinction_correction=(
+                extinction_evaluation.get_array("correction_factor")
+                if extinction_evaluation is not None else None
+            ),
+            extinction_uncertainty=(
+                extinction_evaluation.get_array("correction_uncertainty")
+                if extinction_evaluation is not None else None
+            ),
+            extinction_mask=(
+                extinction_evaluation.get_array("mask")
+                if extinction_evaluation is not None else None
+            ),
         )
         calibrated_flux = response_application.get_array("calibrated_flux")
         calibrated_variance = response_application.get_array("calibrated_variance")
@@ -998,6 +1285,7 @@ class ExposureTask(_SciencePublisher):
                 "pixel_integration": sky_model.integration_method,
                 "response_evidence_state": baseline_metadata.get("evidence_state", "unknown"),
                 "baseline_relative_response_artifact_id": int(baseline_artifact.id),
+                "baseline_atmospheric_content": baseline_convention,
                 "baseline_applied_count": response_application.scalars["baseline_applied_count"],
                 "exposure_illumination_applied_count": response_application.scalars["illumination_applied_count"],
                 "exposure_transparency_measurement": header_transparency,
@@ -1006,13 +1294,35 @@ class ExposureTask(_SciencePublisher):
                     if header_transparency is not None
                     else "not available; no transparency factor applied"
                 ),
+                "mirror_illumination_measurement": header_mirror_illumination,
+                "mirror_illumination_application": (
+                    "applied once as a separate gray factor"
+                    if header_mirror_illumination is not None
+                    else "not available; no mirror-illumination factor applied"
+                ),
+                "seeing_measurement": header_seeing,
+                "seeing_application": "retained separately; not applied as a response factor",
+                "exposure_airmass_measurement": header_airmass,
+                "exposure_airmass_units": "1",
+                "atmospheric_extinction_model_artifact_id": (
+                    int(extinction_artifact.id) if extinction_artifact is not None else None
+                ),
+                "atmospheric_extinction_model_identity": selected_extinction_identity,
+                "atmospheric_extinction_applied_count": response_application.scalars[
+                    "extinction_applied_count"
+                ],
+                "atmospheric_extinction_range_masked_count": (
+                    extinction_evaluation.scalars["outside_valid_range_count"]
+                    if extinction_evaluation is not None else 0
+                ),
                 "absolute_flux_calibration": False,
-                "atmospheric_correction_applied": False,
+                "atmospheric_correction_applied": extinction_evaluation is not None,
                 "isolated_instrumental_throughput": False,
                 "variance_terms": (
                     "extracted statistical variance divided by response squared; measured baseline "
                     "uncertainty added where available; imported Remedy uncertainty is unknown; "
-                    "transparency is treated as fixed because its uncertainty is unavailable; "
+                    "extinction-model uncertainty added where available; gray transparency and "
+                    "mirror illumination are fixed because their uncertainties are unavailable; "
                     "sky-model covariance not yet added"
                 ),
                 "wavelength_fiber_exclusions": wavelength_fiber_exclusions,
@@ -1093,7 +1403,7 @@ class ExposureTask(_SciencePublisher):
             refs=exposure_refs, algorithm="virusflow.tasks.exposure.ExposureTask", version=self.version,
             status=completion_status, usability=completion_usability,
         )
-        return {
+        result = {
             "exposure_completion_manifest": completion_artifact,
             "initial_astrometry": initial_artifact,
             "source_detection_catalog": detection_artifact,
@@ -1110,3 +1420,6 @@ class ExposureTask(_SciencePublisher):
             "amp_to_amp_normalization": amp_artifact,
             "calibrated_fiber_state": calibrated_state,
         }
+        if extinction_artifact is not None:
+            result["atmospheric_extinction_model"] = extinction_artifact
+        return result

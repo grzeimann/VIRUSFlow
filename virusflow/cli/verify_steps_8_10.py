@@ -754,7 +754,7 @@ def main(argv: list[str] | None = None) -> int:
         "checks": checks,
         "limitations": [
             "Peak scratch usage is not sampled because the accepted exposure path currently materializes its temporary states in memory.",
-            "The production baseline is a provisional empirical Remedy effective response with possible atmospheric content and unknown imported uncertainty.",
+            "The production Remedy baseline has atmospheric_content=absorbed_unknown and unknown imported uncertainty; no separate extinction correction is applied.",
             "No accepted physical LSF model is available.",
             "Sky/response covariance is not propagated.",
             "095+004+426+RU+S/N 0048 has zero-valued comparison arrays and no wavelength-dependent extraction.",

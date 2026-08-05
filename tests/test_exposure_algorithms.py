@@ -4,7 +4,9 @@ import sys
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
+from virusflow.algorithms.atmosphere import evaluate_atmospheric_extinction
 from virusflow.algorithms.astrometry import fit_catalog_astrometry, tan_fiber_coordinates
 from virusflow.algorithms.exposure_state import classify_mode_and_effective_time
 from virusflow.algorithms.exposure import apply_relative_response
@@ -150,6 +152,139 @@ def test_unknown_imported_response_uncertainty_does_not_invent_variance():
     assert np.isnan(result.get_array("evaluated_baseline_uncertainty")[0, 0])
     assert result.get_array("evaluated_baseline_mask")[0, 0] & 2
     assert result.get_array("mask")[0, 0] == 0
+
+
+def test_mcdonald_extinction_analytic_factor_and_linear_interpolation():
+    payload, reference = ConfigurationService().resolve_atmospheric_extinction()
+    result = evaluate_atmospheric_extinction(
+        [[4000.0, 4050.0]],
+        payload["wavelength"],
+        payload["extinction_coefficient"],
+        payload["uncertainty"],
+        payload["mask"],
+        airmass=1.5,
+    )
+    assert reference.identity == "mcdonald-observatory-mean-extinction"
+    np.testing.assert_allclose(
+        result.get_array("extinction_coefficient"), [[0.374, (0.374 + 0.337) / 2.0]]
+    )
+    expected = 10.0 ** (0.4 * np.asarray([[0.374, 0.3555]]) * 1.5)
+    np.testing.assert_allclose(result.get_array("correction_factor"), expected, rtol=1e-6)
+    np.testing.assert_allclose(result.get_array("transmission"), 1.0 / expected, rtol=1e-6)
+    assert np.all(np.isnan(result.get_array("correction_uncertainty")))
+    assert np.all(result.get_array("mask") == 2)
+
+
+def test_extinction_requires_airmass_and_handles_range_without_extrapolation():
+    model_wavelength = [3400.0, 3500.0]
+    coefficient = [0.68, 0.63]
+    uncertainty = [0.01, 0.01]
+    mask = np.zeros(2, dtype=np.uint8)
+    with pytest.raises(ValueError, match="explicit exposure airmass"):
+        evaluate_atmospheric_extinction(
+            [3450.0], model_wavelength, coefficient, uncertainty, mask, airmass=None
+        )
+    masked = evaluate_atmospheric_extinction(
+        [3300.0, 3450.0],
+        model_wavelength,
+        coefficient,
+        uncertainty,
+        mask,
+        airmass=1.2,
+        range_policy="mask",
+    )
+    assert np.isnan(masked.get_array("correction_factor")[0])
+    assert masked.get_array("mask")[0] & 1
+    assert np.isfinite(masked.get_array("correction_factor")[1])
+    assert masked.scalars["outside_valid_range_count"] == 1
+    with pytest.raises(ValueError, match="outside the valid"):
+        evaluate_atmospheric_extinction(
+            [3300.0], model_wavelength, coefficient, uncertainty, mask,
+            airmass=1.2, range_policy="fail",
+        )
+
+
+def test_extinction_uncertainty_and_all_response_factors_remain_separate():
+    extinction = evaluate_atmospheric_extinction(
+        [[4000.0]],
+        [3900.0, 4100.0],
+        [0.2, 0.2],
+        [0.01, 0.01],
+        np.zeros(2, dtype=np.uint8),
+        airmass=1.5,
+    )
+    correction = float(extinction.get_array("correction_factor")[0, 0])
+    correction_sigma = float(extinction.get_array("correction_uncertainty")[0, 0])
+    expected_sigma = correction * 0.4 * np.log(10.0) * 1.5 * 0.01
+    assert np.isclose(correction_sigma, expected_sigma)
+
+    applied = apply_relative_response(
+        [[20.0]], [[4.0]], [[4000.0]], [[1.0]],
+        baseline_wavelength=[3900.0, 4100.0],
+        baseline_response=[2.0, 2.0],
+        baseline_uncertainty=[0.1, 0.1],
+        baseline_mask=np.zeros(2, dtype=np.uint8),
+        fiber_illumination=[0.5],
+        exposure_transparency=0.8,
+        mirror_illumination=0.9,
+        baseline_atmospheric_content="removed_with_model",
+        extinction_correction=extinction.get_array("correction_factor"),
+        extinction_uncertainty=extinction.get_array("correction_uncertainty"),
+        extinction_mask=extinction.get_array("mask"),
+    )
+    denominator = 2.0 * 0.5 * 0.8 * 0.9
+    below_atmosphere = 20.0 / denominator
+    np.testing.assert_allclose(applied.get_array("calibrated_flux"), below_atmosphere * correction)
+    np.testing.assert_allclose(applied.get_array("response_denominator"), denominator)
+    np.testing.assert_allclose(applied.get_array("illumination_factor"), 0.5)
+    np.testing.assert_allclose(applied.get_array("transparency_factor"), 0.8)
+    np.testing.assert_allclose(applied.get_array("mirror_illumination_factor"), 0.9)
+    expected_extinction_variance = (below_atmosphere * correction_sigma) ** 2
+    np.testing.assert_allclose(
+        applied.get_array("extinction_uncertainty_variance"), expected_extinction_variance
+    )
+    expected_statistical_variance = 4.0 / denominator**2 * correction**2
+    expected_baseline_variance = (
+        20.0 * correction * 0.1 / (0.5 * 0.8 * 0.9 * 2.0**2)
+    ) ** 2
+    np.testing.assert_allclose(
+        applied.get_array("calibrated_variance"),
+        expected_statistical_variance
+        + expected_baseline_variance
+        + expected_extinction_variance,
+    )
+    assert applied.scalars["baseline_applied_count"] == 1
+    assert applied.scalars["illumination_applied_count"] == 1
+    assert applied.scalars["transparency_applied_count"] == 1
+    assert applied.scalars["mirror_illumination_applied_count"] == 1
+    assert applied.scalars["extinction_applied_count"] == 1
+
+
+def test_atmosphere_absorbing_and_separated_baseline_conventions_cannot_mix():
+    common = dict(
+        sky_subtracted=[[10.0]],
+        spectrum_variance=[[1.0]],
+        wavelength=[[4000.0]],
+        valid_fraction=[[1.0]],
+        baseline_wavelength=[3900.0, 4100.0],
+        baseline_response=[1.0, 1.0],
+        baseline_uncertainty=[np.nan, np.nan],
+        baseline_mask=np.asarray([2, 2], dtype=np.uint8),
+        fiber_illumination=[1.0],
+    )
+    with pytest.raises(ValueError, match="atmosphere-absorbing baseline"):
+        apply_relative_response(
+            **common,
+            baseline_atmospheric_content="absorbed_unknown",
+            extinction_correction=[[1.2]],
+            extinction_uncertainty=[[0.01]],
+            extinction_mask=[[0]],
+        )
+    with pytest.raises(ValueError, match="requires a separate extinction"):
+        apply_relative_response(
+            **common,
+            baseline_atmospheric_content="removed_with_model",
+        )
 
 
 def test_header_tan_projection_and_effective_time_policy():

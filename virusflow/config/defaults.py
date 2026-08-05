@@ -132,7 +132,15 @@ BASELINE_RESPONSE_CONFIGURATION = VersionedConfiguration(
                 "calibration_convention": "relative-response-factorized-3.0",
             },
         },
-        "atmospheric_content": "possibly present; atmospheric extinction was not separately removed",
+        "atmospheric_content": "absorbed_unknown",
+        "atmospheric_separation": {
+            "extinction_model_identity": None,
+            "calibration_exposure_airmasses": [],
+            "reason": (
+                "legacy effective calibration airmass was not recovered; "
+                "no numerical atmosphere separation was attempted"
+            ),
+        },
         "separate_exposure_measurements": (
             "Remedy guider mirror illumination and transparency were exposure-specific "
             "and are not baseline components"
@@ -140,6 +148,29 @@ BASELINE_RESPONSE_CONFIGURATION = VersionedConfiguration(
     },
     evidence_state="provisional",
     source="Imported legacy Remedy throughput.txt and normalization.txt as one effective response",
+)
+
+ATMOSPHERIC_EXTINCTION_CONFIGURATION = VersionedConfiguration(
+    kind="atmospheric_extinction_model",
+    version="mcdonald-mean-extinction-1.0",
+    identity="mcdonald-observatory-mean-extinction",
+    value={
+        "file": "data/mcdonald_extinction.dat",
+        "site": "McDonald Observatory",
+        "coefficient_definition": "extinction magnitude per airmass",
+        "coefficient_units": "mag / airmass",
+        "wavelength_units": "Angstrom",
+        "valid_wavelength_min_angstrom": 3400.0,
+        "valid_wavelength_max_angstrom": 7000.0,
+        "interpolation": "linear within valid range; no extrapolation",
+        "uncertainty_state": "not supplied; NaN with mask bit 2",
+    },
+    evidence_state="provisional",
+    source=(
+        "Imported mcdonald_extinction.dat SHA256 "
+        "d6e41b8bab5185d375371cf70a4288e240527c5890e150e3d93f25e8803c5810; "
+        "bibliographic source not supplied"
+    ),
 )
 
 WAVELENGTH_INPUT_MASK_CONFIGURATION = VersionedConfiguration(

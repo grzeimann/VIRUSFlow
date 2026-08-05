@@ -312,6 +312,7 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     baseline_components = {component["name"] for component in baseline["components"]}
     assert baseline_components == {"wavelength", "response", "uncertainty", "mask"}
     assert baseline["summary"]["response_definition"] == "throughput / normalization"
+    assert baseline["summary"]["atmospheric_content"] == "absorbed_unknown"
     assert baseline["summary"]["absolute_flux_calibration"] is False
     assert baseline["summary"]["atmospheric_correction_applied"] is False
     assert baseline["summary"]["isolated_instrumental_throughput"] is False
@@ -322,6 +323,19 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     assert state_metadata["exposure_transparency_application"] == (
         "applied once as a separate gray factor"
     )
+    assert state_metadata["atmospheric_extinction_applied_count"] == 0
+    assert state_metadata["atmospheric_extinction_model_artifact_id"] is None
+    assert state_metadata["atmospheric_correction_applied"] is False
+    assert "atmospheric_extinction_model" not in result
+    response_state = service.describe(result["fiber_response_model"].id)["summary"]
+    assert response_state["baseline_atmospheric_content"] == "absorbed_unknown"
+    assert response_state["atmospheric_extinction_model_artifact_id"] is None
+    assert response_state["exposure_airmass"] is None
+    assert response_state["gray_factors"] == {
+        "fiber_illumination_artifact_id": result["exposure_illumination_correction"].id,
+        "transparency": 0.8,
+        "mirror_illumination": None,
+    }
     identity = result["calibrated_fiber_state"].fiber_identity
     assert identity.shape[0] == 4 * 112 - 1
     assert not np.any((identity[:, 4] == 0) & (identity[:, 1] == 7))
@@ -395,6 +409,11 @@ def test_later_complete_baseline_supersedes_import_without_composition(tmp_path:
         at,
         metadata={
             "derivation_method_identity": {"extraction": "later measured baseline"},
+            "atmospheric_content": "removed_with_model",
+            "atmospheric_separation": {
+                "extinction_model_identity": "mcdonald-observatory-mean-extinction",
+                "calibration_exposure_airmasses": [1.12, 1.31],
+            },
             "applicability": {
                 "instrument_epoch": "later measured epoch",
                 "algorithm_versions": task._baseline_application_versions(),
@@ -415,6 +434,11 @@ def test_later_complete_baseline_supersedes_import_without_composition(tmp_path:
         at,
         metadata={
             "derivation_method_identity": {"extraction": "incompatible future method"},
+            "atmospheric_content": "absorbed_unknown",
+            "atmospheric_separation": {
+                "extinction_model_identity": None,
+                "calibration_exposure_airmasses": [],
+            },
             "applicability": {
                 "instrument_epoch": "later measured epoch",
                 "algorithm_versions": {
@@ -430,3 +454,27 @@ def test_later_complete_baseline_supersedes_import_without_composition(tmp_path:
     assert selected.id != imported.id
     assert selected.id != incompatible.id
     assert len(service.adapter.list_all(kind="baseline_relative_response")) == 3
+
+    extinction = task._select_or_import_extinction_model(
+        service,
+        config,
+        at,
+        required_identity="mcdonald-observatory-mean-extinction",
+    )
+    extinction_description = service.describe(extinction.id)
+    assert {
+        component["name"] for component in extinction_description["components"]
+    } == {"wavelength", "extinction_coefficient", "uncertainty", "mask"}
+    assert extinction_description["summary"]["site"] == "McDonald Observatory"
+    assert extinction_description["summary"]["coefficient_units"] == "mag / airmass"
+    assert extinction_description["summary"]["applicability"] == {
+        "wavelength_min_angstrom": 3400.0,
+        "wavelength_max_angstrom": 7000.0,
+        "site": "McDonald Observatory",
+        "interpolation": "linear within valid range; no extrapolation",
+    }
+    assert "NaN with mask bit 2" in extinction_description["summary"]["uncertainty_state"]
+    np.testing.assert_array_equal(
+        service.load_component(extinction.id, "mask")["data"],
+        np.full(37, 2, dtype=np.uint16),
+    )

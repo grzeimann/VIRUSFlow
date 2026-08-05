@@ -488,7 +488,26 @@ class ObservationTask(_SciencePublisher):
                     "flux_scale": FLUX_SCALE,
                     "calibration_state": "relative empirical effective response only",
                     "absolute_flux_calibration": False,
-                    "atmospheric_correction_applied": False,
+                    "atmospheric_correction_applied": all(
+                        bool(state.metadata.get("atmospheric_correction_applied", False))
+                        for state in ordered_states
+                    ),
+                    "response_convention_by_exposure": {
+                        state.exposure_id: state.metadata.get(
+                            "baseline_atmospheric_content", "unknown"
+                        )
+                        for state in ordered_states
+                    },
+                    "atmospheric_extinction_model_by_exposure": {
+                        state.exposure_id: state.metadata.get(
+                            "atmospheric_extinction_model_identity"
+                        )
+                        for state in ordered_states
+                    },
+                    "airmass_by_exposure": {
+                        state.exposure_id: state.metadata.get("exposure_airmass_measurement")
+                        for state in ordered_states
+                    },
                     "uncertainty_convention": "variance",
                     "model_artifact_ids_by_exposure": {
                         state.exposure_id: list(state.model_artifact_ids) for state in ordered_states

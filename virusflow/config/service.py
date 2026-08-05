@@ -16,6 +16,7 @@ from .defaults import (
     ORIENTATION_CONFIGURATION,
     READ_NOISE_FALLBACK_CONFIGURATION,
     ASTROMETRY_CONFIGURATION,
+    ATMOSPHERIC_EXTINCTION_CONFIGURATION,
     BASELINE_RESPONSE_CONFIGURATION,
     FIBER_GEOMETRY_CONFIGURATION,
 )
@@ -154,6 +155,70 @@ class ConfigurationService:
             "source_sha256": digest,
         }
         return payload, ConfigurationReference(
+            kind=config.kind,
+            version=config.version,
+            identity=config.identity or selected.name,
+            evidence_state=config.evidence_state,
+        )
+
+    def resolve_atmospheric_extinction(
+        self, path: str | Path | None = None
+    ) -> tuple[dict[str, object], ConfigurationReference]:
+        """Load one selectable extinction-coefficient payload."""
+
+        config = ATMOSPHERIC_EXTINCTION_CONFIGURATION
+        selected = (
+            Path(path)
+            if path is not None
+            else Path(__file__).resolve().parent / str(config.value["file"])
+        )
+        if not selected.is_file():
+            raise FileNotFoundError(f"Atmospheric-extinction file not found: {selected}")
+        lines = selected.read_text().splitlines()
+        first_data_line = next(
+            (index for index, line in enumerate(lines) if line.strip() and not line.startswith("#")),
+            None,
+        )
+        skiprows = (
+            first_data_line + 2
+            if first_data_line is not None
+            and lines[first_data_line].strip().lower().startswith("wavelength ")
+            else 0
+        )
+        data = np.asarray(
+            np.loadtxt(
+                selected,
+                comments="#",
+                skiprows=skiprows,
+            ),
+            dtype=float,
+        )
+        if data.ndim != 2 or data.shape[1] not in {2, 4}:
+            raise ValueError(
+                f"Atmospheric extinction {selected} must have either two columns "
+                "(wavelength, extinction coefficient) or four columns "
+                "(plus uncertainty and mask)"
+            )
+        if data.shape[1] == 2:
+            wavelength, coefficient = data.T
+            uncertainty = np.full(wavelength.shape, np.nan, dtype=float)
+            mask_values = np.full(wavelength.shape, 2.0, dtype=float)
+        else:
+            wavelength, coefficient, uncertainty, mask_values = data.T
+        if not np.all(np.isfinite(mask_values)) or not np.all(
+            mask_values == np.floor(mask_values)
+        ):
+            raise ValueError(f"Atmospheric extinction {selected} has a non-integral mask")
+        digest = hashlib.sha256(selected.read_bytes()).hexdigest()
+        return {
+            "wavelength": wavelength.astype(np.float32),
+            "extinction_coefficient": coefficient.astype(np.float32),
+            "uncertainty": uncertainty.astype(np.float32),
+            "mask": mask_values.astype(np.uint16),
+            "source_path": str(selected),
+            "source_name": selected.name,
+            "source_sha256": digest,
+        }, ConfigurationReference(
             kind=config.kind,
             version=config.version,
             identity=config.identity or selected.name,

@@ -11,7 +11,8 @@
 # method_identity: legacy-remedy-effective-response; exact curve-producing release unknown
 # applicability: legacy Remedy reference epoch unspecified; five-pixel fractional aperture
 # applicability: no fitted detector PSF; gap-sampled smooth scattered-light correction
-# atmospheric_content: provisional; legacy derivation did not separately remove extinction
+# atmospheric_content: absorbed_unknown
+# atmospheric_separation: not attempted; effective calibration airmass was not recovered
 # scientific_claim: empirical effective relative response, not absolute flux calibration
 3470.0 0.034365214903752307 nan 2
 3472.0 0.03484858141975633 nan 2

@@ -175,6 +175,12 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
         Unit.DIMENSIONLESS.value, CoordinateConvention.WAVELENGTH_ANGSTROM,
         ("wavelength", "response", "uncertainty", "mask"),
     ),
+    "atmospheric_extinction_model": _spec(
+        "atmospheric_extinction_model", PhysicalScope.INSTRUMENT_EPOCH,
+        "mag / airmass", CoordinateConvention.WAVELENGTH_ANGSTROM,
+        ("wavelength", "extinction_coefficient", "uncertainty", "mask"),
+        lifecycle=ArtifactLifecycle.MODEL,
+    ),
     "exposure_illumination_correction": _spec("exposure_illumination_correction", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.NONE, ("fiber_factor", "amplifier_factor", "fiber_identity")),
     "final_exposure_response": _spec("final_exposure_response", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("response", "baseline_response", "illumination_factor", "fiber_identity"), lifecycle=ArtifactLifecycle.SCRATCH),
     "fiber_response_model": _spec(
