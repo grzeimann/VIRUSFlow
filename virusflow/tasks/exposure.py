@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Iterable
@@ -11,11 +11,13 @@ from typing import Iterable
 import numpy as np
 
 from .science import PhysicalCCDTask, ReducedScienceAmplifierTask, _SciencePublisher, _instant
+from ..algorithms import dar, source_extraction, spatial_psf
 from ..algorithms.astrometry import (
     ASTROMETRY_VERSION,
     detect_fiber_sources,
     fit_catalog_astrometry,
     parse_header_pointing,
+    sky_to_focal_plane,
     tan_fiber_coordinates,
 )
 from ..algorithms.atmosphere import (
@@ -55,8 +57,12 @@ from ..config import ConfigurationService
 from ..config.defaults import (
     ATMOSPHERIC_EXTINCTION_CONFIGURATION,
     BASELINE_RESPONSE_CONFIGURATION,
+    DAR_SEED_CONFIGURATION,
     EFFECTIVE_EXPOSURE_POLICY,
+    FIBER_GEOMETRY_CONFIGURATION,
+    SOURCE_EXTRACTION_CONFIGURATION,
 )
+from ..core.algo_result import AlgoResult
 from ..core.scientific_metadata import (
     normalize_scientific_metadata,
     scientific_metadata_from_header,
@@ -64,6 +70,9 @@ from ..core.scientific_metadata import (
 from ..io import PanSTARRSCSVProvider, RawFrameLoader
 from ..ontology.scopes import PhysicalScope
 from ..planning.targets import PhysicalCCDTarget
+
+
+SPATIAL_PSF_STATUS_CODE = {"measured": 0, "degraded": 1}
 
 
 AMP_CODE = {"LL": 0, "LU": 1, "RU": 2, "RL": 3}
@@ -627,6 +636,322 @@ class ExposureTask(_SciencePublisher):
             within_response=np.concatenate(global_within),
             parent_ids=parent_ids,
         )
+
+    def _run_point_source_extraction(
+        self, *, calibrated_state, exposure_scope, exposure_refs,
+        detections, final_ra0, final_pa, final_dec0, final_artifact, detection_artifact,
+    ):
+        config = SOURCE_EXTRACTION_CONFIGURATION.value
+        dar_config = DAR_SEED_CONFIGURATION.value
+        fiber_radius = float(FIBER_GEOMETRY_CONFIGURATION.value["fiber_radius_arcsec"])
+        beta = float(config["beta"])
+        grid_half_points = int(config["grid_half_points"])
+        fit_background = bool(config["fit_background"])
+
+        flux = calibrated_state.flux
+        variance = calibrated_state.variance
+        mask = calibrated_state.mask
+        wavelength = calibrated_state.wavelength
+        focal = calibrated_state.focal_plane_coordinates
+
+        override = self.params.get("source_position")
+        source_x = source_y = None
+        source_position_origin = None
+        if override is not None:
+            if "focal_x" in override and "focal_y" in override:
+                source_x = float(override["focal_x"])
+                source_y = float(override["focal_y"])
+                source_position_origin = "override_focal_plane"
+            elif "ra_deg" in override and "dec_deg" in override:
+                converted = sky_to_focal_plane(
+                    final_ra0, final_dec0, final_pa,
+                    override["ra_deg"], override["dec_deg"],
+                )
+                source_x = float(converted.get_array("focal_x"))
+                source_y = float(converted.get_array("focal_y"))
+                source_position_origin = "override_sky"
+        if source_x is None and detections.size:
+            brightest = int(np.argmax(detections[:, 4]))
+            source_x = float(detections[brightest, 2])
+            source_y = float(detections[brightest, 3])
+            source_position_origin = "brightest_detection"
+        if source_x is None:
+            return {"status": "skipped_no_source"}
+
+        exclusion_mask = source_extraction.select_source_fibers(
+            focal[:, 0], focal[:, 1], source_x, source_y,
+            max_distance_arcsec=float(config["max_fiber_distance_arcsec"]),
+        )
+        selected = ~exclusion_mask
+        if int(selected.sum()) == 0:
+            return {"status": "skipped_no_fibers_in_range"}
+
+        selected_x = focal[selected, 0]
+        selected_y = focal[selected, 1]
+        selected_flux = flux[selected].astype(float)
+        selected_variance = variance[selected].astype(float)
+        selected_mask = mask[selected]
+        selected_wavelength = wavelength[selected].astype(float)
+        representative_wavelength = np.nanmedian(selected_wavelength, axis=0)
+
+        dar_result = dar.dar_seed_model(
+            source_wavelength=np.asarray(dar_config["source_wavelength_angstrom"]),
+            source_displacement=np.asarray(dar_config["source_displacement_arcsec"]),
+        )
+        transform, transform_identity = dar.tan_plane_dar_transform(final_ra0, final_dec0, final_pa)
+        dar_evaluation = dar.evaluate_dar_seed(
+            representative_wavelength,
+            cubic_coefficients=dar_result.get_array("cubic_coefficients"),
+            angle_deg=float(dar_config["angle_deg"]),
+            astrometric_transform=transform,
+            astrometric_transform_identity=transform_identity,
+            reference_ra_deg=final_ra0,
+            reference_dec_deg=final_dec0,
+        )
+        dar_artifact = self._request(
+            kind="dar_seed_model", scope=exposure_scope,
+            components={
+                "source_wavelength": _component("source_wavelength", dar_result.get_array("source_wavelength"), "Angstrom", "wavelength_angstrom"),
+                "source_displacement": _component("source_displacement", dar_result.get_array("source_displacement"), "arcsec", "wavelength_angstrom"),
+                "cubic_coefficients": _component("cubic_coefficients", dar_result.get_array("cubic_coefficients"), "1", "none"),
+                "wavelength": _component("wavelength", dar_evaluation.get_array("wavelength"), "Angstrom", "wavelength_angstrom"),
+                "delta_x": _component("delta_x", dar_evaluation.get_array("delta_x"), "arcsec", "wavelength_angstrom"),
+                "delta_y": _component("delta_y", dar_evaluation.get_array("delta_y"), "arcsec", "wavelength_angstrom"),
+                "delta_ra": _component("delta_ra", dar_evaluation.get_array("delta_ra"), "arcsec", "wavelength_angstrom"),
+                "delta_dec": _component("delta_dec", dar_evaluation.get_array("delta_dec"), "arcsec", "wavelength_angstrom"),
+            },
+            parents=[int(final_artifact.id)],
+            summaries={"angle_deg": float(dar_config["angle_deg"])},
+            metadata={
+                "source_position_origin": source_position_origin,
+                "source_focal_x": source_x, "source_focal_y": source_y,
+                "astrometric_transform_identity": transform_identity,
+            },
+            refs=exposure_refs,
+            algorithm="virusflow.algorithms.dar.evaluate_dar_seed", version=dar.DAR_VERSION,
+        )
+
+        interval_count = int(config["psf_interval_count"])
+        intervals = spatial_psf.build_wavelength_intervals(
+            float(np.nanmin(representative_wavelength)),
+            float(np.nanmax(representative_wavelength)),
+            interval_count,
+        )
+        interval_reference_wavelength = intervals.mean(axis=1)
+        interval_dar = dar.evaluate_dar_seed(
+            interval_reference_wavelength,
+            cubic_coefficients=dar_result.get_array("cubic_coefficients"),
+            angle_deg=float(dar_config["angle_deg"]),
+            astrometric_transform=transform,
+            astrometric_transform_identity=transform_identity,
+            reference_ra_deg=final_ra0,
+            reference_dec_deg=final_dec0,
+        )
+        interval_delta_x = interval_dar.get_array("delta_x")
+        interval_delta_y = interval_dar.get_array("delta_y")
+
+        interval_valid = np.zeros(interval_count, dtype=bool)
+        interval_centroid_x = np.zeros(interval_count, dtype=float)
+        interval_centroid_y = np.zeros(interval_count, dtype=float)
+        interval_fwhm = np.zeros(interval_count, dtype=float)
+        interval_weight = np.zeros(interval_count, dtype=float)
+        psf_artifacts = []
+        for i, interval in enumerate(intervals):
+            binned_flux, binned_uncertainty = spatial_psf.bin_flux_by_wavelength_interval(
+                selected_wavelength, selected_flux, selected_variance, selected_mask, interval,
+            )
+            fit_result = spatial_psf.fit_wavelength_interval_psf(
+                selected_x, selected_y, fiber_radius, binned_flux, binned_uncertainty,
+                seed_centroid_x=source_x + float(interval_delta_x[i]),
+                seed_centroid_y=source_y + float(interval_delta_y[i]),
+                wavelength_interval=interval,
+                reference_wavelength=float(interval_reference_wavelength[i]),
+                fwhm_bounds=tuple(config["fwhm_bounds_arcsec"]),
+                search_radius_arcsec=float(config["search_radius_arcsec"]),
+                beta=beta,
+                fit_background=fit_background,
+                grid_half_points=grid_half_points,
+            )
+            valid = bool(fit_result.scalars["valid"])
+            dof = int(fit_result.scalars["dof"])
+            chi2 = float(fit_result.scalars["chi2"])
+            interval_valid[i] = valid
+            interval_centroid_x[i] = float(fit_result.get_array("centroid_x"))
+            interval_centroid_y[i] = float(fit_result.get_array("centroid_y"))
+            interval_fwhm[i] = float(fit_result.get_array("fwhm"))
+            interval_weight[i] = (
+                1.0 / max(chi2 / dof, np.finfo(float).eps)
+                if valid and dof > 0 and np.isfinite(chi2) else 0.0
+            )
+            status = str(fit_result.scalars["status"])
+            psf_artifact = self._request(
+                kind="spatial_psf_measurement", scope=exposure_scope,
+                components={
+                    "wavelength_interval_min": _component("wavelength_interval_min", np.asarray([fit_result.scalars["wavelength_interval_min"]]), "Angstrom", "none"),
+                    "wavelength_interval_max": _component("wavelength_interval_max", np.asarray([fit_result.scalars["wavelength_interval_max"]]), "Angstrom", "none"),
+                    "reference_wavelength": _component("reference_wavelength", np.asarray([fit_result.scalars["reference_wavelength"]]), "Angstrom", "none"),
+                    "centroid_x": _component("centroid_x", np.asarray([fit_result.get_array("centroid_x")]), "arcsec", "none"),
+                    "centroid_y": _component("centroid_y", np.asarray([fit_result.get_array("centroid_y")]), "arcsec", "none"),
+                    "fwhm": _component("fwhm", np.asarray([fit_result.get_array("fwhm")]), "arcsec", "none"),
+                    "beta": _component("beta", np.asarray([fit_result.scalars["beta"]]), "1", "none"),
+                    "amplitude": _component("amplitude", np.asarray([fit_result.get_array("amplitude")]), "1e-17 response-corrected electron", "none"),
+                    "background": _component("background", np.asarray([fit_result.get_array("background")]), "1e-17 response-corrected electron", "none"),
+                    "covariance": _component("covariance", fit_result.get_array("covariance"), "1", "none"),
+                    "chi2": _component("chi2", np.asarray([chi2]), "1", "none"),
+                    "dof": _component("dof", np.asarray([dof]), "1", "none"),
+                    "coverage": _component("coverage", np.asarray([fit_result.scalars["coverage"]]), "1", "none"),
+                    "fibers_used": _mask_component("fibers_used", fit_result.get_array("fibers_used")),
+                    "valid": _component("valid", np.asarray([int(valid)], dtype=np.uint8), "1", "none"),
+                    "status": _component("status", np.asarray([SPATIAL_PSF_STATUS_CODE[status]], dtype=np.int32), "1", "none"),
+                },
+                parents=[int(dar_artifact.id)],
+                summaries={
+                    "valid": valid, "usable_fiber_count": int(fit_result.scalars["usable_fiber_count"]),
+                    "status": status,
+                },
+                metadata={"interval_index": i, "status_code_convention": SPATIAL_PSF_STATUS_CODE},
+                refs=exposure_refs,
+                algorithm="virusflow.algorithms.spatial_psf.fit_wavelength_interval_psf",
+                version=spatial_psf.PSF_FIT_VERSION,
+                status="pass" if valid else "warn",
+                usability="usable" if valid else "degraded",
+            )
+            psf_artifacts.append(psf_artifact)
+
+        try:
+            chromatic_result = spatial_psf.fit_chromatic_psf_model(
+                interval_reference_wavelength, interval_delta_x, interval_delta_y,
+                interval_centroid_x, interval_centroid_y, interval_fwhm,
+                interval_valid, interval_weight, beta=beta,
+            )
+            chromatic_status = "fitted"
+        except ValueError:
+            fallback_fwhm = float(np.mean(config["fwhm_bounds_arcsec"]))
+            chromatic_model = spatial_psf.ChromaticPSFModel(
+                residual_centroid_coefficients_x=np.zeros(3, dtype=float),
+                residual_centroid_coefficients_y=np.zeros(3, dtype=float),
+                fwhm_coefficients=np.asarray([fallback_fwhm], dtype=float),
+                valid_wavelength_min=float("inf"),
+                valid_wavelength_max=float("-inf"),
+                beta=beta,
+            )
+            chromatic_result = AlgoResult(
+                kind="chromatic_psf_model", version=spatial_psf.CHROMATIC_PSF_VERSION,
+                arrays={
+                    "residual_centroid_coefficients_x": chromatic_model.residual_centroid_coefficients_x,
+                    "residual_centroid_coefficients_y": chromatic_model.residual_centroid_coefficients_y,
+                    "fwhm_coefficients": chromatic_model.fwhm_coefficients,
+                },
+                scalars={
+                    "valid_wavelength_min": chromatic_model.valid_wavelength_min,
+                    "valid_wavelength_max": chromatic_model.valid_wavelength_max,
+                    "beta": chromatic_model.beta, "fitted_interval_count": 0,
+                },
+                meta={"model": chromatic_model},
+            )
+            chromatic_status = "prior_only"
+        chromatic_model = chromatic_result.meta["model"]
+        chromatic_artifact = self._request(
+            kind="chromatic_psf_model", scope=exposure_scope,
+            components={
+                "residual_centroid_coefficients_x": _component("residual_centroid_coefficients_x", chromatic_result.get_array("residual_centroid_coefficients_x"), "arcsec", "none"),
+                "residual_centroid_coefficients_y": _component("residual_centroid_coefficients_y", chromatic_result.get_array("residual_centroid_coefficients_y"), "arcsec", "none"),
+                "fwhm_coefficients": _component("fwhm_coefficients", chromatic_result.get_array("fwhm_coefficients"), "arcsec", "none"),
+                "valid_wavelength_min": _component("valid_wavelength_min", np.asarray([chromatic_result.scalars["valid_wavelength_min"]]), "Angstrom", "none"),
+                "valid_wavelength_max": _component("valid_wavelength_max", np.asarray([chromatic_result.scalars["valid_wavelength_max"]]), "Angstrom", "none"),
+                "beta": _component("beta", np.asarray([chromatic_result.scalars["beta"]]), "1", "none"),
+            },
+            parents=[int(dar_artifact.id), *[int(artifact.id) for artifact in psf_artifacts]],
+            summaries={
+                "fitted_interval_count": int(chromatic_result.scalars["fitted_interval_count"]),
+                "status": chromatic_status,
+            },
+            metadata={"status": chromatic_status},
+            refs=exposure_refs,
+            algorithm="virusflow.algorithms.spatial_psf.fit_chromatic_psf_model",
+            version=spatial_psf.CHROMATIC_PSF_VERSION,
+            status="pass" if chromatic_status == "fitted" else "warn",
+            usability="usable" if chromatic_status == "fitted" else "degraded",
+        )
+
+        model_centroid_x, model_centroid_y, model_fwhm, model_status = chromatic_model.evaluate(
+            representative_wavelength,
+            dar_evaluation.get_array("delta_x"),
+            dar_evaluation.get_array("delta_y"),
+        )
+        n_selected = int(selected.sum())
+        n_pixel = representative_wavelength.shape[0]
+        coupling = np.zeros((n_selected, n_pixel), dtype=np.float64)
+        for w in range(n_pixel):
+            coupling[:, w] = spatial_psf.integrate_moffat_over_apertures(
+                selected_x, selected_y, fiber_radius,
+                float(model_centroid_x[w]), float(model_centroid_y[w]), float(model_fwhm[w]),
+                beta=beta, grid_half_points=grid_half_points,
+            )
+
+        flux_for_solve = selected_flux.copy()
+        variance_for_solve = selected_variance.copy()
+        bad = selected_mask != 0
+        flux_for_solve[bad] = np.nan
+        variance_for_solve[bad] = np.nan
+        spectrum_result = source_extraction.extract_source_spectrum(
+            flux_for_solve, variance_for_solve, coupling, background=fit_background,
+        )
+        captured_fraction = spectrum_result.get_array("captured_fraction")
+        median_omitted = float(np.nanmedian(1.0 - captured_fraction))
+        tolerance = float(config["omitted_coupling_tolerance"])
+        extraction_status = "pass" if median_omitted <= tolerance else "warn"
+        extraction_usability = "usable" if median_omitted <= tolerance else "degraded"
+        design_matrix_code = np.asarray([1 if fit_background else 0], dtype=np.int32)
+
+        extraction_components = {
+            "wavelength": _component("wavelength", representative_wavelength.astype(np.float32), "Angstrom", "wavelength_angstrom"),
+            "amplitude": _component("amplitude", spectrum_result.get_array("amplitude"), "1e-17 response-corrected electron", "wavelength_angstrom"),
+            "variance": _component("variance", spectrum_result.get_array("variance"), "1e-17 response-corrected electron", "wavelength_angstrom"),
+            "mask": _mask_component("mask", spectrum_result.get_array("mask")),
+            "captured_fraction": _component("captured_fraction", captured_fraction, "1", "wavelength_angstrom"),
+            "usable_fiber_count": _component("usable_fiber_count", spectrum_result.get_array("usable_fiber_count"), "1", "wavelength_angstrom"),
+            "design_matrix_identity": _component("design_matrix_identity", design_matrix_code, "1", "none"),
+        }
+        extraction_artifact = self._request(
+            kind="point_source_extraction", scope=exposure_scope,
+            components=extraction_components,
+            parents=[int(chromatic_artifact.id), int(final_artifact.id), int(detection_artifact.id)],
+            summaries={
+                "median_captured_fraction": float(np.nanmedian(captured_fraction)),
+                "median_omitted_fraction": median_omitted,
+                "selected_fiber_count": n_selected,
+            },
+            metadata={
+                "source_focal_x": source_x, "source_focal_y": source_y,
+                "source_position_origin": source_position_origin,
+                "omitted_coupling_tolerance": tolerance,
+                "fit_background": fit_background,
+                "design_matrix_identity": spectrum_result.scalars["design_matrix_identity"],
+                "design_matrix_code_convention": {0: "columns=[coupling]", 1: "columns=[coupling, background]"},
+                "chromatic_model_prior_only_fraction": float(np.mean(model_status)),
+                "chromatic_model_status": chromatic_status,
+            },
+            refs=exposure_refs,
+            algorithm="virusflow.algorithms.source_extraction.extract_source_spectrum",
+            version=source_extraction.EXTRACTION_VERSION,
+            status=extraction_status, usability=extraction_usability,
+        )
+
+        return {
+            "status": "extracted",
+            "artifact": extraction_artifact,
+            "dar_seed_model": dar_artifact,
+            "spatial_psf_measurements": tuple(psf_artifacts),
+            "chromatic_psf_model": chromatic_artifact,
+            "spectrum": {
+                "wavelength": representative_wavelength.astype(np.float32),
+                "amplitude": spectrum_result.get_array("amplitude"),
+                "variance": spectrum_result.get_array("variance"),
+                "mask": spectrum_result.get_array("mask"),
+                "captured_fraction": captured_fraction,
+            },
+        }
 
     def run(self, inputs):
         from ..registry import database as db
@@ -1362,6 +1687,18 @@ class ExposureTask(_SciencePublisher):
             },
         )
 
+        source_extraction_result = self._run_point_source_extraction(
+            calibrated_state=calibrated_state, exposure_scope=exposure_scope, exposure_refs=exposure_refs,
+            detections=detections, final_ra0=final_ra0, final_pa=final_pa, final_dec0=final_dec0,
+            final_artifact=final_artifact, detection_artifact=detection_artifact,
+        )
+        if source_extraction_result.get("status") == "extracted":
+            calibrated_state = replace(
+                calibrated_state,
+                point_source_extraction_artifact_id=int(source_extraction_result["artifact"].id),
+                point_source_spectrum=source_extraction_result["spectrum"],
+            )
+
         mode_classification = classify_mode_and_effective_time(
             header, parallel_offset_seconds=EFFECTIVE_EXPOSURE_POLICY.parallel_offset_seconds
         )
@@ -1432,6 +1769,7 @@ class ExposureTask(_SciencePublisher):
                 "coverage_columns": ["reduced", "trace", "wavelength", "extracted", "no_recorded_failure"],
                 "persistent_science_intermediates": [],
                 "scratch_cleanup": "in_memory_released_after_observation_assembly",
+                "point_source_extraction_status": source_extraction_result.get("status"),
             },
             refs=exposure_refs, algorithm="virusflow.tasks.exposure.ExposureTask", version=self.version,
             status=completion_status, usability=completion_usability,
@@ -1455,4 +1793,9 @@ class ExposureTask(_SciencePublisher):
         }
         if extinction_artifact is not None:
             result["atmospheric_extinction_model"] = extinction_artifact
+        if source_extraction_result.get("status") == "extracted":
+            result["dar_seed_model"] = source_extraction_result["dar_seed_model"]
+            result["spatial_psf_measurements"] = source_extraction_result["spatial_psf_measurements"]
+            result["chromatic_psf_model"] = source_extraction_result["chromatic_psf_model"]
+            result["point_source_extraction"] = source_extraction_result["artifact"]
         return result

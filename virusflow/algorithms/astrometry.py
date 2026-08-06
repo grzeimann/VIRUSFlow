@@ -96,7 +96,34 @@ def tan_fiber_coordinates(ra0: float, dec0: float, pa: float, focal_x, focal_y, 
     )
 
 
-def detect_fiber_sources(fiber_flux, ifu_index, focal_x, focal_y, *, threshold_sigma: float = 5.0):
+def sky_to_focal_plane(ra0: float, dec0: float, pa: float, ra, dec, *, system_rotation: float = 1.55) -> AlgoResult:
+    """Invert :func:`tan_fiber_coordinates`: sky RA/Dec to instrument focal-plane arcsec.
+
+    Used only for an explicit, fixed-sky-target source-position override; the
+    production coupling path otherwise works entirely in the focal-plane frame
+    already carried by fiber ``focal_plane_coordinates``.
+    """
+
+    wcs = WCS(naxis=2)
+    wcs.wcs.crpix = [0.0, 0.0]
+    wcs.wcs.crval = [float(ra0), float(dec0)]
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    wcs.wcs.cdelt = [-1.0 / 3600.0, 1.0 / 3600.0]
+    rotation = 360.0 - (90.0 + float(pa) + float(system_rotation))
+    theta = np.deg2rad(rotation)
+    wcs.wcs.pc = [[np.cos(theta), np.sin(theta)], [-np.sin(theta), np.cos(theta)]]
+    pixel = wcs.wcs_world2pix(np.asarray(ra, dtype=float), np.asarray(dec, dtype=float), 1)
+    focal_y = np.asarray(pixel[0], dtype=float)
+    focal_x = np.asarray(pixel[1], dtype=float)
+    return AlgoResult(
+        kind="focal_plane_coordinates_from_sky",
+        version=ASTROMETRY_VERSION,
+        arrays={"focal_x": focal_x, "focal_y": focal_y},
+        scalars={"rotation": rotation},
+    )
+
+
+def detect_fiber_sources(fiber_flux, ifu_index, focal_x, focal_y, *, threshold_sigma: float = 3.0):
     """Deterministic broadband source candidates retained before catalog matching."""
 
     flux = np.asarray(fiber_flux, dtype=float)

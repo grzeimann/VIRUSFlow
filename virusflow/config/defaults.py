@@ -70,6 +70,7 @@ FIBER_GEOMETRY_CONFIGURATION = VersionedConfiguration(
             "RU": (336, 448),
         },
         "reverse_for_extracted_spectrum_order": True,
+        "fiber_radius_arcsec": 0.75,
     },
     evidence_state="verified",
     source=(
@@ -176,6 +177,57 @@ ATMOSPHERIC_EXTINCTION_CONFIGURATION = VersionedConfiguration(
         "Imported mcdonald_extinction.dat SHA256 "
         "d6e41b8bab5185d375371cf70a4288e240527c5890e150e3d93f25e8803c5810; "
         "bibliographic source not supplied"
+    ),
+)
+
+DAR_SEED_CONFIGURATION = VersionedConfiguration(
+    kind="dar_seed_model",
+    version="remedy-empirical-dar-seed-1.0",
+    identity="remedy-five-point-cubic-dar-seed",
+    value={
+        "source_wavelength_angstrom": [3500.0, 4000.0, 4500.0, 5000.0, 5500.0],
+        "source_displacement_arcsec": [-0.74, -0.40, -0.08, 0.08, 0.20],
+        "fit_degree": 3,
+        "instrument_angle_convention": (
+            "angle measured counterclockwise from instrument +x; "
+            "delta_x = cos(angle) * dar_scalar, delta_y = sin(angle) * dar_scalar"
+        ),
+        "zero_point_convention": (
+            "absolute: the cubic curve is evaluated directly at each requested "
+            "wavelength with no reference-wavelength subtraction"
+        ),
+        "angle_deg": 0.0,
+        "angle_convention": (
+            "fixed instrument-frame convention matching Remedy's own application of "
+            "the DAR curve directly along instrument +x with no separate rotation; "
+            "this is a documented seed simplification, not a per-exposure parallactic "
+            "angle computation. Real per-exposure deviation from this seed is intended "
+            "to be absorbed by the fitted chromatic_psf_model centroid residual."
+        ),
+    },
+    evidence_state="provisional",
+    source="Remedy extract.py DAR curve + Extract.get_ADR_RAdec",
+)
+
+SOURCE_EXTRACTION_CONFIGURATION = VersionedConfiguration(
+    kind="point_source_extraction",
+    version="wavelength-local-moffat-coupling-1.0",
+    identity="production-source-extraction-defaults",
+    value={
+        "max_fiber_distance_arcsec": 6.0,
+        "omitted_coupling_tolerance": 0.05,
+        "psf_interval_count": 10,
+        "fwhm_bounds_arcsec": [1.0, 4.0],
+        "search_radius_arcsec": 3.0,
+        "beta": 3.5,
+        "fit_background": True,
+        "grid_half_points": 12,
+        "wavelength_grid_tolerance_angstrom": 1.0,
+    },
+    evidence_state="provisional",
+    source=(
+        "virusflow.algorithms.spatial_psf and virusflow.algorithms.source_extraction "
+        "production defaults; see docs/architecture/spatial-psf-dar-coupling-resource-pycharm.md"
     ),
 )
 

@@ -79,11 +79,97 @@ raw D(e,p)
 
 The arrow chain is an approximate inverse, not yet the full inverse implied by
 the equation. In particular, the extraction operator is a fixed aperture rather
-than an explicit fitted $P_{e,f,p}$; absolute instrumental throughput, variable
-atmospheric transmission beyond the selected mean extinction model, PSF, DAR,
-and the full coupling function are not currently solved; and the final Product
-is a collection of sky-subtracted fiber measurements rather than an estimate of
-the intrinsic surface-brightness field $S^{\mathrm{source}}(\theta,\lambda)$.
+than an explicit fitted $P_{e,f,p}$; absolute instrumental throughput and
+variable atmospheric transmission beyond the selected mean extinction model are
+not currently solved; and the final Product is a collection of sky-subtracted
+fiber measurements rather than an estimate of the intrinsic surface-brightness
+field $S^{\mathrm{source}}(\theta,\lambda)$.
+
+PSF, DAR, and source-to-fiber coupling now have implemented, tested algorithmic
+support and are wired into production exposure and observation publication via
+`ExposureTask._run_point_source_extraction` and the source-spectrum combination
+step in `ObservationTask`:
+
+```text
+retained calibrated point-source fiber measurements
+  + guider, astrometric, airmass, and header-DAR context
+  -> fit and evaluate the empirical five-point Remedy DAR seed on the
+     exposure's own wavelength grid and astrometry: dar_seed_model
+  -> measure, per wavelength interval, a bounded robust Moffat PSF fit
+     seeded by that DAR curve: centroid residual, FWHM, amplitude,
+     covariance, chi-square, coverage, and an explicit valid/degraded
+     status: spatial_psf_measurement
+  -> fit a smooth polynomial chromatic residual model over valid
+     intervals only, falling back to the pure seed outside that range:
+     chromatic_psf_model
+  -> integrate the fitted PSF over actual circular fiber apertures into
+     unnormalized physical coupling C(e,f,lambda); retain the captured
+     fraction sum_f C(e,f,lambda)
+  -> solve a weighted linear system for point-source amplitude and an
+     optional local background: point_source_extraction
+```
+
+This is implemented as pure, tested algorithms
+(`virusflow/algorithms/dar.py`, `virusflow/algorithms/spatial_psf.py`,
+`virusflow/algorithms/source_extraction.py`) with a registered vocabulary
+(`dar_seed_model`, `spatial_psf_measurement`, `chromatic_psf_model`,
+`point_source_extraction`; `spatial_psf_measurement` and
+`point_source_extraction` are analysis-lifecycle) and is now called
+automatically from `ExposureTask.run()` for every exposure that has a usable
+source position. `ExposureTask._run_point_source_extraction` resolves the
+source position (an explicit `self.params["source_position"]` override as
+`{"focal_x","focal_y"}` or `{"ra_deg","dec_deg"}`, converted via the new
+`virusflow/algorithms/astrometry.py::sky_to_focal_plane` inverse-WCS helper;
+otherwise the brightest entry in the exposure's own `source_detection_catalog`),
+selects nearby fibers by distance (`select_source_fibers`,
+`max_fiber_distance_arcsec` from the new `SOURCE_EXTRACTION_CONFIGURATION`),
+bins the selected fibers' spectra into `psf_interval_count` wavelength
+intervals, fits and publishes `dar_seed_model`, one `spatial_psf_measurement`
+per interval, and `chromatic_psf_model`, then integrates the fitted PSF over
+the actual fiber apertures into a dense (never persisted) coupling matrix and
+publishes `point_source_extraction`. When no source position is available
+(no override and an empty `source_detection_catalog`), extraction is skipped
+for that exposure and the outcome is recorded as
+`point_source_extraction_status` in `exposure_completion_manifest` metadata
+rather than treated as a task failure. `ObservationTask` then publishes a new
+`observation_source_spectrum` Artifact (see the inventory below) whenever
+every member exposure of a completed observation carries a
+`point_source_spectrum`, inverse-variance combining the per-exposure
+`point_source_extraction` arrays via
+`source_extraction.combine_observation_source_spectra`.
+
+A failed or under-constrained wavelength interval always retains the seed
+prediction with an explicit degraded/prior-only status rather than being
+represented as a successful VIRUS measurement, and the wiring never
+re-derives or overwrites that status — it always proceeds through to
+`extract_source_spectrum` using whatever the chromatic model returns. The
+dense fiber-by-wavelength coupling matrix remains recomputable from the
+spatial model, fiber geometry, and aperture-integration convention rather than
+persisted, and fiber selection is never used to renormalize it; an
+`omitted_coupling_tolerance` QA diagnostic is recorded in
+`point_source_extraction` metadata/status for this purpose but is never used
+to renormalize the coupling.
+
+This production wiring was validated by `tests/test_source_extraction_task.py`,
+which exercises the full `ExposureTask.run()` / `ObservationTask.run()` paths
+(not just the underlying algorithms) and checks: recovery of a synthetic
+injected point source's amplitude, centroid, FWHM, DAR offset, and background
+through `ExposureTask.run()`; agreement between PSF extraction and a direct
+aperture sum (`sum_aperture_flux`) when `captured_fraction` is near unity, and
+between the captured-fraction-corrected aperture sum and PSF extraction under
+partial coverage; that masking fibers or placing the source near an IFU edge
+reduces `captured_fraction` without renormalizing away the amplitude estimate;
+that two synthetic dithered exposures combined through `ObservationTask`
+produce one consistent `observation_source_spectrum` while each exposure's
+`dar_seed_model`/`chromatic_psf_model`/`point_source_extraction` retain
+distinct artifact ids; that an under-constrained wavelength interval remains
+`status="degraded"`/`prior_only` end-to-end rather than being silently
+promoted to a measured value; an exact cross-check of
+`point_source_extraction.variance` against the weighted-linear-solve
+covariance diagonal from `solve_source_design_matrix`; and that a masked
+pixel/fiber is excluded from the solve and reflected in the output mask. This
+validation used synthetic injected sources within the test fixtures, not
+real on-sky standard stars or catalog spectra.
 
 Reusable response construction is also part of the implemented inverse. Raw
 LDLS, twilight, and optional selected science calibration frames receive the
@@ -219,31 +305,48 @@ coefficients. Dense parents remain rebuildable only from raw data and the
 versioned algorithms; the compact descendants preserve the evidence needed to
 audit the inference, not a lossless reconstruction of the dense illumination.
 
-### Horizon 2: directly remeasure and validate the atmosphere-separated baseline
+### Horizon 2: improve source detection and use retained source-extraction evidence toward eventual baseline remeasurement
 
-The transformed default establishes the atmosphere-separated convention but is
-not a direct remeasurement. The next bounded goal is to replace its fixed-altitude
-construction assumption with an evidence-backed, directly measured and validated
-baseline:
+Production source extraction (the chain described under Horizon 1 above) is
+now wired into `ExposureTask`/`ObservationTask` and validated with synthetic
+injected sources through the full task pipeline, as described above. The next
+bounded goal is not to build that wiring — it exists — but to improve the
+quality of the evidence feeding it and begin exploiting the now-retained
+`point_source_extraction`/`observation_source_spectrum` Artifacts:
 
 ```text
-retained standard-source measurements plus observing-condition evidence
-  -> reduce them with one stated extraction, PSF, contribution-correction,
-     and calibration configuration
-  -> require measured calibration airmass for every standard exposure
-  -> remove the selected extinction model while retaining model and airmass lineage
-  -> account for source centering, aperture capture, and DAR well enough to
-     prevent those color terms from entering the response
-  -> fit an epoch- and method-matched baseline with finite uncertainty and mask
-  -> validate transfer across held-out standards, IFUs, and track positions
-  -> publish atmospheric_content=removed_with_model so the directly measured
-     Product supersedes rather than multiplies the transformed Remedy baseline
+retained point_source_extraction / observation_source_spectrum evidence
+  -> improve source detection: photometric significance, not just an
+     astrometric detection threshold
+  -> understand excess outlier fibers and edge/partial-coverage behavior
+     using the retained captured-fraction and coupling diagnostics
+  -> correct illumination behavior using physical measurements rather than
+     uniformity assumptions
+  -> exercise the pipeline on real, non-synthetic exposures already present
+     in the run database
+  -> use the accumulating retained evidence as the foundation for eventually
+     remeasuring the baseline_relative_response directly
 ```
 
-This horizon remains bounded to a relative instrument-and-reduction-method
-response. It does not fold gray transparency, mirror or fiber illumination, or
-seeing into the baseline; establish an absolute scale; model non-photometric
-chromatic clouds or telluric structure; or reconstruct a source-domain field.
+`source_detection_catalog` is currently produced by an astrometric-threshold
+detector intended to support astrometry, not to certify a point source for
+photometric extraction; it is the input this horizon should improve. Each
+improvement should retain the compact evidence, fitted state, uncertainty,
+masks, QA, and provenance required to diagnose the result.
+
+Direct remeasurement of `baseline_relative_response` from source-extraction
+evidence remains explicitly a *later* goal, not part of this horizon: no
+standard-star-specific plumbing (dedicated standard-star selection, catalog
+flux cross-matching, or a response-fitting consumer of
+`observation_source_spectrum`) was added in the work that wired production
+extraction, so there is not yet a retained population of flux-calibrated
+standard observations to fit against. External standard stars, catalog
+spectra, and a directly measured response baseline remain later validation
+and calibration opportunities rather than a completed part of this horizon.
+
+This horizon does not yet require rebuilding the atmosphere-separated baseline, establishing absolute spectrophotometry, modeling variable chromatic clouds, or reconstructing a general source surface-brightness field.
+
+
 
 ### Horizon 3: long-term physical inversion
 
@@ -273,7 +376,7 @@ surface brightness.
 | $T^{\mathrm{instrument}}_e(\lambda)$ | `baseline_relative_response`, `fiber_response_model`, `final_exposure_response` | One selected instrument-epoch `baseline_relative_response` is interpolated and divided exactly once after sky subtraction. The default Remedy-derived Product is atmosphere-separated with the McDonald model at construction airmass 1.22 and retains that model, fixed-altitude basis, source baseline, and unchanged method identity. | This provisional transformation is not a direct response remeasurement, neither convention establishes absolute throughput, and `final_exposure_response` is scratch-only and superseded. |
 | $T^{\mathrm{atmosphere}}_e(\theta,\lambda)$ | `atmospheric_extinction_model`; exposure airmass and evaluated factors are retained in response-state metadata | The McDonald model retains $k(\lambda)$ in mag/airmass. With the selected `removed_with_model` baseline and canonical scanned `AIRMASS=X`, the code multiplies by $10^{0.4k(\lambda)X}$ once, propagates finite model uncertainty, and masks or fails outside the model range. Exposure airmass is retained as scientific conditioning metadata and the applied value is recorded in response and output provenance. | The McDonald uncertainty is unavailable, airmass uncertainty is not propagated, and variable chromatic clouds, telluric absorption, and directional dependence are not modeled. |
 | $\mathcal{M}_e(\theta)$ | `initial_astrometry`, `source_detection_catalog`, `catalog_match_table`, `final_astrometry`, `fiber_sky_coordinates` | Header TAN geometry is retained and a catalog shift/rotation fit is attempted; failed catalog refinement falls back to header astrometry with degraded QA. | The current fit is simpler than the full spatial model and does not supply formal mapping uncertainty as a separate Product. |
-| PSF, $\Delta\theta_e^{\mathrm{DAR}}(\lambda)$, and $C_{e,f}$ | Astrometry and dither Products provide partial geometry only | Fiber focal-plane and sky coordinates, nominal/refined dither offsets, and footprint coverage are retained. | There is no PSF, DAR, aperture-coupling, or spatial reconstruction Product, so source-to-fiber coupling is not inverted. |
+| PSF, $\Delta\theta_e^{\mathrm{DAR}}(\lambda)$, and $C_{e,f}$ | `dar_seed_model`, `spatial_psf_measurement`, `chromatic_psf_model`, `point_source_extraction`, `observation_source_spectrum` | An empirical five-point Remedy DAR seed is fit and evaluated on each exposure's own wavelength grid and astrometry; wavelength-local Moffat PSF fits (centroid, FWHM, amplitude, covariance, coverage) measure the residual relative to that seed where VIRUS fiber measurements constrain it, retaining an explicit degraded/prior-only status otherwise; a fitted smooth chromatic residual model evaluates the centroid and FWHM at arbitrary wavelength; the fitted PSF is integrated over actual circular fiber apertures into unnormalized coupling used in a weighted linear source (plus optional background) solve; `ObservationTask` inverse-variance combines each member exposure's extraction into `observation_source_spectrum`. | Wired into `ExposureTask`/`ObservationTask` production publication and validated with synthetic injected sources through the full task pipeline (`tests/test_source_extraction_task.py`: injected-source recovery, PSF-vs-aperture agreement at full and partial capture, captured-fraction behavior under masking/edge placement, degraded/prior_only preservation, exact variance-vs-covariance cross-check, multi-exposure `observation_source_spectrum` combination). `spatial_psf_measurement` and `point_source_extraction` remain analysis-lifecycle in the ontology; the fixed `angle_deg=0.0` DAR seed convention (see limitations) and lack of standard-star-specific validation are the current known gaps. |
 | $F^{\mathrm{sky}}_{e,f}(\lambda)$ | `sky_fiber_mask`, `sky_model`, `fiber_sky_prediction`, `sky_subtracted_spectrum`, `candidate_sky_model` | A supersampled common incident sky is fitted at exposure scope, with per-fiber illumination coefficients, then integrated onto each native fiber grid and subtracted in memory. | The baseline assumes one incident sky spectrum, has no accepted fiber-specific LSF, and does not propagate sky-model covariance into final variance. |
 | $S^{\mathrm{source}}_e(\theta,\lambda)$ | `source_detection_catalog`, `calibrated_fiber_observation` | Source detections support astrometry; a complete observation retains extinction-corrected, sky-subtracted, response-normalized relative fiber samples with positions, wavelength, variance, masks, response convention, and applied airmass by exposure. | The Product concatenates exposures rather than coadding or reconstructing them and is not corrected for PSF/DAR coupling or absolute throughput. |
 | $N_{e,p}$ and propagated uncertainty | `read_noise`, `detector_variance`, `pixel_mask`, `extracted_variance`, final variance/mask planes | Read noise plus non-negative Poisson variance is propagated through science extraction with exact weights. Bias scatter is added to the corrected response-frame variance state, while dark/LDLS masks condition response-master extraction; retained master spectra preserve the exact compact aperture/mask validity needed to audit which detector samples contributed. | The robust calibration combine and retained master-spectrum extraction do not yet carry response-frame variance forward. Standalone noise kinds are not published, and dark, sky, response, wavelength, astrometric, systematic, and covariance contributions remain incomplete. |
@@ -301,7 +404,7 @@ propagated but dark-model variance cannot be.
 
 ## Complete registered-kind inventory
 
-The following tables account for all 59 keys currently in `ARTIFACT_KINDS`.
+The following tables account for all 64 keys currently in `ARTIFACT_KINDS`.
 Lifecycle abbreviations are **C** = canonical, **M** = model, **A** = analysis,
 and **S** = scratch. “Production” means a normal calibration, exposure, or
 observation task currently publishes the kind. “Run-local/embedded” means the
@@ -387,6 +490,16 @@ published. `ArtifactService` rejects permanent publication of every S kind.
 | `dither_coverage_map` | dither set / C | Geometric footprint evidence for spatial sampling. | Production observation Product; explicitly a footprint, not cube reconstruction. |
 | `observation_summary` | observation / C | QA/usability summary over member exposure states and coverage. | Production observation Product; does not average away the per-exposure measurements. |
 
+### Spatial PSF, DAR, coupling, and source extraction
+
+| Kind | Scope / lifecycle | Scientific layer and equation role | Current support |
+|---|---|---|---|
+| `dar_seed_model` | exposure / M | Empirical five-point Remedy cubic DAR curve and its evaluation on an exposure's wavelength grid and astrometry into $\Delta\theta_e^{\mathrm{DAR}}(\lambda)$. | Implemented as `dar.dar_seed_model` / `dar.evaluate_dar_seed`, reusing `astrometry.tan_fiber_coordinates` for the sky-plane conversion; retains the five source measurements, cubic coefficients, wavelength range, zero-point and instrument-angle conventions, and the evaluated `delta_ra`/`delta_dec`. Published by `ExposureTask._run_point_source_extraction` for every exposure with a resolvable source position. The seed's `angle_deg` is a fixed `0.0` convention (see limitations), not a per-exposure parallactic-angle computation. |
+| `spatial_psf_measurement` | exposure / A | Wavelength-local bounded, robust Moffat PSF fit seeded by `dar_seed_model`, constraining PSF and the centroid residual relative to the seed. | Implemented as `spatial_psf.fit_wavelength_interval_psf` and published once per wavelength interval by `ExposureTask`; retains centroid, FWHM, amplitude, background, covariance, chi-square, degrees of freedom, coverage, fibers used, and an explicit `valid`/`status` flag so an under-constrained interval falls back to the seed prediction rather than a false measurement. Remains analysis-lifecycle in the ontology; validated via `tests/test_source_extraction_task.py` (injected-source recovery and the under-constrained-interval degraded/prior_only test) rather than on real standard/held-out sources. |
+| `chromatic_psf_model` | exposure / M | Fitted smooth polynomial residual model evaluating centroid and FWHM at arbitrary wavelength from the valid `spatial_psf_measurement` intervals. | Implemented as `spatial_psf.fit_chromatic_psf_model` / `ChromaticPSFModel.evaluate` and published by `ExposureTask`; fits only over valid intervals and returns to the pure seed with a `prior_only` status outside the fitted wavelength range. |
+| `point_source_extraction` | exposure / A | Weighted linear solve for a point source (optionally plus local background) over the unnormalized physical coupling $C_{e,f}(\lambda)$ integrated from the fitted PSF over actual fiber apertures. | Implemented as `source_extraction.extract_source_spectrum` / `solve_source_design_matrix` and published by `ExposureTask`; retains per-wavelength amplitude, variance, mask, captured fraction, usable fiber count, and design-matrix identity. Remains analysis-lifecycle in the ontology; validated via `tests/test_source_extraction_task.py`, including an exact cross-check of the reported variance against the weighted-linear-solve covariance diagonal and mask-propagation checks, using synthetic injected sources rather than real standard/held-out sources. |
+| `observation_source_spectrum` | observation / A | Observation-level point-source spectrum assembled by inverse-variance combining each member exposure's `point_source_extraction`. | Implemented as `source_extraction.combine_observation_source_spectra` and published by `ObservationTask` whenever every member exposure state carries a non-`None` `point_source_spectrum`; requires per-exposure wavelength grids to agree within `wavelength_grid_tolerance_angstrom` or marks `status="degraded"` and falls back to an unweighted mean rather than raising. Validated via `tests/test_source_extraction_task.py`'s two-dithered-exposure combination test, which also checks that each exposure's `dar_seed_model`/`chromatic_psf_model`/`point_source_extraction` artifact ids remain distinct. |
+
 ## Retention boundaries
 
 ### Dense calibration masters
@@ -434,7 +547,7 @@ required-component contract before they may use this release boundary.
 
 ### Registration does not require publication
 
-The 58 registered kinds are a vocabulary, not a mandate to publish every
+The 64 registered kinds are a vocabulary, not a mandate to publish every
 quantity on every run. Retain a quantity when it supports scientific reuse,
 comparison, QA, modeling, or reconstruction without preserving a much larger
 parent. Dense evaluated detector states and ordinary computational
@@ -476,7 +589,14 @@ reduction in which:
 - astrometry, dither identity, coverage, QA, and the state of each exposure are
   retained; and
 - a complete observation can be published as positioned, sky-subtracted fiber
-  spectra with diagonal variance and masks.
+  spectra with diagonal variance and masks; and
+- an empirical DAR seed, wavelength-local VIRUS spatial PSF measurement, a
+  fitted chromatic PSF model, and a weighted-linear point-source-plus-background
+  extraction over physical fiber coupling are wired into production
+  `ExposureTask`/`ObservationTask` publication (`dar_seed_model`,
+  `spatial_psf_measurement`, `chromatic_psf_model`, `point_source_extraction`,
+  `observation_source_spectrum`) and validated with synthetic injected point
+  sources through the full task pipeline.
 
 The current code labels the terminal spectral planes as response-corrected
 electrons rather than physical flux. The selected atmosphere-separated default
@@ -485,34 +605,38 @@ extinction curve and canonical exposure airmass. The construction transform is
 provisional and not a direct remeasurement, and the output still does **not**
 support the stronger claim that
 `calibrated_fiber_observation` is an absolutely spectrophotometric measurement
-of intrinsic source surface brightness. PSF/DAR coupling, aperture loss,
-variable chromatic transparency, and absolute scale remain unresolved.
+of intrinsic source surface brightness. The PSF/DAR/coupling/extraction chain
+is now wired into production and validated with synthetic injected sources
+through the full `ExposureTask`/`ObservationTask` pipeline, but it has not
+been validated against real on-sky standard stars, catalog spectra, or
+repeated real observations, and it does not itself establish absolute
+spectrophotometric scale. The DAR seed's `angle_deg` is fixed at `0.0` — a
+documented Remedy-convention fallback rather than a per-exposure parallactic
+angle derived from headers; real per-exposure deviation from that fixed
+convention is intended to be absorbed by the fitted `chromatic_psf_model`
+centroid residual, not computed directly, and this remains an explicit,
+unvalidated-by-derivation limitation of the current seed.
 
 ## Implementation priorities supported by this crosswalk
 
-1. **Directly remeasure and validate the atmosphere-separated baseline.**
-   Reduce retained primary-standard evidence with explicit calibration
-   airmasses and the selected extinction Product under fully identified
-   extraction, PSF, source-capture, contribution-correction, and calibration
-   configurations. Retain finite uncertainty and held-out validation, then
-   supersede the transformed Remedy baseline without composing response layers.
-2. **Measure chromatic atmospheric variability and absolute response.** Keep
-   gray transparency separate from the mean extinction curve, add uncertainty
-   for airmass and atmospheric coefficients, model departures from the mean
-   atmosphere where evidence permits, and add an absolute scale only before
-   claiming spectrophotometric source flux.
-3. **Develop profile, PSF, DAR, and coupling models.** Measure the operators
-   currently approximated by the fixed aperture and positional geometry.
-   Introduce an Artifact kind only for evidence or evaluated states that meet
-   the retention rule above; versioned model specifications may remain outside
-   the Artifact vocabulary.
-4. **Expand uncertainty propagation and define the eventual source-domain
-   result.** Add a physical dark-rate/uncertainty model and the missing sky,
-   response, wavelength, astrometric, coupling, systematic, and covariance
-   terms, then state precisely what estimate of
-   $S^{\mathrm{source}}(\theta,\lambda)$ the eventual result represents. Until
-   then, keep describing the current terminal Product as calibrated fiber
-   measurements.
+1. **Wire PSF, DAR, coupling, and extraction into production.** *(Done.)*
+   `dar_seed_model`, `spatial_psf_measurement`, `chromatic_psf_model`, and `point_source_extraction` are published through the normal `ExposureTask` workflow, and `observation_source_spectrum` is published through `ObservationTask` when every member exposure has an extraction.
+
+2. **Validate extraction with internal physical constraints.** *(Done for synthetic sources.)*
+   `tests/test_source_extraction_task.py` compares PSF and aperture extraction under high and incomplete capture, recovers injected sources, exercises two dithered exposures through `ObservationTask`, and cross-checks residuals, covariance, and mask propagation. Real repeated-observation and real-source validation remains open.
+
+3. **Complete the supporting exposure model.**
+   Improve source detection — photometric significance, not just the current astrometric-threshold detector — plus illumination correction, masking, and exposure-state handling where current simplifications produce false source fibers or biased extraction. Implement the simplest physical model supported by existing evidence rather than inserting uniform placeholders.
+
+4. **Exercise the system on real scientific targets.**
+   Extract sources from real (non-synthetic) exposures already present in the run database, inspect spectra, compare repeated observations, identify failures, and correct the responsible measurement or model layer while preserving clean provenance and searchable evidence.
+
+5. **Validate against external standards when suitable data exist.**
+   Compare extracted spectra with known sources and eventually build a directly measured relative-response baseline. Agreement in baseline shape, modulo an allowed normalization, will be an important system-level validation rather than an immediate implementation dependency.
+
+6. **Continue toward the full inverse.**
+   Improve detector-profile extraction, atmospheric modeling, uncertainty propagation, source decomposition, and the eventual source-domain Product as the available measurements justify each step.
+
 
 ## Maintenance rule
 

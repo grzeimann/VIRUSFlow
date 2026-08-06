@@ -3,7 +3,7 @@ from __future__ import annotations
 """Run-local calibrated fiber state and final per-fiber response division."""
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Mapping, Optional
 
 import numpy as np
 
@@ -27,6 +27,8 @@ class CalibratedFiberState:
     focal_plane_coordinates: np.ndarray
     model_artifact_ids: tuple[int, ...]
     metadata: Mapping
+    point_source_extraction_artifact_id: Optional[int] = None
+    point_source_spectrum: Optional[Mapping] = None
 
 
 def _evaluate_baseline_response(wavelength, baseline_wavelength, response, uncertainty, mask):

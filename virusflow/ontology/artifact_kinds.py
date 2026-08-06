@@ -247,6 +247,41 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
         "observation_summary", PhysicalScope.OBSERVATION, Unit.DIMENSIONLESS.value,
         CoordinateConvention.NONE, ("member_state", "qa_usability"),
     ),
+    "dar_seed_model": _spec(
+        "dar_seed_model", PhysicalScope.EXPOSURE, "arcsec",
+        CoordinateConvention.WAVELENGTH_ANGSTROM,
+        ("source_wavelength", "source_displacement", "cubic_coefficients",
+         "wavelength", "delta_x", "delta_y", "delta_ra", "delta_dec"),
+        lifecycle=ArtifactLifecycle.MODEL,
+    ),
+    "spatial_psf_measurement": _spec(
+        "spatial_psf_measurement", PhysicalScope.EXPOSURE, "arcsec",
+        CoordinateConvention.NONE,
+        ("wavelength_interval_min", "wavelength_interval_max", "reference_wavelength",
+         "centroid_x", "centroid_y", "fwhm", "beta", "amplitude", "background",
+         "covariance", "chi2", "dof", "coverage", "fibers_used", "valid", "status"),
+        lifecycle=ArtifactLifecycle.ANALYSIS,
+    ),
+    "chromatic_psf_model": _spec(
+        "chromatic_psf_model", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value,
+        CoordinateConvention.NONE,
+        ("residual_centroid_coefficients_x", "residual_centroid_coefficients_y",
+         "fwhm_coefficients", "valid_wavelength_min", "valid_wavelength_max", "beta"),
+        lifecycle=ArtifactLifecycle.MODEL,
+    ),
+    "point_source_extraction": _spec(
+        "point_source_extraction", PhysicalScope.EXPOSURE,
+        "1e-17 response-corrected electron", CoordinateConvention.WAVELENGTH_ANGSTROM,
+        ("wavelength", "amplitude", "variance", "mask", "captured_fraction",
+         "usable_fiber_count", "design_matrix_identity"),
+        lifecycle=ArtifactLifecycle.ANALYSIS,
+    ),
+    "observation_source_spectrum": _spec(
+        "observation_source_spectrum", PhysicalScope.OBSERVATION,
+        "1e-17 response-corrected electron", CoordinateConvention.WAVELENGTH_ANGSTROM,
+        ("wavelength", "amplitude", "variance", "mask", "captured_fraction", "exposure_count"),
+        lifecycle=ArtifactLifecycle.ANALYSIS,
+    ),
 }
 
 

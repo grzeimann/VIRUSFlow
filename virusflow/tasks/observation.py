@@ -18,12 +18,13 @@ from ..algorithms.observation import (
     dither_coverage_map,
     refine_relative_offsets,
 )
+from ..algorithms.source_extraction import combine_observation_source_spectra
 from ..artifacts import ArtifactService, Scope, Validity
 from ..artifacts.models import ConfigurationReference
 from ..artifacts.requests import ArtifactRequest
 from ..artifacts.storage_conventions import FLUX_SCALE, scaled_flux_component, scaled_variance_component
 from ..config import ConfigurationService
-from ..config.defaults import DITHER_POLICY
+from ..config.defaults import DITHER_POLICY, FIBER_GEOMETRY_CONFIGURATION
 from ..core.exposure_metadata import interpret_virus_exposure_header
 from ..core.scientific_metadata import (
     normalize_scientific_metadata,
@@ -388,7 +389,10 @@ class ObservationTask(_SciencePublisher):
 
         coverage_offsets = np.where(registration_success[:, None].astype(bool), refined, nominal)
         local_fibers = np.concatenate([fiber_offsets[amp] for amp in ("LL", "LU", "RU", "RL")])
-        coverage, x_coordinate, y_coordinate = dither_coverage_map(local_fibers, coverage_offsets)
+        fiber_radius_arcsec = float(FIBER_GEOMETRY_CONFIGURATION.value["fiber_radius_arcsec"])
+        coverage, x_coordinate, y_coordinate = dither_coverage_map(
+            local_fibers, coverage_offsets, fiber_radius_arcsec=fiber_radius_arcsec
+        )
         covered = coverage > 0
         duplicated = coverage > 1
         coverage_artifact = self._request(
@@ -408,7 +412,7 @@ class ObservationTask(_SciencePublisher):
             metadata={
                 "member_exposure_ids": list(exposure_ids),
                 "coverage_grid_step_arcsec": 0.25,
-                "fiber_radius_arcsec": 0.75,
+                "fiber_radius_arcsec": fiber_radius_arcsec,
                 "coverage_offsets": "refined_where_successful_else_nominal",
                 "coverage_is_footprint_only_not_cube_reconstruction": True,
             }, refs=refs,
@@ -555,4 +559,66 @@ class ObservationTask(_SciencePublisher):
                 usability="usable" if registration_consistent else "degraded",
             )
             result["calibrated_fiber_observation"] = calibrated_observation
+
+            spectra_states = [
+                state for state in ordered_states if state.point_source_spectrum is not None
+            ]
+            if spectra_states and len(spectra_states) == len(ordered_states):
+                combined = combine_observation_source_spectra(
+                    [state.point_source_spectrum for state in spectra_states]
+                )
+                combined_parents = {
+                    int(calibrated_observation.id),
+                    *(
+                        int(state.point_source_extraction_artifact_id)
+                        for state in spectra_states
+                    ),
+                }
+                source_spectrum_artifact = self._request(
+                    kind="observation_source_spectrum",
+                    scope=membership_scope,
+                    components={
+                        "wavelength": _component(
+                            "wavelength", combined.get_array("wavelength"), "Angstrom",
+                            "wavelength_angstrom",
+                        ),
+                        "amplitude": _component(
+                            "amplitude", combined.get_array("amplitude"),
+                            "1e-17 response-corrected electron", "wavelength_angstrom",
+                        ),
+                        "variance": _component(
+                            "variance", combined.get_array("variance"),
+                            "1e-17 response-corrected electron", "wavelength_angstrom",
+                        ),
+                        "mask": _mask_component(
+                            "mask", combined.get_array("mask"), "1", "wavelength_angstrom",
+                        ),
+                        "captured_fraction": _component(
+                            "captured_fraction", combined.get_array("captured_fraction"),
+                            "1", "wavelength_angstrom",
+                        ),
+                        "exposure_count": _component(
+                            "exposure_count",
+                            np.asarray([combined.scalars["exposure_count"]], dtype=np.int32),
+                            "1", "none",
+                        ),
+                    },
+                    parents=sorted(combined_parents),
+                    summaries={
+                        "exposure_count": combined.scalars["exposure_count"],
+                        "status": combined.scalars["status"],
+                        "wavelength_consistent": combined.scalars["wavelength_consistent"],
+                    },
+                    metadata={
+                        "member_exposure_ids": [state.exposure_id for state in spectra_states],
+                        "point_source_extraction_artifact_ids_by_exposure": {
+                            state.exposure_id: int(state.point_source_extraction_artifact_id)
+                            for state in spectra_states
+                        },
+                    },
+                    refs=refs,
+                    status="pass" if combined.scalars["wavelength_consistent"] else "warn",
+                    usability="usable" if combined.scalars["wavelength_consistent"] else "degraded",
+                )
+                result["observation_source_spectrum"] = source_spectrum_artifact
         return result

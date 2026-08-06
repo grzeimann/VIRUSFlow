@@ -361,8 +361,10 @@ def test_full_exposure_task_fixture_produces_baseline_products_and_refined_catal
     for name, artifact in result.items():
         if name == "calibrated_fiber_state":
             continue
-        for component in service.describe(artifact.id)["components"]:
-            service.load_component(artifact.id, component["name"], verify_checksum=True)
+        artifacts = artifact if isinstance(artifact, tuple) else (artifact,)
+        for one in artifacts:
+            for component in service.describe(one.id)["components"]:
+                service.load_component(one.id, component["name"], verify_checksum=True)
 
 
 def test_exposure_without_calibrations_fails_before_publishing_empty_products(tmp_path: Path):
