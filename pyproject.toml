@@ -28,6 +28,7 @@ classifiers = [
 dependencies = [
   "PyYAML>=6.0.0",
   "scikit-learn",
+  "astroquery",
 ]
 
 [project.urls]

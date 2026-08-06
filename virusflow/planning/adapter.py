@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Thin adapter to bridge planning.Target to legacy CalibrationTask target expectations.
 
@@ -19,9 +17,11 @@ This module provides:
 No task imports are performed here to keep the planning layer independent.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from ..artifacts.models import Scope
 from .targets import Target, TemporalWindow
@@ -52,6 +52,9 @@ class PlanningTargetAdapter:
     end_date: Optional[str]
     start_dt: Optional[datetime] = None
     end_dt: Optional[datetime] = None
+    group_id: Optional[str] = None
+    raw_ids: tuple[int, ...] = ()
+    group_metadata: dict[str, Any] | None = None
 
     @classmethod
     def from_planning(cls, t: Target) -> "PlanningTargetAdapter":
@@ -66,6 +69,9 @@ class PlanningTargetAdapter:
             end_date=_dt_to_date_str(we),
             start_dt=ws,
             end_dt=we,
+            group_id=(t.group.group_id if t.group else None),
+            raw_ids=(t.group.raw_ids if t.group else ()),
+            group_metadata=(dict(t.group.metadata) if t.group else None),
         )
 
 

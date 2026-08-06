@@ -55,7 +55,9 @@ class BiasResultContract(_BaseSimpleContract):
 
 class DarkResultContract(_BaseSimpleContract):
     required_arrays = ["master_dark"]
-    required_scalars = ["bad_fraction"]
+    required_scalars = [
+        "bad_fraction", "reference_exposure_time_seconds", "bias_convention",
+    ]
 
 
 class FlatResultContract(_BaseSimpleContract):
@@ -64,11 +66,23 @@ class FlatResultContract(_BaseSimpleContract):
 
 
 class TraceResultContract(_BaseSimpleContract):
-    pass
+    required_arrays = [
+        "fiber_trace_map", "trace_sample_columns", "sampled_trace_positions",
+        "per_fiber_trace_residual_rms", "trace_sample_valid_mask",
+        "trace_fit_residuals", "per_fiber_valid_sample_count",
+        "trace_interpolated_fiber_mask",
+    ]
 
 
 class WaveResultContract(_BaseSimpleContract):
-    pass
+    required_arrays = [
+        "wavelength_map", "per_fiber_wavelength_residual_rms",
+        "arc_identification", "arc_candidate_evidence", "arc_line_evidence",
+        "seed_region_attempted_mask", "seed_region_success_mask",
+        "seed_region_failure_code", "seed_fit_coefficients",
+        "interpolated_fiber_mask", "extrapolated_fiber_mask",
+        "input_mask_indices", "input_mask_shape",
+    ]
 
 class CmpResultContract(_BaseSimpleContract):
     required_arrays = ["master_comparison_lamp"]
@@ -77,6 +91,36 @@ class TwiResultContract(_BaseSimpleContract):
     required_arrays = ["master_twilight"]
 
 
-class SciResultContract(_BaseSimpleContract):
-    required_arrays = ["master_science"]
-    required_scalars = ["n_inputs"]
+class MasterSciResultContract(_BaseSimpleContract):
+    required_arrays = ["master_sci"]
+    required_scalars = ["n_inputs", "robust_illumination"]
+
+
+class ExtractedMasterSpectrumResultContract(_BaseSimpleContract):
+    required_arrays = [
+        "spectrum", "valid_pixel_fraction", "effective_aperture_width",
+        "extraction_valid", "aperture_start_row", "aperture_first_weight",
+        "aperture_last_weight", "aperture_sample_mask_bits",
+    ]
+    required_scalars = ["fiber_count", "valid_sample_fraction"]
+
+
+class ExtractedMasterSciSpectrumResultContract(ExtractedMasterSpectrumResultContract):
+    """Backward-compatible name for the shared master-spectrum contract."""
+
+
+class AmplifierFiberResponseResultContract(_BaseSimpleContract):
+    required_arrays = [
+        "raw_ratio", "normalization", "valid_mask", "common_twilight",
+        "ftf_ldls", "twilight_broad_correction",
+        "twilight_residual_correction", "wavelength",
+        "amplifier_twilight_level",
+    ]
+    required_scalars = ["valid_fraction", "amplifier_twilight_level"]
+
+
+class FiberWavelengthSpectralMaskResultContract(_BaseSimpleContract):
+    required_arrays = [
+        "mask", "spectral_model", "normalization", "good_wavelength_solution",
+    ]
+    required_scalars = ["masked_fraction", "good_wavelength_solution_count"]

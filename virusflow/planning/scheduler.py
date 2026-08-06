@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Thin scheduler for planned Targets.
 
@@ -13,10 +11,14 @@ Notes:
 - This keeps planning independent: no imports from algorithms/storage layers here.
 - Integration with CLI/executors is left to the runner; this module only assembles.
 """
-from dataclasses import dataclass
-from typing import Dict, Iterable, List, Sequence, Tuple, Optional
 
-from .graph import TaskSpec, Edge
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Sequence, Tuple, Optional
+
+from .graph import TaskSpec, Edge, target_node_id
 from .targets import Target
 
 
@@ -77,7 +79,6 @@ def schedule(
     # Precompute topological order by kinds
     order = _topo_order_kinds(nodes, edges)
     # Group targets by kind then by a stable scope key
-    from ..artifacts.models import Scope  # type: ignore  # type only
     def _scope_key(t: Target) -> Tuple:
         z = getattr(t.scope, 'zipcode', None)
         if z is None:
@@ -90,14 +91,64 @@ def schedule(
         grouped[k].sort(key=_scope_key)
     # Map to scheduled tasks and compute intra-scope deps
     scheduled: List[ScheduledTask] = []
-    name_target_to_id: Dict[Tuple[str, Tuple], str] = {}
+    group_target_to_id: Dict[Tuple[str, str], str] = {}
+    scope_target_to_ids: Dict[Tuple[str, Tuple], List[str]] = {}
     def _make_node_id(t: Target) -> str:
-        w = t.window
-        ws = getattr(w, 'start', None)
-        we = getattr(w, 'end', None)
-        z = getattr(t.scope, 'zipcode', None)
-        zkey = (z.ifuslot, z.ifuid, z.specid, z.amp, z.controller) if z is not None else (None,)
-        return f"{t.kind}:{':'.join(str(x) for x in zkey)}:{getattr(ws, 'isoformat', lambda: None)()}:{getattr(we, 'isoformat', lambda: None)()}"
+        return target_node_id(t)
+    for target in targets:
+        node_id = _make_node_id(target)
+        scope_k = _scope_key(target)
+        scope_target_to_ids.setdefault((target.kind, scope_k), []).append(node_id)
+        if target.group is not None:
+            group_target_to_id[(target.kind, target.group.group_id)] = node_id
+
+    def _time_bounds(target: Target) -> Tuple[Optional[datetime], Optional[datetime]]:
+        window = target.window
+        if window is not None:
+            return window.start, window.end
+        return target.at_time, target.at_time
+
+    def _center(target: Target) -> Optional[datetime]:
+        start, end = _time_bounds(target)
+        if start is not None and end is not None:
+            return start + (end - start) / 2
+        return start or end
+
+    def _qa_gate_dependencies(edge: Edge, target: Target) -> List[str]:
+        """Resolve planned QA gates without treating them as data parents."""
+
+        scope_k = _scope_key(target)
+        candidates = [
+            candidate for candidate in grouped.get(edge.src.kind, [])
+            if _scope_key(candidate) == scope_k
+        ]
+        if not candidates:
+            # An existing, QA-accepted source is not in the planned target set
+            # and therefore needs no execution dependency.
+            return []
+        target_start, target_end = _time_bounds(target)
+        overlapping = []
+        if target_start is not None and target_end is not None:
+            for candidate in candidates:
+                source_start, source_end = _time_bounds(candidate)
+                if source_start is None or source_end is None:
+                    continue
+                if source_start <= target_end and target_start <= source_end:
+                    overlapping.append(candidate)
+        selected = overlapping
+        if not selected:
+            target_center = _center(target)
+            centered = [
+                (abs((_center(candidate) - target_center).total_seconds()), candidate)
+                for candidate in candidates
+                if _center(candidate) is not None and target_center is not None
+            ]
+            if centered:
+                distance, nearest = min(centered, key=lambda item: (item[0], _make_node_id(item[1])))
+                if distance <= max(0, int(edge.tolerance_days)) * 86400:
+                    selected = [nearest]
+        return [_make_node_id(candidate) for candidate in selected]
+
     # Build in topo order by kinds
     for kind in order:
         for t in grouped.get(kind, []):
@@ -109,16 +160,30 @@ def schedule(
             else:
                 ctx = task_context_factory() if task_context_factory else None
                 tgt_for_task = target_adapter(t) if target_adapter else t
-                task_obj = task_cls(ctx, target=tgt_for_task)
+                task_obj = task_cls(
+                    ctx, target=tgt_for_task,
+                    params=dict(getattr(node_by_kind.get(kind), "params_schema", None) or {}),
+                )
             # Determine deps: for each incoming edge (src→dst with dst==kind), depend on src task of same scope
             deps_ids: List[str] = []
             scope_k = _scope_key(t)
-            for e in edges:
-                if e.dst.kind != kind:
+            if t.parent_groups:
+                for parent in t.parent_groups:
+                    dep_id = group_target_to_id.get(parent)
+                    if dep_id and dep_id not in deps_ids:
+                        deps_ids.append(dep_id)
+            else:
+                for e in edges:
+                    if e.dst.kind != kind or e.policy == "qa_gate":
+                        continue
+                    candidates = scope_target_to_ids.get((e.src.kind, scope_k), [])
+                    if len(candidates) == 1 and candidates[0] not in deps_ids:
+                        deps_ids.append(candidates[0])
+            for edge in edges:
+                if edge.dst.kind != kind or edge.policy != "qa_gate":
                     continue
-                dep_id = name_target_to_id.get((e.src.kind, scope_k))
-                if dep_id and dep_id not in deps_ids:
-                    deps_ids.append(dep_id)
+                for dep_id in _qa_gate_dependencies(edge, t):
+                    if dep_id not in deps_ids:
+                        deps_ids.append(dep_id)
             scheduled.append(ScheduledTask(id=node_id, kind=kind, task=task_obj, depends_on=deps_ids))
-            name_target_to_id[(kind, scope_k)] = node_id
     return scheduled

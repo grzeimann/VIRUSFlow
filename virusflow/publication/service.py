@@ -1,25 +1,29 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Protocol, Dict, Any
-from pathlib import Path
+import math
+from typing import Iterable, List, Protocol, Dict
 
-from ..artifacts.models import Artifact, StorageRef, Scope, Provenance
-from ..artifacts.requests import ArtifactRequest, LogicalComponent
+from ..artifacts.models import Artifact
+from ..artifacts.requests import ArtifactRequest
 from ..artifacts.service import ArtifactService
 from ..contracts.artifact import (
     ArtifactContract,
     ArtifactContractSpec,
     MasterBiasContract,
     MasterDarkContract,
-    MasterFlatContract,
-    MasterCmpContract,
-    MasterTwiContract,
-    TraceContract,
-    WaveContract,
+    MasterLDLSContract,
+    MasterHgContract,
+    MasterCdContract,
+    MasterSciContract,
+    ExtractedMasterSciSpectrumContract,
+    FiberWavelengthSpectralMaskContract,
+    MasterArcContract,
+    MasterTwilightContract,
+    TraceMapContract,
+    WavelengthMapContract,
 )
-from ..persistence.policy import PersistencePolicy, RepresentationDecision
-from ..artifacts.serializers import Serializer
-from ..artifacts.io_fits import write_array_fits
+from ..core.scientific_metadata import SCIENTIFIC_METADATA_FIELDS
+from ..persistence.policy import PersistencePolicy
 from .context import PublicationContext
 
 
@@ -44,11 +48,16 @@ class PublicationService(Protocol):
 _KIND_TO_CONTRACT: Dict[str, ArtifactContract] = {
     "master_bias": MasterBiasContract(),
     "master_dark": MasterDarkContract(),
-    "master_flat": MasterFlatContract(),
-    "master_cmp": MasterCmpContract(),
-    "master_twi": MasterTwiContract(),
-    "trace": TraceContract(),
-    "wave": WaveContract(),
+    "master_ldls": MasterLDLSContract(),
+    "master_hg": MasterHgContract(),
+    "master_cd": MasterCdContract(),
+    "master_sci": MasterSciContract(),
+    "extracted_master_sci_spectrum": ExtractedMasterSciSpectrumContract(),
+    "fiber_wavelength_spectral_mask": FiberWavelengthSpectralMaskContract(),
+    "master_arc": MasterArcContract(),
+    "master_twilight": MasterTwilightContract(),
+    "trace_map": TraceMapContract(),
+    "wavelength_map": WavelengthMapContract(),
 }
 
 
@@ -86,97 +95,14 @@ class DefaultPublicationService:
 
     # ---- internals ----
     def _publish_one(self, req: ArtifactRequest, ctx: PublicationContext) -> Artifact:
-        # 1) Validate against ArtifactContract
         spec = _get_contract(req.kind).spec()
         self._validate_against_contract(req, spec)
-        # 2) For now, expect a single required component to persist
-        comp_name, comp = self._select_primary_component(req, spec)
-        # 3) Ask policy for representation decision + filename
-        dec = self.policy.decide(artifact_kind=req.kind, component_name=comp_name, model_type=comp.model_type)
-        tokens = self._filename_tokens(req=req, ctx=ctx)
-        out_path = self.policy.filename(artifact_kind=req.kind, component_name=comp_name, base_dir=self.base_dir, tokens=tokens)
-        # 4) Persist component according to decision (arrays via write_array_fits)
-        storage_format = (dec.storage_format or "fits").lower()
-        payload_type = self._payload_type_for(comp.model_type)
-        if payload_type == "array" and storage_format == "fits":
-            # Build a minimal, policy-owned sidecar from logical summaries/metadata
-            sidecar: Dict[str, Any] = {"kind": req.kind, "role": "calibration", "payload_type": payload_type, "storage_format": storage_format}
-            # Merge logical summaries (bounded-size decisions belong to policy; here we just pass through)
-            for k, v in (req.summaries or {}).items():
-                sidecar[k] = v
-            # Include shape in sidecar for describe()
-            try:
-                import numpy as _np
-                sidecar.setdefault("shape", list(_np.asarray(comp.value).shape))
-            except Exception:
-                pass
-            write_array_fits(
-                out_path,
-                data=comp.value,
-                n_inputs=int(req.metadata.get("n_inputs", 0)),
-                algo_version=str(ctx.algorithm_version or req.metadata.get("algo_version" or "unknown")),
-                extra_primary_cards=None,
-                extra_header=None,
-                mask=None,
-                mask_name=None,
-                sidecar=sidecar,
+        unknown = set(req.scientific_metadata or {}) - set(SCIENTIFIC_METADATA_FIELDS)
+        if unknown:
+            raise ValueError(
+                "unknown scientific metadata fields: " + ", ".join(sorted(unknown))
             )
-        else:
-            raise NotImplementedError(f"No serializer for payload_type={payload_type} storage_format={storage_format}")
-        # 5) Register via ArtifactService
-        scope = req.scope or Scope(zipcode=None)
-        art = Artifact(
-            id=None,
-            kind=req.kind,
-            role="calibration",
-            payload_type=payload_type,
-            storage_format=storage_format,
-            storage=StorageRef(uri=str(out_path), storage_format=storage_format, backend=dec.uri_scheme or "fs"),
-            scope=scope,
-            metadata=dict(req.summaries or {}),
-            provenance=Provenance(
-                algorithm=f"{ctx.algorithm_name or 'unknown'}:{ctx.algorithm_version or 'unknown'}",
-                params={
-                    **dict(ctx.parameters or {}),
-                    "task": {"name": ctx.task_name, "version": ctx.task_version},
-                    "algorithm": {"name": ctx.algorithm_name, "version": ctx.algorithm_version},
-                    "timings": dict(ctx.timings or {}),
-                },
-                parents=[int(p) for p in (ctx.parent_ids or [])],
-            ),
-        )
-        art_id = self.svc.register(art)
-        try:
-            setattr(art, "id", int(art_id))
-        except Exception:
-            pass
-        return art
-
-    def _payload_type_for(self, model_type: str) -> str:
-        mt = (model_type or "").strip().lower()
-        if mt in ("array2d", "array1d"):
-            return "array"
-        if mt == "image":
-            return "image"
-        if mt == "table":
-            return "table"
-        if mt == "scalar":
-            return "scalar"
-        return "collection"
-
-    def _select_primary_component(self, req: ArtifactRequest, spec: ArtifactContractSpec) -> tuple[str, LogicalComponent]:
-        # Prefer the first required component in the contract
-        names_req = [c.name for c in (spec.components or []) if c.required]
-        for nm in names_req:
-            comp = req.get_component(nm)
-            if comp is not None:
-                return nm, comp
-        # Fallback: first component provided
-        for nm in req.component_names():
-            comp = req.get_component(nm)
-            if comp is not None:
-                return nm, comp
-        raise ValueError("ArtifactRequest has no components to persist")
+        return self.svc.persist_request(req, context=ctx, policy=self.policy, base_dir=self.base_dir)
 
     def _validate_against_contract(self, req: ArtifactRequest, spec: ArtifactContractSpec) -> None:
         # Ensure required components exist and model_types match when provided
@@ -186,17 +112,40 @@ class DefaultPublicationService:
                 missing.append(c.name)
         if missing:
             raise ValueError(f"Missing required components for kind={req.kind}: {', '.join(missing)}")
+        missing_metadata = [name for name in spec.required_metadata if req.metadata.get(name) is None]
+        if missing_metadata:
+            raise ValueError(
+                f"Missing required metadata for kind={req.kind}: {', '.join(missing_metadata)}"
+            )
+        missing_summaries = [
+            name for name in spec.required_summaries
+            if req.summaries.get(name) is None
+        ]
+        if missing_summaries:
+            raise ValueError(
+                f"Missing required summaries for kind={req.kind}: "
+                + ", ".join(missing_summaries)
+            )
+        if spec.kind == "master_dark" and not missing_summaries:
+            try:
+                reference_seconds = float(
+                    req.summaries["reference_exposure_time_seconds"]
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "master_dark reference_exposure_time_seconds must be finite and positive"
+                ) from exc
+            if not math.isfinite(reference_seconds) or reference_seconds <= 0.0:
+                raise ValueError(
+                    "master_dark reference_exposure_time_seconds must be finite and positive"
+                )
+            if req.summaries["bias_convention"] != "included_in_electron_master":
+                raise ValueError(
+                    "master_dark bias_convention must be "
+                    "'included_in_electron_master'"
+                )
         # Model type checks (best-effort)
         for c in (spec.components or []):
             rc = req.get_component(c.name)
             if rc is not None and c.model_type and str(rc.model_type).lower() != str(c.model_type).lower():
                 raise ValueError(f"Component '{c.name}' has model_type={rc.model_type}, expected {c.model_type}")
-
-    def _filename_tokens(self, *, req: ArtifactRequest, ctx: PublicationContext) -> Dict[str, str]:
-        # Minimal tokens; tasks may pass more later (zipcode, dates)
-        toks: Dict[str, str] = {
-            "kind": (req.kind or "artifact"),
-            "task": (ctx.task_name or "task"),
-            "tver": (ctx.task_version or "v1"),
-        }
-        return toks

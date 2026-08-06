@@ -28,28 +28,12 @@ from sklearn.linear_model import HuberRegressor
 from ..artifacts.io_fits import read_array_fits
 
 # Algorithm version string for this module
-ALGO_VERSION = "trace-1.0"
+ALGO_VERSION = "trace-1.1"
 
 # Input item type accepted by fit_fiber_traces (kept for interface symmetry)
 TraceInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
 
 
-def _simple_trace_from_flat(master_flat: np.ndarray) -> np.ndarray:
-    """Compute a simple 1D trace proxy from a master flat image.
-
-    For each detector column, return the row index of maximum illumination.
-    Safe for NaNs. Returns float32 vector with length = nx (number of columns).
-    """
-    try:
-        img = np.asarray(master_flat, dtype=float)
-        if img.ndim != 2 or min(img.shape) == 0:
-            raise ValueError("master_flat must be a 2D array with positive shape")
-        col_max_idx = np.nanargmax(img, axis=0)
-        return col_max_idx.astype(np.float32)
-    except Exception:
-        # Fallback: all zeros vector
-        nx = int(np.asarray(master_flat).shape[1]) if np.asarray(master_flat).ndim == 2 else 0
-        return np.zeros((nx,), dtype=np.float32)
 
 
 def robust_polyfit_predict(x_obs: np.ndarray | List[float], y_obs: np.ndarray | List[float], x_pred: np.ndarray | List[float], degree: int = 4) -> np.ndarray:
@@ -253,14 +237,21 @@ def get_trace_reference(specid: str, ifuslot: str, ifuid: str, amp: str, obsdate
         ) from e
 
 
-def _get_trace(twilight: np.ndarray, specid: str, ifuslot: str, ifuid: str, amp: str, obsdate: str, tr_folder: str) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def _get_trace(
+    twilight: np.ndarray,
+    specid: str,
+    ifuslot: str,
+    ifuid: str,
+    amp: str,
+    reference: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute 2D fiber traces from a flat (twilight) image using reference locations.
 
     Returns (trace_2d, ref_table, xchunks, Trace_samples), where trace_2d has
     shape (nfiber, nx) and Trace_samples are the per-chunk sampled positions.
     """
     try:
-        ref = get_trace_reference(specid, ifuslot, ifuid, amp, obsdate, virusconfig=tr_folder)
+        ref = np.asarray(reference, dtype=float)
         # Number of not dead fibers (aka, good fibers)
         N1 = int((ref[:, 1] == 0.0).sum())
         good = np.where(ref[:, 1] == 0.0)[0]
@@ -329,116 +320,78 @@ from ..core.algo_result import AlgoResult
 def fit_fiber_traces(
     raw_inputs: Optional[Iterable[TraceInput]] = None,
     params: Optional[Dict[str, Any]] = None,
+    *,
+    master_ldls_array: Optional[np.ndarray] = None,
+    trace_reference: Optional[np.ndarray] = None,
+    zipcode=None,
 ) -> AlgoResult:
-    """Build a trace solution using the existing master flat artifact.
-
-    Contract:
-    - Inputs: none strictly required, but accepted for future use.
-    - params must include one of:
-        - 'master_flat_path': direct filesystem path to a master_flat FITS
-        - 'master_flat_artifact': dict-like with key 'path' to the artifact
-    - Output: returns a storage-neutral AlgoResult; no file I/O or persistence here.
-
-    Note: This is a minimal scaffolding that migrates the get_trace concept into
-    the standard step_* algorithm form used by VIRUSFlow. A full trace solution
-    requires instrument-identifying parameters; if any are missing, this
-    function will fail fast with a clear error rather than falling back.
-    """
+    """Build a trace solution from arrays supplied by Task/configuration boundaries."""
+    # Compatibility call shape: legacy callers may still pass (raw_inputs, params),
+    # but the params must contain arrays and identity. Path loading is intentionally
+    # not restored to this migrated algorithm boundary.
     params = dict(params or {})
+    master_ldls_array = master_ldls_array if master_ldls_array is not None else params.get("master_ldls_array", params.get("master_flat_array"))
+    trace_reference = trace_reference if trace_reference is not None else params.get("trace_reference")
+    if zipcode is None and all(params.get(name) is not None for name in ("ifuslot", "ifuid", "specid", "amp")):
+        from ..core.identity import ZipCode
 
-    # Resolve master flat strictly via explicit path or provided artifact row.
-    master = None
-    hdr = {}
-    nx = None
-
-    # Prefer a materialized array provided by the Task; fall back to path-based load
-    master = None
-    hdr = {}
-    nx = None
-    try:
-        if isinstance(params.get("master_flat_array"), (list, tuple, np.ndarray)):
-            master = np.asarray(params.get("master_flat_array"))
-            nx = master.shape[1] if master is not None else None
-    except Exception:
-        master = None
-    if master is None:
-        mf_path: Optional[str] = params.get("master_flat_path")
-        if not mf_path:
-            mf_art = params.get("master_flat_artifact") or {}
-            try:
-                mf_path = mf_art.get("path") if isinstance(mf_art, dict) else None
-            except Exception:
-                mf_path = None
-        if not mf_path:
-            raise ValueError("fit_fiber_traces requires a 'master_flat_array' or ('master_flat_path'|'master_flat_artifact') with a 'path'")
-        payload = read_array_fits(str(mf_path))
-        master = payload.get("data")
-        hdr = payload.get("header", {})
-        nx = master.shape[1] if master is not None else None
-        if master is None or nx is None:
-            raise RuntimeError("Failed to load master flat for fit_fiber_traces from path: %s" % str(mf_path))
-
-    # Gather and validate required parameters
-    specid = str(params.get("specid")) if params.get("specid") is not None else None
-    ifuslot = str(params.get("ifuslot")) if params.get("ifuslot") is not None else None
-    ifuid = str(params.get("ifuid")) if params.get("ifuid") is not None else None
-    amp = str(params.get("amp")) if params.get("amp") is not None else None
-    obsdate = str(params.get("obsdate")) if params.get("obsdate") is not None else None
-    tr_folder = (
-        str(params.get("virusconfig") or params.get("trace_config") or params.get("tr_folder"))
-        if (params.get("virusconfig") or params.get("trace_config") or params.get("tr_folder")) is not None
-        else None
-    )
-
-    missing: List[str] = []
-    if specid is None or specid == "None":
-        missing.append("specid")
-    if ifuslot is None or ifuslot == "None":
-        missing.append("ifuslot")
-    if ifuid is None or ifuid == "None":
-        missing.append("ifuid")
-    if amp is None or amp == "None":
-        missing.append("amp")
-    if obsdate is None or obsdate == "None":
-        missing.append("obsdate")
-    if tr_folder is None or tr_folder == "None":
-        missing.append("virusconfig/tr_folder")
-
-    if missing:
-        raise ValueError(
-            "fit_fiber_traces missing required parameters: " + ", ".join(missing) +
-            ". Provide specid, ifuslot, ifuid, amp, obsdate (YYYYMMDD), and virusconfig/tr_folder."
+        zipcode = ZipCode(
+            str(params["ifuslot"]), str(params["ifuid"]), str(params["specid"]),
+            str(params["amp"]), str(params.get("controller") or "unknown"),
         )
+    if master_ldls_array is None or trace_reference is None or zipcode is None:
+        raise TypeError(
+            "fit_fiber_traces requires already-loaded master_ldls_array, explicit "
+            "trace_reference, and zipcode; legacy path parameters are not accepted"
+        )
+    master = np.asarray(master_ldls_array, dtype=float)
+    reference = np.asarray(trace_reference, dtype=float)
+    if master.ndim != 2 or reference.ndim != 2 or reference.shape[1] < 2:
+        raise ValueError("fit_fiber_traces requires a 2D master_ldls_array and Nx2 trace_reference")
+    nx = master.shape[1]
+    specid = str(zipcode.specid).zfill(3)
+    ifuslot = str(zipcode.ifuslot).zfill(3)
+    ifuid = str(zipcode.ifuid).zfill(3)
+    amp = str(zipcode.amp)
 
     # Compute full trace using updated algorithm; no fallback
     try:
-        trace_2d, ref, xchunks, Trace_samples = _get_trace(master, specid, ifuslot, ifuid, amp, obsdate, tr_folder)
+        trace_2d, ref, xchunks, Trace_samples = _get_trace(
+            master, specid, ifuslot, ifuid, amp, reference
+        )
     except Exception as e:
         raise RuntimeError(f"fit_fiber_traces failed to compute trace via _get_trace: {e}") from e
 
-    # Compute per-fiber robust dispersion between sampled chunk traces and the modeled trace2d at xchunks
-    # Use MAD-based standard deviation (astropy.stats.mad_std) for robustness to outliers.
-    try:
-        nfib, nch = Trace_samples.shape
-        xidx = np.clip(np.round(np.asarray(xchunks, dtype=float)).astype(int), 0, nx - 1)
-        rms_fibers = np.full((nfib,), np.nan, dtype=float)
-        for i in range(nfib):
-            ts = np.asarray(Trace_samples[i, :], dtype=float)
-            sel = np.isfinite(ts) & (ts > 0)
-            if np.count_nonzero(sel) >= 2:
-                model = trace_2d[i, xidx[sel]]
-                diff = ts[sel] - model
-                # Robust sigma via MAD; ignore NaNs in diff just in case
-                val = mad_std(diff, ignore_nan=True)
-                try:
-                    val = float(val)
-                except Exception:
-                    val = np.nan
-                if np.isfinite(val):
-                    rms_fibers[i] = val
-    except Exception:
-        # If anything goes wrong, leave rms_fibers as None
-        rms_fibers = None
+    # Preserve the discrete-to-model residual state used by trace QA.  These
+    # compact arrays are the non-reconstructable evidence needed before the
+    # dense LDLS illumination payload may be released.
+    nfib, _ = Trace_samples.shape
+    xidx = np.clip(
+        np.round(np.asarray(xchunks, dtype=float)).astype(int), 0, nx - 1
+    )
+    samples = np.asarray(Trace_samples, dtype=float)
+    modeled_samples = np.asarray(trace_2d[:, xidx], dtype=float)
+    sample_valid = (
+        np.isfinite(samples) & (samples > 0.0) & np.isfinite(modeled_samples)
+    )
+    fit_residuals = np.where(sample_valid, samples - modeled_samples, np.nan)
+    valid_counts = np.count_nonzero(sample_valid, axis=1).astype(np.int16)
+    rms_fibers = np.full((nfib,), np.nan, dtype=float)
+    for i in range(nfib):
+        if valid_counts[i] < 2:
+            continue
+        value = mad_std(fit_residuals[i, sample_valid[i]], ignore_nan=True)
+        try:
+            value = float(value)
+        except Exception:
+            value = np.nan
+        if np.isfinite(value):
+            rms_fibers[i] = value
+    reference_interpolated = np.zeros((nfib,), dtype=np.uint8)
+    if np.asarray(ref).ndim == 2 and np.asarray(ref).shape[0] == nfib:
+        reference_interpolated = (
+            np.asarray(ref)[:, 1] != 0.0
+        ).astype(np.uint8)
 
     # Build storage-neutral AlgoResult (no persistence here)
     scalars = {"trace_len": int(nx) if nx is not None else int(trace_2d.shape[1])}
@@ -447,6 +400,10 @@ def fit_fiber_traces(
         version=ALGO_VERSION,
         meta={
             "trace_map_shape": list(trace_2d.shape),
+            "trace_model": "per_fiber_degree_at_most_4_huber_polynomial",
+            "trace_sample_state": (
+                "measured_active_fibers_or_reference_offset_for_configured_dead_fibers"
+            ),
         },
         scalars=scalars,
         arrays={
@@ -454,5 +411,9 @@ def fit_fiber_traces(
             "per_fiber_trace_residual_rms": rms_fibers,
             "trace_sample_columns": np.asarray(xchunks, dtype=float) if xchunks is not None else None,
             "sampled_trace_positions": Trace_samples,
+            "trace_sample_valid_mask": sample_valid.astype(np.uint8),
+            "trace_fit_residuals": fit_residuals.astype(np.float32),
+            "per_fiber_valid_sample_count": valid_counts,
+            "trace_interpolated_fiber_mask": reference_interpolated,
         },
     )

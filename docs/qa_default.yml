@@ -1,0 +1,51 @@
+version: 2
+
+# Default policy for kinds without explicit sections
+defaults:
+  policy: soft
+
+kinds:
+  master_ldls:
+    policy: soft
+    metrics:
+      p95:
+        from: "reduce.percentile(meta.component.data,95)"
+        default: 0.0
+    checks:
+      - id: "flat_signal_present"
+        where: "p95 > 0.0"
+        severity: warn_if_false
+
+  master_bias:
+    # Read noise is measured by the bias algorithm; QA owns the operational
+    # interpretation.  A critical result is retained for engineering evidence
+    # but is not usable as a science-calibration prerequisite.
+    policy: hard
+    metrics:
+      read_noise:
+        from: "meta.read_noise"
+    checks:
+      - id: "read_noise_at_or_below_critical_6_e"
+        where: "read_noise is not None and read_noise <= 6.0"
+        severity: fail_if_false
+        message: "Measured read noise exceeds the 6.0 electron critical ceiling; retain for diagnostics but exclude this amplifier from batch scientific reduction."
+      - id: "read_noise_at_or_below_warning_4_5_e"
+        where: "read_noise is not None and read_noise <= 4.5"
+        severity: warn_if_false
+        message: "Measured read noise exceeds the 4.5 electron warning ceiling; mark this amplifier degraded and review its electronic stability."
+
+  master_dark:
+    policy: soft
+    metrics: {}
+    checks: []
+
+  master_arc:
+    policy: soft
+    metrics:
+      p95:
+        from: "reduce.percentile(meta.component.data,95)"
+        default: 0.0
+    checks:
+      - id: "arc_signal_present"
+        where: "p95 > 0.0"
+        severity: warn_if_false

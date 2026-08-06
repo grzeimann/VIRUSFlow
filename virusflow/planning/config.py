@@ -15,21 +15,23 @@ nodes:
     scope_mode: per_zipcode
     inputs_raw: ["zro"]
     cadence:
-      type: time
-      every_days: 30
-      min_n_inputs: 25
+      type: nightly
+      minimum_exposures: 1
   master_dark:
     cadence:
-      type: exposure_count
-      min_n: 20
-      max_span_days: 45
+      type: monthly
+      minimum_exposures: 1
 edges:
-  - src: master_flat
-    dst: trace
+  - src: master_ldls
+    dst: trace_map
     policy: latest_valid
     tolerance_days: 90
-  - src: master_cmp
-    dst: wave
+  - src: master_hg
+    dst: master_arc
+    policy: nearest_valid
+    tolerance_days: 1
+  - src: master_arc
+    dst: wavelength_map
     policy: latest_valid
     tolerance_days: 90
 
@@ -44,8 +46,27 @@ try:
 except Exception:  # pragma: no cover - yaml is an optional runtime dep but present in CLI env
     yaml = None  # type: ignore
 
-from .targets import TimeCadence, ExposureCountCadence, CadencePolicy
+from .targets import TimeCadence, ExposureCountCadence, PurposeCadence, CadencePolicy
 from .graph import TaskSpec, Edge
+
+
+SUPPORTED_CALIBRATION_KINDS = frozenset({
+    "master_bias",
+    "master_dark",
+    "master_ldls",
+    "master_hg",
+    "master_cd",
+    "master_arc",
+    "master_twilight",
+    "master_sci",
+    "extracted_master_ldls_spectrum",
+    "extracted_master_twilight_spectrum",
+    "extracted_master_sci_spectrum",
+    "within_amp_fiber_normalization",
+    "fiber_wavelength_spectral_mask",
+    "trace_map",
+    "wavelength_map",
+})
 
 
 @dataclass(frozen=True)
@@ -61,6 +82,12 @@ class NodeConfig:
 @dataclass(frozen=True)
 class PlanningConfig:
     version: int = 1
+    nworkers: Optional[int] = None
+    progress: bool = True
+    progress_mode: str = "auto"
+    progress_interval: float = 30.0
+    progress_path: Optional[str] = None
+    max_retries: int = 0
     nodes: Dict[str, NodeConfig] = field(default_factory=dict)
     edges: List[Edge] = field(default_factory=list)
 
@@ -95,15 +122,6 @@ class PlanningConfig:
             if nc.cadence is not None:
                 new_n = replace(new_n, cadence=nc.cadence)
             out_nodes.append(new_n)
-        # If config introduces entirely new nodes, append them (task_cls=None placeholder)
-        for kind, nc in self.nodes.items():
-            if kind not in base_by_kind and nc.enabled:
-                out_nodes.append(TaskSpec(kind=kind, task_cls=object,  # placeholder
-                                          inputs_raw=list(nc.inputs_raw or []),
-                                          inputs_artifacts=list(nc.inputs_artifacts or []),
-                                          scope_mode=str(nc.scope_mode or "per_zipcode"),
-                                          cadence=nc.cadence,
-                                          params_schema=dict(nc.params or {})))
         # Edges: replace if any provided, else keep base
         out_edges: List[Edge]
         if self.edges:
@@ -133,6 +151,14 @@ def _parse_cadence(d: Mapping[str, Any] | None) -> Optional[CadencePolicy]:
         if min_n <= 0 or span <= 0:
             raise ValueError("exposure_count cadence requires min_n and max_span_days > 0")
         return ExposureCountCadence(min_n=min_n, max_span_days=span)
+    if t in {"purpose", "nightly", "rolling_24h", "monthly", "weekly", "isolated", "paired",
+             "observing_block", "dark_time"}:
+        policy = str(d.get("policy", t if t != "purpose" else "")).strip().lower()
+        if policy not in {"nightly", "rolling_24h", "monthly", "weekly", "isolated", "paired",
+                          "observing_block", "dark_time"}:
+            raise ValueError(f"purpose cadence requires a supported policy, got {policy!r}")
+        options = {str(key): value for key, value in d.items() if key not in {"type", "policy"}}
+        return PurposeCadence(policy, **options)
     raise ValueError(f"Unknown cadence type: {t!r}")
 
 
@@ -176,11 +202,49 @@ def load_planning_config_from_dict(cfg: Mapping[str, Any]) -> PlanningConfig:
         raise ValueError("config.nodes must be a mapping")
     nodes: Dict[str, NodeConfig] = {}
     for kind, nd in nodes_cfg.items():
+        if str(kind) not in SUPPORTED_CALIBRATION_KINDS:
+            raise ValueError(
+                f"unsupported planning node {kind!r}; use a canonical calibration kind"
+            )
         if not isinstance(nd, Mapping):
             raise ValueError(f"nodes.{kind} must be a mapping")
         nodes[kind] = _parse_node(kind, nd)
     edges = _parse_edges(cfg.get("edges"))
-    return PlanningConfig(version=version, nodes=nodes, edges=edges)
+    for edge in edges:
+        for endpoint in (edge.src.kind, edge.dst.kind):
+            if endpoint not in SUPPORTED_CALIBRATION_KINDS:
+                raise ValueError(
+                    f"unsupported planning edge kind {endpoint!r}; use a canonical calibration kind"
+                )
+    execution = cfg.get("execution") or {}
+    configured_workers = execution.get("nworkers") if isinstance(execution, Mapping) else None
+    if configured_workers is None:
+        configured_workers = cfg.get("nworkers")
+    nworkers = None if configured_workers is None else int(configured_workers)
+    if nworkers is not None and nworkers < 1:
+        raise ValueError("nworkers must be at least one")
+    progress = execution.get("progress", True) if isinstance(execution, Mapping) else True
+    progress_mode = str(execution.get("progress_mode", "auto")) if isinstance(execution, Mapping) else "auto"
+    if progress_mode not in {"auto", "tty", "plain", "json"}:
+        raise ValueError("execution.progress_mode must be auto, tty, plain, or json")
+    progress_interval = float(execution.get("progress_interval", 30.0)) if isinstance(execution, Mapping) else 30.0
+    if progress_interval <= 0:
+        raise ValueError("execution.progress_interval must be positive")
+    progress_path = execution.get("progress_path") if isinstance(execution, Mapping) else None
+    max_retries = int(execution.get("max_retries", 0)) if isinstance(execution, Mapping) else 0
+    if max_retries < 0:
+        raise ValueError("execution.max_retries cannot be negative")
+    return PlanningConfig(
+        version=version,
+        nworkers=nworkers,
+        progress=bool(progress),
+        progress_mode=progress_mode,
+        progress_interval=progress_interval,
+        progress_path=(str(progress_path) if progress_path else None),
+        max_retries=max_retries,
+        nodes=nodes,
+        edges=edges,
+    )
 
 
 def load_planning_config(path: str) -> PlanningConfig:

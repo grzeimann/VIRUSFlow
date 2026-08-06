@@ -50,15 +50,21 @@ class DefaultPersistencePolicy:
 
     def decide(self, *, artifact_kind: str, component_name: str, model_type: str) -> RepresentationDecision:
         mt = (model_type or "").strip().lower()
-        if mt in ("array2d", "array1d"):
+        if mt in ("array2d", "array1d", "mask"):
             return RepresentationDecision(storage_format="fits", serializer="array", uri_scheme=self.backend)
         # Future: other mappings (image/png, table/parquet, etc.)
         return RepresentationDecision(storage_format="fits", serializer="array", uri_scheme=self.backend)
 
     def filename(self, *, artifact_kind: str, component_name: str, base_dir: str, tokens: Dict[str, str]) -> str:
-        # Filename scheme: <base>/<kind>/<task>-<tver>/<kind>__<component>.fits
+        # Immutable scheme: <base>/<kind>/<scope>/<validity>/<revision>/<component>.fits
         base = Path(base_dir)
-        subdir = base / (tokens.get("kind") or artifact_kind) / f"{tokens.get('task','task')}-{tokens.get('tver','v1')}"
+        subdir = (
+            base
+            / (tokens.get("kind") or artifact_kind)
+            / (tokens.get("scope") or "global")
+            / (tokens.get("validity") or "open")
+            / (tokens.get("revision") or "legacy")
+        )
         subdir.mkdir(parents=True, exist_ok=True)
-        name = f"{artifact_kind}__{component_name}.fits"
+        name = f"{component_name}.fits"
         return str(subdir / name)

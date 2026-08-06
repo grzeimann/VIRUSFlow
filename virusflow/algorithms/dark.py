@@ -14,15 +14,16 @@ from typing import Iterable, Optional, Dict, Any, List
 
 import logging
 import numpy as np
-from astropy.stats import biweight_location, sigma_clipped_stats
+from astropy.stats import sigma_clipped_stats
 
-from . import ccd as _ccd
+from .inputs import array_frames
+from .robust import chunked_biweight_location
 
 __all__ = ["step_dark"]
 logger = logging.getLogger(__name__)
 
 # Algorithm version string for this module
-ALGO_VERSION = "dark-1.0"
+ALGO_VERSION = "dark-1.1"
 
 # Input item type accepted by step_dark (same structure as bias)
 DarkInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
@@ -46,12 +47,6 @@ def detect_dark_current_outliers(dark: np.ndarray) -> np.ndarray:
     _m, _med, s = sigma_clipped_stats(y1)
     # Base mask: 5-sigma outliers in absolute value
     mask = np.abs(y1) > 5.0 * float(s)
-    # If bright outliers > 100 ADU and the next row is also masked, flag column
-    yind, xind = np.where(y1 > 100)
-    for yi, xi in zip(yind, xind):
-        if yi + 2 < mask.shape[0]:
-            if mask[yi + 1, xi]:
-                mask[:, xi] = True
     return mask.astype(np.uint8)
 
 
@@ -73,45 +68,10 @@ def step_dark(
         Algorithm tuning parameters (reserved; none currently used).
     """
     params = params or {}
-    inputs: List[DarkInput] = list(raw_inputs or [])
-    n_inputs = len(inputs)
-    if n_inputs == 0:
-        raise ValueError("step_dark requires at least one raw dark input in raw_inputs")
-
-    # Read all frames serially. Parallelism is handled by the task/executor layer.
-    def _reduce_one(idx_item):
-        i, it = idx_item
-        p = it.get("path")
-        tm = it.get("tar_member")
-        if not p:
-            return None, i, "no-path"
-        try:
-            img, _err = _ccd.reduce_raw_amplifier_frame(p, tm, return_header=False)
-            return img, i, None
-        except Exception as e:
-            return None, i, str(e)
-
-    frames: List[np.ndarray] = []
-    errors: List[str] = []
-
-    for i, it in enumerate(inputs):
-        img, idx, err = _reduce_one((i, it))
-        if img is not None:
-            frames.append(img)
-        elif err:
-            errors.append(f"[{idx}] {err}")
-
-    if not frames:
-        detail = ("; ".join(errors[:5])) if errors else "no per-input errors captured"
-        raise RuntimeError(f"No readable dark frames provided to step_dark (n_inputs={n_inputs}). Sample errors: {detail}")
-
-    # Align shapes (ensure all equal); if not, raise
-    shapes = {f.shape for f in frames}
-    if len(shapes) != 1:
-        raise ValueError(f"Input dark frames have differing shapes: {sorted(shapes)}")
+    frames = array_frames(raw_inputs or [])
 
     stack = np.stack(frames, axis=0)
-    master = biweight_location(stack, axis=0, ignore_nan=True)
+    master = chunked_biweight_location(stack, axis=0)
 
     dark_mask = detect_dark_current_outliers(master)
     n_bad = int(dark_mask.sum())

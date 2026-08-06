@@ -17,6 +17,7 @@ from .studies.calibration import CalibrationStudy, CalibrationStudyParams
 from .studies.instrument_health import InstrumentHealthStudy, InstrumentHealthParams
 from .studies.trending import TrendingStudy, TrendingStudyParams
 from .studies.reports import ReportsStudy, ReportsStudyParams
+from .studies.bias import BiasStabilityParams, BiasStabilityStudy
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,23 @@ class AnalyticsService:
             p = self._parse_reports_params(req.params)
             study = ReportsStudy(self.svc)
             return study.run(p)
+        if name == "bias_stability":
+            zipcode = req.params.get("zipcode")
+            if isinstance(zipcode, str):
+                from ..core.identity import parse_zipcode_key
+
+                zipcode = parse_zipcode_key(zipcode)
+            if zipcode is None:
+                raise ValueError("bias_stability requires zipcode")
+            limit = req.params.get("limit")
+            study = BiasStabilityStudy(self.svc)
+            return study.run(
+                BiasStabilityParams(
+                    out_dir=Path(req.params.get("out") or req.params.get("out_dir") or "./qa_plots"),
+                    zipcode=zipcode,
+                    limit=int(limit) if limit is not None else None,
+                )
+            )
         raise ValueError(f"Unknown analytics study: {req.name}")
 
     def _parse_trace_params(self, p: Dict[str, Any]) -> TraceStudyParams:

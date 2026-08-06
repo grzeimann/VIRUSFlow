@@ -16,13 +16,29 @@ def _ensure_dir(path: Path) -> None:
 
 
 def _write_sidecar_json(base_path: Path, payload: Dict[str, object]) -> None:
+    tmp = None
     try:
         import json
+        import os
+        import tempfile
         side = base_path.with_suffix(base_path.suffix + ".json")
-        side.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        side.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            prefix=side.name + ".", suffix=".tmp", dir=str(side.parent),
+            mode="w", encoding="utf-8", delete=False,
+        ) as stream:
+            tmp = Path(stream.name)
+            stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str))
+            stream.flush()
+            os.fsync(stream.fileno())
+        tmp.replace(side)
     except Exception:
         # Sidecar is optional; never fail writes
-        pass
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def write_array_fits(
@@ -39,16 +55,31 @@ def write_array_fits(
 ) -> None:
     """Write a 1D/2D array as a FITS artifact with a compact sidecar JSON.
 
-    - Primary HDU stores data as float32
+    - Primary HDU preserves numeric precision (boolean arrays use uint8)
     - Adds NINPUTS and ALGOVER cards to header
     - Optional mask written as uint8 ImageHDU with provided name
     - Writes a small JSON sidecar with generic fields and any extra keys in 'sidecar'
     """
     arr = np.asarray(data)
-    phdu = fits.PrimaryHDU(arr.astype(np.float32))
+    scale = None
+    bunit = None
+    if isinstance(sidecar, dict):
+        scale = sidecar.get("physical_scale")
+        bunit = sidecar.get("bunit") or sidecar.get("BUNIT")
+    if scale is not None:
+        scale = float(scale)
+        if not np.isfinite(scale) or scale <= 0:
+            raise ValueError("physical_scale must be finite and positive")
+        arr = np.asarray(arr / scale, dtype=np.float32)
+    storage_array = arr.astype(np.uint8) if arr.dtype.kind == "b" else arr
+    phdu = fits.PrimaryHDU(storage_array)
     hdr = phdu.header
     hdr["NINPUTS"] = (int(n_inputs), "number of inputs contributing to artifact")
     hdr["ALGOVER"] = (str(algo_version), "algorithm version")
+    if bunit:
+        hdr["BUNIT"] = (str(bunit), "physical unit represented by stored values")
+    if scale is not None:
+        hdr["VFSCAL"] = (float(scale), "physical value per stored unit")
     if extra_primary_cards:
         for k, v in extra_primary_cards.items():
             try:
@@ -130,6 +161,8 @@ def write_array_fits(
         "n_inputs": int(n_inputs),
         "algo_version": str(algo_version),
         "shape": list(arr.shape),
+        "dtype": str(storage_array.dtype),
+        "payload_bytes": int(storage_array.nbytes),
     }
     if isinstance(sidecar, dict):
         try:
@@ -157,5 +190,3 @@ def read_array_fits(path: str) -> Dict:
         data = hdul[0].data
         hdr = dict(hdul[0].header)
     return {"data": data, "header": hdr}
-
-

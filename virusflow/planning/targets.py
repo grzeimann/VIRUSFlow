@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional, List
+from typing import Any, Optional, List
 
 from ..artifacts.models import Scope
+from ..core.identity import ZipCode
 
 
 @dataclass(frozen=True)
@@ -31,6 +32,75 @@ class Target:
     scope: Scope
     window: Optional[TemporalWindow] = None
     at_time: Optional[datetime] = None
+    group: Optional["CalibrationGroup"] = None
+    parent_groups: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class CalibrationGroup:
+    """A scientifically resolved calibration set carried into execution.
+
+    ``raw_ids`` is the computation input identity.  ``applicability`` describes
+    selection/validity and deliberately does not participate in that identity.
+    """
+
+    group_id: str
+    computation_id: str
+    policy: str
+    raw_ids: tuple[int, ...]
+    exposure_ids: tuple[str, ...]
+    timestamps: tuple[datetime, ...]
+    metadata: dict[str, Any]
+    applicability: dict[str, Any]
+    sufficient: bool = True
+    decision: str = "planned"
+    downstream_requesters: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PhysicalCCDTarget:
+    """One paired physical CCD in one atomic science exposure."""
+
+    exposure_id: str
+    specid: str
+    side: str
+    lower_zipcode: ZipCode
+    upper_zipcode: ZipCode
+    at_time: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        side = str(self.side).lower()
+        expected = {"left": ("LL", "LU"), "right": ("RU", "RL")}
+        if side not in expected:
+            raise ValueError("PhysicalCCDTarget.side must be 'left' or 'right'")
+        actual = (self.lower_zipcode.amp, self.upper_zipcode.amp)
+        if actual != expected[side]:
+            raise ValueError(f"{side} physical CCD requires amplifier pair {expected[side]}, got {actual}")
+        if self.lower_zipcode.specid != self.upper_zipcode.specid or self.lower_zipcode.specid != self.specid:
+            raise ValueError("PhysicalCCDTarget amplifier SPECIDs must match target.specid")
+
+
+@dataclass(frozen=True)
+class ExposureTarget:
+    """One atomic science exposure, preserving all available amplifier identities."""
+
+    exposure_id: str
+    at_time: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
+class ObservationTarget:
+    """Explicit grouping target; member identities are never synthesized."""
+
+    observation_id: str
+    dither_set_id: str
+    exposure_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not self.observation_id or not self.dither_set_id:
+            raise ValueError("Observation and DitherSet identities are required")
+        if not self.exposure_ids:
+            raise ValueError("ObservationTarget requires at least one real exposure identity")
 
 
 class CadencePolicy:
@@ -74,5 +144,21 @@ class ExposureCountCadence(CadencePolicy):
         self.max_span_days = int(max_span_days)
 
     # Defer to helper by default
+    def windows(self, *, frame_type: str, scope: Scope, db_path: str) -> List[TemporalWindow]:  # noqa: ARG002
+        raise NotImplementedError
+
+
+class PurposeCadence(CadencePolicy):
+    """Purpose-specific resolved-input grouping configuration.
+
+    The policy is interpreted by :mod:`virusflow.planning.cadence`; keeping the
+    values here makes YAML configuration explicit without creating another
+    planner or execution path.
+    """
+
+    def __init__(self, policy: str, **options: Any) -> None:
+        self.policy = str(policy)
+        self.options = dict(options)
+
     def windows(self, *, frame_type: str, scope: Scope, db_path: str) -> List[TemporalWindow]:  # noqa: ARG002
         raise NotImplementedError

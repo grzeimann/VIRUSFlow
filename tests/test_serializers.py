@@ -36,3 +36,12 @@ def test_array_fits_describe_and_load(tmp_path: Path):
     # Ensure header cards were written
     assert int(hdr.get("NINPUTS", -1)) == 3
     assert str(hdr.get("ALGOVER")) == "t-1.0"
+
+
+def test_array_fits_preserves_float64_astrometric_precision(tmp_path: Path):
+    coordinates = np.asarray([202.500357018943, -8.499797222222], dtype=np.float64)
+    out = tmp_path / "coordinates.fits"
+    write_array_fits(str(out), data=coordinates)
+    loaded = array_fits.load(str(out))["data"]
+    assert loaded.dtype.itemsize == 8
+    np.testing.assert_array_equal(loaded, coordinates)

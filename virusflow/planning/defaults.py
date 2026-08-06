@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Default calibration reduction graph specification.
 
@@ -11,10 +9,12 @@ callers (CLI/scheduler) can map kinds to concrete task classes at run time if
 needed. For now we store a simple placeholder object in task_cls.
 """
 
+from __future__ import annotations
+
 from typing import List, Tuple
 
 from .graph import TaskSpec, Edge
-from .targets import TimeCadence, ExposureCountCadence
+from .targets import PurposeCadence
 from .config import PlanningConfig
 
 
@@ -25,18 +25,25 @@ class _TaskPlaceholder:
 def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[List[TaskSpec], List[Edge]]:
     """Build default calibration TaskSpec nodes and Edge list, optionally apply overrides.
 
-    Kinds and cadences (initial recommendations):
-    - master_bias: TimeCadence(every_days=30, min_n_inputs=25), inputs_raw=["zro"]
-    - master_dark: ExposureCountCadence(min_n=20, max_span_days=45), inputs_raw=["drk"]
-    - master_flat: ExposureCountCadence(min_n=30, max_span_days=30), inputs_raw=["flt"]
-    - master_cmp: TimeCadence(every_days=90, min_n_inputs=1), inputs_artifacts=["master_flat"]
-    - trace: derived, inputs_artifacts=["master_flat"], no cadence
-    - wave: derived, inputs_artifacts=["master_cmp", "trace"], no cadence
+    Canonical kinds and cadences:
+    - master_bias: nightly, all available frames
+    - master_dark: calendar-month groups (weekly is configurable)
+    - master_ldls: isolated <=3-hour groups with at least three exposures
+    - master_hg/master_cd: separate isolated <=3-hour groups, paired into master_arc
+    - master_twilight: weekly groups
+    - master_sci: eligible >300 s science in monthly groups, subject to sufficiency
+    - trace_map: derived from master_ldls
+    - wavelength_map: derived from master_arc + trace_map
+    - extracted_master_sci_spectrum: derived from master_sci + trace_map
+    - extracted_master_ldls_spectrum: derived from master_ldls + trace_map
+    - extracted_master_twilight_spectrum: derived from master_twilight + trace_map
+    - within_amp_fiber_normalization: LDLS-fine response anchored by twilight
+    - amp_to_amp_normalization: coherent calibration-build amplifier scale
+    - fiber_wavelength_spectral_mask: derived from extracted spectra + wavelength_map
+    - master_bias: hard QA gate for every other raw calibration branch
 
-    Config surface:
-    - To declare preprocessing prerequisites for master_flat (e.g., master_bias/master_dark),
-      provide nodes.master_flat.params.preprocess_requires: ["master_bias", "master_dark"] in the planning YAML.
-      When set, edges from each listed kind to master_flat are added by default.
+    Planning YAML may override canonical node fields and may replace the edge
+    list. Dependencies have one representation: explicit edges.
     """
     # Nodes
     bias = TaskSpec(
@@ -45,7 +52,7 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         inputs_raw=["zro"],
         inputs_artifacts=None,
         scope_mode="per_zipcode",
-        cadence=TimeCadence(every_days=30, min_n_inputs=25),
+        cadence=PurposeCadence("nightly", minimum_exposures=1),
     )
     dark = TaskSpec(
         kind="master_dark",
@@ -53,71 +60,170 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         inputs_raw=["drk"],
         inputs_artifacts=None,
         scope_mode="per_zipcode",
-        cadence=ExposureCountCadence(min_n=20, max_span_days=45),
+        cadence=PurposeCadence("monthly", minimum_exposures=1),
     )
     flat = TaskSpec(
-        kind="master_flat",
+        kind="master_ldls",
         task_cls=_TaskPlaceholder,
         inputs_raw=["flt"],
         inputs_artifacts=None,
         scope_mode="per_zipcode",
-        cadence=ExposureCountCadence(min_n=30, max_span_days=30),
+        cadence=PurposeCadence("isolated", maximum_span_hours=3, minimum_exposures=3),
     )
-    cmpn = TaskSpec(
-        kind="master_cmp",
+    hg = TaskSpec(
+        kind="master_hg", task_cls=_TaskPlaceholder, inputs_raw=["cmp", "hg"],
+        inputs_artifacts=None, scope_mode="per_zipcode",
+        cadence=PurposeCadence("isolated", maximum_span_hours=3, minimum_exposures=1),
+    )
+    cd = TaskSpec(
+        kind="master_cd", task_cls=_TaskPlaceholder, inputs_raw=["cmp", "cd"],
+        inputs_artifacts=None, scope_mode="per_zipcode",
+        cadence=PurposeCadence("isolated", maximum_span_hours=3, minimum_exposures=1),
+    )
+    arc = TaskSpec(
+        kind="master_arc",
         task_cls=_TaskPlaceholder,
         inputs_raw=None,
-        inputs_artifacts=["master_flat"],
+        inputs_artifacts=["master_hg", "master_cd"],
         scope_mode="per_zipcode",
-        cadence=TimeCadence(every_days=90, min_n_inputs=1),
+        cadence=PurposeCadence("paired", maximum_pair_separation_hours=3.0),
+    )
+    twilight = TaskSpec(
+        kind="master_twilight",
+        task_cls=_TaskPlaceholder,
+        inputs_raw=["twi"],
+        inputs_artifacts=None,
+        scope_mode="per_zipcode",
+        cadence=PurposeCadence("weekly", minimum_exposures=1),
+    )
+    master_sci = TaskSpec(
+        kind="master_sci", task_cls=_TaskPlaceholder, inputs_raw=["sci"],
+        inputs_artifacts=None, scope_mode="per_zipcode",
+        cadence=PurposeCadence(
+            "monthly", minimum_exposure_seconds=300.0, minimum_exposures=3,
+            minimum_total_exposure_seconds=1800.0,
+        ),
     )
     trace = TaskSpec(
-        kind="trace",
+        kind="trace_map",
         task_cls=_TaskPlaceholder,
         inputs_raw=None,
-        inputs_artifacts=["master_flat"],
+        inputs_artifacts=["master_ldls"],
         scope_mode="per_zipcode",
         cadence=None,
     )
     wave = TaskSpec(
-        kind="wave",
+        kind="wavelength_map",
         task_cls=_TaskPlaceholder,
         inputs_raw=None,
-        inputs_artifacts=["master_cmp", "trace"],
+        inputs_artifacts=["master_arc", "trace_map"],
+        scope_mode="per_zipcode",
+        cadence=None,
+    )
+    master_sci_spectrum = TaskSpec(
+        kind="extracted_master_sci_spectrum",
+        task_cls=_TaskPlaceholder,
+        inputs_raw=None,
+        inputs_artifacts=["master_sci", "trace_map"],
+        scope_mode="physical_ccd_pair",
+        cadence=None,
+    )
+    master_ldls_spectrum = TaskSpec(
+        kind="extracted_master_ldls_spectrum",
+        task_cls=_TaskPlaceholder,
+        inputs_raw=None,
+        inputs_artifacts=["master_ldls", "trace_map"],
+        scope_mode="physical_ccd_pair",
+        cadence=None,
+    )
+    master_twilight_spectrum = TaskSpec(
+        kind="extracted_master_twilight_spectrum",
+        task_cls=_TaskPlaceholder,
+        inputs_raw=None,
+        inputs_artifacts=["master_twilight", "trace_map"],
+        scope_mode="physical_ccd_pair",
+        cadence=None,
+    )
+    amplifier_fiber_response = TaskSpec(
+        kind="within_amp_fiber_normalization",
+        task_cls=_TaskPlaceholder,
+        inputs_raw=None,
+        inputs_artifacts=[
+            "extracted_master_twilight_spectrum",
+            "extracted_master_ldls_spectrum",
+            "wavelength_map",
+            "extracted_master_sci_spectrum",
+        ],
+        scope_mode="physical_ccd_pair",
+        cadence=None,
+    )
+    calibration_amp_normalization = TaskSpec(
+        kind="amp_to_amp_normalization",
+        task_cls=_TaskPlaceholder,
+        inputs_raw=None,
+        inputs_artifacts=["within_amp_fiber_normalization"],
+        scope_mode="calibration_build",
+        cadence=None,
+    )
+    master_sci_mask = TaskSpec(
+        kind="fiber_wavelength_spectral_mask",
+        task_cls=_TaskPlaceholder,
+        inputs_raw=None,
+        inputs_artifacts=["extracted_master_sci_spectrum", "wavelength_map"],
         scope_mode="per_zipcode",
         cadence=None,
     )
 
-    nodes = [bias, dark, flat, cmpn, trace, wave]
+    nodes = [
+        bias, dark, flat, hg, cd, arc, twilight, master_sci, trace, wave,
+        master_ldls_spectrum, master_twilight_spectrum, master_sci_spectrum,
+        amplifier_fiber_response, calibration_amp_normalization, master_sci_mask,
+    ]
 
     # Edges (base)
     edges: List[Edge] = [
+        # These are execution/QA gates, not scientific derivation relations.
+        # A critical nightly read-noise result is retained as diagnostic
+        # evidence, then blocks all other calibration branches for that
+        # amplifier before trace or wavelength fitting can run.
+        Edge(src=bias, dst=dark, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=flat, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=hg, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=cd, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=twilight, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=master_sci, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=arc, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=trace, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=wave, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=master_sci_spectrum, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=master_ldls_spectrum, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=master_twilight_spectrum, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=amplifier_fiber_response, policy="qa_gate", tolerance_days=1),
+        Edge(src=bias, dst=master_sci_mask, policy="qa_gate", tolerance_days=1),
+        # Reusable response illumination is detector corrected with the same
+        # implemented bias + scaled-dark-residual convention as science data.
+        Edge(src=dark, dst=flat, policy="nearest_valid", tolerance_days=90),
+        Edge(src=dark, dst=twilight, policy="nearest_valid", tolerance_days=90),
+        Edge(src=dark, dst=master_sci, policy="nearest_valid", tolerance_days=90),
         Edge(src=flat, dst=trace, policy="latest_valid", tolerance_days=90),
-        Edge(src=cmpn, dst=wave, policy="latest_valid", tolerance_days=90),
+        Edge(src=hg, dst=arc, policy="nearest_valid", tolerance_days=1),
+        Edge(src=cd, dst=arc, policy="nearest_valid", tolerance_days=1),
+        Edge(src=arc, dst=wave, policy="latest_valid", tolerance_days=90),
+        Edge(src=trace, dst=wave, policy="latest_valid", tolerance_days=90),
+        Edge(src=master_sci, dst=master_sci_spectrum, policy="exact_parent_group", tolerance_days=0),
+        Edge(src=trace, dst=master_sci_spectrum, policy="latest_valid", tolerance_days=90),
+        Edge(src=flat, dst=master_ldls_spectrum, policy="exact_parent_group", tolerance_days=0),
+        Edge(src=trace, dst=master_ldls_spectrum, policy="latest_valid", tolerance_days=90),
+        Edge(src=twilight, dst=master_twilight_spectrum, policy="exact_parent_group", tolerance_days=0),
+        Edge(src=trace, dst=master_twilight_spectrum, policy="latest_valid", tolerance_days=90),
+        Edge(src=master_twilight_spectrum, dst=amplifier_fiber_response, policy="exact_parent_group", tolerance_days=0),
+        Edge(src=master_ldls_spectrum, dst=amplifier_fiber_response, policy="nearest_valid", tolerance_days=90),
+        Edge(src=wave, dst=amplifier_fiber_response, policy="nearest_valid", tolerance_days=90),
+        Edge(src=master_sci_spectrum, dst=amplifier_fiber_response, policy="optional_nearest_valid", tolerance_days=90),
+        Edge(src=amplifier_fiber_response, dst=calibration_amp_normalization, policy="coherent_calibration_build", tolerance_days=0),
+        Edge(src=master_sci_spectrum, dst=master_sci_mask, policy="exact_parent_group", tolerance_days=0),
+        Edge(src=wave, dst=master_sci_mask, policy="latest_valid", tolerance_days=90),
     ]
-
-    # Optional preprocessing dependencies for master_flat via config params
-    if config is not None:
-        try:
-            ncfg = config.nodes.get("master_flat") if hasattr(config, "nodes") else None
-            params = getattr(ncfg, "params", None)
-            reqs = []
-            if isinstance(params, dict):
-                val = params.get("preprocess_requires")
-                if isinstance(val, (list, tuple)):
-                    reqs = [str(x).strip() for x in val if str(x).strip()]
-            if reqs:
-                by_kind = {n.kind: n for n in nodes}
-                for rk in reqs:
-                    src_n = by_kind.get(rk)
-                    if src_n is None:
-                        continue
-                    # Avoid duplicates
-                    exists = any((e.src.kind == rk and e.dst.kind == "master_flat") for e in edges)
-                    if not exists:
-                        edges.append(Edge(src=src_n, dst=flat, policy="latest_valid", tolerance_days=90))
-        except Exception:
-            pass
 
     # Apply external overrides if provided (edges replaced only if config.edges is non-empty)
     if config is not None:

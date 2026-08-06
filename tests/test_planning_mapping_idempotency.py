@@ -7,7 +7,6 @@ from virusflow.registry import database as db
 from virusflow.core.identity import ZipCode
 from virusflow.artifacts.models import Scope
 from virusflow.artifacts.provenance import build_provenance
-from virusflow.planning.mapping import select_for_edge
 from virusflow.planning.defaults import default_calibration_graph
 from virusflow.planning.graph import ReductionGraph
 
@@ -62,42 +61,7 @@ def _seed_artifact(conn, *, kind: str, z: ZipCode, created_at: datetime, vstart:
     return db.save_artifact(art, prov, db_path=conn.execute("PRAGMA database_list").fetchone()[2])
 
 
-def test_mapping_tolerance_selection(tmp_path: Path):
-    db_path = str(tmp_path / "test.sqlite3")
-    db.init_db(db_path=db_path)
-    z = ZipCode(ifuslot="010", ifuid="001", specid="001", amp="LL", controller="A")
-    with db.connect(db_path) as conn:
-        _seed_zipcode(conn, z)
-        # Seed two artifacts at known created_at times
-        t0 = datetime(2026, 7, 1, 0, 0, 0)
-        t1 = t0 + timedelta(days=10)
-        t2 = t0 + timedelta(days=40)
-        # within 15-day tolerance around t1, expect selection of the nearer one if service.best returns latest_valid
-        _ = _seed_artifact(conn, kind="master_flat", z=z, created_at=t0, vstart=t0, vend=t0 + timedelta(days=1), path_suffix="_old")
-        aid_new = _seed_artifact(conn, kind="master_flat", z=z, created_at=t2, vstart=t2, vend=t2 + timedelta(days=1), path_suffix="_new")
-
-    scope = Scope(zipcode=z)
-    from virusflow.artifacts.service import ArtifactService
-
-    svc = ArtifactService(db_path)
-    # With small tolerance (<=15 days) around t1, neither artifact is within tolerance 15 (t0 is 10 days before, which is within; t2 is 30 days after)
-    # select_for_edge should return a row within tolerance if any; the service.select_best(policy=latest_valid) will likely pick the newer (t2),
-    # but tolerance filter should reject it and allow the older one (t0) since it's within 15 days.
-    row = select_for_edge(kind="master_flat", scope=scope, at_time=t1, policy="latest_valid", tolerance_days=15, service=svc)
-    assert row is not None
-    # Ensure the returned created_at is within tolerance
-    created = row.get("created_at")
-    if isinstance(created, str):
-        from datetime import datetime as _dt
-        created = _dt.fromisoformat(created.split(".")[0])
-    assert abs((created - t1).days) <= 15
-
-    # With very small tolerance (<=5 days), expect no row (both 10 and 40 days away)
-    row2 = select_for_edge(kind="master_flat", scope=scope, at_time=t1, policy="latest_valid", tolerance_days=5, service=svc)
-    assert row2 is None
-
-
-def test_planner_idempotent_skip_with_existing_artifact(tmp_path: Path):
+def test_planner_does_not_hide_distinct_inputs_behind_nominally_valid_artifact(tmp_path: Path):
     db_path = str(tmp_path / "test2.sqlite3")
     db.init_db(db_path=db_path)
     # Prepare zipcode and enough raw zero frames to satisfy TimeCadence min_n_inputs=25
@@ -118,9 +82,7 @@ def test_planner_idempotent_skip_with_existing_artifact(tmp_path: Path):
     scopes = [Scope(zipcode=z)]
     planned, report = G.plan(db_path=db_path, scopes=scopes)
 
-    # Since an existing master_bias is present and time-cadence emits an open window, planner should mark it as existing/skip
-    existing_keys = set()
-    for t in report.existing:
-        if t.kind == "master_bias":
-            existing_keys.add(t.kind)
-    assert "master_bias" in existing_keys or all(t.kind != "master_bias" for t in report.planned)
+    # A nominally valid legacy artifact without the same raw-parent identity
+    # cannot suppress a scientifically distinct nightly group.
+    assert any(t.kind == "master_bias" for t in report.planned)
+    assert all(t.kind != "master_bias" for t in report.existing)

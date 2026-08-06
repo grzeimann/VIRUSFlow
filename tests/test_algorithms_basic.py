@@ -4,28 +4,34 @@ from pathlib import Path
 import types
 import numpy as np
 import json
+from astropy.stats import biweight_location
 
 from virusflow.algorithms import bias as alg_bias
 from virusflow.algorithms import dark as alg_dark
 from virusflow.algorithms import flat as alg_flat
 from virusflow.algorithms import cmp as alg_cmp
-from virusflow.algorithms import ccd as alg_ccd
+from virusflow.algorithms.robust import chunked_biweight_location
 
 
-def _mk_inputs(n: int):
-    # paths are not used when we monkeypatch reduce_raw_amplifier_frame
-    return [{"path": f"/dev/null/{i}", "tar_member": None} for i in range(n)]
+def _mk_inputs(n: int, shape=(6, 8)):
+    yy, xx = np.indices(shape)
+    return [{"data": (xx + yy + i).astype(float)} for i in range(n)]
 
 
-def test_step_bias_returns_algo_result(monkeypatch):
-    # Monkeypatch reduce_raw_amplifier_frame to return deterministic arrays
-    def fake_reduce(path, tar_member, return_header=False):
-        i = int(str(path).split("/")[-1]) if str(path).split("/")[-1].isdigit() else 0
-        arr = np.full((4, 6), float(i), dtype=float)
-        return (arr, {}) if return_header else (arr, {})
+def test_chunked_biweight_matches_astropy_fixed_center_estimator():
+    rng = np.random.default_rng(8675309)
+    stack = rng.normal(size=(14, 37, 43)).astype(np.float32)
+    stack[0, ::5, ::7] = np.nan
+    stack[1, ::11, ::13] += 10_000.0
+    stack[:, 0, 0] = 7.0
 
-    monkeypatch.setattr(alg_ccd, "reduce_raw_amplifier_frame", fake_reduce)
+    expected = biweight_location(stack, axis=0, ignore_nan=True)
+    actual = chunked_biweight_location(stack, axis=0, chunk_pixels=101)
 
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_step_bias_returns_algo_result():
     ar = alg_bias.step_bias(raw_inputs=_mk_inputs(3), params={})
     # Expect an AlgoResult-like object with arrays and scalars accessible
     from virusflow.core.algo_result import AlgoResult, ensure_algo_result
@@ -37,14 +43,7 @@ def test_step_bias_returns_algo_result(monkeypatch):
     assert "read_noise" in m
 
 
-def test_step_dark_returns_algo_result_with_mask(monkeypatch):
-    def fake_reduce(path, tar_member, return_header=False):
-        i = int(str(path).split("/")[-1]) if str(path).split("/")[-1].isdigit() else 0
-        base = np.indices((4, 6))[1].astype(float) + i
-        return (base, {}) if return_header else (base, {})
-
-    monkeypatch.setattr(alg_ccd, "reduce_raw_amplifier_frame", fake_reduce)
-
+def test_step_dark_returns_algo_result_with_mask():
     ar = alg_dark.step_dark(raw_inputs=_mk_inputs(4), params={})
     from virusflow.core.algo_result import ensure_algo_result, AlgoResult
     ar2 = ensure_algo_result(ar, kind="dark")
@@ -56,15 +55,7 @@ def test_step_dark_returns_algo_result_with_mask(monkeypatch):
     assert "bad_fraction" in m
 
 
-def test_step_flat_returns_algo_result_with_mask(monkeypatch):
-    def fake_reduce(path, tar_member, return_header=False):
-        i = int(str(path).split("/")[-1]) if str(path).split("/")[-1].isdigit() else 0
-        yy, xx = np.indices((6, 8))
-        arr = (xx + yy + i).astype(float)
-        return (arr, {}) if return_header else (arr, {})
-
-    monkeypatch.setattr(alg_flat, "reduce_raw_amplifier_frame", fake_reduce)
-
+def test_step_flat_returns_algo_result_with_mask():
     ar = alg_flat.step_flt(raw_inputs=_mk_inputs(5), params={})
     from virusflow.core.algo_result import ensure_algo_result, AlgoResult
     ar2 = ensure_algo_result(ar, kind="flat")
@@ -77,15 +68,7 @@ def test_step_flat_returns_algo_result_with_mask(monkeypatch):
 
 
 
-def test_step_cmp_returns_algo_result(monkeypatch):
-    def fake_reduce(path, tar_member, return_header=False):
-        i = int(str(path).split("/")[-1]) if str(path).split("/")[-1].isdigit() else 0
-        yy, xx = np.indices((6, 8))
-        arr = (xx + i).astype(float)
-        return (arr, {}) if return_header else (arr, {})
-
-    monkeypatch.setattr(alg_ccd, "reduce_raw_amplifier_frame", fake_reduce)
-
+def test_step_cmp_returns_algo_result():
     ar = alg_cmp.step_cmp(raw_inputs=_mk_inputs(3), params={})
     from virusflow.core.algo_result import ensure_algo_result, AlgoResult
     ar2 = ensure_algo_result(ar, kind="cmp")

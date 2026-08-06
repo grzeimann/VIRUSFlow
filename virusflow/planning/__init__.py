@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 # Public planning interfaces
-from .targets import TemporalWindow, Target, CadencePolicy, TimeCadence, ExposureCountCadence
+from .targets import (
+    CalibrationGroup, CadencePolicy, ExposureCountCadence, PurposeCadence,
+    Target, TemporalWindow, TimeCadence,
+)
 from .graph import TaskSpec, Edge, PlanningReport, ReductionGraph
 from .defaults import default_calibration_graph
 from .config import (
@@ -12,13 +15,7 @@ from .config import (
 )
 from .adapter import PlanningTargetAdapter, adapt_target
 from .validate import validate_edges, validate_graph, PlanningValidationError
-from .mapping import select_for_edge
-# Optional thin scheduler (planning-first execution assembly)
-try:
-    from .scheduler import schedule, ScheduledTask  # type: ignore
-except Exception:  # pragma: no cover - scheduler is optional for now
-    schedule = None  # type: ignore
-    ScheduledTask = None  # type: ignore
+from .scheduler import schedule, ScheduledTask
 
 __all__ = [
     # targets
@@ -27,6 +24,8 @@ __all__ = [
     "CadencePolicy",
     "TimeCadence",
     "ExposureCountCadence",
+    "PurposeCadence",
+    "CalibrationGroup",
     # adapter
     "PlanningTargetAdapter",
     "adapt_target",
@@ -41,9 +40,10 @@ __all__ = [
     "PlanningConfig",
     "load_planning_config",
     "load_planning_config_from_dict",
-    # mapping helper
-    "select_for_edge",
-    # scheduler (optional)
+    "validate_edges",
+    "validate_graph",
+    "PlanningValidationError",
+    # scheduler
     "schedule",
     "ScheduledTask",
 ]

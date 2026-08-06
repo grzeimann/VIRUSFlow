@@ -10,6 +10,8 @@ class Serializer:
     describe: Callable[[str], dict]
     # Full payload loader
     load: Callable[[str], dict]
+    # Representation writer owned by ArtifactService
+    save: Optional[Callable[..., None]] = None
 
 
 class SerializerRegistry:

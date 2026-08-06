@@ -22,7 +22,7 @@ def sanitize_for_filename(text: Optional[str]) -> str:
     """Return a filesystem-safe filename fragment.
 
     - Replaces path separators (os.sep/os.altsep) with '_'.
-    - Collapses spaces and any non [A-Za-z0-9._+-] characters to '_'.
+    - Collapses spaces and any non [A-Za-z0-9._-] characters to '_'.
     - Strips leading/trailing underscores.
     - Returns empty string safely if input is None/empty.
     """
@@ -39,7 +39,7 @@ def sanitize_for_filename(text: Optional[str]) -> str:
     # Replace spaces with underscore
     s = s.replace(" ", "_")
     # Replace any remaining unsafe chars with underscore
-    s = re.sub(r"[^A-Za-z0-9._+-]", "_", s)
+    s = re.sub(r"[^A-Za-z0-9._-]", "_", s)
     # Collapse repeated underscores
     s = re.sub(r"_+", "_", s)
     return s.strip("_")

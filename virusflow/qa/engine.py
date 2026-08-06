@@ -8,16 +8,13 @@ Responsibilities:
 - Extract metrics from inputs (v1: algorithm meta only)
 - Evaluate boolean checks with a safe expression evaluator
 - Determine per-kind status with policy (hard|soft|off)
-- Return decision and allow persistence via DiagnosticsFacade
+- Return a decision for persistence through ArtifactService diagnostics
 """
 
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
-import math
-import operator
 
 try:
     import yaml  # type: ignore
@@ -61,6 +58,16 @@ class QAEngine:
             pol = dfl
         return pol
 
+    @property
+    def policy_version(self) -> str:
+        return str(self._cfg.get("version") or "1")
+
+    def policy_version_for(self, kind: str) -> str:
+        section = (self._cfg.get("kinds") or {}).get(
+            (kind or "").strip().lower()
+        ) or {}
+        return str(section.get("version") or self.policy_version)
+
     def evaluate(self, *, kind: str, meta: Optional[Dict[str, Any]] = None) -> Decision:
         k = (kind or "").strip().lower()
         sec = (self._cfg.get("kinds") or {}).get(k) or {}
@@ -71,28 +78,29 @@ class QAEngine:
         # Build metric namespace
         metrics = _extract_metrics(sec.get("metrics"), meta or {})
         # Evaluate checks
-        checks: List[Tuple[str, str, str]] = []  # (id, expr, severity)
+        checks: List[Tuple[str, str, str, Optional[str]]] = []
         for item in (sec.get("checks") or []):
             try:
                 cid = str(item.get("id") or "check").strip()
                 expr = str(item.get("where") or "True").strip()
                 sev = str(item.get("severity") or "fail_if_false").strip().lower()
-                checks.append((cid, expr, sev))
+                message = item.get("message")
+                checks.append((cid, expr, sev, str(message).strip() if message else None))
             except Exception:
                 continue
         fired_warn = False
         fired_fail = False
         messages: List[str] = []
-        for cid, expr, sev in checks:
+        for cid, expr, sev, configured_message in checks:
             ok, detail = _safe_eval(expr, metrics)
             if sev == "warn_if_false":
                 if not ok:
                     fired_warn = True
-                    messages.append(detail or f"warn: {cid}")
+                    messages.append(configured_message or detail or f"warn: {cid}")
             else:  # default fail_if_false
                 if not ok:
                     fired_fail = True
-                    messages.append(detail or f"fail: {cid}")
+                    messages.append(configured_message or detail or f"fail: {cid}")
         status = "pass"
         if fired_fail:
             status = "fail"

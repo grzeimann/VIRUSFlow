@@ -15,14 +15,14 @@ from typing import Iterable, Optional, Dict, Any, List
 
 import logging
 import numpy as np
-from astropy.stats import biweight_location
-from . import ccd as _ccd
+from .inputs import array_frames
+from .robust import chunked_biweight_location
 
 __all__ = ["step_bias"]
 logger = logging.getLogger(__name__)
 
 # Algorithm version string for this module
-ALGO_VERSION = "bias-1.0"
+ALGO_VERSION = "bias-1.1"
 
 # Input item type accepted by step_bias
 BiasInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
@@ -51,50 +51,11 @@ def step_bias(
     - Read noise scalar = median of the scatter map
     """
     params = params or {}
-    inputs: List[BiasInput] = list(raw_inputs or [])
-    n_inputs = len(inputs)
-    if n_inputs == 0:
-        # Fail fast per architecture guidance: empty inputs indicate a planning/scoping error
-        raise ValueError("step_bias requires at least one raw bias input in raw_inputs")
-
-    # Read all frames serially. Parallelism is handled by the task/executor layer.
-    def _reduce_one(idx_item):
-        i, it = idx_item
-        p = it.get("path")
-        tm = it.get("tar_member")
-        if not p:
-            return None, i, "no-path"
-        try:
-            img, _err = _ccd.reduce_raw_amplifier_frame(p, tm, return_header=False)
-            return img, i, None
-        except Exception as e:
-            # Do not implement test-only fallbacks in production algorithms; tests should
-            # provide inputs via fixtures/mocks. Propagate error for the caller to handle.
-            return None, i, str(e)
-
-    frames: List[np.ndarray] = []
-    errors: List[str] = []
-
-    for i, it in enumerate(inputs):
-        img, idx, err = _reduce_one((i, it))
-        if img is not None:
-            frames.append(img)
-        elif err:
-            errors.append(f"[{idx}] {err}")
-
-    if not frames:
-        # Aggregate a few input errors to aid debugging without changing behavior
-        detail = ("; ".join(errors[:5])) if errors else "no per-input errors captured"
-        raise RuntimeError(f"No readable bias frames provided to step_bias (n_inputs={n_inputs}). Sample errors: {detail}")
-
-    # Align shapes (ensure all equal); if not, raise
-    shapes = {f.shape for f in frames}
-    if len(shapes) != 1:
-        raise ValueError(f"Input bias frames have differing shapes: {sorted(shapes)}")
+    frames = array_frames(raw_inputs or [])
 
     stack = np.stack(frames, axis=0)
     # Use biweight location for stack combination to avoid digitization bias
-    master = biweight_location(stack, axis=0, ignore_nan=True)
+    master = chunked_biweight_location(stack, axis=0)
     # Robust per-pixel scatter via MAD (kept as median-of-abs-dev for now)
     mad = np.median(np.abs(stack - master[None, :, :]), axis=0) * 1.4826
     # Scalar read-noise estimate

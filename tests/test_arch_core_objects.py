@@ -8,9 +8,9 @@ from virusflow.contracts.result import BiasResultContract
 from virusflow.contracts.artifact import (
     MasterBiasContract,
     MasterDarkContract,
-    MasterFlatContract,
-    TraceContract,
-    WaveContract,
+    MasterLDLSContract,
+    TraceMapContract,
+    WavelengthMapContract,
 )
 from virusflow.publication.context import PublicationContext
 
@@ -36,12 +36,12 @@ def test_algo_result_as_meta_includes_kind_and_version():
 essential_arr = np.arange(6, dtype=float).reshape(2, 3)
 
 def test_artifact_request_multi_component():
-    comp_master = LogicalComponent(name="master_flat", model_type="array2d", value=essential_arr)
+    comp_master = LogicalComponent(name="master_ldls", model_type="array2d", value=essential_arr)
     comp_mask = LogicalComponent(name="flat_response_mask", model_type="array2d", value=np.ones_like(essential_arr))
     req = ArtifactRequest(
-        kind="master_flat",
+        kind="master_ldls",
         components={
-            "master_flat": comp_master,
+            "master_ldls": comp_master,
             "flat_response_mask": comp_mask,
         },
         summaries={"bad_fraction": 0.12},
@@ -50,8 +50,8 @@ def test_artifact_request_multi_component():
         labels=["calib", "flat"],
     )
     names = req.component_names()
-    assert set(names) == {"master_flat", "flat_response_mask"}
-    assert req.get_component("master_flat").model_type == "array2d"
+    assert set(names) == {"master_ldls", "flat_response_mask"}
+    assert req.get_component("master_ldls").model_type == "array2d"
 
 
 def test_result_contract_smoke_validation():
@@ -63,7 +63,10 @@ def test_result_contract_smoke_validation():
 
 
 def test_artifact_contract_specs_present():
-    for cls in (MasterBiasContract, MasterDarkContract, MasterFlatContract, TraceContract, WaveContract):
+    for cls in (
+        MasterBiasContract, MasterDarkContract, MasterLDLSContract,
+        TraceMapContract, WavelengthMapContract,
+    ):
         spec = cls().spec()
         assert isinstance(spec.kind, str) and len(spec.kind) > 0
         # At least one component defined

@@ -5,7 +5,7 @@ Unified algorithm return contract (lightweight).
 
 This module defines AlgoResult, a small, optional container that algorithms may
 return to structure their outputs without constraining scientific freedom. It
-unifies how Tasks, QA (DiagnosticsFacade), and Analytics can interact with
+unifies how Tasks, the canonical QA service, and Analytics can interact with
 algorithm returns while remaining fully backward‑compatible with plain dicts.
 
 Usage options (non‑breaking):

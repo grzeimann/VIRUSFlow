@@ -26,7 +26,7 @@ __all__ = ["fit_wavelength_solution"]
 logger = logging.getLogger(__name__)
 
 # Algorithm version string for this module
-ALGO_VERSION = "wave-1.0"
+ALGO_VERSION = "wave-1.1"
 
 # Default pixel length assumption for VIRUS spectra, used in some helpers
 PIXELS = 1032
@@ -257,6 +257,7 @@ def _identify_arc(
         "rms": rms,
         "top_peaks_x": top_peaks_x,
         "peak_x_all": np.array(peak_x, dtype=float),
+        "peak_h_all": np.array(peak_h, dtype=float),
         "detected_x": detected_x,
     }
     return best, len(matches)
@@ -339,7 +340,14 @@ def fit_amplifier_wavelength_map(spec: np.ndarray,
     qa_plotted = False
     ref_img: Optional[Path] = None
     qa_best: Optional[dict] = None
+    attempted = np.zeros((nrows,), dtype=np.uint8)
+    fit_completed = np.zeros((nrows,), dtype=np.uint8)
+    failure_code = np.zeros((nrows,), dtype=np.uint8)
+    fit_coefficients = np.full((nrows, int(order) + 1), np.nan, dtype=float)
+    candidate_evidence = []
+    line_evidence = []
     for j in try_rows:
+        attempted[j] = 1
         try:
             # Robustify by median-combining a small window of rows, as before
             j0 = max(0, j - 2)
@@ -348,6 +356,46 @@ def fit_amplifier_wavelength_map(spec: np.ndarray,
             wave_j, res, best = fit_single_fiber_wavelength_solution(S, final_order=order)
             w_seed[j] = wave_j
             rms[j] = res
+            fit_completed[j] = 1
+            coefficient_values = best.get("coeff")
+            coefficients = np.asarray(
+                [] if coefficient_values is None else coefficient_values, dtype=float
+            ).ravel()
+            if coefficients.size:
+                fit_coefficients[j, -min(coefficients.size, fit_coefficients.shape[1]):] = (
+                    coefficients[-fit_coefficients.shape[1]:]
+                )
+            matches = list(best.get("matches") or [])
+            matched_by_peak = {
+                int(match.get("peak_index")): match
+                for match in matches
+                if match.get("peak_index") is not None
+            }
+            peak_x_values = best.get("peak_x_all")
+            peak_h_values = best.get("peak_h_all")
+            peak_x = np.asarray(
+                [] if peak_x_values is None else peak_x_values, dtype=float
+            ).ravel()
+            peak_h = np.asarray(
+                [] if peak_h_values is None else peak_h_values, dtype=float
+            ).ravel()
+            for peak_index, x_value in enumerate(peak_x):
+                match = matched_by_peak.get(peak_index)
+                candidate_evidence.append([
+                    float(j), float(x_value),
+                    float(peak_h[peak_index]) if peak_index < peak_h.size else np.nan,
+                    float(match is not None),
+                    float(match.get("wave_ref")) if match is not None else np.nan,
+                    float(match.get("wave_resid")) if match is not None else np.nan,
+                    float(match.get("x_resid")) if match is not None else np.nan,
+                ])
+            for match in matches:
+                line_evidence.append([
+                    float(j), float(match.get("x_obs")),
+                    float(match.get("wave_ref")), float(match.get("wave_fit")),
+                    float(match.get("wave_resid")), float(match.get("x_resid")),
+                    float(match.get("peak_index")),
+                ])
             # Track best identification for QA plotting on failure
             try:
                 nmatch = int(best.get("nmatch", 0)) if isinstance(best, dict) else -1
@@ -357,11 +405,32 @@ def fit_amplifier_wavelength_map(spec: np.ndarray,
                 qa_best = {"ref_profile": np.asarray(S, dtype=float), "best": best}
         except Exception:
             # Leave defaults (zeros), continue
-            pass
+            failure_code[j] = 3
 
     good = (rms > 0) & (rms < res_lim)
+    failure_code[(attempted > 0) & (fit_completed > 0) & ~good] = 2
+    failure_code[good] = 1
+    interpolated = np.zeros((nrows,), dtype=np.uint8)
+    extrapolated = np.zeros((nrows,), dtype=np.uint8)
+    good_rows = np.flatnonzero(good)
+    if good_rows.size:
+        row_index = np.arange(nrows)
+        extrapolated[(row_index < good_rows.min()) | (row_index > good_rows.max())] = 1
+        interpolated[(~good) & (extrapolated == 0)] = 1
+    diagnostics = {
+        "seed_region_attempted_mask": attempted,
+        "seed_region_success_mask": good.astype(np.uint8),
+        "seed_region_failure_code": failure_code,
+        "seed_fit_coefficients": fit_coefficients,
+        "arc_candidate_evidence": np.asarray(candidate_evidence, dtype=float).reshape(-1, 7),
+        "arc_line_evidence": np.asarray(line_evidence, dtype=float).reshape(-1, 7),
+        "interpolated_fiber_mask": interpolated,
+        "extrapolated_fiber_mask": extrapolated,
+    }
+    qa_bundle = dict(qa_best or {})
+    qa_bundle["diagnostics"] = diagnostics
     if np.count_nonzero(good) < 7:
-        return None, ref_img, rms, qa_best
+        return None, ref_img, rms, qa_bundle
 
     # Initialize final wavelength array
     wave = np.zeros_like(spec, dtype=float)
@@ -392,9 +461,9 @@ def fit_amplifier_wavelength_map(spec: np.ndarray,
                 jj = int(np.argmin(np.abs(np.where(good)[0] - j)))
                 wave[j] = wave[np.where(good)[0][jj]]
             else:
-                return None, ref_img, rms, qa_best
+                return None, ref_img, rms, qa_bundle
 
-    return wave, ref_img, rms, qa_best
+    return wave, ref_img, rms, qa_bundle
 
 
 
@@ -407,6 +476,7 @@ def fit_wavelength_solution(*,
                             npix_extract: int = 5,
                             res_lim: float = 1.0,
                             order: int = 4,
+                            input_pixel_mask: Optional[np.ndarray] = None,
                             params: Optional[dict] = None) -> AlgoResult:
     """
     Build the wavelength solution from spectra of the master comparison (arc) frame.
@@ -486,14 +556,20 @@ def fit_wavelength_solution(*,
     if wave is None:
         failure_reason = "wavelength modeling failed"
         try:
-            if rms_rows is not None:
+            extracted = np.asarray(comparison_lamp_fiber_spectra, dtype=float)
+            finite_nonzero = np.isfinite(extracted) & (extracted != 0)
+            if not np.any(finite_nonzero):
+                failure_reason = "comparison-lamp extraction contains no finite nonzero signal"
+            elif rms_rows is not None:
                 arr = np.asarray(rms_rows, dtype=float).ravel()
                 fin = arr[np.isfinite(arr) & (arr > 0)]
-                tried = int(np.count_nonzero(np.isfinite(arr)))
+                candidate_rows = np.hstack([np.arange(2, arr.size, 8), arr.size - 3])
+                candidate_rows = np.unique(np.clip(candidate_rows, 0, arr.size - 1))
                 good = int(np.count_nonzero((arr > 0) & (arr < float(res_lim))))
                 med = float(np.nanmedian(fin)) if fin.size else np.nan
                 failure_reason = (f"insufficient good seed rows: {good} < 7 (res_lim={float(res_lim)}) ; "
-                                   f"tried_rows={tried}/{arr.size}; median_rms={med if (med==med) else 'nan'}")
+                                   f"successful_seed_fits={fin.size}/{candidate_rows.size}; "
+                                   f"median_rms={med if (med==med) else 'nan'}")
         except Exception:
             pass
         meta["failure_reason"] = failure_reason
@@ -507,6 +583,78 @@ def fit_wavelength_solution(*,
     except Exception:
         pass
 
+    arc_identification = None
+    try:
+        matches = ((qa_bundle or {}).get("best") or {}).get("matches") or []
+        if matches:
+            arc_identification = np.asarray(
+                [[m.get("x_obs"), m.get("wave_ref"), m.get("wave_fit"), m.get("wave_resid"), m.get("x_resid"), m.get("peak_index")] for m in matches],
+                dtype=float,
+            )
+    except Exception:
+        arc_identification = None
+
+    nrows = int(np.asarray(fiber_trace_map).shape[0])
+    diagnostics = dict((qa_bundle or {}).get("diagnostics") or {})
+    rms_evidence = np.asarray(
+        np.zeros((nrows,), dtype=float) if rms_rows is None else rms_rows,
+        dtype=float,
+    )
+    attempted = np.asarray(
+        diagnostics.get("seed_region_attempted_mask", rms_evidence > 0),
+        dtype=np.uint8,
+    )
+    success = np.asarray(
+        diagnostics.get(
+            "seed_region_success_mask",
+            (rms_evidence > 0) & (rms_evidence < float(res_lim)),
+        ),
+        dtype=np.uint8,
+    )
+    successful_rows = np.flatnonzero(success)
+    fallback_interpolated = np.zeros((nrows,), dtype=np.uint8)
+    fallback_extrapolated = np.zeros((nrows,), dtype=np.uint8)
+    if successful_rows.size:
+        indices = np.arange(nrows)
+        fallback_extrapolated[
+            (indices < successful_rows.min()) | (indices > successful_rows.max())
+        ] = 1
+        fallback_interpolated[(success == 0) & (fallback_extrapolated == 0)] = 1
+    best = (qa_bundle or {}).get("best") or {}
+    fallback_lines = np.asarray([
+        [
+            -1.0, match.get("x_obs"), match.get("wave_ref"),
+            match.get("wave_fit"), match.get("wave_resid"),
+            match.get("x_resid"), match.get("peak_index"),
+        ]
+        for match in (best.get("matches") or [])
+    ], dtype=float).reshape(-1, 7)
+    fallback_peak_values = best.get("peak_x_all")
+    if fallback_peak_values is None:
+        fallback_peak_values = best.get("detected_x")
+    fallback_candidates = np.asarray([
+        [-1.0, value, np.nan, 1.0, np.nan, np.nan, np.nan]
+        for value in np.asarray(
+            [] if fallback_peak_values is None else fallback_peak_values
+        ).ravel()
+    ], dtype=float).reshape(-1, 7)
+    mask = (
+        np.zeros(np.asarray(master_comparison_lamp).shape, dtype=bool)
+        if input_pixel_mask is None and master_comparison_lamp is not None
+        else np.asarray(input_pixel_mask, dtype=bool)
+        if input_pixel_mask is not None
+        else np.zeros((0, 0), dtype=bool)
+    )
+    meta.update({
+        "reference_arc_wavelengths": list(REFERENCE_ARC_WAVELENGTHS),
+        "seed_region_failure_code": {
+            "0": "not_attempted", "1": "accepted", "2": "rms_rejected",
+            "3": "fit_exception",
+        },
+        "wavelength_surface_state": "direct_seed_rows_plus_interpolation_or_extrapolation",
+        "input_pixel_mask_applied": bool(mask.size and np.any(mask)),
+    })
+
     return AlgoResult(
         kind="wave",
         version=ALGO_VERSION,
@@ -515,5 +663,36 @@ def fit_wavelength_solution(*,
         arrays={
             "wavelength_map": wave,
             "per_fiber_wavelength_residual_rms": rms_rows,
+            "arc_identification": arc_identification,
+            "arc_candidate_evidence": np.asarray(
+                diagnostics.get("arc_candidate_evidence", fallback_candidates), dtype=np.float32
+            ),
+            "arc_line_evidence": np.asarray(
+                diagnostics.get("arc_line_evidence", fallback_lines), dtype=np.float32
+            ),
+            "seed_region_attempted_mask": attempted,
+            "seed_region_success_mask": success,
+            "seed_region_failure_code": np.asarray(
+                diagnostics.get(
+                    "seed_region_failure_code",
+                    np.where(success > 0, 1, np.where(attempted > 0, 2, 0)),
+                ), dtype=np.uint8,
+            ),
+            "seed_fit_coefficients": np.asarray(
+                diagnostics.get(
+                    "seed_fit_coefficients",
+                    np.full((nrows, int(order) + 1), np.nan),
+                ), dtype=np.float32,
+            ),
+            "interpolated_fiber_mask": np.asarray(
+                diagnostics.get("interpolated_fiber_mask", fallback_interpolated),
+                dtype=np.uint8,
+            ),
+            "extrapolated_fiber_mask": np.asarray(
+                diagnostics.get("extrapolated_fiber_mask", fallback_extrapolated),
+                dtype=np.uint8,
+            ),
+            "input_mask_indices": np.flatnonzero(mask).astype(np.int32),
+            "input_mask_shape": np.asarray(mask.shape, dtype=np.int32),
         },
     )

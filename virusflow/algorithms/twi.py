@@ -13,13 +13,13 @@ Exports: step_twi
 from typing import Iterable, Optional, Dict, Any, List
 
 import numpy as np
-from astropy.stats import biweight_location
 
-from .ccd import reduce_raw_amplifier_frame
+from .inputs import array_frames
+from .robust import chunked_biweight_location
 # persistence removed per architecture
 
 # Algorithm version string for this module
-ALGO_VERSION = "twi-1.0"
+ALGO_VERSION = "twi-1.1"
 
 # Input item type accepted by step_twi (same structure as bias/dark/flat)
 TwiInput = Dict[str, Optional[str]]  # keys: 'path' (str), 'tar_member' (str|None)
@@ -43,41 +43,10 @@ def step_twi(
         Algorithm tuning parameters (reserved; none currently used).
     """
     params = params or {}
-    inputs: List[TwiInput] = list(raw_inputs or [])
-    if len(inputs) == 0:
-        raise ValueError("step_twi requires at least one raw twilight input in raw_inputs")
-
-    def _reduce_one(idx_item):
-        i, it = idx_item
-        p = it.get("path")
-        tm = it.get("tar_member")
-        if not p:
-            return None, i, "no-path"
-        try:
-            img, _err = reduce_raw_amplifier_frame(p, tm, return_header=False)
-            return img, i, None
-        except Exception as e:
-            return None, i, str(e)
-
-    frames: List[np.ndarray] = []
-    errors: List[str] = []
-
-    for i, it in enumerate(inputs):
-        img, idx, err = _reduce_one((i, it))
-        if img is not None:
-            frames.append(img)
-        elif err:
-            errors.append(f"[{idx}] {err}")
-
-    if not frames:
-        raise RuntimeError("No readable twilight frames provided to step_twi")
-
-    shapes = {f.shape for f in frames}
-    if len(shapes) != 1:
-        raise ValueError(f"Input twilight frames have differing shapes: {sorted(shapes)}")
+    frames = array_frames(raw_inputs or [])
 
     stack = np.stack(frames, axis=0)
-    master = biweight_location(stack, axis=0, ignore_nan=True)
+    master = chunked_biweight_location(stack, axis=0)
 
     return AlgoResult(
         kind="twi",

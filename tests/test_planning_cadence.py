@@ -6,7 +6,10 @@ from pathlib import Path
 from virusflow.registry import database as db
 from virusflow.core.identity import ZipCode
 from virusflow.artifacts.models import Scope
+from virusflow.planning import CadencePolicy, TemporalWindow, adapt_target
 from virusflow.planning.cadence import time_cadence_windows, exposure_count_windows
+from virusflow.planning.graph import ReductionGraph, TaskSpec
+from virusflow.tasks.base import CalibrationTask, TaskContext
 
 
 def _seed_zipcode(conn, z: ZipCode) -> None:
@@ -97,3 +100,43 @@ def test_exposure_count_windows_min_n_and_span(tmp_path: Path):
     scope2 = Scope(zipcode=z2)
     wins2 = exposure_count_windows(db_path=db_path2, scope=scope2, frame_type="flt", min_n=5, max_span_days=30)
     assert wins2 == []
+
+
+def test_planner_deduplicates_equal_effective_inputs_and_preserves_distinct_sets(tmp_path: Path):
+    db_path = str(tmp_path / "effective-inputs.sqlite3")
+    db.init_db(db_path=db_path)
+    z = ZipCode(ifuslot="004", ifuid="001", specid="001", amp="LL", controller="A")
+    with db.connect(db_path) as conn:
+        _seed_zipcode(conn, z)
+        for exposure_id in ("20260609T000500", "20260609T001000"):
+            _seed_exposure(
+                conn, exposure_id=exposure_id, when_ymd="20260609", frame_type="flt"
+            )
+            _seed_raw_file(conn, exposure_id=exposure_id, frame_type="flt", amp_key=z.key())
+
+    class OverlappingCadence(CadencePolicy):
+        def windows(self, **kwargs):
+            return [
+                TemporalWindow(datetime(2026, 6, 9, 0, 0), datetime(2026, 6, 9, 0, 6)),
+                TemporalWindow(datetime(2026, 6, 9, 0, 4), datetime(2026, 6, 9, 0, 6)),
+                TemporalWindow(datetime(2026, 6, 9, 0, 9), datetime(2026, 6, 9, 0, 11)),
+            ]
+
+    node = TaskSpec(kind="master_ldls", task_cls=object, inputs_raw=["flt"], cadence=OverlappingCadence())
+    planned, report = ReductionGraph([node], []).plan(
+        db_path=db_path, scopes=[Scope(zipcode=z)]
+    )
+
+    assert len(planned) == 2
+    assert len(report.skipped) == 1
+    assert set(report.reasons.values()) == {"duplicate_effective_raw_inputs"}
+
+    class FlatInputs(CalibrationTask):
+        frame_type = "flt"
+
+    resolved_ids = []
+    for target in planned:
+        task = FlatInputs(TaskContext(db_path, str(tmp_path), {}), target=adapt_target(target))
+        _, parent_ids = task.query_inputs()
+        resolved_ids.append(parent_ids)
+    assert resolved_ids == [[1], [2]]
