@@ -139,7 +139,7 @@ def build_model_spectra(
     finite &= good_norm[:, None]
     sample_wave = wave[finite]
     sample_flux = (image / norm_per_fiber[:, None])[finite]
-    
+
     if sample_wave.size < 4 or np.nanmax(sample_wave) <= np.nanmin(sample_wave):
         raise ValueError("insufficient finite samples to build spectral model")
 

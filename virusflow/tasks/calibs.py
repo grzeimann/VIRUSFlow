@@ -866,7 +866,7 @@ class AmplifierFiberResponseTask(_CanonicalTask):
             service.load_component(wavelength_id, "wavelength_map")["data"],
             science_spectrum=science_spectrum,
             common_model_bins=int(params.get("common_model_bins", 3000)),
-            broad_twilight_bins=int(params.get("broad_twilight_bins", 5)),
+            broad_ldls_bins=int(params.get("broad_ldls_bins", 5)),
             twilight_residual_bins=int(params.get("twilight_residual_bins", 25)),
             minimum_wavelength_finite_fraction=float(
                 params.get("minimum_wavelength_finite_fraction", 0.8)

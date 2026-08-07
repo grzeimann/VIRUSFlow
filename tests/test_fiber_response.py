@@ -40,15 +40,13 @@ def test_ldls_fine_structure_is_anchored_to_twilight_large_scale_response():
         twilight,
         wavelength,
         common_model_bins=500,
-        broad_twilight_bins=5,
+        broad_ldls_bins=5,
         twilight_residual_bins=25,
     )
     fitted = result.get_array("normalization")
     np.testing.assert_allclose(
         fitted,
-        result.get_array("ftf_ldls")
-        * result.get_array("twilight_broad_correction")
-        * (1.0 + result.get_array("twilight_residual_correction")),
+        result.get_array("ftf_ldls") * result.get_array("twilight_broad_correction"),
         rtol=2e-6,
         atol=2e-6,
     )
