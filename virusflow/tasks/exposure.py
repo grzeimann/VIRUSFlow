@@ -190,6 +190,7 @@ class ExposureTask(_SciencePublisher):
         amp_normalization = None
         response_by_key = {}
         seen_builds = set()
+        best_overlap = -1
         for candidates in candidate_sets:
             for candidate in candidates:
                 candidate_id = int(candidate["id"])
@@ -211,11 +212,15 @@ class ExposureTask(_SciencePublisher):
                         and row.get("amp_key")
                     ):
                         candidate_responses[str(row["amp_key"])] = row
-                if requested_keys <= set(candidate_responses):
+                # A degraded build (missing a routine minority of amplifiers) still
+                # covers this exposure's healthy majority; pick the build with the
+                # best overlap rather than requiring exact full coverage.
+                overlap = len(requested_keys & set(candidate_responses))
+                if overlap > best_overlap:
+                    best_overlap = overlap
                     amp_normalization = candidate
                     response_by_key = candidate_responses
-                    break
-            if amp_normalization is not None:
+            if best_overlap == len(requested_keys):
                 break
         for zipcode in zipcodes:
             kinds = {}
@@ -1078,6 +1083,11 @@ class ExposureTask(_SciencePublisher):
                     if "wavelength_map" not in calibration.get(zipcode.key(), {}):
                         failures.setdefault(zipcode.key(), []).append(
                             "extraction unavailable from wavelength calibration coverage"
+                        )
+                        continue
+                    if "within_amp_fiber_normalization" not in calibration.get(zipcode.key(), {}):
+                        failures.setdefault(zipcode.key(), []).append(
+                            "extraction unavailable from within-amp fiber normalization coverage"
                         )
                         continue
                     image = self._amp_from_physical(physical_image, zipcode.amp)

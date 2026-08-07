@@ -18,28 +18,38 @@ virusflow --help
 ## Quick start
 
 ```bash
-virusflow init --db ./run/registry.sqlite3
-virusflow scan --db ./run/registry.sqlite3 /path/to/raw/virus
-virusflow exposures --db ./run/registry.sqlite3 --start-date 20260609 --end-date 20260609
+virusflow init --raw-db ./run/virusflow_raw.sqlite3
+virusflow scan --raw-db ./run/virusflow_raw.sqlite3 /path/to/raw/virus
+virusflow exposures --raw-db ./run/virusflow_raw.sqlite3 --start-date 20260609 --end-date 20260609
 
 virusflow run calibrations \
-  --db ./run/registry.sqlite3 \
+  --db ./run/virusflow.sqlite3 \
+  --raw-db ./run/virusflow_raw.sqlite3 \
   --workdir ./run/artifacts \
   --configuration-root . \
   --start-date 20260609 \
   --end-date 20260609
 
 virusflow run observation \
-  --db ./run/registry.sqlite3 \
+  --db ./run/virusflow.sqlite3 \
+  --raw-db ./run/virusflow_raw.sqlite3 \
   --workdir ./run/artifacts \
   --configuration-root . \
   --observation-id 20260609-OBSID6 \
   --progress-file ./run/progress.jsonl
 
-virusflow artifact list --db ./run/registry.sqlite3 --kind calibrated_fiber_observation
-virusflow storage report --db ./run/registry.sqlite3
+virusflow artifact list --db ./run/virusflow.sqlite3 --kind calibrated_fiber_observation
+virusflow storage report --db ./run/virusflow.sqlite3
 virusflow cleanup scratch --workdir ./run/artifacts
 ```
+
+`init`, `scan`, and `exposures` operate on the raw-frame catalog only (`--raw-db`,
+default `./virusflow_raw.sqlite3`). `run calibrations|exposure|observation` need
+both the raw-frame catalog (`--raw-db`) and the artifact/product registry
+(`--db`, default `./virusflow.sqlite3`) — these are two distinct SQLite files.
+`artifact`, `model`, `qa`, `study`, `analyze`, and `storage report` only need
+`--db`. Both flags also read from the `VIRUSFLOW_RAW_DB`/`VIRUSFLOW_DB`
+environment variables if set.
 
 Calibration execution is strict: it exits nonzero if any requested Product is scientifically
 unavailable. Successfully published Products remain registered and can support a later exposure

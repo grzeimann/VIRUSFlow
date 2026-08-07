@@ -428,6 +428,16 @@ class ReductionGraph:
                     builds.setdefault(identity, []).append(source)
                 for exposure_ids, members in sorted(builds.items(), key=lambda item: str(item[0])):
                     members.sort(key=lambda target: scope_key(target.scope))
+                    healthy = [
+                        member for member in members
+                        if (upstream, member.group.group_id) not in terminal_groups
+                    ]
+                    excluded = [member for member in members if member not in healthy]
+                    min_coverage_fraction = 0.9  # routine per-amplifier QA flags shouldn't block the whole build
+                    if excluded and healthy and len(healthy) / len(members) >= min_coverage_fraction:
+                        members = healthy  # build from the healthy majority; drop the terminal minority
+                    else:
+                        excluded = []
                     parent_groups = tuple(
                         (upstream, member.group.group_id) for member in members
                     )
@@ -462,6 +472,8 @@ class ReductionGraph:
                             "amplifier_keys": amplifier_keys,
                             "calibration_build_id": identity,
                             "coverage_count": len(amplifier_keys),
+                            "coverage_complete": not excluded,
+                            "excluded_amplifier_keys": [scope_key(member.scope) for member in excluded],
                         },
                         applicability={
                             "start": start.isoformat(), "end": end.isoformat(),

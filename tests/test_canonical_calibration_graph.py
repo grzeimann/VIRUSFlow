@@ -405,6 +405,183 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
     assert [target.kind for target in stale_policy_rerun] == ["master_bias"]
 
 
+def test_amp_to_amp_normalization_builds_from_majority_when_one_amplifier_is_terminal(
+    tmp_path, monkeypatch
+):
+    zipcodes = [
+        ZipCode(ifuslot="020", ifuid=f"{index:03d}", specid="001", amp=amp, controller="A")
+        for index in range(1, 6)
+        for amp in ("LL", "LU")
+    ]
+    database = str(tmp_path / "degraded-coverage.sqlite3")
+    db.init_db(database)
+    with db.connect(database) as conn:
+        for current in zipcodes:
+            conn.execute(
+                "INSERT INTO amplifiers(key, ifuslot, ifuid, specid, amp, controller) VALUES(?,?,?,?,?,?)",
+                (current.key(), current.ifuslot, current.ifuid, current.specid, current.amp, current.controller),
+            )
+            for frame_type, count in (("zro", 10), ("drk", 5), ("flt", 10), ("hg", 1), ("cd", 1), ("twi", 1)):
+                _seed(conn, current, frame_type, count, lamp=frame_type if frame_type in {"hg", "cd"} else None)
+            _seed(conn, current, "sci", 3, exptime=700.0)
+
+    reference_dir = tmp_path / "Fiber_Locations" / "20260609"
+    reference_dir.mkdir(parents=True)
+    for current in zipcodes:
+        np.savetxt(
+            reference_dir / f"fiber_loc_001_020_{current.ifuid}_{current.amp}.txt",
+            np.array([[5.0, 0.0], [12.0, 0.0]]),
+        )
+
+    import virusflow.tasks.calibs as calibs
+
+    def fake_trace(*, master_ldls_array, trace_reference, zipcode):
+        nx = master_ldls_array.shape[1]
+        return AlgoResult(
+            kind="trace", version="test-trace",
+            arrays={
+                "fiber_trace_map": np.repeat(np.array([[6.0], [14.0]]), nx, axis=1),
+                "trace_sample_columns": np.array([4.0, 16.0, 28.0]),
+                "sampled_trace_positions": np.array([[6.0, 6.0, 6.0], [14.0, 14.0, 14.0]]),
+                "per_fiber_trace_residual_rms": np.array([0.0, 0.0]),
+                "trace_sample_valid_mask": np.ones((2, 3), dtype=np.uint8),
+                "trace_fit_residuals": np.zeros((2, 3), dtype=float),
+                "per_fiber_valid_sample_count": np.full(2, 3, dtype=np.int16),
+                "trace_interpolated_fiber_mask": np.zeros(2, dtype=np.uint8),
+            },
+        )
+
+    def fake_wave(**kwargs):
+        trace = kwargs["fiber_trace_map"]
+        return AlgoResult(
+            kind="wave", version="test-wave",
+            arrays={
+                "wavelength_map": np.broadcast_to(
+                    np.linspace(3500.0, 5500.0, trace.shape[1]), trace.shape
+                ).copy(),
+                "per_fiber_wavelength_residual_rms": np.array([0.1, 0.2]),
+                "arc_identification": np.array([[100.0, 4358.3, 4358.4, 0.1, 0.05, 0.0]]),
+                "arc_candidate_evidence": np.array(
+                    [[0.0, 100.0, 10.0, 1.0, 4358.3, 0.1, 0.05]]
+                ),
+                "arc_line_evidence": np.array(
+                    [[0.0, 100.0, 4358.3, 4358.4, 0.1, 0.05, 0.0]]
+                ),
+                "seed_region_attempted_mask": np.ones(2, dtype=np.uint8),
+                "seed_region_success_mask": np.ones(2, dtype=np.uint8),
+                "seed_region_failure_code": np.ones(2, dtype=np.uint8),
+                "seed_fit_coefficients": np.ones((2, 5), dtype=float),
+                "interpolated_fiber_mask": np.zeros(2, dtype=np.uint8),
+                "extrapolated_fiber_mask": np.zeros(2, dtype=np.uint8),
+                "input_mask_indices": np.empty(0, dtype=np.int32),
+                "input_mask_shape": np.asarray([1032, trace.shape[1]], dtype=np.int32),
+            },
+            scalars={"best_nmatch": 1, "best_rms": 0.1},
+        )
+
+    def fake_dark(*, raw_inputs, params):
+        shape = np.asarray(raw_inputs[0]["data"]).shape
+        return AlgoResult(
+            kind="dark", version="test-dark",
+            arrays={
+                "master_dark": np.zeros(shape, dtype=float),
+                "dark_pixel_mask": np.zeros(shape, dtype=np.uint8),
+            },
+            scalars={"bad_fraction": 0.0, "n_inputs": len(raw_inputs)},
+        )
+
+    monkeypatch.setattr(calibs, "fit_fiber_traces", fake_trace)
+    monkeypatch.setattr(calibs, "fit_wavelength_solution", fake_wave)
+    monkeypatch.setattr(calibs.DarkTask, "algorithm", staticmethod(fake_dark))
+
+    nodes, edges = default_calibration_graph()
+    graph = ReductionGraph(nodes, edges)
+    scopes = [Scope(zipcode=current) for current in zipcodes]
+    _, report = graph.plan(db_path=database, scopes=scopes)
+
+    context = TaskContext(
+        database,
+        str(tmp_path / "products"),
+        {"raw_frame_loader": _Loader(), "configuration_root": str(tmp_path)},
+    )
+    scheduled = schedule(
+        targets=report.planned,
+        nodes=nodes,
+        edges=edges,
+        kind_to_task=default_kind_to_task(),
+        task_context_factory=lambda: context,
+        target_adapter=adapt_target,
+    )
+    executor = PlanningExecutor(max_workers=1, debug=False)
+    for item in scheduled:
+        executor.add_task(item.id, item.task, kind=item.kind, depends_on=item.depends_on)
+    executor.run()
+
+    service = ArtifactService(database)
+    amp_row = service.select_best(
+        kind="amp_to_amp_normalization", scope=Scope(zipcode=None), policy="latest"
+    )
+    assert amp_row is not None
+    amp_description = service.describe(amp_row)
+    assert amp_description["summary"]["algorithm_metadata"]["coverage_complete"] is True
+    assert amp_description["summary"]["algorithm_metadata"]["amplifier_keys"] == [
+        current.key() for current in zipcodes
+    ]
+
+    bad_zipcode = zipcodes[0]
+    bad_row = service.select_best(
+        kind="within_amp_fiber_normalization", scope=Scope(zipcode=bad_zipcode), policy="latest"
+    )
+    assert bad_row is not None
+    policy_version = service.diagnostics.policy_version_for("within_amp_fiber_normalization")
+    db.save_qa_bundle(
+        int(bad_row["id"]),
+        facts={"read_noise": {"value": 999.0}},
+        status="fail",
+        usability="unusable",
+        policy_version=policy_version,
+        db_path=database,
+    )
+
+    replanned, replan_report = graph.plan(db_path=database, scopes=scopes)
+    degraded_target = next(
+        target for target in replanned if target.kind == "amp_to_amp_normalization"
+    )
+    assert degraded_target.group.metadata["coverage_complete"] is False
+    assert degraded_target.group.metadata["excluded_amplifier_keys"] == [bad_zipcode.key()]
+    assert bad_zipcode.key() not in degraded_target.group.metadata["amplifier_keys"]
+    assert len(degraded_target.group.metadata["amplifier_keys"]) == 9
+
+    replan_context = TaskContext(
+        database,
+        str(tmp_path / "products"),
+        {"raw_frame_loader": _Loader(), "configuration_root": str(tmp_path)},
+    )
+    replan_scheduled = schedule(
+        targets=replanned,
+        nodes=nodes,
+        edges=edges,
+        kind_to_task=default_kind_to_task(),
+        task_context_factory=lambda: replan_context,
+        target_adapter=adapt_target,
+    )
+    replan_executor = PlanningExecutor(max_workers=1, debug=False)
+    for item in replan_scheduled:
+        replan_executor.add_task(item.id, item.task, kind=item.kind, depends_on=item.depends_on)
+    replan_executor.run()
+
+    degraded_row = service.select_best(
+        kind="amp_to_amp_normalization", scope=Scope(zipcode=None), policy="latest"
+    )
+    assert int(degraded_row["id"]) != int(amp_row["id"])
+    degraded_description = service.describe(degraded_row)
+    assert degraded_description["summary"]["algorithm_metadata"]["coverage_complete"] is False
+    assert degraded_description["summary"]["algorithm_metadata"]["excluded_amplifier_keys"] == [
+        bad_zipcode.key()
+    ]
+    assert len(degraded_description["relations"]) == 9
+
+
 def test_critical_read_noise_blocks_calibration_branches_before_wavelength(
     tmp_path, monkeypatch
 ):

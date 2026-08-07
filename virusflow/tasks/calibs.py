@@ -985,7 +985,8 @@ class CalibrationAmpNormalizationTask(_CanonicalTask):
             meta={
                 "calibration_build_id": build_metadata.get("calibration_build_id"),
                 "amplifier_keys": amplifier_keys,
-                "coverage_complete": True,
+                "coverage_complete": bool(build_metadata.get("coverage_complete", True)),
+                "excluded_amplifier_keys": list(build_metadata.get("excluded_amplifier_keys", []) or []),
                 "illumination_reference": "center_track_master_twilight",
                 "normalization_assumption": "uniform_center_track_twilight",
             },
