@@ -23,6 +23,8 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.collections import EllipseCollection
+from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -366,8 +368,34 @@ def plot_collapsed_focal_plane(service, exposure_id, out_dir, report, ctx):
 
     vmin, vmax = _robust_range(collapsed)
     fig, ax = plt.subplots(figsize=FIGSIZE)
-    scatter = ax.scatter(focal[:, 0], focal[:, 1], c=collapsed, s=8, vmin=vmin, vmax=vmax, cmap="viridis")
-    fig.colorbar(scatter, ax=ax, label="median calibrated flux (1e-17 response-corrected electron)")
+
+    fibers = EllipseCollection(
+        widths=np.full(len(focal), 1.5),
+        heights=np.full(len(focal), 1.5),
+        angles=np.zeros(len(focal)),
+        units="xy",
+        offsets=focal,
+        offset_transform=ax.transData,
+        array=collapsed,
+        cmap="viridis",
+        edgecolors="none",
+        rasterized=True,
+    )
+
+    fibers.set_clim(vmin, vmax)
+    ax.add_collection(fibers)
+
+    ax.update_datalim(focal)
+    ax.autoscale_view()
+    ax.set_aspect("equal")
+    cax = inset_axes(ax, width="25%", height="3%", loc="upper left", bbox_to_anchor=(0.02, -0.1, 1, 1), 
+                     bbox_transform=ax.transAxes, borderpad=0)
+
+    cbar = fig.colorbar(fibers, cax=cax, orientation="horizontal")
+
+    cbar.ax.xaxis.set_ticks_position("top")
+    cbar.ax.xaxis.set_label_position("top")
+    cbar.set_label("median calibrated flux")
 
     detections_row = get_product(service, "source_detection_catalog", exposure_id=exposure_id)
     if detections_row is not None:
@@ -388,7 +416,8 @@ def plot_collapsed_focal_plane(service, exposure_id, out_dir, report, ctx):
     ax.legend(fontsize=8)
     ax.set_aspect("equal", adjustable="datalim")
     path = out_dir / "collapsed_focal_plane.png"
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+
+    fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
     report.generated(f"{exposure_id}/collapsed_focal_plane", path)
 
@@ -410,9 +439,36 @@ def plot_illumination(service, exposure_id, out_dir, report):
         return
 
     vmin, vmax = _robust_range(fiber_factor)
+    vmin, vmax = (0.95, 1.05)
     fig, ax = plt.subplots(figsize=FIGSIZE)
-    scatter = ax.scatter(focal[:, 0], focal[:, 1], c=fiber_factor, s=8, vmin=vmin, vmax=vmax, cmap="magma")
-    fig.colorbar(scatter, ax=ax, label="fiber illumination factor (1)")
+    fibers = EllipseCollection(
+        widths=np.full(len(focal), 1.5),
+        heights=np.full(len(focal), 1.5),
+        angles=np.zeros(len(focal)),
+        units="xy",
+        offsets=focal,
+        offset_transform=ax.transData,
+        array=fiber_factor,
+        cmap="magma",
+        edgecolors="none",
+        rasterized=True,
+    )
+
+    fibers.set_clim(vmin, vmax)
+    ax.add_collection(fibers)
+
+    ax.update_datalim(focal)
+    ax.autoscale_view()
+    ax.set_aspect("equal")
+    cax = inset_axes(ax, width="25%", height="3%", loc="upper left", bbox_to_anchor=(0.02, -0.1, 1, 1),
+                     bbox_transform=ax.transAxes, borderpad=0)
+
+    cbar = fig.colorbar(fibers, cax=cax, orientation="horizontal")
+
+    cbar.ax.xaxis.set_ticks_position("top")
+    cbar.ax.xaxis.set_label_position("top")
+    cbar.set_label("illumination factor")
+    
     ax.set_xlabel("focal-plane x (arcsec)")
     ax.set_ylabel("focal-plane y (arcsec)")
     ax.set_title(f"Exposure {exposure_id}: focal-plane illumination correction")

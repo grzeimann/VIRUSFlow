@@ -134,8 +134,12 @@ def build_model_spectra(
         raise ValueError("spectral model requires at least two bins")
 
     finite = rows[:, None] & np.isfinite(wave) & np.isfinite(image)
+    norm_per_fiber = np.nanmedian(np.where(finite, image, np.nan), axis=1)
+    good_norm = rows & np.isfinite(norm_per_fiber) & (norm_per_fiber > 0)
+    finite &= good_norm[:, None]
     sample_wave = wave[finite]
-    sample_flux = image[finite]
+    sample_flux = (image / norm_per_fiber[:, None])[finite]
+    
     if sample_wave.size < 4 or np.nanmax(sample_wave) <= np.nanmin(sample_wave):
         raise ValueError("insufficient finite samples to build spectral model")
 
