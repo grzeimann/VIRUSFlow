@@ -86,7 +86,6 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         ("master_bias", "extracted_master_sci_spectrum"),
         ("master_bias", "extracted_master_ldls_spectrum"),
         ("master_bias", "extracted_master_twilight_spectrum"),
-        ("master_bias", "exposure_fiber_response"),
         ("master_bias", "fiber_wavelength_spectral_mask"),
         ("master_ldls", "trace_map"),
         ("master_hg", "master_arc"),

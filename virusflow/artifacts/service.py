@@ -89,7 +89,8 @@ class ArtifactService:
         self.serializers = self._default_serializers()
         self.diagnostics = QADiagnosticsService(self.adapter, component_loader=self.load_component)
 
-    def register(self, artifact: Artifact) -> int:
+    def register(self, artifact: Artifact, *, group_declarations=(), group_memberships=(),
+                 group_inputs=()) -> int:
         if not artifact.kind:
             raise ValueError("Artifact.kind is required")
         if not artifact.role:
@@ -137,7 +138,10 @@ class ArtifactService:
                 )
         from ..performance import phase
         with phase("artifact_publish"):
-            return self.adapter.register(artifact, components=components)
+            return self.adapter.register(
+                artifact, components=components, group_declarations=group_declarations,
+                group_memberships=group_memberships, group_inputs=group_inputs,
+            )
 
     def persist_request(self, request: ArtifactRequest, *, context: Any, policy: Any, base_dir: str) -> Artifact:
         if not request.components:
@@ -210,14 +214,20 @@ class ArtifactService:
         stable_parents.extend(
             f"raw:{raw_id}" for raw_id in raw_parents
         )
+        group_declarations, group_memberships, group_inputs = self._group_request_rows(request)
         revision = request.revision or self._logical_revision(
             kind, scope, normalized_components, stable_parents, context,
             request.configuration_refs, request.scientific_metadata,
+            tuple((row["input_name"], row["measurement_group_id"]) for row in group_inputs),
         )
         from ..performance import current_task_timing, phase
         with phase("artifact_lookup"):
             existing = self.adapter.find_by_revision(revision)
         if existing is not None and str(existing.get("state") or "active") == "active":
+            self.adapter.apply_measurement_group_relations(
+                int(existing["id"]), declarations=group_declarations,
+                memberships=group_memberships, inputs=group_inputs,
+            )
             return self._artifact_from_row(existing)
         tokens["revision"] = revision
 
@@ -368,12 +378,19 @@ class ArtifactService:
         )
         setattr(artifact, "_component_records", component_records)
         try:
-            artifact_id = self.register(artifact)
+            artifact_id = self.register(
+                artifact, group_declarations=group_declarations,
+                group_memberships=group_memberships, group_inputs=group_inputs,
+            )
         except sqlite3.IntegrityError:
             concurrent = self.adapter.find_by_revision(revision)
             if concurrent is None:
                 self._remove_written(written_paths)
                 raise
+            self.adapter.apply_measurement_group_relations(
+                int(concurrent["id"]), declarations=group_declarations,
+                memberships=group_memberships, inputs=group_inputs,
+            )
             return self._artifact_from_row(concurrent)
         artifact.id = int(artifact_id)
         timing = current_task_timing()
@@ -593,6 +610,8 @@ class ArtifactService:
                 "created_at": desc.provenance.created_at.isoformat(),
                 "configuration_references": [asdict(value) for value in desc.configuration_refs],
             },
+            "measurement_group_memberships": self.adapter.list_measurement_group_memberships(int(desc.id)),
+            "measurement_group_inputs": self.adapter.list_measurement_group_inputs(int(desc.id)),
             "analysis": {
                 "study_id": desc.metadata.get("study_id"),
                 "accepted_model_id": desc.metadata.get("accepted_model_id"),
@@ -734,7 +753,7 @@ class ArtifactService:
     @staticmethod
     def _logical_revision(
         kind, scope, components, parents, context, configuration_refs=(),
-        scientific_metadata=None,
+        scientific_metadata=None, measurement_group_inputs=(),
     ) -> str:
         digest = hashlib.sha256()
         identity = {
@@ -751,6 +770,7 @@ class ArtifactService:
             "scientific_metadata": normalize_scientific_metadata(
                 scientific_metadata
             ),
+            "measurement_group_inputs": sorted(measurement_group_inputs),
         }
         digest.update(json.dumps(identity, sort_keys=True, default=str).encode("utf-8"))
         for name, component in sorted(components.items()):
@@ -767,6 +787,45 @@ class ArtifactService:
                 digest.update(memoryview(array).cast("B"))
             digest.update(json.dumps(component.metadata, sort_keys=True, default=str).encode("utf-8"))
         return digest.hexdigest()[:32]
+
+    @staticmethod
+    def _group_request_rows(request: ArtifactRequest):
+        """Translate request records without exposing planning types to persistence."""
+        declarations = {}
+        memberships = []
+        inputs = []
+
+        def declaration(group):
+            value = {
+                "measurement_group_id": group.measurement_group_id,
+                "member_kind": group.member_kind, "coherence_rule": group.coherence_rule,
+                "coherence_rule_version": group.coherence_rule_version,
+                "coherence_key": dict(group.coherence_key),
+                "anchor_measurement_group_ids": list(group.anchor_measurement_group_ids),
+                "grouping_parameters": dict(group.grouping_parameters),
+                "configuration_references": [dict(item) for item in group.configuration_references],
+                "declared_slots": [
+                    {"member_scope_key": slot.member_scope_key,
+                     "member_computation_id": slot.member_computation_id}
+                    for slot in group.declared_slots
+                ],
+            }
+            declarations[group.measurement_group_id] = value
+
+        membership = request.measurement_group_membership
+        if membership is not None:
+            declaration(membership.group)
+            memberships.append({"measurement_group_id": membership.group.measurement_group_id,
+                                "member_scope_key": membership.member_scope_key,
+                                "member_computation_id": membership.member_computation_id})
+        for item in request.measurement_group_inputs:
+            declaration(item.group)
+            inputs.append({"input_name": item.input_name,
+                           "measurement_group_id": item.group.measurement_group_id,
+                           "selection_policy": item.selection_policy,
+                           "match_quality": item.match_quality,
+                           "selection_reason": dict(item.selection_reason)})
+        return list(declarations.values()), memberships, inputs
 
     def _artifact_from_row(self, row: Dict[str, Any]) -> Artifact:
         desc = self._describe_row(row, include_payload=False)

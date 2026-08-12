@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-from .graph import TaskSpec, Edge
+from .graph import Edge, SelectionUnit, TaskSpec
 from .targets import PurposeCadence
 from .config import PlanningConfig
 
@@ -189,7 +189,6 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         Edge(src=bias, dst=master_sci_spectrum, policy="qa_gate", tolerance_days=1),
         Edge(src=bias, dst=master_ldls_spectrum, policy="qa_gate", tolerance_days=1),
         Edge(src=bias, dst=master_twilight_spectrum, policy="qa_gate", tolerance_days=1),
-        Edge(src=bias, dst=exposure_fiber_response, policy="qa_gate", tolerance_days=1),
         Edge(src=bias, dst=master_sci_mask, policy="qa_gate", tolerance_days=1),
         # Reusable response illumination is detector corrected with the same
         # implemented bias + scaled-dark-residual convention as science data.
@@ -207,10 +206,10 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         Edge(src=trace, dst=master_ldls_spectrum, policy="latest_valid", tolerance_days=90),
         Edge(src=twilight, dst=master_twilight_spectrum, policy="exact_parent_group", tolerance_days=0),
         Edge(src=trace, dst=master_twilight_spectrum, policy="latest_valid", tolerance_days=90),
-        Edge(src=master_twilight_spectrum, dst=exposure_fiber_response, policy="exact_parent_group", tolerance_days=0),
-        Edge(src=master_ldls_spectrum, dst=exposure_fiber_response, policy="nearest_valid", tolerance_days=90),
-        Edge(src=wave, dst=exposure_fiber_response, policy="nearest_valid", tolerance_days=90),
-        Edge(src=master_sci_spectrum, dst=exposure_fiber_response, policy="optional_nearest_valid", tolerance_days=90),
+        Edge(src=master_twilight_spectrum, dst=exposure_fiber_response, policy="exact_parent_group", tolerance_days=0, selection_unit=SelectionUnit.MEASUREMENT_GROUP),
+        Edge(src=master_ldls_spectrum, dst=exposure_fiber_response, policy="nearest_valid", tolerance_days=90, selection_unit=SelectionUnit.MEASUREMENT_GROUP),
+        Edge(src=wave, dst=exposure_fiber_response, policy="nearest_valid", tolerance_days=90, selection_unit=SelectionUnit.MEASUREMENT_GROUP),
+        Edge(src=master_sci_spectrum, dst=exposure_fiber_response, policy="optional_nearest_valid", tolerance_days=90, selection_unit=SelectionUnit.MEASUREMENT_GROUP),
         Edge(src=master_sci_spectrum, dst=master_sci_mask, policy="exact_parent_group", tolerance_days=0),
         Edge(src=wave, dst=master_sci_mask, policy="latest_valid", tolerance_days=90),
     ]

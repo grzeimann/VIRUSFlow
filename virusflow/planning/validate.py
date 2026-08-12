@@ -1,14 +1,13 @@
-from __future__ import annotations
-
 """
 Validation utilities for planning graphs.
 
 These helpers ensure that nodes and edges satisfy minimal requirements so that
 callers (CLI/CI) can fail fast on misconfigurations.
 """
+from __future__ import annotations
 from typing import Sequence
 
-from .graph import TaskSpec, Edge
+from .graph import Edge, SelectionUnit, TaskSpec
 
 
 class PlanningValidationError(ValueError):
@@ -33,6 +32,10 @@ def validate_edges(nodes: Sequence[TaskSpec], edges: Sequence[Edge]) -> None:
             raise PlanningValidationError(f"edge[{i}] src kind {e.src.kind!r} not found in nodes")
         if e.dst.kind not in kinds:
             raise PlanningValidationError(f"edge[{i}] dst kind {e.dst.kind!r} not found in nodes")
+        if not isinstance(e.selection_unit, SelectionUnit):
+            raise PlanningValidationError(f"edge[{i}] has invalid selection_unit")
+        if e.selection_unit == SelectionUnit.MEASUREMENT_GROUP and e.policy == "qa_gate":
+            raise PlanningValidationError("QA gates cannot select MeasurementGroups")
 
 
 def validate_graph(nodes: Sequence[TaskSpec], edges: Sequence[Edge]) -> None:

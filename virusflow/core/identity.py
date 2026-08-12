@@ -1,7 +1,42 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+import hashlib
+import json
+from typing import Any, Mapping, Optional, Tuple
+
+
+def canonical_json(value: Any) -> str:
+    """Return the canonical JSON representation used by stable identities."""
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def measurement_group_identity(
+    *, member_kind: str, coherence_rule: str, coherence_rule_version: str,
+    coherence_key: Mapping[str, Any], declared_slots: Tuple[Any, ...],
+    anchor_measurement_group_ids: Tuple[str, ...] = (),
+    grouping_parameters: Mapping[str, Any] | None = None,
+    configuration_references: Tuple[Mapping[str, Any], ...] = (),
+) -> str:
+    """Compute the immutable identity of a declared measurement cohort."""
+
+    members = sorted(
+        ({"member_scope_key": slot.member_scope_key,
+          "member_computation_id": slot.member_computation_id} for slot in declared_slots),
+        key=lambda slot: slot["member_scope_key"],
+    )
+    payload = {
+        "identity_schema": 1, "member_kind": str(member_kind),
+        "coherence_rule": str(coherence_rule),
+        "coherence_rule_version": str(coherence_rule_version),
+        "coherence_key": dict(coherence_key),
+        "anchor_measurement_group_ids": sorted(map(str, anchor_measurement_group_ids)),
+        "material_grouping_parameters": dict(grouping_parameters or {}),
+        "material_configuration_references": list(configuration_references),
+        "declared_members": members,
+    }
+    return "mg:v1:" + hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)

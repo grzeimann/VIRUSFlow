@@ -1,6 +1,6 @@
-from __future__ import annotations
-
 """Dependency-aware execution for planned VIRUSFlow task graphs."""
+
+from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -19,6 +19,7 @@ class _Node:
     task: object
     deps: List[str]
     target: str
+    success_tolerant_dependencies: List[str]
 
 
 class WorkflowExecutionError(RuntimeError):
@@ -112,6 +113,7 @@ class PlanningExecutor:
         task: object,
         kind: Optional[str] = None,
         depends_on: List[str] | None = None,
+        success_tolerant_dependencies: List[str] | None = None,
         *,
         target: str | None = None,
     ) -> None:
@@ -119,12 +121,16 @@ class PlanningExecutor:
             raise ValueError(f"task node is already registered: {node_id}")
         task_kind = str(kind or getattr(task, "kind", "task"))
         label = str(target or self._target_label(node_id, task))
+        tolerant = list(success_tolerant_dependencies or [])
+        if not set(tolerant).issubset(set(depends_on or [])):
+            raise ValueError("success_tolerant_dependencies must be dependencies")
         self._nodes[node_id] = _Node(
             id=node_id,
             kind=task_kind,
             task=task,
             deps=list(depends_on or []),
             target=label,
+            success_tolerant_dependencies=tolerant,
         )
         self.progress.add_node(
             node_id, kind=task_kind, target=label,
@@ -261,7 +267,11 @@ class PlanningExecutor:
             while ready or in_flight:
                 while ready and len(in_flight) < self.max_workers:
                     node_id = ready.popleft()
-                    failed_dependencies = [dep for dep in self._nodes[node_id].deps if dep in unsuccessful]
+                    failed_dependencies = [
+                        dep for dep in self._nodes[node_id].deps
+                        if dep in unsuccessful
+                        and dep not in self._nodes[node_id].success_tolerant_dependencies
+                    ]
                     if failed_dependencies:
                         reason = f"blocked by prerequisite(s): {', '.join(failed_dependencies)}"
                         unsuccessful.add(node_id)

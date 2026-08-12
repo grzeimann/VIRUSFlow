@@ -14,17 +14,33 @@ Design constraints:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from datetime import datetime
 import hashlib
 import json
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..artifacts.models import Scope
+from ..ontology.entities import MeasurementGroup, MeasurementGroupSlot
 from ..ontology.scopes import PhysicalScope
 from ..artifacts.service import ArtifactService
 from ..registry import database as db
 
-from .targets import CalibrationGroup, PurposeCadence, Target, TemporalWindow, CadencePolicy
+from .targets import (CalibrationGroup, CadencePolicy, MeasurementGroupSelection,
+                      PurposeCadence, Target, TemporalWindow)
+
+
+class SelectionUnit(str, Enum):
+    ARTIFACT = "artifact"
+    MEASUREMENT_GROUP = "measurement_group"
+
+
+@dataclass(frozen=True)
+class MeasurementGroupingSpec:
+    coherence_rule: str
+    coherence_rule_version: str
+    anchor_input_kinds: tuple[str, ...] = ()
+    grouping_parameters: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -47,6 +63,7 @@ class TaskSpec:
     scope_mode: str = "per_zipcode"
     cadence: Optional[CadencePolicy] = None
     params_schema: Optional[Dict[str, Any]] = None
+    measurement_grouping: Optional[MeasurementGroupingSpec] = None
 
 
 @dataclass(frozen=True)
@@ -60,6 +77,7 @@ class Edge:
     dst: TaskSpec
     policy: str = "latest_valid"
     tolerance_days: int = 90
+    selection_unit: SelectionUnit = SelectionUnit.ARTIFACT
 
 
 @dataclass
@@ -428,16 +446,6 @@ class ReductionGraph:
                     builds.setdefault(identity, []).append(source)
                 for exposure_ids, members in sorted(builds.items(), key=lambda item: str(item[0])):
                     members.sort(key=lambda target: scope_key(target.scope))
-                    healthy = [
-                        member for member in members
-                        if (upstream, member.group.group_id) not in terminal_groups
-                    ]
-                    excluded = [member for member in members if member not in healthy]
-                    min_coverage_fraction = 0.9  # routine per-amplifier QA flags shouldn't block the whole build
-                    if excluded and healthy and len(healthy) / len(members) >= min_coverage_fraction:
-                        members = healthy  # build from the healthy majority; drop the terminal minority
-                    else:
-                        excluded = []
                     # An exposure-scoped product may consume several
                     # per-amplifier dependency kinds.  Carry every
                     # planner-resolved parent group forward so the task can
@@ -504,21 +512,85 @@ class ReductionGraph:
                             "parent_groups": list(parent_groups),
                             "amplifier_keys": amplifier_keys,
                             "calibration_build_id": identity,
-                            "coverage_count": len(amplifier_keys),
-                            "coverage_complete": not excluded,
-                            "excluded_amplifier_keys": [scope_key(member.scope) for member in excluded],
                         },
                         applicability={
                             "start": start.isoformat(), "end": end.isoformat(),
                             "selection_domain": "coherent_center_track_twilight_build",
                         },
                     )
+                    selections = []
+                    for dependency_kind in node.inputs_artifacts or ():
+                        candidates = [candidate for scope in scopes for candidate in
+                                      available.get((dependency_kind, scope_key(scope)), [])
+                                      if candidate.group is not None and
+                                      tuple(candidate.group.exposure_ids) == tuple(exposure_ids)]
+                        if not candidates:
+                            continue
+                        definition = MeasurementGroup(
+                            member_kind=dependency_kind,
+                            coherence_rule="shared_exposure_set",
+                            coherence_rule_version="1",
+                            coherence_key={"exposure_ids": sorted(exposure_ids)},
+                            declared_slots=tuple(MeasurementGroupSlot(
+                                scope_key(candidate.scope), candidate.group.computation_id
+                            ) for candidate in candidates),
+                        )
+                        edge = next(edge for edge in self._incoming[node.kind]
+                                    if edge.src.kind == dependency_kind)
+                        # Persisted normalized groups are candidates too.  The
+                        # registry merely supplies facts; this planner owns the
+                        # deterministic whole-cohort choice.
+                        persisted = svc.adapter.list_measurement_groups(dependency_kind)
+                        matching = [item for item in persisted if
+                                    item.get("coherence_key", {}).get("exposure_ids")
+                                    == sorted(exposure_ids)]
+                        if matching:
+                            slot_rows = svc.adapter.list_measurement_group_slots(
+                                [item["measurement_group_id"] for item in matching]
+                            )
+                            by_group = {}
+                            for slot in slot_rows:
+                                by_group.setdefault(slot["measurement_group_id"], []).append(slot)
+                            ranked = []
+                            for item in matching:
+                                slots = by_group.get(item["measurement_group_id"], [])
+                                usable = [slot for slot in slots if slot.get("artifact_id") is not None
+                                          and str(slot.get("state") or "active") == "active"
+                                          and str(slot.get("qa_usability") or "usable") != "unusable"]
+                                ranked.append((len(usable), str(item["measurement_group_id"]), item, slots))
+                            _, _, selected_item, selected_slots = max(ranked, key=lambda value: (value[0], value[1]))
+                            definition = MeasurementGroup(
+                                member_kind=selected_item["member_kind"],
+                                coherence_rule=selected_item["coherence_rule"],
+                                coherence_rule_version=selected_item["coherence_rule_version"],
+                                coherence_key=selected_item["coherence_key"],
+                                declared_slots=tuple(MeasurementGroupSlot(
+                                    slot["member_scope_key"], slot["member_computation_id"]
+                                ) for slot in selected_slots),
+                                anchor_measurement_group_ids=tuple(selected_item.get("anchor_group_ids") or ()),
+                                grouping_parameters=selected_item.get("grouping_parameters") or {},
+                                configuration_references=tuple(selected_item.get("configuration_refs") or ()),
+                                measurement_group_id=selected_item["measurement_group_id"],
+                            )
+                            existing = {slot["member_scope_key"]: int(slot["artifact_id"])
+                                        for slot in selected_slots if slot.get("artifact_id") is not None}
+                        else:
+                            existing = {}
+                        selections.append(MeasurementGroupSelection(
+                            input_name=dependency_kind, group=definition,
+                            existing_artifact_ids=existing,
+                            scheduled_node_ids={scope_key(candidate.scope): target_node_id(candidate)
+                                                for candidate in candidates if candidate in planned},
+                            requested_scope_keys=tuple(scope_key(member.scope) for member in members),
+                            policy=edge.policy, reason={"coherence_key": definition.coherence_key},
+                        ))
                     emit(Target(
                         kind=node.kind,
                         scope=Scope(zipcode=None, physical_scope=PhysicalScope.EXPOSURE),
                         window=TemporalWindow(start, end),
                         group=group,
                         parent_groups=parent_groups,
+                        selected_measurement_groups=tuple(selections),
                     ))
                 continue
 

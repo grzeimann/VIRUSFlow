@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional, List
+from typing import Any, Mapping, Optional, List
+
+from ..ontology.entities import MeasurementGroup
 
 from ..artifacts.models import Scope
 from ..core.identity import ZipCode
@@ -34,6 +36,8 @@ class Target:
     at_time: Optional[datetime] = None
     group: Optional["CalibrationGroup"] = None
     parent_groups: tuple[tuple[str, str], ...] = ()
+    output_measurement_group: Optional[MeasurementGroup] = None
+    selected_measurement_groups: tuple["MeasurementGroupSelection", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -55,6 +59,27 @@ class CalibrationGroup:
     sufficient: bool = True
     decision: str = "planned"
     downstream_requesters: tuple[str, ...] = ()
+    coherence_key: str = ""
+
+
+@dataclass(frozen=True)
+class MeasurementGroupSelection:
+    """Planner-frozen binding of one aggregate input to a declared cohort."""
+
+    input_name: str
+    group: MeasurementGroup
+    existing_artifact_ids: Mapping[str, int]
+    scheduled_node_ids: Mapping[str, str]
+    requested_scope_keys: tuple[str, ...]
+    policy: str
+    match_quality: Optional[str] = None
+    reason: Mapping[str, Any] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "existing_artifact_ids", dict(self.existing_artifact_ids))
+        object.__setattr__(self, "scheduled_node_ids", dict(self.scheduled_node_ids))
+        object.__setattr__(self, "requested_scope_keys", tuple(sorted(self.requested_scope_keys)))
+        object.__setattr__(self, "reason", dict(self.reason or {}))
 
 
 @dataclass(frozen=True)

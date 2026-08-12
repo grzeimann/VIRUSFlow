@@ -857,3 +857,42 @@ All of the following must hold before implementation is complete:
 20. Neither planner nor executor imposes a generic coverage threshold. Model,
     task, and QA contracts own scientific sufficiency, and 296-of-300 is valid
     when those contracts accept it.
+
+## Execution progress
+
+- [x] Task 1 — Added immutable ontology group/slot values, deterministic
+  `mg:v1` identity, calibration coherence evidence, and typed target selection
+  carriers.
+- [x] Task 2 — Added normalized registry tables, immutable declaration,
+  conditional slot realization, and bulk read primitives.
+- [x] Task 3 — Made canonical detail persistence explicitly transactional and
+  included group declarations, memberships, and group inputs in that boundary.
+- [x] Task 4 — Added storage-neutral group membership/input requests, logical
+  revision participation, describe output, and existing/concurrent revision
+  relation handling.
+- [x] Task 5 — Added deterministic cadence coherence keys from shared exposure
+  evidence.
+- [x] Task 6 — Added grouping/selection declarations, YAML parsing validation,
+  measurement-group response edges, and removed the misleading direct bias QA
+  gate.
+- [x] Task 7 — `ReductionGraph.plan` forms immutable planned cohorts and bulk
+  hydrates persisted normalized group definitions and slots.
+- [x] Task 8 — Response inputs are selected as whole coherent cohorts with
+  deterministic whole-group ranking and frozen cached/scheduled bindings;
+  the obsolete 90% coverage behavior is removed.
+- [x] Task 9 — Scheduler/executor support frozen success-tolerant dependencies;
+  planner binding of those selections remains dependent on Tasks 7–8.
+- [x] Task 10 — The planning adapter forwards declarations/selections and
+  `_CanonicalTask._publish` generically translates them into normalized
+  membership and selected-input publication requests.
+- [x] Task 11 — `ExposureFiberResponseTask` consumes typed frozen scheduled and
+  existing bindings when present, performs the required-group intersection,
+  and retains the legacy path only for legacy targets/tests.
+- [x] Task 12 — Obsolete planner coverage metadata is removed and focused
+  planner/response integration regressions are green. Full-suite execution is
+  still recommended before release.
+
+Completed focused checks: `test_calibration_grouping_policies`, service,
+multi-component, planning-smoke, progress-monitor, CLI-summary, and
+fiber-response regressions; touched-file Ruff checks passed. Existing graph
+expectations were updated for the removed response bias gate.

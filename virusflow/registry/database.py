@@ -405,6 +405,43 @@ CREATE TABLE IF NOT EXISTS qa_decisions (
     FOREIGN KEY(artifact_id) REFERENCES artifacts(id)
 );
 
+CREATE TABLE IF NOT EXISTS measurement_groups (
+    measurement_group_id TEXT PRIMARY KEY,
+    member_kind TEXT NOT NULL,
+    coherence_rule TEXT NOT NULL,
+    coherence_rule_version TEXT NOT NULL,
+    coherence_key_json TEXT NOT NULL,
+    anchor_group_ids_json TEXT NOT NULL DEFAULT '[]',
+    grouping_parameters_json TEXT NOT NULL DEFAULT '{}',
+    configuration_refs_json TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS measurement_group_slots (
+    measurement_group_id TEXT NOT NULL,
+    member_scope_key TEXT NOT NULL,
+    member_computation_id TEXT NOT NULL,
+    artifact_id INTEGER,
+    realized_at TEXT,
+    PRIMARY KEY (measurement_group_id, member_scope_key),
+    UNIQUE (measurement_group_id, artifact_id)
+);
+
+CREATE TABLE IF NOT EXISTS artifact_measurement_group_inputs (
+    artifact_id INTEGER NOT NULL,
+    input_name TEXT NOT NULL,
+    measurement_group_id TEXT NOT NULL,
+    selection_policy TEXT NOT NULL,
+    match_quality TEXT,
+    selection_reason_json TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (artifact_id, input_name)
+);
+CREATE INDEX IF NOT EXISTS measurement_group_kind_idx ON measurement_groups(member_kind);
+CREATE INDEX IF NOT EXISTS measurement_group_slots_idx
+ON measurement_group_slots(measurement_group_id, artifact_id);
+CREATE INDEX IF NOT EXISTS measurement_group_slot_artifact_idx
+ON measurement_group_slots(artifact_id);
+
 CREATE TABLE IF NOT EXISTS analysis_studies (
     study_id TEXT PRIMARY KEY,
     scientific_question TEXT NOT NULL,
@@ -1512,14 +1549,37 @@ def save_artifact_details(
     components: Iterable[Dict[str, Any]],
     relations: Iterable[Dict[str, Any]],
     raw_relations: Iterable[Dict[str, Any]] = (),
+    group_declarations: Iterable[Dict[str, Any]] = (),
+    group_memberships: Iterable[Dict[str, Any]] = (),
+    group_inputs: Iterable[Dict[str, Any]] = (),
     db_path: str = DEFAULT_DB_PATH,
 ) -> None:
     """Persist canonical Artifact registry rows, components, relations, and state."""
-    import json
-
     init_artifact_db(db_path)
     with connect(db_path) as conn:
-        conn.execute(
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _save_artifact_details_in_transaction(
+                conn, artifact_id, record=record, components=components,
+                relations=relations, raw_relations=raw_relations,
+                group_declarations=group_declarations,
+                group_memberships=group_memberships, group_inputs=group_inputs,
+            )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
+
+def _save_artifact_details_in_transaction(
+    conn: sqlite3.Connection, artifact_id: int, *, record: Dict[str, Any],
+    components: Iterable[Dict[str, Any]], relations: Iterable[Dict[str, Any]],
+    raw_relations: Iterable[Dict[str, Any]], group_declarations: Iterable[Dict[str, Any]],
+    group_memberships: Iterable[Dict[str, Any]], group_inputs: Iterable[Dict[str, Any]],
+) -> None:
+    """Canonical detail rows; caller owns the transaction."""
+    import json
+    conn.execute(
             """
             INSERT INTO artifact_records(
                 artifact_id, canonical_kind, role, payload_type, storage_format,
@@ -1571,8 +1631,8 @@ def save_artifact_details(
                 record.get("created_at") or datetime.utcnow().isoformat(),
             ),
         )
-        scientific = scientific_metadata_for_database(record.get("scientific_metadata"))
-        conn.execute(
+    scientific = scientific_metadata_for_database(record.get("scientific_metadata"))
+    conn.execute(
             """
             INSERT INTO artifact_scientific_metadata(
                 artifact_id, observation_time, airmass, ambient_temperature, humidity, pressure,
@@ -1597,8 +1657,8 @@ def save_artifact_details(
                 *(scientific[field] for field in SCIENTIFIC_METADATA_FIELDS),
             ),
         )
-        for component in components:
-            conn.execute(
+    for component in components:
+        conn.execute(
                 """
                 INSERT INTO artifact_components(
                     artifact_id, name, model_type, path, payload_type,
@@ -1638,19 +1698,19 @@ def save_artifact_details(
                     json.dumps(component.get("eviction") or {}, sort_keys=True, default=str),
                 ),
             )
-        for relation in relations:
-            parent_id = int(relation["parent_id"])
-            relation_name = str(relation.get("relation") or "derived_from")
-            conn.execute(
+    for relation in relations:
+        parent_id = int(relation["parent_id"])
+        relation_name = str(relation.get("relation") or "derived_from")
+        conn.execute(
                 "INSERT OR IGNORE INTO dependencies(parent_id, child_id) VALUES(?,?)",
                 (parent_id, int(artifact_id)),
             )
-            conn.execute(
+        conn.execute(
                 "INSERT OR IGNORE INTO artifact_relations(parent_id, child_id, relation) VALUES(?,?,?)",
                 (parent_id, int(artifact_id), relation_name),
             )
-        for relation in raw_relations:
-            conn.execute(
+    for relation in raw_relations:
+        conn.execute(
                 """
                 INSERT OR IGNORE INTO raw_artifact_relations(
                     raw_catalog, raw_id, child_id, relation
@@ -1663,6 +1723,205 @@ def save_artifact_details(
                     str(relation.get("relation") or "derived_from"),
                 ),
             )
+    for declaration in group_declarations:
+        declare_measurement_group(declaration, connection=conn)
+    for membership in group_memberships:
+        realize_measurement_group_slot(
+            membership["measurement_group_id"], membership["member_scope_key"],
+            membership["member_computation_id"], int(artifact_id), connection=conn,
+        )
+    for group_input in group_inputs:
+        group_id = str(group_input["measurement_group_id"])
+        if conn.execute("SELECT 1 FROM measurement_groups WHERE measurement_group_id=?", (group_id,)).fetchone() is None:
+            raise KeyError(f"unknown measurement group {group_id}")
+        conn.execute(
+            """INSERT INTO artifact_measurement_group_inputs(
+                 artifact_id,input_name,measurement_group_id,selection_policy,match_quality,selection_reason_json)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(artifact_id,input_name) DO UPDATE SET
+                 measurement_group_id=excluded.measurement_group_id,
+                 selection_policy=excluded.selection_policy, match_quality=excluded.match_quality,
+                 selection_reason_json=excluded.selection_reason_json""",
+            (int(artifact_id), str(group_input["input_name"]), group_id,
+             str(group_input.get("selection_policy") or ""), group_input.get("match_quality"),
+             json.dumps(group_input.get("selection_reason") or {}, sort_keys=True, default=str)),
+        )
+
+
+def declare_measurement_group(declaration: Dict[str, Any], *, db_path: str = DEFAULT_DB_PATH,
+                              connection: sqlite3.Connection | None = None) -> None:
+    """Insert one immutable group declaration, accepting only identical repeats."""
+    import json
+    if connection is None:
+        init_artifact_db(db_path)
+        with connect(db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                declare_measurement_group(declaration, connection=conn)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return
+    conn = connection
+    group_id = str(declaration["measurement_group_id"])
+    canonical = (
+        str(declaration["member_kind"]), str(declaration["coherence_rule"]),
+        str(declaration["coherence_rule_version"]),
+        json.dumps(declaration.get("coherence_key") or {}, sort_keys=True),
+        json.dumps(declaration.get("anchor_measurement_group_ids") or (), sort_keys=True),
+        json.dumps(declaration.get("grouping_parameters") or {}, sort_keys=True),
+        json.dumps(declaration.get("configuration_references") or (), sort_keys=True),
+    )
+    row = conn.execute("SELECT * FROM measurement_groups WHERE measurement_group_id=?", (group_id,)).fetchone()
+    if row is not None:
+        actual = tuple(row[key] for key in ("member_kind", "coherence_rule", "coherence_rule_version", "coherence_key_json", "anchor_group_ids_json", "grouping_parameters_json", "configuration_refs_json"))
+        if actual != canonical:
+            raise ValueError(f"conflicting measurement group redeclaration: {group_id}")
+    else:
+        conn.execute(
+            "INSERT INTO measurement_groups VALUES(?,?,?,?,?,?,?,?,?)",
+            (group_id, *canonical, datetime.utcnow().isoformat()),
+        )
+    for slot in declaration.get("declared_slots") or ():
+        scope, computation = str(slot["member_scope_key"]), str(slot["member_computation_id"])
+        existing = conn.execute("SELECT member_computation_id FROM measurement_group_slots WHERE measurement_group_id=? AND member_scope_key=?", (group_id, scope)).fetchone()
+        if existing is not None and existing[0] != computation:
+            raise ValueError(f"conflicting measurement group slot: {group_id}/{scope}")
+        conn.execute("INSERT OR IGNORE INTO measurement_group_slots(measurement_group_id,member_scope_key,member_computation_id) VALUES(?,?,?)", (group_id, scope, computation))
+
+
+def realize_measurement_group_slot(group_id: str, scope_key: str, computation_id: str,
+                                   artifact_id: int, *, db_path: str = DEFAULT_DB_PATH,
+                                   connection: sqlite3.Connection | None = None) -> None:
+    if connection is None:
+        init_artifact_db(db_path)
+        with connect(db_path) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                realize_measurement_group_slot(group_id, scope_key, computation_id, artifact_id, connection=conn)
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return
+    conn = connection
+    slot = conn.execute("SELECT member_computation_id,artifact_id FROM measurement_group_slots WHERE measurement_group_id=? AND member_scope_key=?", (group_id, scope_key)).fetchone()
+    if slot is None:
+        raise KeyError(f"unknown measurement group slot: {group_id}/{scope_key}")
+    if str(slot[0]) != str(computation_id):
+        raise ValueError("measurement group slot computation mismatch")
+    if conn.execute("SELECT 1 FROM artifacts WHERE id=?", (int(artifact_id),)).fetchone() is None:
+        raise KeyError(f"unknown artifact {artifact_id}")
+    if slot[1] is not None:
+        if int(slot[1]) != int(artifact_id):
+            raise ValueError("measurement group slot is already realized by a different Artifact")
+        return
+    cursor = conn.execute("UPDATE measurement_group_slots SET artifact_id=?,realized_at=? WHERE measurement_group_id=? AND member_scope_key=? AND artifact_id IS NULL", (int(artifact_id), datetime.utcnow().isoformat(), group_id, scope_key))
+    if cursor.rowcount != 1:
+        raise ValueError("measurement group slot realization conflict")
+
+
+def list_measurement_groups(member_kind: str, *, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    """Load candidate declarations by kind without making any selection decision."""
+    import json
+    init_artifact_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM measurement_groups WHERE member_kind=? ORDER BY measurement_group_id",
+            (str(member_kind),),
+        ).fetchall()
+    result = _rows_to_dicts(rows)
+    for row in result:
+        for column in ("coherence_key_json", "anchor_group_ids_json", "grouping_parameters_json", "configuration_refs_json"):
+            row[column.removesuffix("_json")] = json.loads(row.pop(column))
+    return result
+
+
+def list_measurement_group_slots(group_ids: Iterable[str], *, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    """Bulk-load slots and basic member evidence for declared candidate groups."""
+    wanted = tuple(dict.fromkeys(str(value) for value in group_ids))
+    if not wanted:
+        return []
+    init_artifact_db(db_path)
+    marks = ",".join("?" for _ in wanted)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            f"""SELECT slot.*, artifact.kind, artifact.amp_key, record.state,
+                       decision.status AS qa_status, decision.usability AS qa_usability,
+                       artifact.validity_start, artifact.validity_end
+                FROM measurement_group_slots slot
+                LEFT JOIN artifacts artifact ON artifact.id=slot.artifact_id
+                LEFT JOIN artifact_records record ON record.artifact_id=slot.artifact_id
+                LEFT JOIN qa_decisions decision ON decision.artifact_id=slot.artifact_id
+                WHERE slot.measurement_group_id IN ({marks})
+                ORDER BY slot.measurement_group_id, slot.member_scope_key""",
+            wanted,
+        ).fetchall()
+    return _rows_to_dicts(rows)
+
+
+def list_artifact_measurement_group_inputs(artifact_id: int, *, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    import json
+    init_artifact_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM artifact_measurement_group_inputs WHERE artifact_id=? ORDER BY input_name",
+            (int(artifact_id),),
+        ).fetchall()
+    result = _rows_to_dicts(rows)
+    for row in result:
+        row["selection_reason"] = json.loads(row.pop("selection_reason_json") or "{}")
+    return result
+
+
+def list_measurement_group_memberships(artifact_id: int, *, db_path: str = DEFAULT_DB_PATH) -> List[Dict[str, Any]]:
+    init_artifact_db(db_path)
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM measurement_group_slots WHERE artifact_id=? ORDER BY measurement_group_id",
+            (int(artifact_id),),
+        ).fetchall()
+    return _rows_to_dicts(rows)
+
+
+def save_artifact_group_relations(
+    artifact_id: int, *, declarations: Iterable[Dict[str, Any]] = (),
+    memberships: Iterable[Dict[str, Any]] = (), group_inputs: Iterable[Dict[str, Any]] = (),
+    db_path: str = DEFAULT_DB_PATH,
+) -> None:
+    """Transactional relation-only path for an already published revision."""
+    import json
+    init_artifact_db(db_path)
+    with connect(db_path) as conn:
+        if conn.execute("SELECT 1 FROM artifacts WHERE id=?", (int(artifact_id),)).fetchone() is None:
+            raise KeyError(f"unknown artifact {artifact_id}")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for declaration in declarations:
+                declare_measurement_group(declaration, connection=conn)
+            for membership in memberships:
+                realize_measurement_group_slot(
+                    membership["measurement_group_id"], membership["member_scope_key"],
+                    membership["member_computation_id"], int(artifact_id), connection=conn,
+                )
+            for group_input in group_inputs:
+                conn.execute(
+                    """INSERT INTO artifact_measurement_group_inputs(
+                         artifact_id,input_name,measurement_group_id,selection_policy,match_quality,selection_reason_json)
+                       VALUES(?,?,?,?,?,?)
+                       ON CONFLICT(artifact_id,input_name) DO UPDATE SET
+                         measurement_group_id=excluded.measurement_group_id,
+                         selection_policy=excluded.selection_policy, match_quality=excluded.match_quality,
+                         selection_reason_json=excluded.selection_reason_json""",
+                    (int(artifact_id), str(group_input["input_name"]), str(group_input["measurement_group_id"]),
+                     str(group_input.get("selection_policy") or ""), group_input.get("match_quality"),
+                     json.dumps(group_input.get("selection_reason") or {}, sort_keys=True, default=str)),
+                )
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def get_artifact_details(artifact_id: int, db_path: str = DEFAULT_DB_PATH) -> Optional[Dict[str, Any]]:

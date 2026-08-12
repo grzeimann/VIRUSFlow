@@ -19,7 +19,9 @@ class RegistryAdapter:
         self.db_path = db_path
 
     # --- Persistence ---
-    def register(self, art: Artifact, *, components: Iterable[Dict] = ()) -> int:
+    def register(self, art: Artifact, *, components: Iterable[Dict] = (),
+                 group_declarations: Iterable[Dict] = (), group_memberships: Iterable[Dict] = (),
+                 group_inputs: Iterable[Dict] = ()) -> int:
         """Transactionally register artifact and provenance.
         Uses the existing db.save_artifact which handles both.
         """
@@ -121,6 +123,9 @@ class RegistryAdapter:
                 components=list(components or []),
                 relations=relation_rows,
                 raw_relations=raw_relation_rows,
+                group_declarations=group_declarations,
+                group_memberships=group_memberships,
+                group_inputs=group_inputs,
                 db_path=self.db_path,
             )
         except BaseException:
@@ -132,6 +137,31 @@ class RegistryAdapter:
                 connection.execute("DELETE FROM artifacts WHERE id=?", (int(artifact_id),))
             raise
         return artifact_id
+
+    def declare_measurement_group(self, declaration: Dict) -> None:
+        db.declare_measurement_group(declaration, db_path=self.db_path)
+
+    def list_measurement_groups(self, member_kind: str) -> List[dict]:
+        return db.list_measurement_groups(member_kind, db_path=self.db_path)
+
+    def list_measurement_group_slots(self, group_ids: Iterable[str]) -> List[dict]:
+        return db.list_measurement_group_slots(group_ids, db_path=self.db_path)
+
+    def list_measurement_group_memberships(self, artifact_id: int) -> List[dict]:
+        return db.list_measurement_group_memberships(artifact_id, db_path=self.db_path)
+
+    def list_measurement_group_inputs(self, artifact_id: int) -> List[dict]:
+        return db.list_artifact_measurement_group_inputs(artifact_id, db_path=self.db_path)
+
+    def apply_measurement_group_relations(
+        self, artifact_id: int, *, declarations: Iterable[Dict] = (),
+        memberships: Iterable[Dict] = (), inputs: Iterable[Dict] = (),
+    ) -> None:
+        """Apply explicit normalized group relations to an existing Artifact."""
+        db.save_artifact_group_relations(
+            int(artifact_id), declarations=declarations, memberships=memberships,
+            group_inputs=inputs, db_path=self.db_path,
+        )
 
     # --- Retrieval ---
     def get_row(self, artifact_id: int) -> Optional[dict]:

@@ -5,6 +5,27 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from .models import ArtifactRelation, ConfigurationReference, Scope, Validity
 from ..ontology.lifecycle import ArtifactLifecycle
+from ..ontology.entities import MeasurementGroup
+
+
+@dataclass(frozen=True)
+class MeasurementGroupMembershipRequest:
+    """Storage-neutral request to realize this Artifact's declared group slot."""
+
+    group: MeasurementGroup
+    member_scope_key: str
+    member_computation_id: str
+
+
+@dataclass(frozen=True)
+class MeasurementGroupInputRequest:
+    """Storage-neutral provenance for a planner-selected measurement group."""
+
+    input_name: str
+    group: MeasurementGroup
+    selection_policy: str
+    match_quality: Optional[str] = None
+    selection_reason: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -49,6 +70,8 @@ class ArtifactRequest:
     lifecycle: Optional[ArtifactLifecycle] = None
     raw_parents: List[int] = field(default_factory=list)
     raw_catalog: Optional[str] = None
+    measurement_group_membership: Optional[MeasurementGroupMembershipRequest] = None
+    measurement_group_inputs: List[MeasurementGroupInputRequest] = field(default_factory=list)
 
     def component_names(self) -> List[str]:
         return list((self.components or {}).keys())

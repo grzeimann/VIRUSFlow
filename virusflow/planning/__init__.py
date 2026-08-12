@@ -2,10 +2,11 @@ from __future__ import annotations
 
 # Public planning interfaces
 from .targets import (
-    CalibrationGroup, CadencePolicy, ExposureCountCadence, PurposeCadence,
+    CalibrationGroup, CadencePolicy, ExposureCountCadence, MeasurementGroupSelection, PurposeCadence,
     Target, TemporalWindow, TimeCadence,
 )
-from .graph import TaskSpec, Edge, PlanningReport, ReductionGraph
+from .graph import (Edge, MeasurementGroupingSpec, PlanningReport, ReductionGraph,
+                    SelectionUnit, TaskSpec)
 from .defaults import default_calibration_graph
 from .config import (
     NodeConfig,
@@ -26,6 +27,7 @@ __all__ = [
     "ExposureCountCadence",
     "PurposeCadence",
     "CalibrationGroup",
+    "MeasurementGroupSelection",
     # adapter
     "PlanningTargetAdapter",
     "adapt_target",
@@ -34,6 +36,8 @@ __all__ = [
     "Edge",
     "PlanningReport",
     "ReductionGraph",
+    "MeasurementGroupingSpec",
+    "SelectionUnit",
     # defaults/config
     "default_calibration_graph",
     "NodeConfig",

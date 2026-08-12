@@ -28,6 +28,7 @@ class ScheduledTask:
     kind: str
     task: object
     depends_on: List[str]
+    success_tolerant_dependencies: List[str] = None  # type: ignore[assignment]
 
 
 def _topo_order_kinds(nodes: Sequence[TaskSpec], edges: Sequence[Edge]) -> List[str]:
@@ -185,5 +186,14 @@ def schedule(
                 for dep_id in _qa_gate_dependencies(edge, t):
                     if dep_id not in deps_ids:
                         deps_ids.append(dep_id)
-            scheduled.append(ScheduledTask(id=node_id, kind=kind, task=task_obj, depends_on=deps_ids))
+            tolerant = []
+            for selection in t.selected_measurement_groups:
+                tolerant.extend(selection.scheduled_node_ids.values())
+            for dep_id in tolerant:
+                if dep_id not in deps_ids:
+                    deps_ids.append(dep_id)
+            scheduled.append(ScheduledTask(
+                id=node_id, kind=kind, task=task_obj, depends_on=deps_ids,
+                success_tolerant_dependencies=list(dict.fromkeys(tolerant)),
+            ))
     return scheduled

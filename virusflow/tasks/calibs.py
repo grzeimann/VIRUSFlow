@@ -15,7 +15,6 @@ from ..algorithms.trace import fit_fiber_traces
 from ..algorithms.twi import step_twi
 from ..algorithms.master_sci import build_master_sci
 from ..algorithms.fiber_response import (
-    FIBER_RESPONSE_VERSION,
     fit_exposure_fiber_response,
 )
 from ..algorithms.calibration_detector import (
@@ -32,9 +31,11 @@ from ..algorithms.physical_ccd import (
     fit_gap_scattered_light,
 )
 from ..algorithms.wave import fit_wavelength_solution
-from ..artifacts import ArtifactService, Scope, Validity
+from ..artifacts import ArtifactService, Scope
 from ..artifacts.models import ConfigurationReference
-from ..artifacts.requests import ArtifactRequest, LogicalComponent
+from ..artifacts.requests import (ArtifactRequest, LogicalComponent,
+                                  MeasurementGroupInputRequest,
+                                  MeasurementGroupMembershipRequest)
 from ..config.defaults import (
     MASTER_SCI_EXTRACTION_CONFIGURATION,
     MASTER_SCI_SPECTRAL_MASK_CONFIGURATION,
@@ -202,6 +203,21 @@ class _CanonicalTask(CalibrationTask):
                 if configuration_refs is None else configuration_refs
             ),
             labels=["calibration", self.artifact_name],
+            measurement_group_membership=(
+                MeasurementGroupMembershipRequest(
+                    group=self.target.output_measurement_group,
+                    member_scope_key=self.target.zipcode.key(),
+                    member_computation_id=getattr(self.target, "group_id", ""),
+                ) if getattr(self.target, "output_measurement_group", None) is not None
+                and self.target.zipcode is not None else None
+            ),
+            measurement_group_inputs=[
+                MeasurementGroupInputRequest(
+                    input_name=selection.input_name, group=selection.group,
+                    selection_policy=selection.policy, match_quality=selection.match_quality,
+                    selection_reason=selection.reason,
+                ) for selection in getattr(self.target, "selected_measurement_groups", ())
+            ],
         )
         service = ArtifactService(self.ctx.db_path)
         publisher = DefaultPublicationService(
@@ -827,22 +843,40 @@ class ExposureFiberResponseTask(_CanonicalTask):
             "extracted_master_twilight_spectrum",
             "wavelength_map",
         )
+        # Selections are frozen by the planner.  Build an ID index from only
+        # terminal-successful scheduled dependencies; never query current slots.
+        selections = {item.input_name: item for item in getattr(
+            self.target, "selected_measurement_groups", ()
+        )}
         resolved_rows = {}
         for kind in (*required_kinds, "extracted_master_sci_spectrum"):
             rows = {}
-            for artifact in _dependency_artifacts(inputs, kind):
-                row = service.adapter.get_row(_artifact_id(artifact))
-                if row is not None and row.get("amp_key"):
-                    # Scheduled dependencies are the graph's authoritative
-                    # resolution for this execution.
-                    rows[str(row["amp_key"])] = row
-            for row in _planned_parent_rows(service, self.target, kind):
-                if row.get("amp_key"):
-                    # Cached graph parents fill only gaps left by this run.
-                    rows.setdefault(str(row["amp_key"]), row)
+            selection = selections.get(kind)
+            if selection is not None:
+                for scope_key, artifact_id in selection.existing_artifact_ids.items():
+                    row = service.adapter.get_row(int(artifact_id))
+                    if row is not None:
+                        rows[str(scope_key)] = row
+                for scope_key, node_id in selection.scheduled_node_ids.items():
+                    output = inputs.get(node_id)
+                    artifact = output.get(kind) if isinstance(output, dict) else None
+                    if artifact is not None:
+                        row = service.adapter.get_row(_artifact_id(artifact))
+                        if row is not None:
+                            rows[str(scope_key)] = row
+            else:  # compatibility for legacy targets only
+                for artifact in _dependency_artifacts(inputs, kind):
+                    row = service.adapter.get_row(_artifact_id(artifact))
+                    if row is not None and row.get("amp_key"):
+                        rows[str(row["amp_key"])] = row
+                for row in _planned_parent_rows(service, self.target, kind):
+                    if row.get("amp_key"):
+                        rows.setdefault(str(row["amp_key"]), row)
             resolved_rows[kind] = rows
         ldls_rows = resolved_rows["extracted_master_ldls_spectrum"]
         requested_keys = list(
+            selections.get("extracted_master_ldls_spectrum").requested_scope_keys
+            if selections.get("extracted_master_ldls_spectrum") is not None else
             (getattr(self.target, "group_metadata", None) or {}).get("amplifier_keys")
             or sorted(ldls_rows)
         )

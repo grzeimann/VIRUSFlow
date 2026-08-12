@@ -189,6 +189,11 @@ def _make_group(
             "policy": policy,
         },
         sufficient=bool(sufficient), decision="planned" if sufficient else "insufficient",
+        coherence_key=hashlib.sha256(json.dumps({
+            "kind": kind, "purpose": policy, "exposure_ids": sorted(exposure_ids),
+            "observing_blocks": sorted({str(row.get("observing_block") or "") for row in rows}),
+            "grouping_configuration": dict(options),
+        }, sort_keys=True, default=str).encode("utf-8")).hexdigest(),
     )
 
 

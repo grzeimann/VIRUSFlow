@@ -47,7 +47,7 @@ except Exception:  # pragma: no cover - yaml is an optional runtime dep but pres
     yaml = None  # type: ignore
 
 from .targets import TimeCadence, ExposureCountCadence, PurposeCadence, CadencePolicy
-from .graph import TaskSpec, Edge
+from .graph import Edge, SelectionUnit, TaskSpec
 
 
 SUPPORTED_CALIBRATION_KINDS = frozenset({
@@ -191,7 +191,11 @@ def _parse_edges(lst: Sequence[Mapping[str, Any]] | None) -> List[Edge]:
             raise ValueError(f"edge[{i}] missing key: {ex}") from ex
         policy = str(e.get("policy", "latest_valid"))
         tol = int(e.get("tolerance_days", 90) or 90)
-        out.append(Edge(src=TaskSpec(kind=src, task_cls=object), dst=TaskSpec(kind=dst, task_cls=object), policy=policy, tolerance_days=tol))
+        try:
+            selection_unit = SelectionUnit(str(e.get("selection_unit", "artifact")))
+        except ValueError as ex:
+            raise ValueError(f"edge[{i}] has unknown selection_unit") from ex
+        out.append(Edge(src=TaskSpec(kind=src, task_cls=object), dst=TaskSpec(kind=dst, task_cls=object), policy=policy, tolerance_days=tol, selection_unit=selection_unit))
     return out
 
 

@@ -583,7 +583,10 @@ def _run_planned(args: argparse.Namespace) -> None:
     )
     # Add tasks preserving dependencies
     for st in scheduled:
-        execp.add_task(st.id, st.task, kind=st.kind, depends_on=st.depends_on)
+        execp.add_task(
+            st.id, st.task, kind=st.kind, depends_on=st.depends_on,
+            success_tolerant_dependencies=st.success_tolerant_dependencies or [],
+        )
     execution_error = None
     try:
         execp.run()

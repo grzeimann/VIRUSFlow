@@ -55,6 +55,8 @@ class PlanningTargetAdapter:
     group_id: Optional[str] = None
     raw_ids: tuple[int, ...] = ()
     group_metadata: dict[str, Any] | None = None
+    output_measurement_group: object | None = None
+    selected_measurement_groups: tuple = ()
 
     @classmethod
     def from_planning(cls, t: Target) -> "PlanningTargetAdapter":
@@ -72,6 +74,8 @@ class PlanningTargetAdapter:
             group_id=(t.group.group_id if t.group else None),
             raw_ids=(t.group.raw_ids if t.group else ()),
             group_metadata=(dict(t.group.metadata) if t.group else None),
+            output_measurement_group=t.output_measurement_group,
+            selected_measurement_groups=t.selected_measurement_groups,
         )
 
 

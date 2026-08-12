@@ -8,7 +8,9 @@ from .artifact_kinds import (
 )
 from .assumptions import ASSUMPTIONS, AssumptionSpec, EvidenceState
 from .coordinates import CoordinateConvention, UPPER_AMPLIFIER_REFLECTION_INDEX
-from .entities import AmplifierIdentity, DitherSetIdentity, ExposureIdentity, ObservationIdentity, PhysicalCCDIdentity
+from .entities import (AmplifierIdentity, DitherSetIdentity, ExposureIdentity,
+                       MeasurementGroup, MeasurementGroupSlot, ObservationIdentity,
+                       PhysicalCCDIdentity)
 from .relations import RelationKind
 from .scopes import PhysicalScope
 from .units import UNKNOWN_UNIT, Unit
@@ -30,6 +32,8 @@ __all__ = [
     "ExposureIdentity",
     "ObservationIdentity",
     "PhysicalCCDIdentity",
+    "MeasurementGroup",
+    "MeasurementGroupSlot",
     "RelationKind",
     "PhysicalScope",
     "UNKNOWN_UNIT",
