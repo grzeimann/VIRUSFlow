@@ -6,6 +6,8 @@ from astropy.stats import biweight_location, mad_std
 from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter1d
 
+from ..robust import chunked_biweight_location
+
 def interpolate_masked_detector_pixels(image: np.ndarray, mask: np.ndarray, sigma: float = 1.0) -> np.ndarray:
     """Fill masked pixels in an IFU arc image using row-wise interpolation and Gaussian smoothing.
 
@@ -134,7 +136,9 @@ def build_model_spectra(
         raise ValueError("spectral model requires at least two bins")
 
     finite = rows[:, None] & np.isfinite(wave) & np.isfinite(image)
-    norm_per_fiber = np.nanmedian(np.where(finite, image, np.nan), axis=1)
+    norm_per_fiber = chunked_biweight_location(
+        np.where(finite, image, np.nan).T, axis=0
+    )
     good_norm = rows & np.isfinite(norm_per_fiber) & (norm_per_fiber > 0)
     finite &= good_norm[:, None]
     sample_wave = wave[finite]

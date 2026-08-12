@@ -168,7 +168,11 @@ def schedule(
             # Determine deps: for each incoming edge (src→dst with dst==kind), depend on src task of same scope
             deps_ids: List[str] = []
             scope_k = _scope_key(t)
-            if t.parent_groups:
+            if t.selected_measurement_groups:
+                # Cross-scope aggregate dependencies come solely from frozen
+                # selections and are success-tolerant member dependencies.
+                pass
+            elif t.parent_groups:
                 for parent in t.parent_groups:
                     dep_id = group_target_to_id.get(parent)
                     if dep_id and dep_id not in deps_ids:

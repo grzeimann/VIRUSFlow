@@ -881,7 +881,12 @@ All of the following must hold before implementation is complete:
   deterministic whole-group ranking and frozen cached/scheduled bindings;
   the obsolete 90% coverage behavior is removed.
 - [x] Task 9 — Scheduler/executor support frozen success-tolerant dependencies;
-  planner binding of those selections remains dependent on Tasks 7–8.
+  planner binding of those selections is complete. The scheduler explicitly
+  ignores legacy `parent_groups` for a selected aggregate, preventing frozen
+  member nodes from being reintroduced as ordinary blocking prerequisites.
+  Regression coverage includes failed RL/RU LDLS, wavelength, and optional
+  science members with a successful LL/LU response aggregate, plus ordinary
+  dependency blocking.
 - [x] Task 10 — The planning adapter forwards declarations/selections and
   `_CanonicalTask._publish` generically translates them into normalized
   membership and selected-input publication requests.

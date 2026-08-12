@@ -589,7 +589,10 @@ class ReductionGraph:
                         scope=Scope(zipcode=None, physical_scope=PhysicalScope.EXPOSURE),
                         window=TemporalWindow(start, end),
                         group=group,
-                        parent_groups=parent_groups,
+                        # The frozen selections above are the only aggregate
+                        # fan-in; legacy parent groups would be ordinary,
+                        # success-required scheduler dependencies.
+                        parent_groups=(),
                         selected_measurement_groups=tuple(selections),
                     ))
                 continue

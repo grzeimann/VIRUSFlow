@@ -148,6 +148,47 @@ def test_json_progress_retries_failures_and_blocked_dependencies():
     assert failed.execution_stats["blocked"] == 1
 
 
+def test_frozen_group_member_failures_are_terminal_required_but_success_tolerant():
+    """RL/RU group members fail without blocking the response aggregate."""
+
+    events = []
+
+    class Member:
+        def __init__(self, scope, fail=False):
+            self.scope, self.fail = scope, fail
+
+        def run(self, _inputs):
+            if self.fail:
+                raise RuntimeError(f"failed {self.scope}")
+            return {"scope": self.scope}
+
+    class Response:
+        def run(self, inputs):
+            events.append(sorted(inputs))
+            return sorted(inputs)
+
+    executor = PlanningExecutor(max_workers=1, progress=False)
+    tolerated = []
+    for kind in ("ldls", "wavelength", "science"):
+        for scope in ("LL", "LU", "RL", "RU"):
+            node_id = f"{kind}-{scope}"
+            failed = scope in {"RL", "RU"}
+            executor.add_task(node_id, Member(scope, failed), kind=kind)
+            tolerated.append(node_id)
+    executor.add_task(
+        "response", Response(), kind="exposure_fiber_response",
+        depends_on=tolerated, success_tolerant_dependencies=tolerated,
+    )
+    with pytest.raises(WorkflowExecutionError):
+        executor.run()
+    assert events == [[
+        "ldls-LL", "ldls-LU", "science-LL", "science-LU",
+        "wavelength-LL", "wavelength-LU",
+    ]]
+    assert executor.execution_stats["succeeded"] == 7
+    assert executor.execution_stats["failed"] == 6
+
+
 def test_progress_does_not_change_task_results_or_identity():
     def execute(enabled):
         executor = PlanningExecutor(max_workers=1, progress=enabled)
