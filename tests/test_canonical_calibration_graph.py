@@ -49,8 +49,8 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         "master_bias", "master_dark", "master_ldls", "master_hg", "master_cd",
         "master_arc", "master_twilight", "master_sci", "trace_map", "wavelength_map",
         "extracted_master_ldls_spectrum", "extracted_master_twilight_spectrum",
-        "extracted_master_sci_spectrum", "within_amp_fiber_normalization",
-        "amp_to_amp_normalization", "fiber_wavelength_spectral_mask",
+        "extracted_master_sci_spectrum", "exposure_fiber_response",
+        "fiber_wavelength_spectral_mask",
     }
     assert by_kind["master_hg"].inputs_raw == ["cmp", "hg"]
     assert by_kind["master_cd"].inputs_raw == ["cmp", "cd"]
@@ -66,14 +66,11 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
     assert by_kind["extracted_master_twilight_spectrum"].inputs_artifacts == [
         "master_twilight", "trace_map",
     ]
-    assert by_kind["within_amp_fiber_normalization"].inputs_artifacts == [
+    assert by_kind["exposure_fiber_response"].inputs_artifacts == [
         "extracted_master_twilight_spectrum", "extracted_master_ldls_spectrum",
         "wavelength_map", "extracted_master_sci_spectrum",
     ]
-    assert by_kind["amp_to_amp_normalization"].inputs_artifacts == [
-        "within_amp_fiber_normalization"
-    ]
-    assert by_kind["amp_to_amp_normalization"].scope_mode == "calibration_build"
+    assert by_kind["exposure_fiber_response"].scope_mode == "calibration_build"
     assert by_kind["fiber_wavelength_spectral_mask"].inputs_artifacts == [
         "extracted_master_sci_spectrum", "wavelength_map",
     ]
@@ -89,7 +86,7 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         ("master_bias", "extracted_master_sci_spectrum"),
         ("master_bias", "extracted_master_ldls_spectrum"),
         ("master_bias", "extracted_master_twilight_spectrum"),
-        ("master_bias", "within_amp_fiber_normalization"),
+        ("master_bias", "exposure_fiber_response"),
         ("master_bias", "fiber_wavelength_spectral_mask"),
         ("master_ldls", "trace_map"),
         ("master_hg", "master_arc"),
@@ -102,11 +99,10 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         ("trace_map", "extracted_master_ldls_spectrum"),
         ("master_twilight", "extracted_master_twilight_spectrum"),
         ("trace_map", "extracted_master_twilight_spectrum"),
-        ("extracted_master_twilight_spectrum", "within_amp_fiber_normalization"),
-        ("extracted_master_ldls_spectrum", "within_amp_fiber_normalization"),
-        ("wavelength_map", "within_amp_fiber_normalization"),
-        ("extracted_master_sci_spectrum", "within_amp_fiber_normalization"),
-        ("within_amp_fiber_normalization", "amp_to_amp_normalization"),
+        ("extracted_master_twilight_spectrum", "exposure_fiber_response"),
+        ("extracted_master_ldls_spectrum", "exposure_fiber_response"),
+        ("wavelength_map", "exposure_fiber_response"),
+        ("extracted_master_sci_spectrum", "exposure_fiber_response"),
         ("extracted_master_sci_spectrum", "fiber_wavelength_spectral_mask"),
         ("wavelength_map", "fiber_wavelength_spectral_mask"),
     }
@@ -247,10 +243,10 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
     service = ArtifactService(database)
     rows = {
         kind: service.select_best(kind=kind, scope=Scope(zipcode=zipcode), policy="latest")
-        for kind in {node.kind for node in nodes} - {"amp_to_amp_normalization"}
+        for kind in {node.kind for node in nodes} - {"exposure_fiber_response"}
     }
-    rows["amp_to_amp_normalization"] = service.select_best(
-        kind="amp_to_amp_normalization", scope=Scope(zipcode=None), policy="latest"
+    rows["exposure_fiber_response"] = service.select_best(
+        kind="exposure_fiber_response", scope=Scope(zipcode=None), policy="latest"
     )
     assert all(rows.values())
     assert {item["name"] for item in service.describe(rows["master_bias"])["components"]} == {
@@ -294,12 +290,11 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
             "extraction_valid", "aperture_start_row", "aperture_first_weight",
             "aperture_last_weight", "aperture_sample_mask_bits",
         }
-    response_description = service.describe(rows["within_amp_fiber_normalization"])
+    response_description = service.describe(rows["exposure_fiber_response"])
     assert {item["name"] for item in response_description["components"]} >= {
-        "raw_ratio", "normalization", "valid_mask", "common_twilight",
-        "ftf_ldls", "twilight_broad_correction",
-        "twilight_residual_correction", "wavelength",
-        "amplifier_twilight_level",
+        "raw_ratio", "normalization", "valid_mask", "common_ldls", "common_twilight",
+        "within_amplifier_response", "amplifier_response", "amplifier_scalar",
+        "amplifier_common_response", "fiber_amplifier_index", "amplifier_identity", "wavelength",
     }
     assert response_description["summary"]["algorithm_metadata"]["fine_structure_source"] == (
         "master_ldls"
@@ -307,13 +302,11 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
     assert response_description["summary"]["algorithm_metadata"]["large_scale_anchor"] == (
         "master_twilight"
     )
-    amp_description = service.describe(rows["amp_to_amp_normalization"])
-    assert amp_description["scope"]["exposure_id"] is None
-    assert amp_description["summary"]["algorithm_metadata"]["coverage_complete"] is True
-    assert amp_description["summary"]["algorithm_metadata"]["amplifier_keys"] == [
+    assert response_description["scope"]["exposure_id"] is None
+    assert response_description["summary"]["algorithm_metadata"]["amplifier_keys"] == [
         current.key() for current in zipcodes
     ]
-    assert len(amp_description["relations"]) == len(zipcodes)
+    assert len(response_description["relations"]) == 4 * len(zipcodes)
     calibration_scatter = [
         row for row in service.adapter.list_all(kind="ccd_scattered_light_model")
         if row.get("exposure_id") is None
@@ -372,11 +365,12 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
         item["parent_id"] for item in twilight_extraction_relations
     }
     response_relations = response_description["relations"]
-    assert {item["parent_id"] for item in response_relations} == {
-        int(rows["extracted_master_ldls_spectrum"]["id"]),
-        int(rows["extracted_master_twilight_spectrum"]["id"]),
-        int(rows["extracted_master_sci_spectrum"]["id"]),
-        int(rows["wavelength_map"]["id"]),
+    assert len(response_relations) == 4 * len(zipcodes)
+    assert {
+        service.adapter.get_row(item["parent_id"])["kind"] for item in response_relations
+    } == {
+        "extracted_master_ldls_spectrum", "extracted_master_twilight_spectrum",
+        "extracted_master_sci_spectrum", "wavelength_map",
     }
     mask_relations = service.describe(
         rows["fiber_wavelength_spectral_mask"]
@@ -405,7 +399,7 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
     assert [target.kind for target in stale_policy_rerun] == ["master_bias"]
 
 
-def test_amp_to_amp_normalization_builds_from_majority_when_one_amplifier_is_terminal(
+def test_exposure_response_excludes_terminal_amplifier_when_majority_is_healthy(
     tmp_path, monkeypatch
 ):
     zipcodes = [
@@ -519,7 +513,7 @@ def test_amp_to_amp_normalization_builds_from_majority_when_one_amplifier_is_ter
 
     service = ArtifactService(database)
     amp_row = service.select_best(
-        kind="amp_to_amp_normalization", scope=Scope(zipcode=None), policy="latest"
+        kind="exposure_fiber_response", scope=Scope(zipcode=None), policy="latest"
     )
     assert amp_row is not None
     amp_description = service.describe(amp_row)
@@ -530,10 +524,10 @@ def test_amp_to_amp_normalization_builds_from_majority_when_one_amplifier_is_ter
 
     bad_zipcode = zipcodes[0]
     bad_row = service.select_best(
-        kind="within_amp_fiber_normalization", scope=Scope(zipcode=bad_zipcode), policy="latest"
+        kind="exposure_fiber_response", scope=Scope(zipcode=None), policy="latest"
     )
     assert bad_row is not None
-    policy_version = service.diagnostics.policy_version_for("within_amp_fiber_normalization")
+    policy_version = service.diagnostics.policy_version_for("exposure_fiber_response")
     db.save_qa_bundle(
         int(bad_row["id"]),
         facts={"read_noise": {"value": 999.0}},
@@ -545,7 +539,7 @@ def test_amp_to_amp_normalization_builds_from_majority_when_one_amplifier_is_ter
 
     replanned, replan_report = graph.plan(db_path=database, scopes=scopes)
     degraded_target = next(
-        target for target in replanned if target.kind == "amp_to_amp_normalization"
+        target for target in replanned if target.kind == "exposure_fiber_response"
     )
     assert degraded_target.group.metadata["coverage_complete"] is False
     assert degraded_target.group.metadata["excluded_amplifier_keys"] == [bad_zipcode.key()]
@@ -571,7 +565,7 @@ def test_amp_to_amp_normalization_builds_from_majority_when_one_amplifier_is_ter
     replan_executor.run()
 
     degraded_row = service.select_best(
-        kind="amp_to_amp_normalization", scope=Scope(zipcode=None), policy="latest"
+        kind="exposure_fiber_response", scope=Scope(zipcode=None), policy="latest"
     )
     assert int(degraded_row["id"]) != int(amp_row["id"])
     degraded_description = service.describe(degraded_row)

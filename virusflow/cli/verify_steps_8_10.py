@@ -25,7 +25,7 @@ LEFT_ZIPCODE = "060+003+206+LL+S/N 0039"
 RIGHT_ZIPCODE = "060+003+206+RU+S/N 0039"
 
 STEP_KINDS = {
-    "ccd_scattered_light_model", "amp_to_amp_normalization", "initial_astrometry",
+    "ccd_scattered_light_model", "exposure_fiber_response", "initial_astrometry",
     "source_detection_catalog", "catalog_match_table", "final_astrometry",
     "fiber_sky_coordinates", "sky_fiber_mask", "sky_model", "baseline_relative_response",
     "exposure_illumination_correction", "fiber_response_model",
@@ -45,7 +45,7 @@ EXPOSURE_RESULT_KINDS = (
     "exposure_completion_manifest", "initial_astrometry", "source_detection_catalog",
     "catalog_match_table", "final_astrometry", "fiber_sky_coordinates", "sky_fiber_mask",
     "sky_model", "baseline_relative_response", "exposure_illumination_correction", "fiber_response_model",
-    "exposure_mode_classification", "effective_exposure_time", "amp_to_amp_normalization",
+    "exposure_mode_classification", "effective_exposure_time", "exposure_fiber_response",
 )
 
 
@@ -280,8 +280,8 @@ def _exposure_figure(output_dir: Path, service, exposure_result: dict) -> dict:
     axes[0, 1].legend(fontsize=7)
     axes[0, 1].set_title("extraction and variance")
 
-    amp_row = service.adapter.get_row(int(exposure_result["amp_to_amp_normalization"].id))
-    factors = np.asarray(service.load_component(amp_row, "amplifier_factors")["data"], dtype=float)
+    amp_row = service.adapter.get_row(int(exposure_result["exposure_fiber_response"].id))
+    factors = np.asarray(service.load_component(amp_row, "amplifier_response")["data"], dtype=float)
     axes[0, 2].hist(factors[np.isfinite(factors)], bins=40, histtype="step")
     axes[0, 2].set_title("amplifier normalization")
 

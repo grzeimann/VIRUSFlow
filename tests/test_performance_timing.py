@@ -224,7 +224,7 @@ def test_exposure_selection_falls_back_to_nearest_calibration(monkeypatch, tmp_p
     assert policies == ["latest_valid", "nearest"]
     assert available[zipcode.key()] == {"master_bias": nearest}
     assert any(
-        "amp_to_amp_normalization: missing published calibration build" in message
+        "exposure_fiber_response: absent from selected exposure response" in message
         for message in failures[zipcode.key()]
     )
 

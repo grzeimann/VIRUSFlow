@@ -62,7 +62,7 @@ SUPPORTED_CALIBRATION_KINDS = frozenset({
     "extracted_master_ldls_spectrum",
     "extracted_master_twilight_spectrum",
     "extracted_master_sci_spectrum",
-    "within_amp_fiber_normalization",
+    "exposure_fiber_response",
     "fiber_wavelength_spectral_mask",
     "trace_map",
     "wavelength_map",

@@ -27,13 +27,15 @@ class FiberResponseModel:
         if wave.shape[0] != self.within_amp_knots.shape[0]:
             raise ValueError("response model and wavelength fiber counts differ")
         output = np.empty(wave.shape, dtype=np.float32)
-        amp_index = np.asarray(self.fiber_identity)[:, 0].astype(int)
         for index in range(wave.shape[0]):
             output[index] = np.interp(
                 wave[index], self.wavelength_knots[index], self.within_amp_knots[index],
                 left=np.nan, right=np.nan,
             )
-        output *= self.amplifier_factors[amp_index, None]
+        factors = np.asarray(self.amplifier_factors, dtype=np.float32)
+        if factors.shape != output.shape:
+            raise ValueError("amplifier factors must be sampled for every fiber and wavelength")
+        output *= factors
         output *= self.illumination_factors[:, None]
         return output
 
@@ -93,29 +95,16 @@ def within_amplifier_normalization(twilight_spectrum, *, smooth_pixels: int = 51
     )
 
 
-def amplifier_normalization(amplifier_twilight_levels) -> AlgoResult:
-    """Place amplifiers in one exposure-wide robust twilight reference frame."""
-
-    levels = np.asarray(amplifier_twilight_levels, dtype=float)
-    positive = np.isfinite(levels) & (levels > 0)
-    reference = float(np.nanmedian(levels[positive])) if positive.any() else float("nan")
-    factors = np.full(levels.shape, np.nan, dtype=float)
-    factors[positive] = levels[positive] / reference
-    return AlgoResult(
-        kind="amplifier_normalization",
-        version=NORMALIZATION_VERSION,
-        arrays={"amplifier_factors": factors.astype(np.float32)},
-        scalars={"reference_level": reference},
-    )
-
-
 def normalize_amplifier_spectrum(spectrum, variance, within_normalization, amplifier_factor) -> AlgoResult:
     """Combine within-amplifier and amplifier-to-amplifier response into one divisor."""
 
     spec = np.asarray(spectrum, dtype=float)
     var = np.asarray(variance, dtype=float)
     within = np.asarray(within_normalization, dtype=float)
-    final_response = within * amplifier_factor
+    factor = np.asarray(amplifier_factor, dtype=float)
+    if factor.shape not in ((), spec.shape):
+        raise ValueError("amplifier_factor must be scalar or match the spectrum shape")
+    final_response = within * factor
     normalized = spec / final_response
     normalized_variance = var / np.square(final_response)
     return AlgoResult(
@@ -126,7 +115,7 @@ def normalize_amplifier_spectrum(spectrum, variance, within_normalization, ampli
             "normalized_variance": normalized_variance.astype(np.float32),
             "final_response": final_response.astype(np.float32),
         },
-        scalars={"amplifier_factor": float(amplifier_factor)},
+        scalars={"amplifier_factor_median": float(np.nanmedian(factor))},
     )
 
 

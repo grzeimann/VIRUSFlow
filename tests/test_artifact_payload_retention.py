@@ -198,7 +198,7 @@ def test_ldls_eviction_preserves_evidentiary_mask(tmp_path: Path):
         parents=[ldls.id, trace.id, scatter.id],
     )
     response = _publish(
-        publisher, "within_amp_fiber_normalization", parents=[spectrum.id]
+        publisher, "exposure_fiber_response", parents=[spectrum.id]
     )
     _pass_qa(service, ldls, trace, scatter, spectrum, response)
 
@@ -255,7 +255,7 @@ def test_fiber_response_stage_evicts_only_dense_flat_payloads(tmp_path: Path):
     )
     response = _publish(
         publisher,
-        "within_amp_fiber_normalization",
+        "exposure_fiber_response",
         parents=[ldls_spectrum.id, twilight_spectrum.id],
     )
     _pass_qa(

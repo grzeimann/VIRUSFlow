@@ -135,20 +135,16 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
         lifecycle=ArtifactLifecycle.SCRATCH,
     ),
     "extracted_variance": _spec("extracted_variance", PhysicalScope.FIBER, Unit.ELECTRON_VARIANCE.value, CoordinateConvention.FIBER_BY_DISPERSION_PIXEL, ("variance",), lifecycle=ArtifactLifecycle.SCRATCH),
-    "within_amp_fiber_normalization": _spec(
-        "within_amp_fiber_normalization", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value,
+    "exposure_fiber_response": _spec(
+        "exposure_fiber_response", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value,
         CoordinateConvention.FIBER_BY_DISPERSION_PIXEL,
         (
-            "raw_ratio", "normalization", "valid_mask", "common_twilight",
-            "ftf_ldls", "twilight_broad_correction",
-            "twilight_residual_correction", "wavelength",
-            "amplifier_twilight_level",
+            "raw_ratio", "normalization", "valid_mask", "common_ldls",
+            "common_twilight", "within_amplifier_response",
+            "amplifier_response", "amplifier_scalar", "amplifier_common_response",
+            "fiber_amplifier_index", "amplifier_identity", "wavelength",
         ),
         ("science_residual_per_fiber",),
-    ),
-    "amp_to_amp_normalization": _spec(
-        "amp_to_amp_normalization", PhysicalScope.EXPOSURE, Unit.DIMENSIONLESS.value,
-        CoordinateConvention.NONE, ("amplifier_factors", "amplifier_twilight_levels", "reference_level", "amplifier_identity"),
     ),
     "fiber_normalization": _spec(
         "fiber_normalization", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value,

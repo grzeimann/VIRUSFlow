@@ -33,6 +33,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from virusflow.artifacts import ArtifactService, Scope
 from virusflow.algorithms.spatial_psf import ChromaticPSFModel
 from virusflow.algorithms.source_extraction import select_source_fibers
+from virusflow.algorithms.astrometry import sky_to_focal_plane
 from virusflow.config.defaults import SOURCE_EXTRACTION_CONFIGURATION
 
 FIGSIZE = (7.0, 6.0)
@@ -148,7 +149,7 @@ def plot_observation_summary(ctx, out_dir, report):
     rows = []
     columns = [
         "exposure", "dither", "seeing", "airmass", "transparency",
-        "astrometry", "detections", "extraction", "captured_frac",
+        "astrometry", "astrom rms", "detections", "sky residual", "iterations", "extraction", "captured_frac",
         "reduced/raw amp", "failed amp",
     ]
     for index, exposure_id in enumerate(ctx.exposure_ids):
@@ -157,12 +158,14 @@ def plot_observation_summary(ctx, out_dir, report):
         astrometry_row = get_product(service, "final_astrometry", exposure_id=exposure_id)
         detections_row = get_product(service, "source_detection_catalog", exposure_id=exposure_id)
         extraction_row = get_product(service, "point_source_extraction", exposure_id=exposure_id)
+        sky_model_row = get_product(service, "sky_model", exposure_id=exposure_id)
 
         state_summary = summary_of(service, state_row) if state_row is not None else {}
         completion_summary = summary_of(service, completion_row) if completion_row is not None else {}
         astrometry_summary = summary_of(service, astrometry_row) if astrometry_row is not None else {}
         detection_summary = summary_of(service, detections_row) if detections_row is not None else {}
         extraction_summary = summary_of(service, extraction_row) if extraction_row is not None else {}
+        sky_summary = summary_of(service, sky_model_row) if sky_model_row is not None else {}
 
         state_array = load(service, state_row, "state") if state_row is not None else None
         seeing = float(state_array[0]) if state_array is not None else float("nan")
@@ -178,7 +181,11 @@ def plot_observation_summary(ctx, out_dir, report):
 
         rows.append([
             exposure_id, str(index), f"{seeing:.2f}", f"{airmass:.3f}", f"{transparency:.2f}",
-            astrometry_status, str(detection_summary.get("detection_count", "-")),
+            astrometry_status,
+            f"{astrometry_summary.get('residual_rms_arcsec', float('nan')):.2f}",
+            str(detection_summary.get("detection_count", "-")),
+            f"{sky_summary.get('sky_residual_robust_sigma', float('nan')):.2f}",
+            str(sky_summary.get("exposure_inference_iteration", "-")),
             extraction_summary.get("median_captured_fraction") is not None and "extracted" or (
                 "no_source" if extraction_row is None else "extracted"
             ),
@@ -290,6 +297,20 @@ def plot_astrometry(service, exposure_id, out_dir, report):
     ax.scatter(focal[:, 0], focal[:, 1], s=2, color="0.7", label="fibers")
     if detections.size:
         ax.scatter(detections[:, 2], detections[:, 3], s=30, marker="*", color="crimson", label="detections")
+    if matches_row is not None:
+        matches = load(service, matches_row, "matches")
+        catalog = load(service, matches_row, "catalog_rows")
+        accepted = matches[matches[:, 6].astype(bool)] if matches.size else np.empty((0, 9))
+        if accepted.size:
+            parameters = load(service, final_row, "parameters")
+            catalog_rows = catalog[accepted[:, 1].astype(int)]
+            catalog_focal = sky_to_focal_plane(
+                parameters[0], parameters[1], parameters[2], catalog_rows[:, 0], catalog_rows[:, 1]
+            )
+            ax.scatter(
+                catalog_focal.get_array("focal_x"), catalog_focal.get_array("focal_y"),
+                s=70, marker="+", color="gold", linewidths=1.5, label="accepted catalog positions",
+            )
     ax.set_xlabel("focal-plane x (arcsec)")
     ax.set_ylabel("focal-plane y (arcsec)")
     ax.set_title(f"astrometry: {'catalog-refined' if refined else 'header-only/degraded'}")
@@ -477,6 +498,80 @@ def plot_illumination(service, exposure_id, out_dir, report):
     fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     report.generated(f"{exposure_id}/illumination", path)
+
+
+def plot_sky_and_normalization(service, exposure_id, out_dir, report):
+    """Show the retained sky evidence and separate calibration/exposure factors."""
+    sky_mask_row = get_product(service, "sky_fiber_mask", exposure_id=exposure_id)
+    sky_model_row = get_product(service, "sky_model", exposure_id=exposure_id)
+    response_row = get_product(service, "fiber_response_model", exposure_id=exposure_id)
+    coords_row = get_product(service, "fiber_sky_coordinates", exposure_id=exposure_id)
+    if any(row is None for row in (sky_mask_row, sky_model_row, response_row, coords_row)):
+        report.skipped(
+            f"{exposure_id}/sky_and_normalization",
+            "missing sky_fiber_mask, sky_model, fiber_response_model, or fiber_sky_coordinates",
+        )
+        return
+
+    sky_mask = load(service, sky_mask_row, "mask").astype(bool)
+    focal = load(service, coords_row, "focal_plane_coordinates")
+    wavelength = load(service, sky_model_row, "latent_wavelength")
+    latent_sky = load(service, sky_model_row, "latent_flux_density")
+    latent_variance = load(service, sky_model_row, "latent_variance_density")
+    sample_count = load(service, sky_model_row, "sample_count")
+    illumination = load(service, response_row, "illumination_factors")
+    within_amp = load(service, response_row, "within_amp_knots")
+    identity = load(service, response_row, "fiber_identity")
+    sky_summary = summary_of(service, sky_model_row)
+
+    fig, axes = plt.subplots(2, 2, figsize=(12.0, 9.0))
+    ax = axes[0, 0]
+    ax.scatter(focal[~sky_mask, 0], focal[~sky_mask, 1], s=3, color="0.8", label="object/rejected")
+    ax.scatter(focal[sky_mask, 0], focal[sky_mask, 1], s=5, color="steelblue", label="sky fibers")
+    ax.set(xlabel="focal-plane x (arcsec)", ylabel="focal-plane y (arcsec)", title="sky-fiber selection")
+    ax.legend(fontsize=8)
+    ax.set_aspect("equal", adjustable="datalim")
+
+    ax = axes[0, 1]
+    ax.plot(wavelength, latent_sky, color="midnightblue", linewidth=0.8, label="latent sky")
+    uncertainty = np.sqrt(np.where(latent_variance >= 0, latent_variance, np.nan))
+    ax.fill_between(wavelength, latent_sky - uncertainty, latent_sky + uncertainty, color="midnightblue", alpha=0.2)
+    ax.set(xlabel="wavelength (Angstrom)", ylabel="electron / Angstrom", title="latent sky model")
+
+    ax = axes[1, 0]
+    ax.plot(wavelength, sample_count, color="seagreen", linewidth=0.8)
+    ax.set(xlabel="wavelength (Angstrom)", ylabel="contributing samples", title="sky-model sampling support")
+
+    ax = axes[1, 1]
+    calibration_factor = np.nanmedian(within_amp, axis=1)
+    for amplifier in np.unique(identity[:, 0]):
+        selected = identity[:, 0] == amplifier
+        ax.scatter(
+            calibration_factor[selected], illumination[selected], s=6, alpha=0.5,
+            label=f"amp {int(amplifier)}",
+        )
+    ax.axhline(1.0, color="0.7", linewidth=0.8)
+    ax.axvline(1.0, color="0.7", linewidth=0.8)
+    ax.set(
+        xlabel="median within-amplifier calibration normalization",
+        ylabel="measured exposure illumination factor",
+        title="calibration normalization vs exposure illumination",
+    )
+    ax.legend(fontsize=6, ncol=2)
+
+    residual = sky_summary.get("sky_residual_robust_sigma")
+    fig.suptitle(
+        f"Exposure {exposure_id}: sky fit and normalization"
+        + (f" (global sky residual robust sigma={residual:.3g})" if residual is not None else "")
+    )
+    fig.tight_layout()
+    path = out_dir / "sky_and_normalization.png"
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    report.generated(
+        f"{exposure_id}/sky_and_normalization", path,
+        "fiber/amp/IFU residual arrays are not retained; only the global robust residual is available",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -808,6 +903,7 @@ def main(argv=None):
         run_diagnostic(report, f"{exposure_id}/astrometry", plot_astrometry, service, exposure_id, exposure_dir, report)
         run_diagnostic(report, f"{exposure_id}/collapsed_focal_plane", plot_collapsed_focal_plane, service, exposure_id, exposure_dir, report, ctx)
         run_diagnostic(report, f"{exposure_id}/illumination", plot_illumination, service, exposure_id, exposure_dir, report)
+        run_diagnostic(report, f"{exposure_id}/sky_and_normalization", plot_sky_and_normalization, service, exposure_id, exposure_dir, report)
         run_diagnostic(report, f"{exposure_id}/source_geometry", plot_source_geometry, service, exposure_id, exposure_dir, report)
         run_diagnostic(report, f"{exposure_id}/psf_dar", plot_psf_dar, service, exposure_id, exposure_dir, report)
         run_diagnostic(report, f"{exposure_id}/source_spectrum", plot_source_spectra, service, exposure_id, exposure_dir, report)

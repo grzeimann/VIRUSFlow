@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from .base import Task, TaskContext
 from .calibs import (
-    AmplifierFiberResponseTask, BiasTask, CalibrationAmpNormalizationTask, DarkTask,
+    ExposureFiberResponseTask, BiasTask, DarkTask,
     ExtractedMasterLdlsSpectrumTask, ExtractedMasterTwilightSpectrumTask,
     FlatTask, CmpTask, TwiTask, TraceTask, WaveTask,
 )
@@ -15,6 +15,5 @@ __all__ = [
     "TwiTask", "TraceTask", "WaveTask", "ExposureTask", "ObservationTask",
     "PhysicalCCDTask", "ReducedScienceAmplifierTask",
     "ExtractedMasterLdlsSpectrumTask", "ExtractedMasterTwilightSpectrumTask",
-    "AmplifierFiberResponseTask",
-    "CalibrationAmpNormalizationTask",
+    "ExposureFiberResponseTask",
 ]

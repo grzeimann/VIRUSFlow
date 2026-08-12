@@ -14,7 +14,10 @@ from ..algorithms.flat import step_flt
 from ..algorithms.trace import fit_fiber_traces
 from ..algorithms.twi import step_twi
 from ..algorithms.master_sci import build_master_sci
-from ..algorithms.fiber_response import fit_within_amplifier_response
+from ..algorithms.fiber_response import (
+    FIBER_RESPONSE_VERSION,
+    fit_exposure_fiber_response,
+)
 from ..algorithms.calibration_detector import (
     DARK_BIAS_CONVENTION,
     correct_response_calibration_frames,
@@ -28,7 +31,6 @@ from ..algorithms.physical_ccd import (
     compact_scattered_light_payload,
     fit_gap_scattered_light,
 )
-from ..algorithms.response import NORMALIZATION_VERSION, amplifier_normalization
 from ..algorithms.wave import fit_wavelength_solution
 from ..artifacts import ArtifactService, Scope, Validity
 from ..artifacts.models import ConfigurationReference
@@ -47,7 +49,7 @@ from ..contracts.result import (
     TwiResultContract,
     WaveResultContract,
     MasterSciResultContract,
-    AmplifierFiberResponseResultContract,
+    ExposureFiberResponseResultContract,
     ExtractedMasterSpectrumResultContract,
     ExtractedMasterSciSpectrumResultContract,
     FiberWavelengthSpectralMaskResultContract,
@@ -489,7 +491,7 @@ class MasterSciTask(_RawCalibrationTask):
 
 
 class _ExtractedMasterSpectrumTask(_CanonicalTask):
-    version = "v1"
+    version = "v2"
     master_kind = ""
     result_contract = ExtractedMasterSpectrumResultContract
     algorithm_name = "virusflow.algorithms.master_spectrum.extract_master_spectrum"
@@ -771,100 +773,126 @@ class ExtractedMasterTwilightSpectrumTask(_ExtractedMasterSpectrumTask):
     result_kind = artifact_name
 
 
-class AmplifierFiberResponseTask(_CanonicalTask):
-    """Publish the reusable LDLS-fine, twilight-anchored amplifier response."""
+class ExposureFiberResponseTask(_CanonicalTask):
+    """Publish one exposure-wide, three-component fiber response."""
 
-    name = "amplifier_fiber_response"
-    version = "v1"
-    artifact_name = "within_amp_fiber_normalization"
-    algorithm_name = "virusflow.algorithms.fiber_response.fit_within_amplifier_response"
-    result_kind = "within_amplifier_normalization"
-    result_contract = AmplifierFiberResponseResultContract
+    name = "exposure_fiber_response"
+    version = "v2"
+    artifact_name = "exposure_fiber_response"
+    algorithm_name = "virusflow.algorithms.fiber_response.fit_exposure_fiber_response"
+    result_kind = artifact_name
+    result_contract = ExposureFiberResponseResultContract
     component_map = {
         "raw_ratio": "raw_ratio",
         "normalization": "normalization",
         "valid_mask": "valid_mask",
+        "common_ldls": "common_ldls",
         "common_twilight": "common_twilight",
+        "within_amplifier_response": "within_amplifier_response",
+        "amplifier_response": "amplifier_response",
+        "amplifier_scalar": "amplifier_scalar",
+        "amplifier_common_response": "amplifier_common_response",
+        "fiber_amplifier_index": "fiber_amplifier_index",
+        "amplifier_identity": "amplifier_identity",
         "ftf_ldls": "ftf_ldls",
         "twilight_broad_correction": "twilight_broad_correction",
         "twilight_residual_correction": "twilight_residual_correction",
         "wavelength": "wavelength",
-        "amplifier_twilight_level": "amplifier_twilight_level",
         "science_residual_per_fiber": "science_residual_per_fiber",
     }
     component_units = {
         "raw_ratio": "1",
         "normalization": "1",
         "valid_mask": "1",
+        "common_ldls": "electron",
         "common_twilight": "electron",
+        "within_amplifier_response": "1",
+        "amplifier_response": "1",
+        "amplifier_scalar": "1",
+        "amplifier_common_response": "1",
+        "fiber_amplifier_index": "1",
+        "amplifier_identity": "1",
         "ftf_ldls": "1",
         "twilight_broad_correction": "1",
         "twilight_residual_correction": "1",
         "wavelength": "Angstrom",
-        "amplifier_twilight_level": "electron",
         "science_residual_per_fiber": "1",
     }
 
     def run(self, inputs):
         self._require_target()
         service = ArtifactService(self.ctx.db_path)
-
-        def required(kind: str):
-            row = None
-            for candidate in _dependency_artifacts(inputs, kind):
-                candidate_row = service.adapter.get_row(_artifact_id(candidate))
-                if candidate_row is not None and candidate_row.get("amp_key") == self.target.zipcode.key():
-                    row = candidate_row
-                    break
-            if row is None:
-                row = next((
-                    candidate for candidate in _planned_parent_rows(
-                        service, self.target, kind
+        required_kinds = (
+            "extracted_master_ldls_spectrum",
+            "extracted_master_twilight_spectrum",
+            "wavelength_map",
+        )
+        direct_rows = {}
+        for kind in (*required_kinds, "extracted_master_sci_spectrum"):
+            rows = []
+            for artifact in _dependency_artifacts(inputs, kind):
+                row = service.adapter.get_row(_artifact_id(artifact))
+                if row is not None and row.get("amp_key"):
+                    rows.append(row)
+            rows.extend(_planned_parent_rows(service, self.target, kind))
+            direct_rows[kind] = {str(row["amp_key"]): row for row in rows if row.get("amp_key")}
+        ldls_rows = direct_rows["extracted_master_ldls_spectrum"]
+        requested_keys = list(
+            (getattr(self.target, "group_metadata", None) or {}).get("amplifier_keys")
+            or sorted(ldls_rows)
+        )
+        if not requested_keys:
+            raise RuntimeError("ExposureFiberResponseTask requires planned LDLS spectra")
+        at = self._target_mid_time()
+        participants = []
+        for key in sorted(requested_keys):
+            zipcode = parse_zipcode_key(key)
+            rows = {}
+            for kind in required_kinds:
+                row = direct_rows[kind].get(key)
+                if row is None:
+                    row = service.select_best(
+                        kind=kind, scope=Scope(zipcode=zipcode), at_time=at,
+                        policy="latest_valid",
+                    ) or service.select_best(
+                        kind=kind, scope=Scope(zipcode=zipcode), at_time=at,
+                        policy="nearest",
                     )
-                    if candidate.get("amp_key") == self.target.zipcode.key()
-                ), None)
-            if row is None and not _planned_parent_rows(service, self.target, kind):
-                row = self._resolve_artifact(kind, required=True)
-            if row is None:
-                raise RuntimeError(
-                    f"{self.__class__.__name__} cannot resolve planned {kind} "
-                    f"for zipcode={self.target.zipcode.key()}"
-                )
-            return row, int(row.id) if hasattr(row, "id") else int(row["id"])
-
-        ldls_row, ldls_id = required("extracted_master_ldls_spectrum")
-        twilight_row, twilight_id = required("extracted_master_twilight_spectrum")
-        wavelength_row, wavelength_id = required("wavelength_map")
-        science_row = None
-        for candidate in _dependency_artifacts(
-            inputs, "extracted_master_sci_spectrum"
-        ):
-            candidate_row = service.adapter.get_row(_artifact_id(candidate))
-            if (
-                candidate_row is not None
-                and candidate_row.get("amp_key") == self.target.zipcode.key()
-            ):
-                science_row = candidate_row
-                break
-        if science_row is None:
-            science_row = next((
-                candidate for candidate in _planned_parent_rows(
-                    service, self.target, "extracted_master_sci_spectrum"
-                )
-                if candidate.get("amp_key") == self.target.zipcode.key()
-            ), None)
-        science_id = None
-        science_spectrum = None
-        if science_row is not None:
-            science_id = int(science_row.id) if hasattr(science_row, "id") else int(science_row["id"])
-            science_spectrum = service.load_component(science_id, "spectrum")["data"]
-
+                if row is not None:
+                    rows[kind] = row
+            if len(rows) == len(required_kinds):
+                participants.append((key, rows))
+        if not participants:
+            raise RuntimeError("ExposureFiberResponseTask has no amplifiers with all required dependencies")
         params = self._params()
-        result = fit_within_amplifier_response(
-            service.load_component(ldls_id, "spectrum")["data"],
-            service.load_component(twilight_id, "spectrum")["data"],
-            service.load_component(wavelength_id, "wavelength_map")["data"],
-            science_spectrum=science_spectrum,
+        ldls = [service.load_component(rows["extracted_master_ldls_spectrum"], "spectrum")["data"]
+                for _, rows in participants]
+        twilight = [service.load_component(rows["extracted_master_twilight_spectrum"], "spectrum")["data"]
+                    for _, rows in participants]
+        wavelength = [service.load_component(rows["wavelength_map"], "wavelength_map")["data"]
+                      for _, rows in participants]
+        science_parts = []
+        science_rows = []
+        for key, _ in participants:
+            zipcode = parse_zipcode_key(key)
+            row = direct_rows["extracted_master_sci_spectrum"].get(key)
+            if row is None:
+                row = service.select_best(
+                    kind="extracted_master_sci_spectrum", scope=Scope(zipcode=zipcode),
+                    at_time=at, policy="latest_valid",
+                ) or service.select_best(
+                    kind="extracted_master_sci_spectrum", scope=Scope(zipcode=zipcode),
+                    at_time=at, policy="nearest",
+                )
+            if row is None:
+                science_parts = []
+                science_rows = []
+                break
+            science_rows.append(row)
+            science_parts.append(service.load_component(row, "spectrum")["data"])
+        result = fit_exposure_fiber_response(
+            ldls, twilight, wavelength,
+            science_spectrum=(np.concatenate(science_parts) if science_parts else None),
             common_model_bins=int(params.get("common_model_bins", 3000)),
             broad_ldls_bins=int(params.get("broad_ldls_bins", 5)),
             twilight_residual_bins=int(params.get("twilight_residual_bins", 25)),
@@ -872,131 +900,30 @@ class AmplifierFiberResponseTask(_CanonicalTask):
                 params.get("minimum_wavelength_finite_fraction", 0.8)
             ),
         )
-        result.meta.update(service.get_scientific_metadata(twilight_id))
+        identities = []
+        parent_ids = []
+        for key, rows in participants:
+            zipcode = parse_zipcode_key(key)
+            identities.append([int(zipcode.ifuslot), int(zipcode.ifuid), int(zipcode.specid), AMP_CODE[zipcode.amp]])
+            parent_ids.extend(_artifact_id(row) for row in rows.values())
+        parent_ids.extend(_artifact_id(row) for row in science_rows)
+        result.arrays["amplifier_identity"] = np.asarray(identities, dtype=np.int32)
+        result.meta.update(aggregate_scientific_metadata([
+            service.get_scientific_metadata(_artifact_id(rows["extracted_master_twilight_spectrum"]))
+            for _, rows in participants
+        ]))
+        result.meta.update({
+            "amplifier_keys": [key for key, _ in participants],
+            "excluded_amplifier_keys": sorted(set(requested_keys) - {key for key, _ in participants}),
+            "participating_amplifiers": len(participants),
+        })
         report = self.result_contract().validate(result)
         if not report.ok:
             raise ValueError(
-                "AmplifierFiberResponseTask result contract: " + "; ".join(report.errors)
+                "ExposureFiberResponseTask result contract: " + "; ".join(report.errors)
             )
-        parent_ids = [ldls_id, twilight_id, wavelength_id]
-        if science_id is not None:
-            parent_ids.append(science_id)
-        artifact = self._publish(result, parent_ids, parameters=params)
-        return {self.artifact_name: artifact}
-
-
-class CalibrationAmpNormalizationTask(_CanonicalTask):
-    """Place one coherent calibration build on a common amplifier scale."""
-
-    name = "calibration_amp_normalization"
-    version = "v1"
-    artifact_name = "amp_to_amp_normalization"
-    algorithm_name = "virusflow.algorithms.response.amplifier_normalization"
-    result_kind = "amplifier_normalization"
-    component_map = {
-        "amplifier_factors": "amplifier_factors",
-        "amplifier_twilight_levels": "amplifier_twilight_levels",
-        "reference_level": "reference_level",
-        "amplifier_identity": "amplifier_identity",
-    }
-    component_units = {
-        "amplifier_factors": "1",
-        "amplifier_twilight_levels": "electron",
-        "reference_level": "electron",
-        "amplifier_identity": "1",
-    }
-
-    def run(self, inputs):
-        self._require_target()
-        service = ArtifactService(self.ctx.db_path)
-        rows = []
-        seen = set()
-        for artifact in _dependency_artifacts(inputs, "within_amp_fiber_normalization"):
-            artifact_id = _artifact_id(artifact)
-            if artifact_id in seen:
-                continue
-            row = service.adapter.get_row(artifact_id)
-            if row is not None and row.get("amp_key"):
-                rows.append(row)
-                seen.add(artifact_id)
-        # A coherent build may combine newly scheduled responses with responses
-        # already present in the registry.  Existing parents have no executor
-        # result, so recover only the exact planned calibration-group identities.
-        planned_rows = _planned_parent_rows(
-            service, self.target, "within_amp_fiber_normalization"
-        )
-        if planned_rows:
-            for row in planned_rows:
-                if int(row["id"]) in seen or not row.get("amp_key"):
-                    continue
-                rows.append(row)
-                seen.add(int(row["id"]))
-        rows.sort(key=lambda row: str(row["amp_key"]))
-        if not rows:
-            raise RuntimeError("CalibrationAmpNormalizationTask requires amplifier response Products")
-        amplifier_keys = [str(row["amp_key"]) for row in rows]
-        configured_keys = sorted(
-            str(value) for value in (
-                (getattr(self.target, "group_metadata", None) or {}).get("amplifier_keys")
-                or amplifier_keys
-            )
-        )
-        if amplifier_keys != configured_keys:
-            raise RuntimeError(
-                "calibration-build response coverage differs from the planned coherent amplifier set"
-            )
-        levels = np.asarray([
-            float(np.asarray(service.load_component(
-                row, "amplifier_twilight_level"
-            )["data"]).ravel()[0])
-            for row in rows
-        ], dtype=np.float32)
-        normalized = amplifier_normalization(levels)
-        factors = normalized.get_array("amplifier_factors")
-        if not np.all(np.isfinite(factors) & (factors > 0.0)):
-            raise RuntimeError("calibration-build amplifier normalization is not finite and positive")
-        identities = []
-        for key in amplifier_keys:
-            zipcode = parse_zipcode_key(key)
-            identities.append([
-                int(zipcode.ifuslot), int(zipcode.ifuid), int(zipcode.specid),
-                AMP_CODE[zipcode.amp],
-            ])
-        build_metadata = getattr(self.target, "group_metadata", None) or {}
-        result = AlgoResult(
-            kind=self.result_kind,
-            version=NORMALIZATION_VERSION,
-            arrays={
-                "amplifier_factors": np.asarray(factors, dtype=np.float32),
-                "amplifier_twilight_levels": levels,
-                "reference_level": np.asarray(
-                    [normalized.scalars["reference_level"]], dtype=np.float32
-                ),
-                "amplifier_identity": np.asarray(identities, dtype=np.int32),
-            },
-            scalars={
-                "amplifier_count": len(rows),
-                "reference_level": float(normalized.scalars["reference_level"]),
-                "factor_median": float(np.nanmedian(factors)),
-                "factor_robust_sigma": float(
-                    1.4826 * np.nanmedian(np.abs(factors - np.nanmedian(factors)))
-                ),
-            },
-            meta={
-                "calibration_build_id": build_metadata.get("calibration_build_id"),
-                "amplifier_keys": amplifier_keys,
-                "coverage_complete": bool(build_metadata.get("coverage_complete", True)),
-                "excluded_amplifier_keys": list(build_metadata.get("excluded_amplifier_keys", []) or []),
-                "illumination_reference": "center_track_master_twilight",
-                "normalization_assumption": "uniform_center_track_twilight",
-            },
-        )
-        result.meta.update(aggregate_scientific_metadata([
-            service.get_scientific_metadata(int(row["id"])) for row in rows
-        ]))
         artifact = self._publish(
-            result, [int(row["id"]) for row in rows],
-            configuration_refs=[], parameters=self._params()
+            result, sorted(set(parent_ids)), configuration_refs=[], parameters=params
         )
         return {self.artifact_name: artifact}
 
@@ -1036,28 +963,14 @@ class FiberWavelengthSpectralMaskTask(_CanonicalTask):
         spectrum_id = int(spectrum_row.id) if hasattr(spectrum_row, "id") else int(spectrum_row["id"])
         wavelength_id = int(wavelength_row.id) if hasattr(wavelength_row, "id") else int(wavelength_row["id"])
 
-        normalization = None
         parent_ids = [spectrum_id, wavelength_id]
-        # Normalization is an explicit optional dependency, never an ambient
-        # registry lookup: otherwise the same planned target could change when
-        # a twilight product happened to appear between planning and execution.
-        normalization_row = self._dependency(inputs, "within_amp_fiber_normalization")
-        if normalization_row is not None:
-            normalization_id = (
-                int(normalization_row.id)
-                if hasattr(normalization_row, "id") else int(normalization_row["id"])
-            )
-            normalization = service.load_component(
-                normalization_id, "normalization"
-            )["data"]
-            parent_ids.append(normalization_id)
 
         params = dict(MASTER_SCI_SPECTRAL_MASK_CONFIGURATION.value)
         params.update(self._params())
         result = build_master_sci_spectral_mask(
             service.load_component(spectrum_id, "spectrum")["data"],
             service.load_component(wavelength_id, "wavelength_map")["data"],
-            fiber_normalization=normalization,
+            fiber_normalization=None,
             coarse_bins=int(params["coarse_bins"]),
             model_bins=int(params["model_bins"]),
             minimum_wavelength_finite_fraction=float(

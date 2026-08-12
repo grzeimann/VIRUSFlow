@@ -13,10 +13,9 @@ from virusflow.algorithms.exposure_state import classify_mode_and_effective_time
 from virusflow.algorithms.exposure import apply_relative_response
 from virusflow.algorithms.extraction import extract_fractional_aperture, fractional_aperture_geometry
 from virusflow.algorithms.response import (
-    amplifier_normalization,
     baseline_relative_response,
-    within_amplifier_normalization,
 )
+from virusflow.algorithms.fiber_response import fit_exposure_fiber_response
 from virusflow.config import ConfigurationService
 from virusflow.algorithms.sky import oversampled_incident_sky, select_sky_fibers
 from virusflow.io.catalogs import PanSTARRSCSVProvider
@@ -74,20 +73,23 @@ def test_fractional_extraction_characterizes_legacy_parity_and_intentional_edge_
 def test_normalization_stays_decomposed_and_multiplies_exactly():
     x = np.linspace(1.0, 2.0, 101)
     twilight = np.vstack((x, 2 * x, 4 * x))
-    within_result = within_amplifier_normalization(twilight, smooth_pixels=11)
-    raw = within_result.get_array("raw_ratio")
-    within = within_result.get_array("normalization")
-    valid = within_result.get_array("valid_mask")
-    common = within_result.get_array("common_twilight")
-    assert raw.shape == within.shape == valid.shape == twilight.shape
-    amp_normalization_result = amplifier_normalization([10.0, 20.0, 40.0])
-    amp_factor = amp_normalization_result.get_array("amplifier_factors")
-    reference = amp_normalization_result.scalars["reference_level"]
-    np.testing.assert_allclose(amp_factor, [0.5, 1.0, 2.0])
-    assert reference == 20.0
-    final = within * amp_factor[1]
-    np.testing.assert_allclose(final, within)
-    assert common.shape == x.shape
+    wave = np.broadcast_to(np.linspace(3500.0, 5500.0, x.size), twilight.shape)
+    ldls = [
+        np.vstack((x, 1.1 * x, 0.9 * x)),
+        np.vstack((x, 1.1 * x, 0.9 * x)),
+        np.vstack((x, 1.1 * x, 0.9 * x)),
+    ]
+    response = fit_exposure_fiber_response(
+        ldls,
+        [twilight, twilight * (1.0 + 0.2 * (x - 1.5)), twilight * 2.0],
+        [wave, wave, wave],
+        common_model_bins=x.size,
+    )
+    final = response.get_array("within_amplifier_response")
+    final *= response.get_array("amplifier_response").repeat(3, axis=0)
+    final *= np.repeat(response.get_array("amplifier_scalar"), 3)[:, None]
+    np.testing.assert_allclose(final, response.get_array("normalization"))
+    assert np.ptp(response.get_array("amplifier_response")[1]) > 0.1
 
 
 def test_default_baseline_removes_mcdonald_extinction_at_construction_airmass():

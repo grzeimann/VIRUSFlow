@@ -231,38 +231,33 @@ def _build_source_exposure(
             "input_mask_indices": np.asarray([], dtype=np.int32),
             "input_mask_shape": np.asarray([1032, nx], dtype=np.int32),
         }, at)
-        normalization = np.ones_like(wavelength, dtype=np.float32)
-        response_rows.append(_publish(service, tmp_path, "within_amp_fiber_normalization", zipcode, {
-            "raw_ratio": normalization,
-            "normalization": normalization,
-            "valid_mask": np.ones_like(normalization, dtype=np.uint8),
-            "common_twilight": np.full_like(normalization, 1000.0),
-            "ftf_ldls": normalization,
-            "twilight_broad_correction": normalization,
-            "twilight_residual_correction": normalization,
-            "wavelength": wavelength,
-            "amplifier_twilight_level": np.asarray([1000.0], dtype=np.float32),
-        }, at))
+    total_fibers = len(zipcodes) * trace.shape[0]
     _publish(
-        service, tmp_path, "amp_to_amp_normalization", None,
+        service, tmp_path, "exposure_fiber_response", None,
         {
-            "amplifier_factors": np.ones(len(zipcodes), dtype=np.float32),
-            "amplifier_twilight_levels": np.full(len(zipcodes), 1000.0, dtype=np.float32),
-            "reference_level": np.asarray([1000.0], dtype=np.float32),
+            "raw_ratio": np.ones((total_fibers, nx), dtype=np.float32),
+            "normalization": np.ones((total_fibers, nx), dtype=np.float32),
+            "valid_mask": np.ones((total_fibers, nx), dtype=np.uint8),
+            "common_ldls": np.full((total_fibers, nx), 1000.0, dtype=np.float32),
+            "common_twilight": np.full((total_fibers, nx), 1000.0, dtype=np.float32),
+            "within_amplifier_response": np.ones((total_fibers, nx), dtype=np.float32),
+            "amplifier_response": np.ones((len(zipcodes), nx), dtype=np.float32),
+            "amplifier_scalar": np.ones(len(zipcodes), dtype=np.float32),
+            "amplifier_common_response": np.ones((len(zipcodes), nx), dtype=np.float32),
+            "fiber_amplifier_index": np.repeat(np.arange(len(zipcodes)), trace.shape[0]),
             "amplifier_identity": np.asarray([
                 [int(item.ifuslot), int(item.ifuid), int(item.specid), index]
                 for index, item in enumerate(zipcodes)
             ], dtype=np.int32),
+            "wavelength": np.tile(np.linspace(3500, 5500, nx, dtype=np.float32), (total_fibers, 1)),
         },
         at,
-        parents=[row.id for row in response_rows],
         metadata={
             "algorithm_metadata": {
                 "amplifier_keys": [item.key() for item in zipcodes],
-                "coverage_complete": True,
-                "calibration_build_id": "fixture-build",
             }
         },
+        summaries={"fibers_per_amplifier": trace.shape[0]},
     )
 
     task = ExposureTask(

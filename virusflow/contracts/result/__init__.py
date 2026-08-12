@@ -109,14 +109,14 @@ class ExtractedMasterSciSpectrumResultContract(ExtractedMasterSpectrumResultCont
     """Backward-compatible name for the shared master-spectrum contract."""
 
 
-class AmplifierFiberResponseResultContract(_BaseSimpleContract):
+class ExposureFiberResponseResultContract(_BaseSimpleContract):
     required_arrays = [
-        "raw_ratio", "normalization", "valid_mask", "common_twilight",
-        "ftf_ldls", "twilight_broad_correction",
-        "twilight_residual_correction", "wavelength",
-        "amplifier_twilight_level",
+        "raw_ratio", "normalization", "valid_mask", "common_ldls",
+        "common_twilight", "within_amplifier_response",
+        "amplifier_response", "amplifier_scalar", "amplifier_common_response",
+        "fiber_amplifier_index", "wavelength",
     ]
-    required_scalars = ["valid_fraction", "amplifier_twilight_level"]
+    required_scalars = ["valid_fraction", "amplifier_count", "amplifier_reference_scalar"]
 
 
 class FiberWavelengthSpectralMaskResultContract(_BaseSimpleContract):
