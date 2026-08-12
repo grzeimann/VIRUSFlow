@@ -438,9 +438,42 @@ class ReductionGraph:
                         members = healthy  # build from the healthy majority; drop the terminal minority
                     else:
                         excluded = []
-                    parent_groups = tuple(
-                        (upstream, member.group.group_id) for member in members
-                    )
+                    # An exposure-scoped product may consume several
+                    # per-amplifier dependency kinds.  Carry every
+                    # planner-resolved parent group forward so the task can
+                    # resolve only graph-selected scheduled/cached rows.
+                    parent_groups_list = []
+                    for member in members:
+                        parent = (upstream, member.group.group_id)
+                        if parent not in parent_groups_list:
+                            parent_groups_list.append(parent)
+                        for dependency_kind in (node.inputs_artifacts or [])[1:]:
+                            choices = [
+                                candidate
+                                for candidate in available.get(
+                                    (dependency_kind, scope_key(member.scope)), []
+                                )
+                                if candidate.group is not None
+                            ]
+                            if not choices:
+                                continue
+                            exact = [
+                                candidate for candidate in choices
+                                if tuple(candidate.group.exposure_ids)
+                                == tuple(member.group.exposure_ids)
+                            ]
+                            choice = min(exact or choices, key=lambda candidate: (
+                                abs(((candidate.group.timestamps[0] +
+                                      (candidate.group.timestamps[-1] - candidate.group.timestamps[0]) / 2)
+                                     - (member.group.timestamps[0] +
+                                        (member.group.timestamps[-1] - member.group.timestamps[0]) / 2)
+                                     ).total_seconds()),
+                                candidate.group.group_id,
+                            ))
+                            parent = (dependency_kind, choice.group.group_id)
+                            if parent not in parent_groups_list:
+                                parent_groups_list.append(parent)
+                    parent_groups = tuple(parent_groups_list)
                     amplifier_keys = [scope_key(member.scope) for member in members]
                     identity = hashlib.sha256(json.dumps({
                         "kind": node.kind,

@@ -827,37 +827,32 @@ class ExposureFiberResponseTask(_CanonicalTask):
             "extracted_master_twilight_spectrum",
             "wavelength_map",
         )
-        direct_rows = {}
+        resolved_rows = {}
         for kind in (*required_kinds, "extracted_master_sci_spectrum"):
-            rows = []
+            rows = {}
             for artifact in _dependency_artifacts(inputs, kind):
                 row = service.adapter.get_row(_artifact_id(artifact))
                 if row is not None and row.get("amp_key"):
-                    rows.append(row)
-            rows.extend(_planned_parent_rows(service, self.target, kind))
-            direct_rows[kind] = {str(row["amp_key"]): row for row in rows if row.get("amp_key")}
-        ldls_rows = direct_rows["extracted_master_ldls_spectrum"]
+                    # Scheduled dependencies are the graph's authoritative
+                    # resolution for this execution.
+                    rows[str(row["amp_key"])] = row
+            for row in _planned_parent_rows(service, self.target, kind):
+                if row.get("amp_key"):
+                    # Cached graph parents fill only gaps left by this run.
+                    rows.setdefault(str(row["amp_key"]), row)
+            resolved_rows[kind] = rows
+        ldls_rows = resolved_rows["extracted_master_ldls_spectrum"]
         requested_keys = list(
             (getattr(self.target, "group_metadata", None) or {}).get("amplifier_keys")
             or sorted(ldls_rows)
         )
         if not requested_keys:
             raise RuntimeError("ExposureFiberResponseTask requires planned LDLS spectra")
-        at = self._target_mid_time()
         participants = []
         for key in sorted(requested_keys):
-            zipcode = parse_zipcode_key(key)
             rows = {}
             for kind in required_kinds:
-                row = direct_rows[kind].get(key)
-                if row is None:
-                    row = service.select_best(
-                        kind=kind, scope=Scope(zipcode=zipcode), at_time=at,
-                        policy="latest_valid",
-                    ) or service.select_best(
-                        kind=kind, scope=Scope(zipcode=zipcode), at_time=at,
-                        policy="nearest",
-                    )
+                row = resolved_rows[kind].get(key)
                 if row is not None:
                     rows[kind] = row
             if len(rows) == len(required_kinds):
@@ -874,16 +869,7 @@ class ExposureFiberResponseTask(_CanonicalTask):
         science_parts = []
         science_rows = []
         for key, _ in participants:
-            zipcode = parse_zipcode_key(key)
-            row = direct_rows["extracted_master_sci_spectrum"].get(key)
-            if row is None:
-                row = service.select_best(
-                    kind="extracted_master_sci_spectrum", scope=Scope(zipcode=zipcode),
-                    at_time=at, policy="latest_valid",
-                ) or service.select_best(
-                    kind="extracted_master_sci_spectrum", scope=Scope(zipcode=zipcode),
-                    at_time=at, policy="nearest",
-                )
+            row = resolved_rows["extracted_master_sci_spectrum"].get(key)
             if row is None:
                 science_parts = []
                 science_rows = []
