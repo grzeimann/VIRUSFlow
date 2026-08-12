@@ -8,6 +8,7 @@ import numpy as np
 from scipy.ndimage import median_filter
 
 from ..core.algo_result import AlgoResult
+from .robust import chunked_biweight_location
 
 
 NORMALIZATION_VERSION = "twilight-within-and-amplifier-1.0"
@@ -68,7 +69,7 @@ def within_amplifier_normalization(twilight_spectrum, *, smooth_pixels: int = 51
     twilight = np.asarray(twilight_spectrum, dtype=float)
     if twilight.ndim != 2:
         raise ValueError("twilight_spectrum must be fiber by wavelength")
-    common = np.nanmedian(twilight, axis=0)
+    common = chunked_biweight_location(twilight, axis=0)
     with np.errstate(divide="ignore", invalid="ignore"):
         raw_ratio = twilight / common[None, :]
     size = max(3, int(smooth_pixels))

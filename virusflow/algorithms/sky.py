@@ -8,6 +8,7 @@ from typing import Optional
 import numpy as np
 
 from ..core.algo_result import AlgoResult
+from .robust import chunked_biweight_location
 
 
 SKY_VERSION = "native-grid-oversampled-1.0"
@@ -118,7 +119,7 @@ def select_sky_fibers(spectrum, valid_fraction, *, upper_sigma: float = 2.5, sou
 
     spec = np.asarray(spectrum, dtype=float)
     valid = np.asarray(valid_fraction, dtype=float)
-    broadband = np.nanmedian(spec, axis=1)
+    broadband = chunked_biweight_location(spec.T, axis=0)
     good = np.nanmedian(valid, axis=1) >= 0.8
     if source_mask is not None:
         good &= ~np.asarray(source_mask, dtype=bool)

@@ -5,11 +5,12 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
-from astropy.stats import biweight_location, mad_std
+from astropy.stats import mad_std
 from scipy.interpolate import interp1d
 
 from ..core.algo_result import AlgoResult
 from .utils.masks import build_model_spectra
+from .robust import chunked_biweight_location
 
 
 FIBER_RESPONSE_VERSION = "exposure-ldls-twilight-factorization-2.0"
@@ -44,9 +45,7 @@ def get_continuum(spectra: np.ndarray, *, nbins: int) -> np.ndarray:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
             try:
-                binned[:, index] = biweight_location(
-                    values[:, columns], axis=1, ignore_nan=True
-                )
+                binned[:, index] = chunked_biweight_location(values[:, columns].T)
             except (TypeError, ValueError):
                 binned[:, index] = np.nanmedian(values[:, columns], axis=1)
 
@@ -154,7 +153,9 @@ def fit_exposure_fiber_response(
     # Force each fine LDLS response to unit median so LDLS carries no
     # broadband fiber normalization.
     fine_valid = good_solutions[:, None] & np.isfinite(ldls_fine) & (ldls_fine > 0.0)
-    ldls_fine_scale = np.nanmedian(np.where(fine_valid, ldls_fine, np.nan), axis=1)
+    ldls_fine_scale = chunked_biweight_location(
+        np.where(fine_valid, ldls_fine, np.nan).T
+    )
     good_fine_scale = np.isfinite(ldls_fine_scale) & (ldls_fine_scale > 0.0)
     ldls_fine = _safe_divide(ldls_fine, ldls_fine_scale[:, None])
 
@@ -180,6 +181,8 @@ def fit_exposure_fiber_response(
     for amplifier in range(amplifier_count):
         start, stop = amplifier * fibers_per_amplifier, (amplifier + 1) * fibers_per_amplifier
         local_valid = valid[start:stop]
+        # Keep the median convention here: it enforces the documented unit
+        # median of each within-amplifier response component.
         common = np.nanmedian(np.where(local_valid, candidate[start:stop], np.nan), axis=0)
         amplifier_common[amplifier] = common
         within[start:stop] = _safe_divide(candidate[start:stop], common[None, :])

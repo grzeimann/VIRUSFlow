@@ -17,10 +17,11 @@ from typing import Optional, Tuple
 
 import logging
 import numpy as np
-from astropy.stats import biweight_location
 from scipy.ndimage import gaussian_filter1d
 
+from ..core.algo_result import AlgoResult
 from .io import read_fits
+from .robust import chunked_biweight_location
 
 __all__ = ["orient_amplifier_image", "reduce_amplifier_array", "reduce_raw_amplifier_frame", "repair_masked_columns"]
 logger = logging.getLogger(__name__)
@@ -68,8 +69,6 @@ def reduce_amplifier_array(data: np.ndarray, header: dict) -> "AlgoResult":
     AlgoResult
         Named overscan, reduced-image, error, and variance evidence.
     """
-    from ..core.algo_result import AlgoResult
-
     hdr = dict(header or {})
 
     # Defensive copies and dtype
@@ -86,7 +85,10 @@ def reduce_amplifier_array(data: np.ndarray, header: dict) -> "AlgoResult":
         # Use all but the last 2 columns in the overscan, like reference code
         osc_region = img[:, -(overscan_length - 2) :] if overscan_length >= 3 else img[:, -overscan_length:]
         # biweight location per row (robust central tendency)
-        overscan_model = np.asarray(biweight_location(osc_region, axis=1, ignore_nan=True), dtype=float)
+        # ``osc_region`` is (detector_rows, overscan_columns).  Transpose so
+        # axis 0 is the overscan sample population and the result is one value
+        # per original detector row, matching the prior Astropy axis=1 call.
+        overscan_model = np.asarray(chunked_biweight_location(osc_region.T, axis=0), dtype=float)
         img -= overscan_model[:, np.newaxis]
 
     # 2) Trim image (drop overscan columns)
