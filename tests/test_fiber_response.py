@@ -3,7 +3,9 @@ from __future__ import annotations
 import numpy as np
 
 from virusflow.algorithms.fiber_response import fit_exposure_fiber_response
-from virusflow.algorithms.calibration_detector import correct_response_calibration_frames
+from virusflow.algorithms.calibration_detector import (
+    correct_response_calibration_frames,
+)
 from virusflow.algorithms.extraction import extract_fractional_aperture
 from virusflow.algorithms.master_spectrum import extract_master_spectrum
 
@@ -36,9 +38,13 @@ def _calibration_spectra():
 def test_exposure_response_keeps_three_components_and_reconstructs_total():
     ldls, twilight, _, wavelength, _ = _calibration_spectra()
     second_ldls = ldls * 1.03
-    second_twilight = twilight * 1.7 * (1.0 + 0.10 * np.sin(np.arange(twilight.shape[1]) / 31.0))
+    second_twilight = (
+        twilight * 1.7 * (1.0 + 0.10 * np.sin(np.arange(twilight.shape[1]) / 31.0))
+    )
     result = fit_exposure_fiber_response(
-        [ldls, second_ldls], [twilight, second_twilight], [wavelength, wavelength],
+        [ldls, second_ldls],
+        [twilight, second_twilight],
+        [wavelength, wavelength],
         common_model_bins=500,
         broad_ldls_bins=5,
         twilight_residual_bins=25,
@@ -52,14 +58,67 @@ def test_exposure_response_keeps_three_components_and_reconstructs_total():
         rtol=2e-6,
         atol=2e-6,
     )
-    np.testing.assert_allclose(np.nanmedian(result.get_array("within_amplifier_response")[:24], axis=0), 1.0, rtol=2e-5)
-    np.testing.assert_allclose(np.nanmedian(result.get_array("within_amplifier_response")[24:], axis=0), 1.0, rtol=2e-5)
+    hybrid = result.get_array("within_amplifier_response") * result.get_array(
+        "amplifier_common_response"
+    ).repeat(24, axis=0)
+    np.testing.assert_allclose(
+        result.get_array("normalization")
+        * result.scalars["amplifier_reference_scalar"],
+        hybrid,
+        rtol=3e-6,
+        atol=3e-6,
+    )
+    np.testing.assert_allclose(
+        np.nanmedian(result.get_array("within_amplifier_response")[:24], axis=0),
+        1.0,
+        rtol=2e-5,
+    )
+    np.testing.assert_allclose(
+        np.nanmedian(result.get_array("within_amplifier_response")[24:], axis=0),
+        1.0,
+        rtol=2e-5,
+    )
     assert np.ptp(result.get_array("amplifier_response")[1]) > 0.05
-    np.testing.assert_allclose(result.get_array("amplifier_scalar"), [1 / 1.35, 1.7 / 1.35], rtol=0.05)
+    np.testing.assert_allclose(
+        result.get_array("amplifier_scalar"), [1 / 1.35, 1.7 / 1.35], rtol=0.05
+    )
     assert result.meta["fine_structure_source"] == "master_ldls"
     assert result.meta["large_scale_anchor"] == "master_twilight"
     assert result.scalars["valid_fraction"] == 1.0
     assert result.meta["amplifier_response_representation"] == "linear"
+    assert result.meta["amplifier_common_response_role"] == (
+        "full_pre_scalar_amplifier_response"
+    )
+
+
+def test_sharp_raw_twilight_feature_is_diagnostic_not_amplifier_response():
+    """A narrow solar-like twilight feature cannot define the 1-D response."""
+
+    ldls, twilight, _, wavelength, _ = _calibration_spectra()
+    clean = fit_exposure_fiber_response(
+        [ldls, ldls * 1.08],
+        [twilight, twilight * 1.4],
+        [wavelength, wavelength],
+        common_model_bins=32,
+        broad_ldls_bins=5,
+    )
+    contaminated_twilight = twilight.copy()
+    contaminated_twilight[:, 120:123] *= 0.15
+    contaminated = fit_exposure_fiber_response(
+        [ldls, ldls * 1.08],
+        [contaminated_twilight, twilight * 1.4],
+        [wavelength, wavelength],
+        common_model_bins=32,
+        broad_ldls_bins=5,
+    )
+    # The continuum-only twilight broad term may change smoothly, but the
+    # narrow raw feature must not be copied into amplifier_response.
+    change = (
+        contaminated.get_array("amplifier_response")[0]
+        / clean.get_array("amplifier_response")[0]
+    )
+    assert np.ptp(change[118:125]) < 0.02
+    assert np.isfinite(contaminated.get_array("twilight_residual_correction")).any()
 
 
 def test_master_science_is_validation_only_and_does_not_change_response():
@@ -68,7 +127,11 @@ def test_master_science_is_validation_only_and_does_not_change_response():
         [ldls], [twilight], [wavelength], common_model_bins=500
     )
     with_science = fit_exposure_fiber_response(
-        [ldls], [twilight], [wavelength], science_spectrum=science, common_model_bins=500
+        [ldls],
+        [twilight],
+        [wavelength],
+        science_spectrum=science,
+        common_model_bins=500,
     )
     np.testing.assert_array_equal(
         with_science.get_array("normalization"),
@@ -119,11 +182,17 @@ def test_master_spectrum_retains_compact_exact_aperture_evidence():
     pixel_mask = np.zeros_like(image, dtype=np.uint8)
     pixel_mask[2, 1] = 1
     retained = extract_master_spectrum(
-        image, trace, result_kind="extracted_master_ldls_spectrum",
+        image,
+        trace,
+        result_kind="extracted_master_ldls_spectrum",
         pixel_mask=pixel_mask,
     )
     direct = extract_fractional_aperture(
-        image, np.zeros_like(image), trace, pixel_mask=pixel_mask, width=5.0,
+        image,
+        np.zeros_like(image),
+        trace,
+        pixel_mask=pixel_mask,
+        width=5.0,
     )
 
     direct_weights = direct.get_array("fractional_weights")

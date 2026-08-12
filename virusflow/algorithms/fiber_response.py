@@ -13,7 +13,7 @@ from .utils.masks import build_model_spectra
 from .robust import chunked_biweight_location
 
 
-FIBER_RESPONSE_VERSION = "exposure-ldls-twilight-factorization-2.0"
+FIBER_RESPONSE_VERSION = "exposure-ldls-twilight-factorization-3.0"
 
 
 def _safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
@@ -57,8 +57,12 @@ def get_continuum(spectra: np.ndarray, *, nbins: int) -> np.ndarray:
             continue
         kind = "quadratic" if np.count_nonzero(good) >= 3 else "linear"
         continuum[fiber] = interp1d(
-            centers[good], row[good], kind=kind, bounds_error=False,
-            fill_value="extrapolate", assume_sorted=True,
+            centers[good],
+            row[good],
+            kind=kind,
+            bounds_error=False,
+            fill_value="extrapolate",
+            assume_sorted=True,
         )(columns)
     return continuum
 
@@ -87,26 +91,24 @@ def fit_exposure_fiber_response(
     twilight_residual_bins: int = 25,
     minimum_wavelength_finite_fraction: float = 0.8,
 ) -> AlgoResult:
-    """Factor one exposure's fiber response into 2-D, 1-D, and 0-D terms.
+    """Factor an exposure response into within-amplifier, 1-D, and 0-D terms.
 
-    LDLS is divided by its robust common spectrum, and the resulting ratio is
-    itself divided by its own broad continuum (``broad_ldls_bins``) so that
-    LDLS contributes only fine, wavelength-dependent structure with unit
-    median per fiber.  Twilight is independently divided by its common
-    spectrum and by that fine LDLS response; the smooth remainder defines the
-    broadband within-amplifier fiber response, so broad-scale normalization is
-    determined by twilight rather than by LDLS's own broad illumination
-    shape.  The final normalization is the fine LDLS response times this
-    twilight-derived broad response.
+    Exposure-wide common models ``M_L`` and ``M_T`` remove LDLS and twilight
+    source spectra.  ``R_L = L / M_L`` is split into an LDLS broad continuum
+    ``B_L`` and unit-normalized fine response ``F_L = R_L / B_L``.  LDLS is
+    therefore the sole source of sharp wavelength-dependent response.
 
-    Fitting the LDLS ratio and a fitted twilight residual back into the
-    normalization can reintroduce broadband illumination structure and noise
-    into the within-amplifier fiber response, making the decomposition less
-    physically identifiable.  The remaining twilight residual after applying
-    the normalization is therefore binned (``twilight_residual_bins``) and
-    retained only as diagnostic evidence; it is never multiplied back into
-    the fitted response.  Master Science, when supplied, is evaluated only as
-    validation evidence and never changes the fitted response.
+    Twilight supplies only a broad illumination envelope: ``R_T = T / M_T``,
+    ``Q = R_T / F_L``, and ``B_T = continuum(Q)``.  The hybrid response is
+    ``H = F_L * B_T`` (``twilight_scaled_ldls_response``).  For each amplifier,
+    ``R_a = median_i(H_ai)`` is the full pre-scalar response and
+    ``F_ai = H_ai / R_a`` is the unit-median within-amplifier component.
+    In linear space, ``g_a = median_lambda(R_a)`` and ``A_a = R_a / g_a``;
+    after an exposure reference scalar, the published normalization is
+    ``F_ai * A_a * g_a_rel``.
+
+    Raw twilight residuals (including sharp solar/LSF structure) and optional
+    science residuals are diagnostics only. Neither is fed back into the fit.
     """
 
     if not (len(ldls_spectra) == len(twilight_spectra) == len(wavelengths)):
@@ -119,8 +121,10 @@ def fit_exposure_fiber_response(
     shapes = {part.shape for part in ldls_parts}
     if len(shapes) != 1 or len(next(iter(shapes))) != 2:
         raise ValueError("all participating LDLS spectra must have one common 2D shape")
-    if any(twilight.shape != ldls.shape or wave.shape != ldls.shape
-           for ldls, twilight, wave in zip(ldls_parts, twilight_parts, wave_parts)):
+    if any(
+        twilight.shape != ldls.shape or wave.shape != ldls.shape
+        for ldls, twilight, wave in zip(ldls_parts, twilight_parts, wave_parts)
+    ):
         raise ValueError("LDLS, twilight, and wavelength must be matching 2D arrays")
     ldls = np.concatenate(ldls_parts)
     twilight = np.concatenate(twilight_parts)
@@ -128,7 +132,9 @@ def fit_exposure_fiber_response(
     amplifier_count = len(ldls_parts)
     fibers_per_amplifier, samples = ldls_parts[0].shape
 
-    science = None if science_spectrum is None else np.asarray(science_spectrum, dtype=float)
+    science = (
+        None if science_spectrum is None else np.asarray(science_spectrum, dtype=float)
+    )
     if science is not None and science.shape != ldls.shape:
         raise ValueError("science_spectrum must match concatenated calibration spectra")
 
@@ -139,80 +145,101 @@ def fit_exposure_fiber_response(
 
     # Estimate common spectral shapes after removing fiber-to-fiber
     # normalization differences in _common_spectrum().
-    ldls_model = _common_spectrum(ldls, wave, good_solutions, nbins=common_model_bins)
-    twilight_model = _common_spectrum(twilight, wave, good_solutions, nbins=common_model_bins)
+    ldls_common_spectrum = _common_spectrum(
+        ldls, wave, good_solutions, nbins=common_model_bins
+    )
+    twilight_common_spectrum = _common_spectrum(
+        twilight, wave, good_solutions, nbins=common_model_bins
+    )
 
     # Both common spectra are deliberately fitted once from every usable fiber
     # in the exposure, rather than once per amplifier.
-    ldls_ratio = _safe_divide(ldls, ldls_model)
+    ldls_relative_response = _safe_divide(ldls, ldls_common_spectrum)
 
     # LDLS supplies only the fine wavelength-dependent fiber response.
-    ldls_broad = get_continuum(ldls_ratio, nbins=broad_ldls_bins)
-    ldls_fine = _safe_divide(ldls_ratio, ldls_broad)
+    ldls_broad_response = get_continuum(ldls_relative_response, nbins=broad_ldls_bins)
+    ldls_fine_response = _safe_divide(ldls_relative_response, ldls_broad_response)
 
     # Force each fine LDLS response to unit median so LDLS carries no
     # broadband fiber normalization.
-    fine_valid = good_solutions[:, None] & np.isfinite(ldls_fine) & (ldls_fine > 0.0)
+    fine_valid = (
+        good_solutions[:, None]
+        & np.isfinite(ldls_fine_response)
+        & (ldls_fine_response > 0.0)
+    )
     ldls_fine_scale = chunked_biweight_location(
-        np.where(fine_valid, ldls_fine, np.nan).T
+        np.where(fine_valid, ldls_fine_response, np.nan).T
     )
     good_fine_scale = np.isfinite(ldls_fine_scale) & (ldls_fine_scale > 0.0)
-    ldls_fine = _safe_divide(ldls_fine, ldls_fine_scale[:, None])
+    ldls_fine_response = _safe_divide(ldls_fine_response, ldls_fine_scale[:, None])
 
     # Remove the common twilight spectrum and fine LDLS response. The
     # remaining smooth structure contains the broad fiber response plus
     # the overall amplifier twilight level.
-    twilight_ratio = _safe_divide(twilight, twilight_model)
-    twilight_for_broad = _safe_divide(twilight_ratio, ldls_fine)
-    twilight_broad = get_continuum(twilight_for_broad, nbins=broad_ldls_bins)
-
-    # First form the candidate within-amplifier response.  Its column-wise
-    # robust amplifier median is deliberately removed below, forcing the 2-D
-    # factor to contain no amplifier-common wavelength structure.
-    candidate = ldls_fine * twilight_broad
-    valid = (
-        good_solutions[:, None] & good_fine_scale[:, None] & np.isfinite(wave)
-        & np.isfinite(candidate) & (candidate > 0.0)
+    twilight_relative_response = _safe_divide(twilight, twilight_common_spectrum)
+    twilight_without_ldls_fine = _safe_divide(
+        twilight_relative_response, ldls_fine_response
     )
-    within = np.full_like(candidate, np.nan)
-    amplifier_common = np.full((amplifier_count, samples), np.nan, dtype=float)
-    amplifier_response = np.full_like(amplifier_common, np.nan)
+    twilight_broad_response = get_continuum(
+        twilight_without_ldls_fine, nbins=broad_ldls_bins
+    )
+
+    # H = F_L * B_T: fine structure from LDLS, broad envelope from twilight.
+    twilight_scaled_ldls_response = ldls_fine_response * twilight_broad_response
+    valid = (
+        good_solutions[:, None]
+        & good_fine_scale[:, None]
+        & np.isfinite(wave)
+        & np.isfinite(twilight_scaled_ldls_response)
+        & (twilight_scaled_ldls_response > 0.0)
+    )
+    within_amplifier_response = np.full_like(twilight_scaled_ldls_response, np.nan)
+    amplifier_total_response = np.full((amplifier_count, samples), np.nan, dtype=float)
+    amplifier_response = np.full_like(amplifier_total_response, np.nan)
     amplifier_scalar = np.full(amplifier_count, np.nan, dtype=float)
     for amplifier in range(amplifier_count):
-        start, stop = amplifier * fibers_per_amplifier, (amplifier + 1) * fibers_per_amplifier
+        start, stop = (
+            amplifier * fibers_per_amplifier,
+            (amplifier + 1) * fibers_per_amplifier,
+        )
         local_valid = valid[start:stop]
         # Keep the median convention here: it enforces the documented unit
         # median of each within-amplifier response component.
-        common = np.nanmedian(np.where(local_valid, candidate[start:stop], np.nan), axis=0)
-        amplifier_common[amplifier] = common
-        within[start:stop] = _safe_divide(candidate[start:stop], common[None, :])
-        # After removing F, collapse the twilight ratio over fibers.  This is
-        # a linear-space estimate: no log transform or log-space averaging.
-        remaining = _safe_divide(
-            twilight[start:stop], twilight_model[start:stop] * within[start:stop]
+        amplifier_total = np.nanmedian(
+            np.where(local_valid, twilight_scaled_ldls_response[start:stop], np.nan),
+            axis=0,
         )
-        response = np.nanmedian(np.where(local_valid, remaining, np.nan), axis=0)
-        scalar = float(np.nanmedian(response[np.isfinite(response) & (response > 0.0)]))
+        amplifier_total_response[amplifier] = amplifier_total
+        within_amplifier_response[start:stop] = _safe_divide(
+            twilight_scaled_ldls_response[start:stop], amplifier_total[None, :]
+        )
+        scalar = float(
+            np.nanmedian(
+                amplifier_total[np.isfinite(amplifier_total) & (amplifier_total > 0.0)]
+            )
+        )
         if not np.isfinite(scalar) or scalar <= 0.0:
-            raise ValueError("invalid amplifier twilight scalar")
+            raise ValueError("invalid amplifier response scalar")
         amplifier_scalar[amplifier] = scalar
-        amplifier_response[amplifier] = response / scalar
+        amplifier_response[amplifier] = amplifier_total / scalar
     reference_scalar = float(np.nanmedian(amplifier_scalar))
     if not np.isfinite(reference_scalar) or reference_scalar <= 0.0:
         raise ValueError("invalid exposure amplifier reference")
     amplifier_scalar /= reference_scalar
-    normalization = within * amplifier_response.repeat(fibers_per_amplifier, axis=0) * np.repeat(
-        amplifier_scalar, fibers_per_amplifier
-    )[:, None]
+    normalization = (
+        within_amplifier_response
+        * amplifier_response.repeat(fibers_per_amplifier, axis=0)
+        * np.repeat(amplifier_scalar, fibers_per_amplifier)[:, None]
+    )
 
-    valid &= np.isfinite(within) & (within > 0.0)
+    valid &= np.isfinite(within_amplifier_response) & (within_amplifier_response > 0.0)
     valid &= np.isfinite(normalization) & (normalization > 0.0)
     normalization[~valid] = np.nan
-    within[~valid] = np.nan
+    within_amplifier_response[~valid] = np.nan
 
     # Retain the twilight residual as diagnostic evidence rather than
     # fitting it back into the normalization.
-    predicted_twilight = twilight_model * normalization * reference_scalar
+    predicted_twilight = twilight_common_spectrum * normalization * reference_scalar
     twilight_residual_raw = _safe_divide(twilight, predicted_twilight) - 1.0
     twilight_residual_raw[~valid] = np.nan
 
@@ -222,20 +249,20 @@ def fit_exposure_fiber_response(
     twilight_residual_correction[~valid] = np.nan
 
     arrays = {
-        "raw_ratio": twilight_ratio.astype(np.float32),
+        "raw_ratio": twilight_relative_response.astype(np.float32),
         "normalization": normalization.astype(np.float32),
         "valid_mask": valid.astype(np.uint8),
-        "common_ldls": ldls_model.astype(np.float32),
-        "common_twilight": twilight_model.astype(np.float32),
-        "within_amplifier_response": within.astype(np.float32),
+        "common_ldls": ldls_common_spectrum.astype(np.float32),
+        "common_twilight": twilight_common_spectrum.astype(np.float32),
+        "within_amplifier_response": within_amplifier_response.astype(np.float32),
         "amplifier_response": amplifier_response.astype(np.float32),
         "amplifier_scalar": amplifier_scalar.astype(np.float32),
-        "amplifier_common_response": amplifier_common.astype(np.float32),
+        "amplifier_common_response": amplifier_total_response.astype(np.float32),
         "fiber_amplifier_index": np.repeat(
             np.arange(amplifier_count, dtype=np.int32), fibers_per_amplifier
         ),
-        "ftf_ldls": ldls_fine.astype(np.float32),
-        "twilight_broad_correction": twilight_broad.astype(np.float32),
+        "ftf_ldls": ldls_fine_response.astype(np.float32),
+        "twilight_broad_correction": twilight_broad_response.astype(np.float32),
         "twilight_residual_correction": twilight_residual_correction.astype(np.float32),
         "wavelength": wave.astype(np.float32),
     }
@@ -271,8 +298,11 @@ def fit_exposure_fiber_response(
             "large_scale_anchor": "master_twilight",
             "twilight_reference_mode": "exposure_wide_robust_common_fiber_spectrum",
             "amplifier_response_representation": "linear",
+            "amplifier_common_response_role": "full_pre_scalar_amplifier_response",
             "twilight_residual_role": "diagnostic_only",
-            "science_role": "validation_only" if science is not None else "not_available",
+            "science_role": (
+                "validation_only" if science is not None else "not_available"
+            ),
             "scattered_light_treatment": (
                 "paired_physical_ccd_gap_model_subtracted_before_extraction"
             ),
