@@ -311,8 +311,8 @@ class ChromaticPSFModel:
         seed_x = np.asarray(seed_delta_x, dtype=float)
         seed_y = np.asarray(seed_delta_y, dtype=float)
         inside = (wave >= self.valid_wavelength_min) & (wave <= self.valid_wavelength_max)
-        residual_x = np.where(inside, np.polyval(self.residual_centroid_coefficients_x, wave), 0.0)
-        residual_y = np.where(inside, np.polyval(self.residual_centroid_coefficients_y, wave), 0.0)
+        residual_x = np.polyval(self.residual_centroid_coefficients_x, wave)
+        residual_y = np.polyval(self.residual_centroid_coefficients_y, wave)
         centroid_x = seed_x + residual_x
         centroid_y = seed_y + residual_y
         if np.isfinite(self.valid_wavelength_min) and np.isfinite(self.valid_wavelength_max):
