@@ -14,7 +14,7 @@ from .calibs import (
     ExposureFiberResponseTask, ArcTask, BiasTask,
     CdTask, DarkTask,
     ExtractedMasterLdlsSpectrumTask, ExtractedMasterSciSpectrumTask,
-    ExtractedMasterTwilightSpectrumTask, FiberWavelengthSpectralMaskTask,
+    ExtractedMasterTwilightSpectrumTask,
     FlatTask, HgTask, MasterSciTask, TraceTask, TwiTask, WaveTask,
 )
 
@@ -38,7 +38,6 @@ def default_kind_to_task() -> Dict[str, Type[Task]]:
         "extracted_master_twilight_spectrum": ExtractedMasterTwilightSpectrumTask,
         "extracted_master_sci_spectrum": ExtractedMasterSciSpectrumTask,
         "exposure_fiber_response": ExposureFiberResponseTask,
-        "fiber_wavelength_spectral_mask": FiberWavelengthSpectralMaskTask,
         "trace_map": TraceTask,
         "wavelength_map": WaveTask,
     }

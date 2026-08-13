@@ -38,7 +38,6 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
     - extracted_master_ldls_spectrum: derived from master_ldls + trace_map
     - extracted_master_twilight_spectrum: derived from master_twilight + trace_map
     - exposure_fiber_response: exposure-wide LDLS/twilight fiber response factorization
-    - fiber_wavelength_spectral_mask: derived from extracted spectra + wavelength_map
     - master_bias: hard QA gate for every other raw calibration branch
 
     Planning YAML may override canonical node fields and may replace the edge
@@ -156,19 +155,10 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         scope_mode="calibration_build",
         cadence=None,
     )
-    master_sci_mask = TaskSpec(
-        kind="fiber_wavelength_spectral_mask",
-        task_cls=_TaskPlaceholder,
-        inputs_raw=None,
-        inputs_artifacts=["extracted_master_sci_spectrum", "wavelength_map"],
-        scope_mode="per_zipcode",
-        cadence=None,
-    )
-
     nodes = [
         bias, dark, flat, hg, cd, arc, twilight, master_sci, trace, wave,
         master_ldls_spectrum, master_twilight_spectrum, master_sci_spectrum,
-        exposure_fiber_response, master_sci_mask,
+        exposure_fiber_response,
     ]
 
     # Edges (base)
@@ -189,7 +179,6 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         Edge(src=bias, dst=master_sci_spectrum, policy="qa_gate", tolerance_days=1),
         Edge(src=bias, dst=master_ldls_spectrum, policy="qa_gate", tolerance_days=1),
         Edge(src=bias, dst=master_twilight_spectrum, policy="qa_gate", tolerance_days=1),
-        Edge(src=bias, dst=master_sci_mask, policy="qa_gate", tolerance_days=1),
         # Reusable response illumination is detector corrected with the same
         # implemented bias + scaled-dark-residual convention as science data.
         Edge(src=dark, dst=flat, policy="nearest_valid", tolerance_days=90),
@@ -210,8 +199,6 @@ def default_calibration_graph(config: PlanningConfig | None = None) -> Tuple[Lis
         Edge(src=master_ldls_spectrum, dst=exposure_fiber_response, policy="nearest_valid", tolerance_days=90, selection_unit=SelectionUnit.MEASUREMENT_GROUP),
         Edge(src=wave, dst=exposure_fiber_response, policy="nearest_valid", tolerance_days=90, selection_unit=SelectionUnit.MEASUREMENT_GROUP),
         Edge(src=master_sci_spectrum, dst=exposure_fiber_response, policy="optional_nearest_valid", tolerance_days=90, selection_unit=SelectionUnit.MEASUREMENT_GROUP),
-        Edge(src=master_sci_spectrum, dst=master_sci_mask, policy="exact_parent_group", tolerance_days=0),
-        Edge(src=wave, dst=master_sci_mask, policy="latest_valid", tolerance_days=90),
     ]
 
     # Apply external overrides if provided (edges replaced only if config.edges is non-empty)

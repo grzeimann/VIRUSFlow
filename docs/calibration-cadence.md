@@ -81,26 +81,18 @@ the plan marks that measurement pending; the task evaluates it after combining
 and refuses publication when the measured value is below the threshold.
 
 The canonical `master_sci` contains only the robust `float32`
-detector-coordinate aggregate. Two separately persisted downstream products
-make its spectral use explicit:
+detector-coordinate aggregate. Its currently persisted downstream spectral
+product is:
 
 ```text
 master_sci + trace_map
   -> extracted_master_sci_spectrum
-
-extracted_master_sci_spectrum + wavelength_map
-  -> fiber_wavelength_spectral_mask
 ```
 
 The extraction uses the configured fractional five-pixel aperture and retains
 valid-pixel fraction, effective aperture width, and extraction validity. The
-mask artifact retains the mask, wavelength-space spectral model, applied fiber
-normalization, and per-fiber wavelength-solution usability. If a compatible
-twilight-derived `within_amp_fiber_normalization` is supplied explicitly, it is
-recorded as an additional parent. The default graph instead removes broad fiber
-throughput with deterministic, recorded coarse-bin self-normalization. The former
-`fiber_wavelength_mask_support` detector-stack scatter plane is no longer
-created or interpreted as spectral-mask evidence.
+former spectral-mask stage is intentionally not scheduled; a replacement will
+be introduced later in the calibration flow.
 
 LDLS and twilight have parallel trace-based extraction products and then meet
 in one calibration-time response task:

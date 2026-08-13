@@ -282,25 +282,21 @@ def test_fiber_response_stage_evicts_only_dense_flat_payloads(tmp_path: Path):
     assert service.payload_status(twilight.id) == "evicted_rebuildable"
 
 
-def test_spectral_mask_stage_evicts_master_sci(tmp_path: Path):
+def test_master_sci_extraction_stage_evicts_master_sci(tmp_path: Path):
     service, publisher = _fixture(tmp_path)
     science = _publish(publisher, "master_sci")
     scatter = _publish(publisher, "ccd_scattered_light_model", parents=[science.id])
     spectrum = _publish(
         publisher, "extracted_master_sci_spectrum", parents=[science.id, scatter.id]
     )
-    mask = _publish(
-        publisher, "fiber_wavelength_spectral_mask", parents=[spectrum.id]
-    )
-    _pass_qa(service, science, scatter, spectrum, mask)
+    _pass_qa(service, science, scatter, spectrum)
 
-    report = service.evict_payloads_triggered_by(mask.id)
+    report = service.evict_payloads_triggered_by(spectrum.id)
 
     assert report["evicted_artifact_ids"] == [science.id]
     assert report["refused"] == []
     assert service.payload_status(science.id) == "evicted_rebuildable"
     assert service.payload_status(spectrum.id) == "present"
-    assert service.payload_status(mask.id) == "present"
 
 
 def test_calibration_publication_runs_retention_hook_only_after_qa(

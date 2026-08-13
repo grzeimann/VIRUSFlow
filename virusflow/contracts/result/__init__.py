@@ -117,10 +117,3 @@ class ExposureFiberResponseResultContract(_BaseSimpleContract):
         "fiber_amplifier_index", "wavelength",
     ]
     required_scalars = ["valid_fraction", "amplifier_count", "amplifier_reference_scalar"]
-
-
-class FiberWavelengthSpectralMaskResultContract(_BaseSimpleContract):
-    required_arrays = [
-        "mask", "spectral_model", "normalization", "good_wavelength_solution",
-    ]
-    required_scalars = ["masked_fraction", "good_wavelength_solution_count"]

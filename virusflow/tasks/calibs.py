@@ -22,7 +22,6 @@ from ..algorithms.calibration_detector import (
     correct_response_calibration_frames,
 )
 from ..algorithms.master_spectrum import extract_master_spectrum
-from ..algorithms.master_sci_mask import build_master_sci_spectral_mask
 from ..algorithms.physical_ccd import (
     ALGORITHM_VERSION as SCATTER_ALGORITHM_VERSION,
     TRANSFORM_VERSION,
@@ -38,7 +37,6 @@ from ..artifacts.requests import (ArtifactRequest, LogicalComponent,
                                   MeasurementGroupMembershipRequest)
 from ..config.defaults import (
     MASTER_SCI_EXTRACTION_CONFIGURATION,
-    MASTER_SCI_SPECTRAL_MASK_CONFIGURATION,
     WAVELENGTH_INPUT_MASK_CONFIGURATION,
 )
 from ..contracts.result import (
@@ -53,7 +51,6 @@ from ..contracts.result import (
     ExposureFiberResponseResultContract,
     ExtractedMasterSpectrumResultContract,
     ExtractedMasterSciSpectrumResultContract,
-    FiberWavelengthSpectralMaskResultContract,
 )
 from ..core.algo_result import AlgoResult, ensure_algo_result
 from ..core.identity import parse_zipcode_key
@@ -947,75 +944,6 @@ class ExposureFiberResponseTask(_CanonicalTask):
         )
         return {self.artifact_name: artifact}
 
-
-class FiberWavelengthSpectralMaskTask(_CanonicalTask):
-    name = "master_sci_spectral_mask"
-    version = "v1"
-    artifact_name = "fiber_wavelength_spectral_mask"
-    algorithm_name = (
-        "virusflow.algorithms.master_sci_mask.build_master_sci_spectral_mask"
-    )
-    result_kind = "fiber_wavelength_spectral_mask"
-    result_contract = FiberWavelengthSpectralMaskResultContract
-    component_map = {
-        "mask": "mask",
-        "spectral_model": "spectral_model",
-        "normalization": "normalization",
-        "good_wavelength_solution": "good_wavelength_solution",
-    }
-    component_units = {
-        "mask": "1",
-        "spectral_model": "electron",
-        "normalization": "1",
-        "good_wavelength_solution": "1",
-    }
-
-    def run(self, inputs):
-        self._require_target()
-        service = ArtifactService(self.ctx.db_path)
-        spectrum_row = (
-            self._dependency(inputs, "extracted_master_sci_spectrum")
-            or self._resolve_artifact("extracted_master_sci_spectrum", required=True)
-        )
-        wavelength_row = self._dependency(inputs, "wavelength_map") or self._resolve_artifact(
-            "wavelength_map", required=True
-        )
-        spectrum_id = int(spectrum_row.id) if hasattr(spectrum_row, "id") else int(spectrum_row["id"])
-        wavelength_id = int(wavelength_row.id) if hasattr(wavelength_row, "id") else int(wavelength_row["id"])
-
-        parent_ids = [spectrum_id, wavelength_id]
-
-        params = dict(MASTER_SCI_SPECTRAL_MASK_CONFIGURATION.value)
-        params.update(self._params())
-        result = build_master_sci_spectral_mask(
-            service.load_component(spectrum_id, "spectrum")["data"],
-            service.load_component(wavelength_id, "wavelength_map")["data"],
-            fiber_normalization=None,
-            coarse_bins=int(params["coarse_bins"]),
-            model_bins=int(params["model_bins"]),
-            minimum_wavelength_finite_fraction=float(
-                params["minimum_wavelength_finite_fraction"]
-            ),
-            amplifier_fibers=int(params["amplifier_fibers"]),
-            very_bad_threshold=float(params["very_bad_threshold"]),
-        )
-        result.meta.update(service.get_scientific_metadata(spectrum_id))
-        report = self.result_contract().validate(result)
-        if not report.ok:
-            raise ValueError(
-                "FiberWavelengthSpectralMaskTask result contract: "
-                + "; ".join(report.errors)
-            )
-        refs = self.configuration_references() + [ConfigurationReference(
-            MASTER_SCI_SPECTRAL_MASK_CONFIGURATION.kind,
-            MASTER_SCI_SPECTRAL_MASK_CONFIGURATION.version,
-            self.target.zipcode.key(),
-            MASTER_SCI_SPECTRAL_MASK_CONFIGURATION.evidence_state,
-        )]
-        artifact = self._publish(
-            result, parent_ids, configuration_refs=refs, parameters=params
-        )
-        return {self.artifact_name: artifact}
 
 class TwiTask(_RawCalibrationTask):
     name = "twi"

@@ -52,9 +52,8 @@ CACHEABLE_CALIBRATION_PAYLOADS: dict[str, PayloadRetentionRule] = {
         (
             "ccd_scattered_light_model",
             "extracted_master_sci_spectrum",
-            "fiber_wavelength_spectral_mask",
         ),
-        "fiber_wavelength_spectral_mask",
+        "extracted_master_sci_spectrum",
     ),
 }
 

@@ -50,7 +50,6 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         "master_arc", "master_twilight", "master_sci", "trace_map", "wavelength_map",
         "extracted_master_ldls_spectrum", "extracted_master_twilight_spectrum",
         "extracted_master_sci_spectrum", "exposure_fiber_response",
-        "fiber_wavelength_spectral_mask",
     }
     assert by_kind["master_hg"].inputs_raw == ["cmp", "hg"]
     assert by_kind["master_cd"].inputs_raw == ["cmp", "cd"]
@@ -71,9 +70,6 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         "wavelength_map", "extracted_master_sci_spectrum",
     ]
     assert by_kind["exposure_fiber_response"].scope_mode == "calibration_build"
-    assert by_kind["fiber_wavelength_spectral_mask"].inputs_artifacts == [
-        "extracted_master_sci_spectrum", "wavelength_map",
-    ]
     assert {(edge.src.kind, edge.dst.kind) for edge in edges} >= {
         ("master_bias", "master_dark"),
         ("master_bias", "master_ldls"),
@@ -86,7 +82,6 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         ("master_bias", "extracted_master_sci_spectrum"),
         ("master_bias", "extracted_master_ldls_spectrum"),
         ("master_bias", "extracted_master_twilight_spectrum"),
-        ("master_bias", "fiber_wavelength_spectral_mask"),
         ("master_ldls", "trace_map"),
         ("master_hg", "master_arc"),
         ("master_cd", "master_arc"),
@@ -102,8 +97,6 @@ def test_canonical_graph_declares_separate_lamps_composed_arc_and_master_sci():
         ("extracted_master_ldls_spectrum", "exposure_fiber_response"),
         ("wavelength_map", "exposure_fiber_response"),
         ("extracted_master_sci_spectrum", "exposure_fiber_response"),
-        ("extracted_master_sci_spectrum", "fiber_wavelength_spectral_mask"),
-        ("wavelength_map", "fiber_wavelength_spectral_mask"),
     }
     assert set(default_kind_to_task()) == set(by_kind)
 
@@ -315,25 +308,10 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
         service.describe(row)["summary"]["calibration_input_kind"]
         for row in calibration_scatter
     } == {"master_ldls", "master_twilight", "master_sci"}
-    assert {item["name"] for item in service.describe(
-        rows["fiber_wavelength_spectral_mask"]
-    )["components"]} == {
-        "mask", "spectral_model", "normalization", "good_wavelength_solution",
-    }
     extraction_description = service.describe(rows["extracted_master_sci_spectrum"])
     assert extraction_description["summary"]["algorithm_metadata"]["extraction_method"] == (
         "fractional_top_hat_aperture"
     )
-    mask_description = service.describe(rows["fiber_wavelength_spectral_mask"])
-    assert mask_description["summary"]["algorithm_metadata"]["normalization_mode"] == (
-        "coarse_self_normalization"
-    )
-    assert {
-        item["kind"]
-        for item in mask_description["provenance"]["configuration_references"]
-    } >= {
-        "master_sci_spectral_mask"
-    }
     arc_relations = service.describe(rows["master_arc"])["relations"]
     assert {item["parent_id"] for item in arc_relations} == {
         int(rows["master_hg"]["id"]), int(rows["master_cd"]["id"])
@@ -371,14 +349,6 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
         "extracted_master_ldls_spectrum", "extracted_master_twilight_spectrum",
         "extracted_master_sci_spectrum", "wavelength_map",
     }
-    mask_relations = service.describe(
-        rows["fiber_wavelength_spectral_mask"]
-    )["relations"]
-    assert {item["parent_id"] for item in mask_relations} == {
-        int(rows["extracted_master_sci_spectrum"]["id"]),
-        int(rows["wavelength_map"]["id"]),
-    }
-
     rerun, rerun_report = graph.plan(db_path=database, scopes=scopes)
     assert rerun == []
     assert len(rerun_report.existing) == len(scheduled)

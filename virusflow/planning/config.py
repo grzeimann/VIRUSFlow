@@ -63,7 +63,6 @@ SUPPORTED_CALIBRATION_KINDS = frozenset({
     "extracted_master_twilight_spectrum",
     "extracted_master_sci_spectrum",
     "exposure_fiber_response",
-    "fiber_wavelength_spectral_mask",
     "trace_map",
     "wavelength_map",
 })
