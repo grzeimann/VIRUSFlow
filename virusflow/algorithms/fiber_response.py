@@ -5,7 +5,6 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
-from astropy.stats import mad_std
 from scipy.interpolate import interp1d
 
 from ..core.algo_result import AlgoResult
@@ -13,7 +12,7 @@ from .utils.masks import build_model_spectra
 from .robust import chunked_biweight_location
 
 
-FIBER_RESPONSE_VERSION = "exposure-ldls-twilight-factorization-3.0"
+FIBER_RESPONSE_VERSION = "exposure-ldls-twilight-factorization-3.2"
 
 
 def _safe_divide(numerator: np.ndarray, denominator: np.ndarray) -> np.ndarray:
@@ -270,13 +269,25 @@ def fit_exposure_fiber_response(
         science_model = _common_spectrum(
             science, wave, good_solutions, nbins=common_model_bins
         )
-        ftf_science = _safe_divide(science, science_model)
-        science_residual = _safe_divide(ftf_science, normalization) - 1.0
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            arrays["science_residual_per_fiber"] = np.asarray(
-                mad_std(science_residual, ignore_nan=True, axis=1), dtype=np.float32
-            )
+        science_model_with_response = science_model * normalization
+        science_scale_samples = _safe_divide(science, science_model_with_response)
+        science_scale_valid = (
+            valid
+            & np.isfinite(science_scale_samples)
+            & (science_scale_samples > 0.0)
+        )
+        science_scalar = float(
+            np.nanmedian(np.where(science_scale_valid, science_scale_samples, np.nan))
+        )
+        if not np.isfinite(science_scalar) or science_scalar <= 0.0:
+            raise ValueError("invalid science reference electron scale")
+
+        predicted_science = science_model_with_response * science_scalar
+        science_relative_residual = _safe_divide(
+            science - predicted_science, science_scalar
+        )
+        science_relative_residual[~(valid & np.isfinite(science))] = np.nan
+        arrays["science_residual_scaled"] = science_relative_residual.astype(np.float32)
 
     return AlgoResult(
         kind="exposure_fiber_response",
@@ -291,6 +302,11 @@ def fit_exposure_fiber_response(
             "amplifier_count": amplifier_count,
             "fibers_per_amplifier": fibers_per_amplifier,
             "amplifier_reference_scalar": reference_scalar,
+            **(
+                {"science_reference_electrons": science_scalar}
+                if science is not None
+                else {}
+            ),
         },
         meta={
             "response_factorization": "within_amplifier_response * amplifier_response * amplifier_scalar",
@@ -302,6 +318,11 @@ def fit_exposure_fiber_response(
             "twilight_residual_role": "diagnostic_only",
             "science_role": (
                 "validation_only" if science is not None else "not_available"
+            ),
+            "science_residual_definition": (
+                "(science - predicted_science) / science_reference_electrons"
+                if science is not None
+                else "not_available"
             ),
             "scattered_light_treatment": (
                 "paired_physical_ccd_gap_model_subtracted_before_extraction"

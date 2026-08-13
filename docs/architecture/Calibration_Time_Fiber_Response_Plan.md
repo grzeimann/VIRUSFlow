@@ -55,10 +55,9 @@ These are established by reading the current code, not proposed:
    exposure-bound.** `baseline_relative_response` is already published at this
    scope (`ontology/artifact_kinds.py`). This resolves where the group-wide
    response Product should live (§4).
-7. **`mad_std` is already the repository's robust-QA statistic**
-   (`algorithms/utils/masks.py`, used in `make_spectral_mask`) — the requested
-   master-science QA (`mad_std(science_residual, ignore_nan=True, axis=1)`)
-   reuses this convention directly, no new statistic.
+7. **Master-science QA retains the full scaled residual array** so downstream
+   consumers can choose an appropriate summary rather than being limited to a
+   per-fiber robust dispersion.
 8. **No twilight-reference/lookup configuration exists anywhere in
    `virusflow/config/`.** `ConfigurationService.resolve_trace_reference()`
    (`config/service.py:67`) is the shape a future `resolve_twilight_reference()`
@@ -164,7 +163,7 @@ to also carry the full result set requested:
     ),
     optional=(
         "twilight_reference_identity",   # lookup path/identity when used
-        "science_residual_per_fiber",    # mad_std QA summary; absent => unvalidated
+        "science_residual_scaled",       # scaled science-minus-prediction residual
     ),
 ),
 ```
@@ -223,16 +222,15 @@ implementing the eleven steps exactly as specified, built on:
   and, when used, `"twilight_reference_identity"` — directly populating the
   two new optional/required components in §4.
 - Master-science QA, computed but never fed back into the fit:
-  `science_residual = ftfsci / ftf - 1.0; science_residual_per_fiber = mad_std(science_residual, ignore_nan=True, axis=1)`,
-  reusing the same `astropy.stats.mad_std` import already used by
-  `make_spectral_mask`. `ftfsci` and `S(wave_all)` are computed whenever
+  `science_residual_scaled = (science - predicted_science) / science_reference_electrons`.
+  `S(wave_all)` is computed whenever
   `scispec` is provided; when it is `None` (optional dependency absent),
-  `science_residual_per_fiber` is omitted from `arrays` entirely rather than
+  `science_residual_scaled` is omitted from `arrays` entirely rather than
   filled with NaN, giving `AmplifierFiberResponseTask`'s publication step a
   clean absent/present signal for the "unvalidated" QA state via
   `evaluate_qa()` (`tasks/base.py:212`) — no new QA-status vocabulary, reusing
   the existing `evaluate_and_save`/`should_block` pipeline with a rule keyed
-  on `science_residual_per_fiber` presence and magnitude.
+  on `science_residual_scaled` presence and magnitude.
 
 `within_amplifier_normalization()` and `amplifier_normalization()`
 (`algorithms/exposure.py:260,283`) are retired from `algorithms/exposure.py`

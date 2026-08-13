@@ -144,7 +144,7 @@ ARTIFACT_KINDS: Dict[str, ArtifactKindSpec] = {
             "amplifier_response", "amplifier_scalar", "amplifier_common_response",
             "fiber_amplifier_index", "amplifier_identity", "wavelength",
         ),
-        ("science_residual_per_fiber",),
+        ("science_residual_scaled",),
     ),
     "fiber_normalization": _spec(
         "fiber_normalization", PhysicalScope.FIBER, Unit.DIMENSIONLESS.value,

@@ -137,9 +137,34 @@ def test_master_science_is_validation_only_and_does_not_change_response():
         with_science.get_array("normalization"),
         without_science.get_array("normalization"),
     )
-    assert with_science.get_array("science_residual_per_fiber").shape == (24,)
+    assert with_science.get_array("science_residual_scaled").shape == science.shape
     assert with_science.meta["science_role"] == "validation_only"
-    assert "science_residual_per_fiber" not in without_science.arrays
+    assert "science_residual_scaled" not in without_science.arrays
+
+
+def test_master_science_residual_uses_predicted_electron_scale():
+    """Science QA is science minus prediction, in units of typical electrons."""
+
+    ldls, twilight, science, wavelength, _ = _calibration_spectra()
+    result = fit_exposure_fiber_response(
+        [ldls],
+        [twilight],
+        [wavelength],
+        science_spectrum=science,
+        common_model_bins=500,
+    )
+
+    # This synthetic science spectrum is exactly response-scaled, so fitting
+    # its common shape and scalar should leave only numerical interpolation
+    # noise. The residual is dimensionless after normalization by the
+    # representative science electron level.
+    assert result.scalars["science_reference_electrons"] > 800.0
+    residual = result.get_array("science_residual_scaled")
+    assert residual.shape == science.shape
+    assert np.nanstd(residual) < 2e-3
+    assert result.meta["science_residual_definition"] == (
+        "(science - predicted_science) / science_reference_electrons"
+    )
 
 
 def test_fiber_response_rejects_incompatible_calibration_shapes():

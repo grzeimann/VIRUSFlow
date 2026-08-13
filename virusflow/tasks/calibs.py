@@ -814,7 +814,7 @@ class ExposureFiberResponseTask(_CanonicalTask):
         "twilight_broad_correction": "twilight_broad_correction",
         "twilight_residual_correction": "twilight_residual_correction",
         "wavelength": "wavelength",
-        "science_residual_per_fiber": "science_residual_per_fiber",
+        "science_residual_scaled": "science_residual_scaled",
     }
     component_units = {
         "raw_ratio": "1",
@@ -832,7 +832,7 @@ class ExposureFiberResponseTask(_CanonicalTask):
         "twilight_broad_correction": "1",
         "twilight_residual_correction": "1",
         "wavelength": "Angstrom",
-        "science_residual_per_fiber": "1",
+        "science_residual_scaled": "1",
     }
 
     def run(self, inputs):
