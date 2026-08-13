@@ -17,7 +17,13 @@ from virusflow.algorithms.response import (
 )
 from virusflow.algorithms.fiber_response import fit_exposure_fiber_response
 from virusflow.config import ConfigurationService
-from virusflow.algorithms.sky import oversampled_incident_sky, select_sky_fibers
+from virusflow.algorithms.sky import (
+    LatentSkyModel,
+    oversampled_incident_sky,
+    predict_and_subtract_sky,
+    select_sky_fibers,
+    wavelength_bin_edges,
+)
 from virusflow.io.catalogs import PanSTARRSCSVProvider
 from virusflow.algorithms.fiber import get_spectra as legacy_get_spectra
 
@@ -425,6 +431,75 @@ def test_sky_selection_and_native_grid_oversampling():
     assert np.all(np.isfinite(sky))
     assert np.all(variance >= 0)
     assert count.max() > 0
+
+
+def test_oversampled_sky_common_model_conserves_narrow_line_flux():
+    centers = np.linspace(3500.0, 3510.0, 101)
+    spectrum = np.ones_like(centers)
+    spectrum[50] += 100.0
+    incident = oversampled_incident_sky(
+        centers[None, :], spectrum[None, :], [True], oversample=3
+    )
+    model = LatentSkyModel(
+        incident.get_array("wavelength"),
+        incident.get_array("flux_density"),
+        integration_method=incident.scalars["integration_method"],
+    )
+    prediction = model.evaluate(wavelength_bin_edges(centers))
+    np.testing.assert_allclose(prediction.sum(), spectrum.sum(), rtol=0, atol=1e-4)
+    assert prediction[50] > prediction[49] > 1.0
+
+
+def test_oversampled_sky_common_model_preserves_normalized_fiber_levels():
+    centers = np.linspace(3500.0, 3510.0, 101)
+    spectra = np.vstack((np.full(centers.size, 2.0), np.full(centers.size, 4.0)))
+    incident = oversampled_incident_sky(
+        np.broadcast_to(centers, spectra.shape), spectra, [True, True], oversample=3
+    )
+    model = LatentSkyModel(
+        incident.get_array("wavelength"),
+        incident.get_array("flux_density"),
+        integration_method=incident.scalars["integration_method"],
+    )
+    prediction = model.evaluate(wavelength_bin_edges(centers))
+    np.testing.assert_allclose(prediction, np.full(centers.size, 3.0), rtol=0, atol=1e-4)
+
+
+def test_sky_model_rejects_one_contaminated_sky_fiber_line():
+    centers = np.linspace(3500.0, 3510.0, 101)
+    spectra = np.ones((9, centers.size))
+    spectra[-1, 50] += 100.0
+    incident = oversampled_incident_sky(
+        np.broadcast_to(centers, spectra.shape), spectra, np.ones(9, dtype=bool),
+        oversample=3,
+    )
+    model = LatentSkyModel(
+        incident.get_array("wavelength"),
+        incident.get_array("flux_density"),
+        integration_method=incident.scalars["integration_method"],
+    )
+    prediction = model.evaluate(wavelength_bin_edges(centers))
+    np.testing.assert_allclose(prediction, np.ones_like(centers), rtol=0, atol=1e-4)
+
+
+def test_sky_subtraction_projects_normalized_model_to_measured_space():
+    grid = np.linspace(3500.0, 3503.0, 4)
+    model = LatentSkyModel(grid, np.ones(4), integration_method="piecewise_constant_bin_integral")
+    centers = np.asarray([3500.5, 3501.5])
+    normalized = np.ones((1, 2))
+    response = np.asarray([[2.0, 4.0]])
+    measured = normalized * response
+    result = predict_and_subtract_sky(
+        model,
+        centers[None, :],
+        normalized,
+        [True],
+        [1.0],
+        measured_spectrum=measured,
+        normalization=response,
+    )
+    np.testing.assert_allclose(result.get_array("sky_subtracted"), 0.0)
+    np.testing.assert_allclose(result.get_array("measured_sky_prediction"), measured)
 
 
 def test_panstarrs_csv_provider_contract_and_sentinel_handling(monkeypatch):

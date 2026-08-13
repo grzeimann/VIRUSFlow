@@ -121,6 +121,7 @@ class GlobalFiberFrame:
 
     spectrum: np.ndarray
     variance: np.ndarray
+    measured_spectrum: np.ndarray
     valid_fraction: np.ndarray
     wavelength: np.ndarray
     fiber_identity: np.ndarray
@@ -680,6 +681,7 @@ class ExposureTask(_SciencePublisher):
     ) -> GlobalFiberFrame:
         global_spectrum = []
         global_variance = []
+        global_measured_spectrum = []
         global_valid = []
         global_wavelength = []
         global_identity = []
@@ -724,6 +726,9 @@ class ExposureTask(_SciencePublisher):
             ).astype(np.int32)
             global_spectrum.append(normalized[valid_rows].astype(np.float32))
             global_variance.append(normalized_variance[valid_rows].astype(np.float32))
+            global_measured_spectrum.append(
+                item["spectrum"][valid_rows].astype(np.float32)
+            )
             response_valid_fraction = np.where(
                 item["normalization_valid"] > 0,
                 item["valid_fraction"],
@@ -741,6 +746,7 @@ class ExposureTask(_SciencePublisher):
         return GlobalFiberFrame(
             spectrum=np.concatenate(global_spectrum),
             variance=np.concatenate(global_variance),
+            measured_spectrum=np.concatenate(global_measured_spectrum),
             valid_fraction=np.concatenate(global_valid),
             wavelength=np.concatenate(global_wavelength),
             fiber_identity=np.concatenate(global_identity),
@@ -833,8 +839,9 @@ class ExposureTask(_SciencePublisher):
         self, *, frame, catalog, ra0, dec0, pa, ordered_keys
     ) -> tuple[ExposureInferenceState, list[dict]]:
         """Run the small, in-memory source/sky/astrometry coordination loop."""
-        spectrum, valid_fraction, wavelength = (
+        spectrum, measured_spectrum, valid_fraction, wavelength = (
             frame.spectrum,
+            frame.measured_spectrum,
             frame.valid_fraction,
             frame.wavelength,
         )
@@ -963,6 +970,9 @@ class ExposureTask(_SciencePublisher):
                 sampling_target=sampling_target,
                 oversampling_factor=oversampling_factor,
                 reference_resolution="intrinsic_without_accepted_lsf",
+                integration_method=str(
+                    incident.scalars["integration_method"]
+                ),
             )
             subtraction = predict_and_subtract_sky(
                 sky_model,
@@ -970,6 +980,10 @@ class ExposureTask(_SciencePublisher):
                 spectrum,
                 sky_mask,
                 illumination.get_array("fiber_factor"),
+                measured_spectrum=measured_spectrum,
+                normalization=(
+                    frame.within_response * frame.amplifier_response
+                ),
             )
             state = ExposureInferenceState(
                 refined_ra0,
@@ -1609,25 +1623,42 @@ class ExposureTask(_SciencePublisher):
                 )
             )
         reduced = {}
-        for zipcode in zipcodes:
+
+        def reduced_state(zipcode):
+            """Materialize one detector state only when its CCD pair needs it."""
+
+            key = zipcode.key()
+            if key in reduced:
+                return reduced[key]
             try:
                 state = ReducedScienceAmplifierTask(
                     self.ctx,
                     target=SimpleNamespace(zipcode=zipcode, exposure_id=exposure_id),
                     params={"apply_calibrations": True},
-                ).run(calibration.get(zipcode.key(), {}))["reduced_science_state"]
-                reduced[zipcode.key()] = state
+                ).run(calibration.get(key, {}))["reduced_science_state"]
+                reduced[key] = state
+                return state
             except Exception as exc:
-                failures.setdefault(zipcode.key(), []).append(
+                failures.setdefault(key, []).append(
                     f"reduced_science_state: {type(exc).__name__}: {exc}"
                 )
+                return None
 
         groups = {}
         for zipcode in zipcodes:
             key = (zipcode.ifuslot, zipcode.ifuid, zipcode.specid, zipcode.controller)
             groups.setdefault(key, {})[zipcode.amp] = zipcode
 
-        physical = {}
+        amp_results = {}
+        wavelength_fiber_exclusions = {}
+        reduction_parent_ids = []
+        # An exposure_fiber_response payload is exposure-wide: its first axis
+        # contains every participating amplifier.  Do not reload it in the
+        # per-amplifier loop below.  Apart from repeated I/O, slices of a
+        # freshly loaded full payload are views, so retaining those slices in
+        # ``amp_results`` would keep one complete all-amplifier payload alive
+        # for every amplifier.
+        response_components: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for identity, amps in sorted(groups.items()):
             for side, pair in (("left", ("LL", "LU")), ("right", ("RU", "RL"))):
                 if not all(amp in amps for amp in pair):
@@ -1638,13 +1669,15 @@ class ExposureTask(_SciencePublisher):
                             )
                     continue
                 lower, upper = amps[pair[0]], amps[pair[1]]
+                lower_state = reduced_state(lower)
+                upper_state = reduced_state(upper)
                 if (
                     any(
                         "trace_map" not in calibration.get(zipcode.key(), {})
                         for zipcode in (lower, upper)
                     )
-                    or lower.key() not in reduced
-                    or upper.key() not in reduced
+                    or lower_state is None
+                    or upper_state is None
                 ):
                     failures.setdefault(lower.key(), []).append(
                         f"{side} physical CCD unavailable from calibration coverage"
@@ -1652,36 +1685,33 @@ class ExposureTask(_SciencePublisher):
                     failures.setdefault(upper.key(), []).append(
                         f"{side} physical CCD unavailable from calibration coverage"
                     )
+                    reduced.pop(lower.key(), None)
+                    reduced.pop(upper.key(), None)
                     continue
                 try:
                     target = PhysicalCCDTarget(
                         exposure_id, lower.specid, side, lower, upper, at
                     )
-                    result = PhysicalCCDTask(self.ctx, target=target).run(
+                    physical_result = PhysicalCCDTask(self.ctx, target=target).run(
                         {
-                            "lower_state": reduced[lower.key()],
-                            "upper_state": reduced[upper.key()],
+                            "lower_state": lower_state,
+                            "upper_state": upper_state,
                             "lower_trace": calibration[lower.key()]["trace_map"],
                             "upper_trace": calibration[upper.key()]["trace_map"],
                         }
                     )
-                    physical[(identity, side)] = {
-                        "model": result["ccd_scattered_light_model"],
-                        "state": result["physical_ccd_state"],
-                    }
+                    scatter_model = physical_result["ccd_scattered_light_model"]
+                    physical_state = physical_result["physical_ccd_state"]
                 except Exception as exc:
-                    failures.setdefault(lower.key(), []).append(f"{side} CCD: {type(exc).__name__}: {exc}")
-                    failures.setdefault(upper.key(), []).append(f"{side} CCD: {type(exc).__name__}: {exc}")
-
-        amp_results = {}
-        wavelength_fiber_exclusions = {}
-        reduction_parent_ids = []
-        for identity, amps in sorted(groups.items()):
-            for side, pair in (("left", ("LL", "LU")), ("right", ("RU", "RL"))):
-                product = physical.get((identity, side))
-                if product is None:
+                    failures.setdefault(lower.key(), []).append(
+                        f"{side} CCD: {type(exc).__name__}: {exc}"
+                    )
+                    failures.setdefault(upper.key(), []).append(
+                        f"{side} CCD: {type(exc).__name__}: {exc}"
+                    )
+                    reduced.pop(lower.key(), None)
+                    reduced.pop(upper.key(), None)
                     continue
-                physical_state = product["state"]
                 physical_image = np.asarray(
                     physical_state.scatter.get_array("scatter_subtracted_image"),
                     dtype=np.float32,
@@ -1692,7 +1722,7 @@ class ExposureTask(_SciencePublisher):
                 physical_mask = np.asarray(
                     physical_state.assembly.get_array("pixel_mask"), dtype=np.uint8
                 )
-                scatter_model_id = int(product["model"].id)
+                scatter_model_id = int(scatter_model.id)
                 reduction_parent_ids.append(scatter_model_id)
                 lower, upper = amps[pair[0]], amps[pair[1]]
                 lower_trace_row = calibration[lower.key()]["trace_map"]
@@ -1736,13 +1766,30 @@ class ExposureTask(_SciencePublisher):
                         continue
                     response_index = response_keys.index(zipcode.key())
                     fibers_per_amp = int(response_summary.get("fibers_per_amplifier") or 0)
-                    total = np.asarray(service.load_component(normalization_row, "normalization")["data"], dtype=np.float32)
-                    total_valid = np.asarray(service.load_component(normalization_row, "valid_mask")["data"], dtype=np.uint8)
+                    if normalization_id not in response_components:
+                        response_components[normalization_id] = (
+                            np.asarray(
+                                service.load_component(
+                                    normalization_row, "normalization"
+                                )["data"],
+                                dtype=np.float32,
+                            ),
+                            np.asarray(
+                                service.load_component(
+                                    normalization_row, "valid_mask"
+                                )["data"],
+                                dtype=np.uint8,
+                            ),
+                        )
+                    total, total_valid = response_components[normalization_id]
                     spectrum_shape = extraction.get_array("spectrum").shape
                     start = response_index * fibers_per_amp
                     stop = start + fibers_per_amp
-                    within = total[start:stop]
-                    normalization_valid = total_valid[start:stop]
+                    # Copy the amplifier portion.  ``amp_results`` survives
+                    # until global frame assembly, and views would otherwise
+                    # pin the large exposure-wide parent arrays.
+                    within = total[start:stop].copy()
+                    normalization_valid = total_valid[start:stop].copy()
                     if (
                         within.shape != spectrum_shape
                         or normalization_valid.shape != spectrum_shape
@@ -1801,6 +1848,23 @@ class ExposureTask(_SciencePublisher):
                         "normalization_valid": normalization_valid,
                     }
 
+                # Each reduced input is consumed by exactly one physical CCD.
+                # Likewise, the physical assembly and fit are only needed to
+                # make these two extracted spectra.  Drop their dense
+                # detector images before proceeding to the next CCD.
+                reduced.pop(lower.key(), None)
+                reduced.pop(upper.key(), None)
+                del (
+                    physical_result,
+                    physical_state,
+                    scatter_model,
+                    physical_image,
+                    physical_variance,
+                    physical_mask,
+                    lower_trace,
+                    upper_trace,
+                )
+
         ordered_keys = sorted(amp_results)
         if not ordered_keys:
             raise RuntimeError(self._no_extractable_message(exposure_id, failures))
@@ -1812,6 +1876,11 @@ class ExposureTask(_SciencePublisher):
             raise RuntimeError("extracted amplifiers do not share one exposure fiber response")
         response_row = next(iter(response_rows.values()))
         response_artifact_id = int(response_row["id"])
+        # Per-amplifier copies above are the only response samples needed
+        # from here on; release the exposure-wide arrays before building the
+        # remaining exposure products.
+        response_components.clear()
+        del total, total_valid
         # The per-amplifier values stored above are already F * A * g.  Pass a
         # unit companion term solely through the existing frame assembler;
         # no median, continuum, or amplifier re-fit occurs during evaluation.

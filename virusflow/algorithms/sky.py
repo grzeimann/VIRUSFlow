@@ -9,9 +9,10 @@ import numpy as np
 
 from ..core.algo_result import AlgoResult
 from .robust import chunked_biweight_location
+from .utils.masks import build_model_spectra
 
 
-SKY_VERSION = "native-grid-oversampled-1.0"
+SKY_VERSION = "native-grid-overlap-conserving-2.0"
 
 
 def wavelength_bin_edges(wavelength) -> np.ndarray:
@@ -60,8 +61,11 @@ class LatentSkyModel:
     integration_method: str = "piecewise_linear_bin_integral"
 
     def __post_init__(self) -> None:
-        wavelength = np.asarray(self.wavelength, dtype=np.float32)
-        density = np.asarray(self.flux_density, dtype=np.float32)
+        # The oversampled grid is used as an integration boundary.  Keep its
+        # precision through serialization so a narrow line is not shifted by
+        # float32 rounding at a 3500--5500 Angstrom coordinate offset.
+        wavelength = np.asarray(self.wavelength, dtype=np.float64)
+        density = np.asarray(self.flux_density, dtype=np.float64)
         if wavelength.ndim != 1 or wavelength.size < 2 or density.shape != wavelength.shape:
             raise ValueError("latent wavelength and flux density must be matched 1D arrays")
         if np.any(np.diff(wavelength) <= 0):
@@ -75,8 +79,19 @@ class LatentSkyModel:
             object.__setattr__(self, "variance_density", variance)
 
     @staticmethod
-    def _integral(grid: np.ndarray, density: np.ndarray, edges: np.ndarray) -> np.ndarray:
-        increments = 0.5 * (density[1:] + density[:-1]) * np.diff(grid)
+    def _integral(
+        grid: np.ndarray,
+        density: np.ndarray,
+        edges: np.ndarray,
+        *,
+        method: str = "piecewise_linear_bin_integral",
+    ) -> np.ndarray:
+        if method == "piecewise_constant_bin_integral":
+            increments = density[:-1] * np.diff(grid)
+        elif method == "piecewise_linear_bin_integral":
+            increments = 0.5 * (density[1:] + density[:-1]) * np.diff(grid)
+        else:
+            raise ValueError(f"unsupported sky integration method {method!r}")
         cumulative = np.r_[0.0, np.cumsum(increments, dtype=np.float64)]
         values = np.interp(edges, grid, cumulative, left=np.nan, right=np.nan)
         return np.diff(values)
@@ -105,7 +120,12 @@ class LatentSkyModel:
                 else:
                     raise TypeError("lsf_model must be callable or expose convolve")
                 density = np.asarray(density, dtype=float)
-            output[fiber_index] = self._integral(self.wavelength, density, edges[fiber_index])
+            output[fiber_index] = self._integral(
+                self.wavelength,
+                density,
+                edges[fiber_index],
+                method=self.integration_method,
+            )
         if coefficients is not None:
             factors = np.asarray(coefficients, dtype=np.float32)
             if factors.shape != (output.shape[0],):
@@ -134,6 +154,25 @@ def select_sky_fibers(spectrum, valid_fraction, *, upper_sigma: float = 2.5, sou
     )
 
 
+def _common_spectrum(
+    spectrum: np.ndarray,
+    wavelength: np.ndarray,
+    good_solutions: np.ndarray,
+    *,
+    nbins: int,
+) -> np.ndarray:
+    """Fit a common spectrum without changing already-normalized fiber levels."""
+
+    interpolator, _, _, _ = build_model_spectra(
+        spectrum,
+        wavelength,
+        good_solutions,
+        nbins=int(nbins),
+        normalize_per_fiber=False,
+    )
+    return np.asarray(interpolator(wavelength), dtype=float)
+
+
 def oversampled_incident_sky(
     wavelength,
     spectrum,
@@ -143,7 +182,7 @@ def oversampled_incident_sky(
     minimum_lsf_fwhm: float | None = None,
     target_samples_per_fwhm: float = 6.0,
 ) -> AlgoResult:
-    """Combine native wavelength samples into a sigma-clipped oversampled sky."""
+    """Fit the already-normalized sky fibers on an oversampled wavelength grid."""
 
     wave = np.asarray(wavelength, dtype=float)
     spec = np.asarray(spectrum, dtype=float)
@@ -163,39 +202,48 @@ def oversampled_incident_sky(
             target_samples_per_fwhm=target_samples_per_fwhm,
         )
     step = native_step / max(1, int(oversample))
+    selected_wave = wave[selected]
+    selected_density = spec[selected] / native_width[selected]
     selected_edges = native_edges[selected]
     grid_start = float(np.nanmin(selected_edges))
     grid_stop = float(np.nanmax(selected_edges))
-    grid = np.arange(grid_start, grid_stop + step / 2.0, step)
-    total = np.zeros(grid.size, dtype=float)
-    total2 = np.zeros(grid.size, dtype=float)
-    count = np.zeros(grid.size, dtype=np.int64)
-    for w, widths, s in zip(wave[selected], native_width[selected], spec[selected]):
-        valid = np.isfinite(w) & np.isfinite(s)
-        if not valid.any():
-            continue
-        index = np.clip(np.rint((w[valid] - grid[0]) / step).astype(int), 0, grid.size - 1)
-        density = s[valid] / widths[valid]
-        total += np.bincount(index, weights=density, minlength=grid.size)
-        total2 += np.bincount(index, weights=np.square(density), minlength=grid.size)
-        count += np.bincount(index, minlength=grid.size)
-    mean = np.divide(total, count, out=np.full_like(total, np.nan), where=count > 0)
-    variance = np.divide(total2, count, out=np.full_like(total2, np.nan), where=count > 0) - np.square(mean)
-    # Fill rare empty oversampled bins from neighboring finite samples.
-    finite = np.isfinite(mean)
-    if finite.sum() >= 2:
-        mean[~finite] = np.interp(grid[~finite], grid[finite], mean[finite])
-        variance[~finite] = np.interp(grid[~finite], grid[finite], variance[finite])
+    grid = grid_start + step * np.arange(
+        int(np.ceil((grid_stop - grid_start) / step)) + 1,
+        dtype=float,
+    )
+    if grid[-1] < grid_stop:
+        grid = np.append(grid, grid_stop)
+    common = _common_spectrum(
+        selected_density,
+        selected_wave,
+        np.ones(selected_density.shape[0], dtype=bool),
+        nbins=max(2, grid.size),
+    )
+    model_valid = np.isfinite(selected_wave) & np.isfinite(common)
+    model_order = np.argsort(selected_wave[model_valid])
+    mean = np.interp(
+        grid,
+        selected_wave[model_valid][model_order],
+        common[model_valid][model_order],
+    )
+    flat_wave = selected_wave[np.isfinite(selected_wave) & np.isfinite(selected_density)]
+    index = np.clip(np.searchsorted(grid, flat_wave), 0, grid.size - 1)
+    sample_count = np.bincount(index, minlength=grid.size).astype(np.int32)
+    variance = np.zeros(grid.size, dtype=float)
     return AlgoResult(
         kind="oversampled_incident_sky",
         version=SKY_VERSION,
         arrays={
-            "wavelength": grid.astype(np.float32),
-            "flux_density": mean.astype(np.float32),
+            "wavelength": grid.astype(np.float64),
+            "flux_density": mean,
             "variance_density": np.maximum(variance, 0).astype(np.float32),
-            "sample_count": count.astype(np.int32),
+            "sample_count": sample_count,
         },
-        scalars={"oversampling_factor": int(oversample), "native_step": native_step},
+        scalars={
+            "oversampling_factor": int(oversample),
+            "native_step": native_step,
+            "integration_method": "piecewise_linear_bin_integral",
+        },
     )
 
 
@@ -235,7 +283,12 @@ def sky_sampling_convergence(
         density = sky_result.get_array("flux_density")
         variance = sky_result.get_array("variance_density")
         prediction = LatentSkyModel(
-            grid, density, variance, float(target), factor,
+            grid,
+            density,
+            variance,
+            float(target),
+            factor,
+            integration_method=str(sky_result.scalars["integration_method"]),
         ).evaluate(edges, lsf_model=lsf_model)
         delta = float("nan") if not predictions else float(np.nanmax(np.abs(prediction - predictions[-1])))
         rows.append(
@@ -251,18 +304,54 @@ def sky_sampling_convergence(
     return {"candidates": rows, "predictions": predictions}
 
 
-def predict_and_subtract_sky(sky_model: LatentSkyModel, wavelength, spectrum, sky_mask, fiber_coefficients) -> AlgoResult:
-    """Evaluate the latent sky through native bins and subtract it from the spectra."""
+def predict_and_subtract_sky(
+    sky_model: LatentSkyModel,
+    wavelength,
+    spectrum,
+    sky_mask,
+    fiber_coefficients,
+    *,
+    measured_spectrum=None,
+    normalization=None,
+) -> AlgoResult:
+    """Project a normalized sky model into detector space before subtraction.
+
+    The latent model is fit from response-normalized spectra.  When the
+    corresponding measured spectra and normalizations are supplied, evaluate
+    the sky model there, multiply it by each fiber response, subtract in the
+    measured space, and only then return the normalized residual.  This keeps
+    response interpolation errors from being silently folded into the sky
+    model or its diagnostics.
+    """
 
     edges = wavelength_bin_edges(wavelength)
     sky_prediction = sky_model.evaluate(edges, coefficients=fiber_coefficients)
     spec = np.asarray(spectrum, dtype=float)
-    sky_subtracted = spec - sky_prediction
+    if measured_spectrum is None and normalization is None:
+        measured_prediction = sky_prediction
+        sky_subtracted = spec - sky_prediction
+    elif measured_spectrum is None or normalization is None:
+        raise ValueError("measured_spectrum and normalization must be supplied together")
+    else:
+        measured = np.asarray(measured_spectrum, dtype=float)
+        response = np.asarray(normalization, dtype=float)
+        if measured.shape != spec.shape or response.shape != spec.shape:
+            raise ValueError("measured_spectrum and normalization must match spectrum")
+        measured_prediction = sky_prediction * response
+        sky_subtracted = np.full(spec.shape, np.nan, dtype=float)
+        usable = np.isfinite(response) & (response != 0.0)
+        sky_subtracted[usable] = (
+            measured[usable] - measured_prediction[usable]
+        ) / response[usable]
     residual = sky_subtracted[np.asarray(sky_mask, dtype=bool)]
     residual_sigma = float(1.4826 * np.nanmedian(np.abs(residual - np.nanmedian(residual))))
     return AlgoResult(
         kind="sky_subtraction",
         version=SKY_VERSION,
-        arrays={"sky_prediction": sky_prediction.astype(np.float32), "sky_subtracted": sky_subtracted.astype(np.float32)},
+        arrays={
+            "sky_prediction": sky_prediction.astype(np.float32),
+            "measured_sky_prediction": measured_prediction.astype(np.float32),
+            "sky_subtracted": sky_subtracted.astype(np.float32),
+        },
         scalars={"residual_robust_sigma": residual_sigma},
     )

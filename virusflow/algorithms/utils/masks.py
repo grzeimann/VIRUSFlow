@@ -118,11 +118,14 @@ def build_model_spectra(
     good_solutions: np.ndarray,
     *,
     nbins: int = 2000,
+    normalize_per_fiber: bool = True,
 ):
     """Build the archival robust common spectrum on a wavelength grid.
 
     Returns the interpolation callable and the same diagnostic arrays as the
     archival helper so the numerical operation remains independently testable.
+    Set ``normalize_per_fiber=False`` when the input has already been placed
+    on a common fiber-response scale.
     """
 
     image = np.asarray(spectra, dtype=float).copy()
@@ -136,11 +139,14 @@ def build_model_spectra(
         raise ValueError("spectral model requires at least two bins")
 
     finite = rows[:, None] & np.isfinite(wave) & np.isfinite(image)
-    norm_per_fiber = chunked_biweight_location(
-        np.where(finite, image, np.nan).T, axis=0
-    )
-    good_norm = rows & np.isfinite(norm_per_fiber) & (norm_per_fiber > 0)
-    finite &= good_norm[:, None]
+    if normalize_per_fiber:
+        norm_per_fiber = chunked_biweight_location(
+            np.where(finite, image, np.nan).T, axis=0
+        )
+        good_norm = rows & np.isfinite(norm_per_fiber) & (norm_per_fiber > 0)
+        finite &= good_norm[:, None]
+    else:
+        norm_per_fiber = np.ones(image.shape[0], dtype=float)
     sample_wave = wave[finite]
     sample_flux = (image / norm_per_fiber[:, None])[finite]
 
