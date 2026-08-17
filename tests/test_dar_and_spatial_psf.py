@@ -171,7 +171,7 @@ def test_fit_wavelength_interval_psf_falls_back_to_seed_when_underconstrained():
     np.testing.assert_allclose(float(result.get_array("centroid_y")), 0.2, atol=1e-6)
 
 
-def test_chromatic_psf_model_interpolates_inside_and_falls_back_outside_valid_range():
+def test_chromatic_psf_model_interpolates_inside_and_marks_continuous_extrapolation():
     reference_wavelength = np.array([4000.0, 4500.0, 5000.0, 5500.0, 6000.0])
     seed_delta_x = np.zeros_like(reference_wavelength)
     seed_delta_y = np.zeros_like(reference_wavelength)
@@ -198,7 +198,7 @@ def test_chromatic_psf_model_interpolates_inside_and_falls_back_outside_valid_ra
 
     outside_wavelength = np.array([3000.0])
     fitted_x, fitted_y, _, status = model.evaluate(outside_wavelength, seed_delta_x=5.0, seed_delta_y=-3.0)
-    assert fitted_x[0] == 5.0
+    assert fitted_x[0] == 4.98
     assert fitted_y[0] == -3.0
     assert status[0] == 1
 

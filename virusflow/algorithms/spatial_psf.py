@@ -293,10 +293,11 @@ class ChromaticPSFModel:
     """Smooth exposure PSF and chromatic-centroid-residual model.
 
     The centroid is evaluated as the seed DAR prediction plus a fitted
-    polynomial residual, valid only inside the wavelength range actually
-    spanned by measured intervals; outside that range the residual is zero
-    (falls back to the pure seed) and the returned status marks the sample
-    ``prior_only`` rather than measured.
+    polynomial residual. A fitted residual is evaluated continuously at every
+    requested wavelength; samples outside the wavelength range actually
+    spanned by measured intervals are extrapolated and the returned status
+    marks them ``prior_only`` rather than measured. If no interval can be
+    fitted, the zero-residual model remains the pure seed everywhere.
     """
 
     residual_centroid_coefficients_x: np.ndarray
