@@ -62,6 +62,7 @@ def build_master_sci_spectral_mask(
         wavelength,
         good_solutions,
         nbins=int(model_bins),
+        normalize_per_fiber=False,
     )
     model = np.asarray(interpolator(wavelength), dtype=float)
     mask = make_spectral_mask(
