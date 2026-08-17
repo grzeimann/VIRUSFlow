@@ -47,14 +47,6 @@ CACHEABLE_CALIBRATION_PAYLOADS: dict[str, PayloadRetentionRule] = {
         ),
         "exposure_fiber_response",
     ),
-    "master_sci": PayloadRetentionRule(
-        ("master_sci",),
-        (
-            "ccd_scattered_light_model",
-            "extracted_master_sci_spectrum",
-        ),
-        "extracted_master_sci_spectrum",
-    ),
 }
 
 

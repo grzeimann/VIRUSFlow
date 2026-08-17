@@ -282,7 +282,7 @@ def test_fiber_response_stage_evicts_only_dense_flat_payloads(tmp_path: Path):
     assert service.payload_status(twilight.id) == "evicted_rebuildable"
 
 
-def test_master_sci_extraction_stage_evicts_master_sci(tmp_path: Path):
+def test_master_sci_remains_retained_until_spectral_mask_is_published(tmp_path: Path):
     service, publisher = _fixture(tmp_path)
     science = _publish(publisher, "master_sci")
     scatter = _publish(publisher, "ccd_scattered_light_model", parents=[science.id])
@@ -293,10 +293,12 @@ def test_master_sci_extraction_stage_evicts_master_sci(tmp_path: Path):
 
     report = service.evict_payloads_triggered_by(spectrum.id)
 
-    assert report["evicted_artifact_ids"] == [science.id]
+    assert report["evicted_artifact_ids"] == []
     assert report["refused"] == []
-    assert service.payload_status(science.id) == "evicted_rebuildable"
+    assert service.payload_status(science.id) == "present"
     assert service.payload_status(spectrum.id) == "present"
+    with pytest.raises(ValueError, match="permanently retained"):
+        service.evict_payload(science.id)
 
 
 def test_calibration_publication_runs_retention_hook_only_after_qa(
