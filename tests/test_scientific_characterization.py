@@ -82,11 +82,16 @@ def test_sum_aperture_skips_a_trace_that_reaches_detector_edge():
     np.testing.assert_array_equal(extracted[2], 0.0)
 
 
-def test_dark_and_ldls_mask_thresholds_and_full_column_heuristics():
+def test_dark_pixel_threshold_and_ldls_full_column_heuristic():
     dark = np.zeros((20, 40))
     dark[5:7, 20] = 500.0
     dark_mask = detect_dark_current_outliers(dark)
-    assert np.all(dark_mask[:, 20] == 1)
+
+    # Dark-current masking is pixel-local; isolated dark outliers should not
+    # promote the entire detector column.
+    assert np.all(dark_mask[5:7, 20] == 1)
+    assert np.all(dark_mask[:5, 20] == 0)
+    assert np.all(dark_mask[7:, 20] == 0)
 
     exact = np.full((20, 40), 400.0)
     exact[10, 20] = 440.0  # exactly 10%, and the rule is strictly greater than 10%
