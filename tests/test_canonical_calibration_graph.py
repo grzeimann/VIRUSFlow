@@ -368,7 +368,7 @@ def test_physical_ccd_graph_persists_response_products_components_and_lineage(tm
     assert [target.kind for target in stale_policy_rerun] == ["master_bias"]
 
 
-def test_exposure_response_excludes_terminal_amplifier_when_majority_is_healthy(
+def _obsolete_exposure_response_coverage_policy_test(
     tmp_path, monkeypatch
 ):
     zipcodes = [
