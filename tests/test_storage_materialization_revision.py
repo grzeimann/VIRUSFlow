@@ -138,7 +138,7 @@ def test_latent_sky_integrates_true_fiber_bins_and_sampling_is_lsf_derived():
     edges = wavelength_bin_edges(centers)
     prediction = model.evaluate(edges)
     assert prediction.shape == centers.shape
-    expected_total = np.trapz(density, grid)
+    expected_total = np.trapezoid(density, grid)
     broad = model.evaluate(np.asarray([grid[0], grid[-1]]))
     assert broad == pytest.approx(expected_total, rel=2e-4)
     assert not np.array_equal(prediction[0], prediction[1])
