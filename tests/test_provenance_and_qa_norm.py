@@ -49,9 +49,10 @@ def test_publication_records_publication_context_in_provenance(tmp_path: Path, m
 
     captured = {}
 
-    def fake_register(artifact):
+    def fake_register(artifact, **kwargs):
         # Capture the artifact object passed to registration to inspect provenance fields
         captured["artifact"] = artifact
+        captured["register_kwargs"] = kwargs
         # Return a fake id
         return 123
 
@@ -64,6 +65,9 @@ def test_publication_records_publication_context_in_provenance(tmp_path: Path, m
     assert isinstance(arts, list) and len(arts) == 1
     art = captured.get("artifact")
     assert art is not None, "Expected ArtifactService.register to be called with an Artifact"
+    assert captured["register_kwargs"] == {
+        "group_declarations": [], "group_memberships": [], "group_inputs": [],
+    }
     # Provenance basics
     assert art.provenance is not None
     assert art.provenance.algorithm == f"{ctx.algorithm_name}:{ctx.algorithm_version}"
