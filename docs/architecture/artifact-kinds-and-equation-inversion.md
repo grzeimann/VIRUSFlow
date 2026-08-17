@@ -451,8 +451,7 @@ published. `ArtifactService` rejects permanent publication of every S kind.
 
 | Kind | Scope / lifecycle | Scientific layer and equation role | Current support |
 |---|---|---|---|
-| `within_amp_fiber_normalization` | fiber / C | Fitted empirical factor for wavelength-dependent within-amplifier $R^{\mathrm{fiber}}$. | Production calibration Product fitted from detector- and scatter-corrected LDLS/twilight spectra, with optional master-science validation and explicit calibration-build lineage. Its LDLS fine term, twilight broad and residual terms, wavelength grid, validity, and amplifier anchor are required payload evidence. |
-| `amp_to_amp_normalization` | exposure / C | Evaluated center-track-build-wide $R^{\mathrm{amp}}$ factors. | Production calibration Product with no science `exposure_id`; one coherent build compares all sibling amplifier anchors and retains full amplifier keys, levels, factors, reference scale, coverage, and exact within-amplifier parents. |
+| `exposure_fiber_response` | exposure / C | Joint empirical within-amplifier $R^{\mathrm{fiber}}$ and amplifier $R^{\mathrm{amp}}$ response factorization. | Production calibration Product with no science `exposure_id`; one coherent build retains LDLS fine structure, twilight broad/residual terms, wavelength grids, validity, amplifier identities and scalar/common response factors, with optional master-science validation and explicit calibration-build lineage. |
 | `fiber_normalization` | fiber / C | Intended multiplied within-amplifier and amplifier factor. | Registered gap: no current producer or consumer. Its operational role is split across normalization in memory and `fiber_response_model`. |
 | `initial_astrometry` | exposure / C | Header-derived prior for $\mathcal{M}_e$. | Production exposure Product. |
 | `source_detection_catalog` | exposure / C | Detection evidence used to constrain $\mathcal{M}_e$; not yet a final science-source catalog. | Production exposure Product. |
