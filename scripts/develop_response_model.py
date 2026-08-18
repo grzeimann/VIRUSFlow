@@ -32,7 +32,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from astropy.io import fits
 from scipy.ndimage import median_filter
+from scipy.interpolate import PchipInterpolator, UnivariateSpline
 from scipy.optimize import least_squares
+from scipy.special import betainc
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -366,12 +368,19 @@ class LocalProfileMap:
 
     u_grid: np.ndarray
     density: np.ndarray
-    amplitude: np.ndarray
     chunk_columns: np.ndarray
     group_bounds: np.ndarray
     fiber_group: np.ndarray
     sample_count: np.ndarray
     valley_constraint_count: np.ndarray
+    bin_count: np.ndarray
+    bin_scatter: np.ndarray
+    bin_used: np.ndarray
+    peak_u: np.ndarray
+    left_valley_u: np.ndarray
+    right_valley_u: np.ndarray
+    left_inflection_u: np.ndarray
+    right_inflection_u: np.ndarray
 
     def indices(self, fiber: int, column: int) -> tuple[int, int]:
         group = int(self.fiber_group[int(fiber)])
@@ -383,163 +392,289 @@ class LocalProfileMap:
         return self.density[chunk, group]
 
 
-def fit_empirical_profile(u: np.ndarray, values: np.ndarray, *, support: float, bin_width: float) -> tuple[np.ndarray, np.ndarray, float]:
-    """Fit one asymmetric profile and retain its local aperture-normalized scale."""
-    edges = np.arange(-support, support + bin_width, bin_width)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    profile = np.full(centers.shape, np.nan)
-    indices = np.digitize(u, edges) - 1
-    for index in range(centers.size):
-        selected = values[(indices == index) & np.isfinite(values)]
-        if selected.size >= 8:
-            location = np.median(selected)
-            scale = 1.4826 * np.median(np.abs(selected - location))
-            if np.isfinite(scale) and scale > 0:
-                selected = selected[np.abs(selected - location) <= 5.0 * scale]
-            profile[index] = np.median(selected)
-    good = np.isfinite(profile)
-    if good.sum() < 8:
-        raise ValueError("insufficient empirical profile bins")
-    profile = np.interp(centers, centers[good], profile[good], left=0.0, right=0.0)
-    profile = np.clip(profile, 0.0, None)
-    integral = trapezoidal_integral(profile, centers)
-    if not np.isfinite(integral) or integral <= 0:
-        raise ValueError("empirical profile has non-positive integral")
-    return centers, profile / integral, float(integral)
+@dataclass(frozen=True)
+class ProfileEvidence:
+    """One immutable detector-sample collection for all local-profile passes."""
+
+    u: np.ndarray
+    signal: np.ndarray
+    fiber: np.ndarray
+    column: np.ndarray
+    chunk: np.ndarray
+    group: np.ndarray
+    five_pixel_normalization: np.ndarray
+    seed_core: np.ndarray
+    neighbor_fiber: np.ndarray
+    neighbor_u: np.ndarray
+    neighbor_overlaps: np.ndarray
+    valley_signal: np.ndarray
+    valley_first_fiber: np.ndarray
+    valley_second_fiber: np.ndarray
+    valley_column: np.ndarray
+    valley_chunk: np.ndarray
+    valley_group: np.ndarray
+    valley_first_u: np.ndarray
+    valley_second_u: np.ndarray
 
 
-def _group_profile_samples(
+def _profile_layout(trace: np.ndarray, *, support: float, chunk_width: int, group_size: int) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray]:
+    """Build fixed local chunks and groups, splitting groups at physical gaps."""
+    nx = trace.shape[1]
+    chunks = [np.arange(start, min(nx, start + int(chunk_width))) for start in range(0, nx, int(chunk_width))]
+    groups: list[np.ndarray] = []
+    group_start = 0
+    for fiber in range(1, trace.shape[0]):
+        separation = np.abs(trace[fiber] - trace[fiber - 1])
+        has_gap = bool(np.nanmedian(separation) > 2.0 * support)
+        if fiber - group_start >= int(group_size) or has_gap:
+            groups.append(np.arange(group_start, fiber))
+            group_start = fiber
+    groups.append(np.arange(group_start, trace.shape[0]))
+    fiber_group = np.empty(trace.shape[0], dtype=np.int16)
+    for group_index, fibers in enumerate(groups):
+        fiber_group[fibers] = group_index
+    return chunks, groups, fiber_group
+
+
+def collect_profile_evidence(
     image: np.ndarray,
     trace: np.ndarray,
-    preliminary: np.ndarray,
+    five_pixel_normalization: np.ndarray,
     mask: np.ndarray,
-    columns: np.ndarray,
-    fibers: np.ndarray,
     *,
     support: float,
-    u_grid: np.ndarray | None = None,
-    profile: np.ndarray | None = None,
-    profile_amplitude: float = 1.0,
-    seed_from_valleys: bool = False,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return local deblended samples plus valley-derived overlap constraints.
+    chunks: list[np.ndarray],
+    groups: list[np.ndarray],
+    fiber_group: np.ndarray,
+) -> ProfileEvidence:
+    """Collect every valid profile pixel and overlap/valley fact exactly once."""
+    ny, nx = image.shape
+    chunk_for_column = np.empty(nx, dtype=np.int16)
+    for chunk_index, columns in enumerate(chunks):
+        chunk_for_column[columns] = chunk_index
+    pair_overlap = np.zeros((trace.shape[0] - 1, nx), dtype=bool)
+    valley_row = np.full((trace.shape[0] - 1, nx), np.nan, dtype=float)
+    for first in range(trace.shape[0] - 1):
+        for column in range(nx):
+            first_center, second_center = trace[first, column], trace[first + 1, column]
+            if not (np.isfinite(first_center) and np.isfinite(second_center) and abs(second_center - first_center) <= 2.0 * support):
+                continue
+            pair_overlap[first, column] = True
+            low = max(0, int(np.ceil(min(first_center, second_center))))
+            high = min(ny, int(np.floor(max(first_center, second_center))) + 1)
+            if high - low < 2:
+                continue
+            rows = np.arange(low, high)
+            usable = ~mask[rows, column] & np.isfinite(image[rows, column])
+            if np.any(usable):
+                valley_row[first, column] = float(rows[usable][np.argmin(image[rows[usable], column])])
 
-    Every pixel within ``support`` of a member trace is retained, including
-    pixels closer to a neighboring trace.  Once a local profile estimate is
-    available, adjacent-fiber contributions are subtracted using each fiber's
-    own preliminary spectrum.  At each inter-fiber valley, the observed value
-    is decomposed between the pair according to their local normalizations and
-    their (not assumed symmetric) profile values.
-    """
-    ny = image.shape[0]
-    sample_u: list[np.ndarray] = []
-    sample_value: list[np.ndarray] = []
-    valley_u: list[float] = []
-    valley_value: list[float] = []
-    all_fibers = range(trace.shape[0])
-
-    def evaluate(offset: np.ndarray) -> np.ndarray:
-        if u_grid is None or profile is None:
-            return np.zeros_like(offset, dtype=float)
-        return float(profile_amplitude) * np.interp(offset, u_grid, profile, left=0.0, right=0.0)
-
-    def neighboring_valley(first: int, second: int, column: int) -> float | None:
-        """Locate the observed local minimum between two adjacent traces."""
-        first_center, second_center = trace[first, column], trace[second, column]
-        if not (np.isfinite(first_center) and np.isfinite(second_center)):
-            return None
-        low = max(0, int(np.ceil(min(first_center, second_center))))
-        high = min(ny, int(np.floor(max(first_center, second_center))) + 1)
-        if high - low < 2:
-            return None
-        rows = np.arange(low, high)
-        usable = ~mask[rows, column] & np.isfinite(image[rows, column])
-        if not np.any(usable):
-            return None
-        return float(rows[usable][np.argmin(image[rows[usable], column])])
-
-    for fiber in fibers:
-        for column in columns:
+    values: dict[str, list[np.ndarray]] = {name: [] for name in (
+        "u", "signal", "fiber", "column", "chunk", "group", "normalization", "seed_core",
+        "neighbor_fiber", "neighbor_u", "neighbor_overlaps",
+    )}
+    for fiber in range(trace.shape[0]):
+        for column in range(nx):
             center = trace[fiber, column]
-            normalization = preliminary[fiber, column]
+            normalization = five_pixel_normalization[fiber, column]
             if not (np.isfinite(center) and np.isfinite(normalization) and normalization > 0.0):
                 continue
             lo = max(0, int(np.floor(center - support)))
             hi = min(ny, int(np.ceil(center + support)) + 1)
             rows = np.arange(lo, hi)
             good = ~mask[rows, column] & np.isfinite(image[rows, column])
-            if seed_from_valleys:
-                # Use the observed inter-fiber valleys only to initialize the
-                # uncontaminated core.  The deblended passes below retain the
-                # complete overlap region on both sides of every trace.
-                lower = neighboring_valley(fiber - 1, fiber, column) if fiber > 0 else None
-                upper = neighboring_valley(fiber, fiber + 1, column) if fiber + 1 < trace.shape[0] else None
-                if lower is not None:
-                    good &= rows >= lower
-                if upper is not None:
-                    good &= rows <= upper
             if not np.any(good):
                 continue
-            offsets = rows[good] - center
-            value = np.asarray(image[rows[good], column], dtype=float)
-            # Only the immediate physical neighbors are needed for the local
-            # wing correction at VIRUS fiber spacing; farther fibers are
-            # represented through their own adjacent-pair valley constraints.
-            for neighbor in (fiber - 1, fiber + 1):
-                if neighbor not in all_fibers:
+            rows = rows[good]
+            lower_valley = valley_row[fiber - 1, column] if fiber > 0 and pair_overlap[fiber - 1, column] else np.nan
+            upper_valley = valley_row[fiber, column] if fiber + 1 < trace.shape[0] and pair_overlap[fiber, column] else np.nan
+            core = np.ones(rows.size, dtype=bool)
+            if np.isfinite(lower_valley):
+                core &= rows >= lower_valley
+            if np.isfinite(upper_valley):
+                core &= rows <= upper_valley
+            neighbor_fiber = np.full((rows.size, 2), -1, dtype=np.int16)
+            neighbor_u = np.full((rows.size, 2), np.nan, dtype=np.float32)
+            neighbor_overlaps = np.zeros((rows.size, 2), dtype=bool)
+            for slot, neighbor in enumerate((fiber - 1, fiber + 1)):
+                if neighbor < 0 or neighbor >= trace.shape[0]:
                     continue
-                neighbor_center = trace[neighbor, column]
-                neighbor_normalization = preliminary[neighbor, column]
-                if np.isfinite(neighbor_center) and np.isfinite(neighbor_normalization) and neighbor_normalization > 0.0:
-                    value -= neighbor_normalization * evaluate(rows[good] - neighbor_center)
-            sample_u.append(offsets)
-            sample_value.append(value / normalization)
+                pair = min(fiber, neighbor)
+                if not pair_overlap[pair, column]:
+                    continue
+                neighbor_fiber[:, slot] = neighbor
+                neighbor_u[:, slot] = rows - trace[neighbor, column]
+                neighbor_overlaps[:, slot] = True
+            values["u"].append((rows - center).astype(np.float32))
+            values["signal"].append(np.asarray(image[rows, column], dtype=np.float32))
+            values["fiber"].append(np.full(rows.size, fiber, dtype=np.int16))
+            values["column"].append(np.full(rows.size, column, dtype=np.int16))
+            values["chunk"].append(np.full(rows.size, chunk_for_column[column], dtype=np.int16))
+            values["group"].append(np.full(rows.size, fiber_group[fiber], dtype=np.int16))
+            values["normalization"].append(np.full(rows.size, normalization, dtype=np.float32))
+            values["seed_core"].append(core)
+            values["neighbor_fiber"].append(neighbor_fiber)
+            values["neighbor_u"].append(neighbor_u)
+            values["neighbor_overlaps"].append(neighbor_overlaps)
 
-    # The fiber_utils precedent identifies the local minimum between adjacent
-    # fibers.  Here its signal is split by the fitted asymmetric wings and the
-    # two local normalizations, rather than by a fixed equal split.
-    for first, second in zip(fibers[:-1], fibers[1:]):
-        if second != first + 1:
+    valley_values: dict[str, list[float | int]] = {name: [] for name in (
+        "signal", "first", "second", "column", "chunk", "group", "first_u", "second_u",
+    )}
+    for first in range(trace.shape[0] - 1):
+        second = first + 1
+        if fiber_group[first] != fiber_group[second]:
             continue
-        for column in columns:
-            first_center, second_center = trace[first, column], trace[second, column]
-            first_norm, second_norm = preliminary[first, column], preliminary[second, column]
-            if not (
-                np.isfinite(first_center) and np.isfinite(second_center)
-                and np.isfinite(first_norm) and np.isfinite(second_norm)
-                and first_norm > 0.0 and second_norm > 0.0
-            ):
+        for column in range(nx):
+            row = valley_row[first, column]
+            if not np.isfinite(row):
                 continue
-            valley_row = neighboring_valley(first, second, column)
-            if valley_row is None:
+            first_norm = five_pixel_normalization[first, column]
+            second_norm = five_pixel_normalization[second, column]
+            if not (np.isfinite(first_norm) and np.isfinite(second_norm) and first_norm > 0.0 and second_norm > 0.0):
                 continue
-            first_u, second_u = valley_row - first_center, valley_row - second_center
-            first_profile = float(evaluate(np.asarray([first_u]))[0])
-            second_profile = float(evaluate(np.asarray([second_u]))[0])
-            denominator = first_norm * first_profile + second_norm * second_profile
-            if not np.isfinite(denominator) or denominator <= 0.0:
-                continue
-            observed = float(image[int(valley_row), column])
-            if not np.isfinite(observed):
-                continue
-            valley_u.extend((first_u, second_u))
-            valley_value.extend((
-                observed * first_profile / denominator,
-                observed * second_profile / denominator,
-            ))
+            valley_values["signal"].append(float(image[int(row), column]))
+            valley_values["first"].append(first)
+            valley_values["second"].append(second)
+            valley_values["column"].append(column)
+            valley_values["chunk"].append(int(chunk_for_column[column]))
+            valley_values["group"].append(int(fiber_group[first]))
+            valley_values["first_u"].append(float(row - trace[first, column]))
+            valley_values["second_u"].append(float(row - trace[second, column]))
 
-    if not sample_u:
-        return tuple(np.empty(0, dtype=float) for _ in range(4))
-    return (
-        np.concatenate(sample_u), np.concatenate(sample_value),
-        np.asarray(valley_u, dtype=float), np.asarray(valley_value, dtype=float),
+    return ProfileEvidence(
+        u=np.concatenate(values["u"]), signal=np.concatenate(values["signal"]),
+        fiber=np.concatenate(values["fiber"]), column=np.concatenate(values["column"]),
+        chunk=np.concatenate(values["chunk"]), group=np.concatenate(values["group"]),
+        five_pixel_normalization=np.concatenate(values["normalization"]),
+        seed_core=np.concatenate(values["seed_core"]),
+        neighbor_fiber=np.concatenate(values["neighbor_fiber"]),
+        neighbor_u=np.concatenate(values["neighbor_u"]),
+        neighbor_overlaps=np.concatenate(values["neighbor_overlaps"]),
+        valley_signal=np.asarray(valley_values["signal"], dtype=np.float32),
+        valley_first_fiber=np.asarray(valley_values["first"], dtype=np.int16),
+        valley_second_fiber=np.asarray(valley_values["second"], dtype=np.int16),
+        valley_column=np.asarray(valley_values["column"], dtype=np.int16),
+        valley_chunk=np.asarray(valley_values["chunk"], dtype=np.int16),
+        valley_group=np.asarray(valley_values["group"], dtype=np.int16),
+        valley_first_u=np.asarray(valley_values["first_u"], dtype=np.float32),
+        valley_second_u=np.asarray(valley_values["second_u"], dtype=np.float32),
     )
 
 
-def _fill_missing_local_profiles(profiles: np.ndarray, amplitudes: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def robust_profile_bins(u: np.ndarray, values: np.ndarray, *, support: float, bin_width: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return robust bin medians, counts, and scatter without fitting a curve."""
+    centers = np.arange(-support + bin_width / 2.0, support, bin_width)
+    edges = np.r_[centers - bin_width / 2.0, centers[-1] + bin_width / 2.0]
+    median = np.full(centers.shape, np.nan)
+    scatter = np.full(centers.shape, np.nan)
+    count = np.zeros(centers.shape, dtype=np.int32)
+    indices = np.digitize(u, edges) - 1
+    for index in range(centers.size):
+        selected = values[(indices == index) & np.isfinite(values)]
+        if selected.size:
+            location = float(np.median(selected))
+            scale = float(1.4826 * np.median(np.abs(selected - location)))
+            if np.isfinite(scale) and scale > 0.0:
+                selected = selected[np.abs(selected - location) <= 5.0 * scale]
+            count[index] = selected.size
+            median[index] = np.median(selected)
+            scatter[index] = 1.4826 * np.median(np.abs(selected - median[index]))
+    return centers, median, scatter, count
+
+
+def fit_constrained_profile(
+    u: np.ndarray,
+    values: np.ndarray,
+    *,
+    support: float,
+    bin_width: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
+    """Regularize robust bins into an asymmetric, one-peak compact profile.
+
+    A weighted smoothing spline absorbs bin-level noise and supplies the
+    peak/valley locations.  Separate beta-CDF branches are then fit to that
+    local empirical shape.  They are non-negative, C1 at the peak and valley,
+    asymmetric, monotone, and have exactly one data-fitted inflection per
+    branch without assuming a Gaussian profile.
+    """
+    centers, median, scatter, count = robust_profile_bins(u, values, support=support, bin_width=bin_width)
+    finite = np.isfinite(median) & np.isfinite(scatter) & (count >= 8)
+    if finite.sum() < 8:
+        raise ValueError("insufficient robust local-profile bins")
+    peak_scale = float(np.nanmax(np.abs(median[finite])))
+    noise = max(float(np.nanmedian(scatter[finite])), peak_scale * 1e-4, 1e-8)
+    excessive_scatter = scatter > max(5.0 * noise, 0.5 * peak_scale)
+    used = finite & ~excessive_scatter
+    if used.sum() < 8:
+        used = finite
+    weights = np.sqrt(count[used]) / np.maximum(scatter[used], noise)
+    try:
+        smooth = UnivariateSpline(centers[used], median[used], w=weights, k=3, s=1.5 * used.sum())
+        provisional = smooth(centers)
+    except Exception:
+        provisional = PchipInterpolator(centers[used], median[used], extrapolate=False)(centers)
+    provisional = np.nan_to_num(provisional, nan=0.0, posinf=0.0, neginf=0.0)
+    provisional = np.clip(provisional, 0.0, None)
+    peak_index = int(np.argmax(provisional))
+    if peak_index == 0 or peak_index == centers.size - 1:
+        raise ValueError("local profile peak is not bracketed by detector evidence")
+    if (used[:peak_index].sum() < 4 or used[peak_index + 1:].sum() < 4):
+        raise ValueError("local profile lacks two-sided detector support")
+    peak = float(provisional[peak_index])
+    level = max(3.0 * noise, 0.003 * peak)
+    left_active = np.flatnonzero((np.arange(centers.size) < peak_index) & (provisional >= level))
+    right_active = np.flatnonzero((np.arange(centers.size) > peak_index) & (provisional >= level))
+    left_index = max(0, int(left_active[0]) - 1) if left_active.size else 0
+    right_index = min(centers.size - 1, int(right_active[-1]) + 1) if right_active.size else centers.size - 1
+    left_valley = float(centers[left_index])
+    right_valley = float(centers[right_index])
+    peak_u = float(centers[peak_index])
+    if not (left_valley < peak_u < right_valley):
+        raise ValueError("local profile valley locations do not bracket the peak")
+    fit_u = centers[used]
+    fit_values = np.clip(median[used], 0.0, None)
+    fit_weights = weights
+
+    def branch_model(theta: np.ndarray, coordinate: np.ndarray) -> np.ndarray:
+        height = np.exp(theta[0])
+        left_a, left_b, right_a, right_b = 1.0 + np.exp(theta[1:])
+        result = np.zeros_like(coordinate, dtype=float)
+        left = (coordinate >= left_valley) & (coordinate <= peak_u)
+        right = (coordinate > peak_u) & (coordinate <= right_valley)
+        result[left] = height * betainc(left_a, left_b, (coordinate[left] - left_valley) / (peak_u - left_valley))
+        result[right] = height * betainc(right_a, right_b, (right_valley - coordinate[right]) / (right_valley - peak_u))
+        return result
+
+    initial = np.log([max(peak, noise), 1.0, 1.0, 1.0, 1.0])
+    lower = np.log([max(peak * 0.25, noise), 0.02, 0.02, 0.02, 0.02])
+    upper = np.log([max(peak * 4.0, noise * 4.0), 20.0, 20.0, 20.0, 20.0])
+    result = least_squares(
+        lambda theta: (branch_model(theta, fit_u) - fit_values) * fit_weights,
+        initial, bounds=(lower, upper), loss="soft_l1",
+    )
+    regularized = branch_model(result.x, centers)
+    integral = trapezoidal_integral(regularized, centers)
+    if not np.isfinite(integral) or integral <= 0.0:
+        raise ValueError("constrained local profile has non-positive integral")
+    regularized /= integral
+    peak_index = int(np.argmax(regularized))
+    left_a, left_b, right_a, right_b = 1.0 + np.exp(result.x[1:])
+    left_transition = left_valley + (peak_u - left_valley) * (left_a - 1.0) / (left_a + left_b - 2.0)
+    right_transition = right_valley - (right_valley - peak_u) * (right_a - 1.0) / (right_a + right_b - 2.0)
+    topology = {
+        "peak_u": peak_u,
+        "left_valley_u": left_valley,
+        "right_valley_u": right_valley,
+        "left_inflection_u": float(left_transition),
+        "right_inflection_u": float(right_transition),
+    }
+    return centers, regularized, count, scatter, used, topology
+
+
+def _fill_missing_local_profiles(profiles: np.ndarray, *arrays: np.ndarray) -> tuple[np.ndarray, ...]:
     """Borrow only the nearest chunk/group profile when a local fit is sparse."""
     result = profiles.copy()
-    result_amplitude = amplitudes.copy()
+    results = [array.copy() for array in arrays]
     available = np.isfinite(result).all(axis=-1)
     if not np.any(available):
         raise ValueError("no usable local LDLS profile fits")
@@ -547,87 +682,176 @@ def _fill_missing_local_profiles(profiles: np.ndarray, amplitudes: np.ndarray) -
         distances = np.abs(np.argwhere(available) - np.asarray([chunk, group])).sum(axis=1)
         nearest_chunk, nearest_group = np.argwhere(available)[int(np.argmin(distances))]
         result[chunk, group] = result[nearest_chunk, nearest_group]
-        result_amplitude[chunk, group] = result_amplitude[nearest_chunk, nearest_group]
-    return result, result_amplitude
+        for array in results:
+            array[chunk, group] = array[nearest_chunk, nearest_group]
+    return (result, *results)
+
+
+def _profile_sample_values(
+    evidence: ProfileEvidence,
+    selection: np.ndarray,
+    compact_total: np.ndarray,
+    profiles: LocalProfileMap | None,
+) -> np.ndarray:
+    """Interpret fixed detector evidence with the current overlap model."""
+    indices = np.flatnonzero(selection)
+    value = evidence.signal[indices].astype(float)
+    if profiles is not None:
+        for slot in range(2):
+            neighbor = evidence.neighbor_fiber[indices, slot]
+            overlaps = evidence.neighbor_overlaps[indices, slot] & (neighbor >= 0)
+            if not np.any(overlaps):
+                continue
+            for neighbor_group in np.unique(profiles.fiber_group[neighbor[overlaps]]):
+                use = overlaps & (profiles.fiber_group[np.maximum(neighbor, 0)] == neighbor_group)
+                if not np.any(use):
+                    continue
+                chunk = int(evidence.chunk[indices[use][0]])
+                shape = np.interp(
+                    evidence.neighbor_u[indices[use], slot], profiles.u_grid,
+                    profiles.density[chunk, int(neighbor_group)], left=0.0, right=0.0,
+                )
+                value[use] -= compact_total[neighbor[use], evidence.column[indices[use]]] * shape
+    normalization = compact_total[evidence.fiber[indices], evidence.column[indices]]
+    return np.divide(value, normalization, out=np.full(value.shape, np.nan), where=np.isfinite(normalization) & (normalization > 0.0))
+
+
+def _valley_constraints(
+    evidence: ProfileEvidence,
+    chunk: int,
+    group: int,
+    compact_total: np.ndarray,
+    profiles: LocalProfileMap | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split the fixed observed valleys according to the current local maps."""
+    if profiles is None:
+        return np.empty(0, dtype=float), np.empty(0, dtype=float)
+    use = (evidence.valley_chunk == chunk) & (evidence.valley_group == group)
+    if not np.any(use):
+        return np.empty(0, dtype=float), np.empty(0, dtype=float)
+    first = evidence.valley_first_fiber[use]
+    second = evidence.valley_second_fiber[use]
+    column = evidence.valley_column[use]
+    first_group = profiles.fiber_group[first]
+    second_group = profiles.fiber_group[second]
+    first_profile = np.empty(first.size, dtype=float)
+    second_profile = np.empty(second.size, dtype=float)
+    for profile_group in np.unique(first_group):
+        selected = first_group == profile_group
+        first_profile[selected] = np.interp(evidence.valley_first_u[use][selected], profiles.u_grid, profiles.density[chunk, profile_group], left=0.0, right=0.0)
+    for profile_group in np.unique(second_group):
+        selected = second_group == profile_group
+        second_profile[selected] = np.interp(evidence.valley_second_u[use][selected], profiles.u_grid, profiles.density[chunk, profile_group], left=0.0, right=0.0)
+    first_total = compact_total[first, column]
+    second_total = compact_total[second, column]
+    denominator = first_total * first_profile + second_total * second_profile
+    valid = np.isfinite(denominator) & (denominator > 0.0)
+    if not np.any(valid):
+        return np.empty(0, dtype=float), np.empty(0, dtype=float)
+    observed = evidence.valley_signal[use][valid]
+    return (
+        np.r_[evidence.valley_first_u[use][valid], evidence.valley_second_u[use][valid]],
+        np.r_[observed * first_profile[valid] / denominator[valid], observed * second_profile[valid] / denominator[valid]],
+    )
 
 
 def measure_local_profiles(
-    image: np.ndarray,
+    evidence: ProfileEvidence,
     trace: np.ndarray,
-    preliminary: np.ndarray,
-    mask: np.ndarray,
+    five_pixel_normalization: np.ndarray,
     *,
+    detector_rows: int,
+    aperture_width: float,
     support: float,
     bin_width: float,
     chunk_width: int,
     group_size: int,
     iterations: int,
     valley_weight: int,
-) -> LocalProfileMap:
-    """Measure coarse ``P(u; x_chunk, fiber_group)`` LDLS profile maps."""
-    nx = image.shape[1]
-    if int(chunk_width) < 1 or int(group_size) < 1:
-        raise ValueError("profile chunk width and group size must be positive")
-    chunks = [np.arange(start, min(nx, start + int(chunk_width))) for start in range(0, nx, int(chunk_width))]
-    groups = [np.arange(start, min(trace.shape[0], start + int(group_size))) for start in range(0, trace.shape[0], int(group_size))]
+) -> tuple[LocalProfileMap, np.ndarray, int, bool, float, float]:
+    """Fit local maps from fixed evidence, updating only its interpretation."""
+    chunks, groups, fiber_group = _profile_layout(trace, support=support, chunk_width=chunk_width, group_size=group_size)
     u_grid = np.arange(-support + bin_width / 2.0, support, bin_width)
     profiles = np.full((len(chunks), len(groups), u_grid.size), np.nan, dtype=float)
-    amplitudes = np.full((len(chunks), len(groups)), np.nan, dtype=float)
     sample_count = np.zeros((len(chunks), len(groups)), dtype=np.int32)
     valley_count = np.zeros((len(chunks), len(groups)), dtype=np.int32)
-
-    # First pass keeps overlap pixels intact and produces a local empirical
-    # seed.  Later passes deblend using that seed and add valley constraints.
-    for chunk_index, columns in enumerate(chunks):
-        for group_index, fibers in enumerate(groups):
-            u, values, _, _ = _group_profile_samples(
-                image, trace, preliminary, mask, columns, fibers, support=support,
-                seed_from_valleys=True,
-            )
-            sample_count[chunk_index, group_index] = u.size
-            if u.size:
-                try:
-                    fitted_u, fitted, amplitude = fit_empirical_profile(u, values, support=support, bin_width=bin_width)
-                    profiles[chunk_index, group_index] = np.interp(u_grid, fitted_u, fitted, left=0.0, right=0.0)
-                    amplitudes[chunk_index, group_index] = amplitude
-                except ValueError:
-                    pass
-    profiles, amplitudes = _fill_missing_local_profiles(profiles, amplitudes)
-
-    for _ in range(max(0, int(iterations))):
+    bin_count = np.zeros_like(profiles, dtype=np.int32)
+    bin_scatter = np.full_like(profiles, np.nan)
+    bin_used = np.zeros_like(profiles, dtype=bool)
+    peak_u = np.full((len(chunks), len(groups)), np.nan)
+    left_valley_u = np.full_like(peak_u, np.nan)
+    right_valley_u = np.full_like(peak_u, np.nan)
+    left_inflection_u = np.full_like(peak_u, np.nan)
+    right_inflection_u = np.full_like(peak_u, np.nan)
+    compact_total = five_pixel_normalization.copy()
+    previous: LocalProfileMap | None = None
+    completed_iterations = 0
+    converged = False
+    capture_change = float("inf")
+    shape_change = float("inf")
+    for iteration in range(max(1, int(iterations) + 1)):
+        completed_iterations = iteration + 1
         updated = np.full_like(profiles, np.nan)
-        updated_amplitudes = np.full_like(amplitudes, np.nan)
-        for chunk_index, columns in enumerate(chunks):
-            for group_index, fibers in enumerate(groups):
-                u, values, valley_u, valley_values = _group_profile_samples(
-                    image, trace, preliminary, mask, columns, fibers, support=support,
-                    u_grid=u_grid, profile=profiles[chunk_index, group_index],
-                    profile_amplitude=amplitudes[chunk_index, group_index],
-                )
-                sample_count[chunk_index, group_index] = u.size
+        for chunk_index in range(len(chunks)):
+            for group_index in range(len(groups)):
+                selected = (evidence.chunk == chunk_index) & (evidence.group == group_index)
+                sample_count[chunk_index, group_index] = int(selected.sum())
+                values = _profile_sample_values(evidence, selected, compact_total, previous)
+                sample_u = evidence.u[selected]
+                if previous is None:
+                    core = evidence.seed_core[selected]
+                    sample_u = sample_u[core]
+                    values = values[core]
+                valley_u, valley_values = _valley_constraints(evidence, chunk_index, group_index, compact_total, previous)
                 valley_count[chunk_index, group_index] = valley_u.size
-                fit_u = np.concatenate((u, np.repeat(valley_u, max(1, int(valley_weight)))))
-                fit_values = np.concatenate((values, np.repeat(valley_values, max(1, int(valley_weight)))))
+                if valley_u.size:
+                    sample_u = np.r_[sample_u, np.repeat(valley_u, max(1, int(valley_weight)))]
+                    values = np.r_[values, np.repeat(valley_values, max(1, int(valley_weight)))]
                 try:
-                    fitted_u, fitted, amplitude = fit_empirical_profile(fit_u, fit_values, support=support, bin_width=bin_width)
+                    fitted_u, fitted, counts, scatter, used, topology = fit_constrained_profile(sample_u, values, support=support, bin_width=bin_width)
                     updated[chunk_index, group_index] = np.interp(u_grid, fitted_u, fitted, left=0.0, right=0.0)
-                    updated_amplitudes[chunk_index, group_index] = amplitude
+                    bin_count[chunk_index, group_index] = counts
+                    bin_scatter[chunk_index, group_index] = scatter
+                    bin_used[chunk_index, group_index] = used
+                    peak_u[chunk_index, group_index] = topology["peak_u"]
+                    left_valley_u[chunk_index, group_index] = topology["left_valley_u"]
+                    right_valley_u[chunk_index, group_index] = topology["right_valley_u"]
+                    left_inflection_u[chunk_index, group_index] = topology["left_inflection_u"]
+                    right_inflection_u[chunk_index, group_index] = topology["right_inflection_u"]
                 except ValueError:
-                    updated[chunk_index, group_index] = profiles[chunk_index, group_index]
-                    updated_amplitudes[chunk_index, group_index] = amplitudes[chunk_index, group_index]
-        profiles, amplitudes = _fill_missing_local_profiles(updated, updated_amplitudes)
+                    if previous is not None:
+                        updated[chunk_index, group_index] = previous.density[chunk_index, group_index]
+        profiles, bin_count, bin_scatter, bin_used, peak_u, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u = _fill_missing_local_profiles(
+            updated, bin_count, bin_scatter, bin_used, peak_u, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u,
+        )
+        current = LocalProfileMap(
+            u_grid=u_grid, density=profiles,
+            chunk_columns=np.asarray([(int(chunk[0]), int(chunk[-1])) for chunk in chunks], dtype=np.int32),
+            group_bounds=np.asarray([(int(group[0]), int(group[-1])) for group in groups], dtype=np.int32),
+            fiber_group=fiber_group, sample_count=sample_count, valley_constraint_count=valley_count,
+            bin_count=bin_count, bin_scatter=bin_scatter, bin_used=bin_used,
+            peak_u=peak_u, left_valley_u=left_valley_u, right_valley_u=right_valley_u,
+            left_inflection_u=left_inflection_u, right_inflection_u=right_inflection_u,
+        )
+        captured = aperture_capture(trace, detector_rows, current, aperture_width)
+        updated_total = np.divide(five_pixel_normalization, captured, out=compact_total.copy(), where=np.isfinite(captured) & (captured > 0.0))
+        if previous is not None:
+            capture_change = np.nanmedian(np.abs(updated_total - compact_total) / np.maximum(np.abs(compact_total), 1e-12))
+            shape_change = np.nanmedian(np.abs(current.density - previous.density) / np.maximum(previous.density, 1e-8))
+            compact_total = updated_total
+            if np.isfinite(capture_change) and np.isfinite(shape_change) and capture_change < 2e-3 and shape_change < 5e-3:
+                converged = True
+                break
+        else:
+            compact_total = updated_total
+        previous = current
 
-    chunk_columns = np.asarray([(int(chunk[0]), int(chunk[-1])) for chunk in chunks], dtype=np.int32)
-    group_bounds = np.asarray([(int(group[0]), int(group[-1])) for group in groups], dtype=np.int32)
-    fiber_group = np.empty(trace.shape[0], dtype=np.int16)
-    for group_index, fibers in enumerate(groups):
-        fiber_group[fibers] = group_index
-    return LocalProfileMap(
-        u_grid=u_grid, density=profiles, amplitude=amplitudes,
-        chunk_columns=chunk_columns,
-        group_bounds=group_bounds, fiber_group=fiber_group,
-        sample_count=sample_count, valley_constraint_count=valley_count,
+    final_capture = aperture_capture(trace, detector_rows, current, aperture_width)
+    final_total = np.divide(
+        five_pixel_normalization, final_capture, out=compact_total.copy(),
+        where=np.isfinite(final_capture) & (final_capture > 0.0),
     )
+    return current, final_total, completed_iterations, converged, float(capture_change), float(shape_change)
 
 
 def profile_integral(u_grid: np.ndarray, profile: np.ndarray, left: np.ndarray, right: np.ndarray) -> np.ndarray:
@@ -742,16 +966,16 @@ def predict_halo_image(traces: np.ndarray, wavelength: np.ndarray, source_info: 
 
 
 def plot_profile_diagnostics(
-    image: np.ndarray,
     trace: np.ndarray,
-    preliminary: np.ndarray,
-    mask: np.ndarray,
+    evidence: ProfileEvidence,
     profiles: LocalProfileMap,
+    compact_total: np.ndarray,
     path: Path,
     support: float,
 ) -> None:
-    """Show actual chunk/group samples and the fitted local profile at five locations."""
-    ny, nx = image.shape
+    """Show all fixed detector evidence constraining five local profiles."""
+    nx = trace.shape[1]
+    ny = int(np.ceil(np.nanmax(trace))) + 1
     targets = [(nx // 2, ny // 2), (nx // 8, ny // 8), (7 * nx // 8, ny // 8), (nx // 8, 7 * ny // 8), (7 * nx // 8, 7 * ny // 8)]
     fig, axes = plt.subplots(1, 5, figsize=(19, 3.6), sharey=True)
     for axis, (x0, y0) in zip(axes, targets):
@@ -759,29 +983,25 @@ def plot_profile_diagnostics(
         chunk, group = profiles.indices(fiber, x0)
         start, stop = profiles.chunk_columns[chunk]
         first_fiber, last_fiber = profiles.group_bounds[group]
-        cols = np.arange(start, stop + 1)
-        fibers = np.arange(first_fiber, last_fiber + 1)
-        uu, vv, valley_u, valley_v = _group_profile_samples(
-            image, trace, preliminary, mask, cols, fibers, support=support,
-            u_grid=profiles.u_grid, profile=profiles.density[chunk, group],
-            profile_amplitude=profiles.amplitude[chunk, group],
-        )
-        axis.plot(uu, vv, ".", ms=1.2, alpha=0.16, color="tab:blue")
+        selected = (evidence.chunk == chunk) & (evidence.group == group)
+        uu = evidence.u[selected]
+        vv = _profile_sample_values(evidence, selected, compact_total, profiles)
+        valley_u, valley_v = _valley_constraints(evidence, chunk, group, compact_total, profiles)
+        axis.plot(uu, vv, ".", ms=1.0, alpha=0.035, color="tab:blue", label="all detector samples")
         if valley_u.size:
-            axis.plot(valley_u, valley_v, "x", ms=3.0, alpha=0.6, color="tab:orange", label="valley split")
-        axis.plot(
-            profiles.u_grid,
-            profiles.amplitude[chunk, group] * profiles.density[chunk, group],
-            color="black", lw=1.5, label="local fit",
-        )
+            axis.plot(valley_u, valley_v, "x", ms=2.5, alpha=0.55, color="tab:orange", label="valley constraints")
+        axis.plot(profiles.u_grid, profiles.density[chunk, group], color="black", lw=1.5, label="constrained fit")
+        axis.axvline(profiles.peak_u[chunk, group], color="0.35", lw=0.7, ls="--")
+        axis.axvline(profiles.left_valley_u[chunk, group], color="0.6", lw=0.6, ls=":")
+        axis.axvline(profiles.right_valley_u[chunk, group], color="0.6", lw=0.6, ls=":")
         axis.set(
-            title=(f"x={x0}, fiber={fiber}\nchunk {start}-{stop}, group {first_fiber}-{last_fiber}"),
+            title=(f"x={x0}, fiber={fiber}\nchunk {start}-{stop}, group {first_fiber}-{last_fiber}; n={uu.size}"),
             xlabel="u (pixel)", xlim=(-support, support),
         )
         axis.grid(alpha=0.2)
-    axes[0].set_ylabel("LDLS pixel / preliminary spectrum")
+    axes[0].set_ylabel("LDLS pixel / estimated compact total flux")
     axes[0].legend(frameon=False, fontsize=7, loc="upper right")
-    fig.suptitle("Local phase-sampled LDLS profiles with neighboring-fiber valley constraints")
+    fig.suptitle("All fixed local LDLS evidence, distinct valley constraints, and constrained profiles")
     fig.tight_layout()
     fig.savefig(path, dpi=170)
     plt.close(fig)
@@ -821,7 +1041,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile-bin-width", type=float, default=0.05)
     parser.add_argument("--profile-chunk-width", type=int, default=100)
     parser.add_argument("--profile-group-size", type=int, default=16)
-    parser.add_argument("--profile-deblend-iterations", type=int, default=2)
+    parser.add_argument("--profile-deblend-iterations", type=int, default=6, help="Maximum post-seed capture/deblend refinements; exits early once stable")
     parser.add_argument("--profile-valley-weight", type=int, default=1)
     parser.add_argument("--ldls-smoothing-window", type=int, default=101)
     parser.add_argument("--arc-smoothing-window", type=int, default=51)
@@ -881,10 +1101,25 @@ def main(argv: list[str] | None = None) -> int:
     fits.writeto(output / "01_assembled_science_baseline_subtracted.fits", sci, overwrite=True)
     fits.writeto(output / "01_assembled_arc_extended_light_retained.fits", arc, overwrite=True)
 
-    preliminary = np.asarray(extract_fractional_aperture(ldls, np.zeros_like(ldls), traces, pixel_mask=ldls_mask, width=15.0).get_array("spectrum"), dtype=float)
+    # The profile normalizer must use the same compact aperture geometry as the
+    # later flux correction.  A 15-pixel aperture has gap-dependent neighbor
+    # contamination, which makes edge fibers such as 111 incomparable with
+    # normally spaced fibers in a shared local profile fit.
+    preliminary = np.asarray(extract_fractional_aperture(
+        ldls, np.zeros_like(ldls), traces, pixel_mask=ldls_mask,
+        width=args.aperture_width,
+    ).get_array("spectrum"), dtype=float)
     preliminary = smooth_spectra(preliminary, args.ldls_smoothing_window)
-    profiles = measure_local_profiles(
-        ldls, traces, preliminary, ldls_mask,
+    profile_chunks, profile_groups, profile_fiber_group = _profile_layout(
+        traces, support=args.profile_support,
+        chunk_width=args.profile_chunk_width, group_size=args.profile_group_size,
+    )
+    evidence = collect_profile_evidence(
+        ldls, traces, preliminary, ldls_mask, support=args.profile_support,
+        chunks=profile_chunks, groups=profile_groups, fiber_group=profile_fiber_group,
+    )
+    profiles, compact_total, profile_iterations, profile_converged, capture_change, profile_change = measure_local_profiles(
+        evidence, traces, preliminary, detector_rows=ldls.shape[0], aperture_width=args.aperture_width,
         support=args.profile_support, bin_width=args.profile_bin_width,
         chunk_width=args.profile_chunk_width, group_size=args.profile_group_size,
         iterations=args.profile_deblend_iterations,
@@ -894,15 +1129,37 @@ def main(argv: list[str] | None = None) -> int:
     np.savez_compressed(
         output / "02_ldls_profile_data.npz",
         profile_u=profiles.u_grid, profile_density=profiles.density,
-        profile_amplitude=profiles.amplitude,
         profile_chunk_columns=profiles.chunk_columns,
         profile_group_bounds=profiles.group_bounds,
         fiber_profile_group=profiles.fiber_group,
         profile_sample_count=profiles.sample_count,
         valley_constraint_count=profiles.valley_constraint_count,
+        profile_bin_count=profiles.bin_count,
+        profile_bin_scatter=profiles.bin_scatter,
+        profile_bin_used=profiles.bin_used,
+        profile_peak_u=profiles.peak_u,
+        profile_left_valley_u=profiles.left_valley_u,
+        profile_right_valley_u=profiles.right_valley_u,
+        profile_left_inflection_u=profiles.left_inflection_u,
+        profile_right_inflection_u=profiles.right_inflection_u,
         aperture_capture=captured, preliminary_spectrum=preliminary,
+        compact_total_spectrum=compact_total,
+        evidence_u=evidence.u, evidence_signal=evidence.signal,
+        evidence_fiber=evidence.fiber, evidence_column=evidence.column,
+        evidence_chunk=evidence.chunk, evidence_group=evidence.group,
+        evidence_five_pixel_normalization=evidence.five_pixel_normalization,
+        evidence_seed_core=evidence.seed_core,
+        evidence_neighbor_fiber=evidence.neighbor_fiber,
+        evidence_neighbor_u=evidence.neighbor_u,
+        evidence_neighbor_overlaps=evidence.neighbor_overlaps,
+        valley_signal=evidence.valley_signal,
+        valley_first_fiber=evidence.valley_first_fiber,
+        valley_second_fiber=evidence.valley_second_fiber,
+        valley_column=evidence.valley_column,
+        valley_chunk=evidence.valley_chunk, valley_group=evidence.valley_group,
+        valley_first_u=evidence.valley_first_u, valley_second_u=evidence.valley_second_u,
     )
-    plot_profile_diagnostics(ldls, traces, preliminary, ldls_mask, profiles, output / "02_ldls_profile_samples.png", args.profile_support)
+    plot_profile_diagnostics(traces, evidence, profiles, compact_total, output / "02_ldls_profile_samples.png", args.profile_support)
     write_json(output / "02_aperture_capture.json", {
         "aperture_width_pixels": args.aperture_width,
         "capture_median": float(np.nanmedian(captured)),
@@ -913,8 +1170,16 @@ def main(argv: list[str] | None = None) -> int:
             "group_size_fibers": args.profile_group_size,
             "chunk_count": int(profiles.density.shape[0]),
             "group_count": int(profiles.density.shape[1]),
-            "deblend_iterations": args.profile_deblend_iterations,
+            "normalization_iterations": profile_iterations,
+            "normalization_converged": profile_converged,
+            "final_capture_relative_change": capture_change,
+            "final_profile_relative_change": profile_change,
+            "detector_sample_count": int(evidence.u.size),
+            "seed_core_sample_count": int(evidence.seed_core.sum()),
+            "final_constraining_sample_count": int(profiles.sample_count.sum()),
+            "robust_bin_count": int(profiles.bin_used.sum()),
             "valley_constraint_count": int(profiles.valley_constraint_count.sum()),
+            "topology": "non-negative, one-peak, monotone asymmetric beta-CDF branches fitted from smoothing-spline peak/valley evidence",
         },
         "interpretation": "total compact flux = fractional-aperture flux / the local P(u; x_chunk, fiber_group) capture fraction",
     })
