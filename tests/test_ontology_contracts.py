@@ -10,7 +10,7 @@ from virusflow.ontology import (
     CoordinateConvention,
     PhysicalScope,
     RelationKind,
-    UPPER_AMPLIFIER_REFLECTION_INDEX,
+    UPPER_AMPLIFIER_Y_OFFSET,
     canonical_kind,
     kind_candidates,
     kind_spec,
@@ -42,9 +42,9 @@ def test_canonical_calibration_kinds_and_legacy_aliases():
 
 
 def test_approved_upper_amplifier_transform_is_unambiguous():
-    assert UPPER_AMPLIFIER_REFLECTION_INDEX == 2063
-    y = np.array([0, 1, 2063])
-    assert (UPPER_AMPLIFIER_REFLECTION_INDEX - y).tolist() == [2063, 2062, 0]
+    assert UPPER_AMPLIFIER_Y_OFFSET == 1032
+    y = np.array([0, 1, 1031])
+    assert (UPPER_AMPLIFIER_Y_OFFSET + y).tolist() == [1032, 1033, 2063]
 
 
 def test_artifact_request_expresses_scope_validity_units_and_configuration():

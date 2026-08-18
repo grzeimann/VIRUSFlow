@@ -14,7 +14,7 @@ class CoordinateConvention(str, Enum):
     NONE = "none"
 
 
-# Approved indexed transform for reflected upper amplifiers.  Step 8 will use
-# this constant; no 2064-y alternative is retained in the implementation.
-UPPER_AMPLIFIER_REFLECTION_INDEX = 2063
-
+# Physical-CCD row at which an already oriented upper amplifier begins.  Both
+# amplifier images increase away from the seam, so upper rows are translated,
+# never reflected.
+UPPER_AMPLIFIER_Y_OFFSET = 1032

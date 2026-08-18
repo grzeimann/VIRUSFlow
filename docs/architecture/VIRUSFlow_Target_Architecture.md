@@ -280,19 +280,19 @@ left_ccd:
   upper_amp: LU
   x_transform: x
   lower_y_transform: y
-  upper_y_transform: 2063 - y
+  upper_y_transform: 1032 + y
 
 right_ccd:
   lower_amp: RU
   upper_amp: RL
   x_transform: x
   lower_y_transform: y
-  upper_y_transform: 2063 - y
+  upper_y_transform: 1032 + y
 ```
 
 The configuration uses the canonical zero-indexed array and trace-coordinate
-transform `2063 - y`. The historical `2064 - y` expression is characterization
-evidence from a one-indexed interpretation, not an alternative convention.
+transform `1032 + y`. The upper amplifier is already in canonical orientation,
+so it is translated to the rows above the seam without reflection.
 
 A transform record should therefore include:
 
@@ -305,7 +305,7 @@ continuous_coordinate_transform
 ```
 
 The physical ordering and materialization convention are resolved as exactly
-`2063 - y`; endpoint, invertibility, and row-coverage behavior remain required
+`1032 + y`; endpoint, invertibility, and row-coverage behavior remain required
 validation tests.
 
 ## 5.2 Configuration record

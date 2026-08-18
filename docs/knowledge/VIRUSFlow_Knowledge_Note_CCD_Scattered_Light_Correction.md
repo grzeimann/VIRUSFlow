@@ -105,7 +105,7 @@ amplifiers.
 For an amplifier in the canonical reduction orientation:
 
 - `x` is unchanged between paired amplifiers;
-- the paired amplifier is reflected in `y`;
+- the upper paired amplifier is translated in `y`;
 - `LL` and `RU` occupy the lower side of their physical CCD;
 - `LU` and `RL` occupy the upper side.
 
@@ -115,11 +115,11 @@ therefore be written as:
 ```text
 Left CCD:
     LL: x_CCD = x, y_CCD = y
-    LU: x_CCD = x, y_CCD = 2063 - y
+    LU: x_CCD = x, y_CCD = 1032 + y
 
 Right CCD:
     RU: x_CCD = x, y_CCD = y
-    RL: x_CCD = x, y_CCD = 2063 - y
+    RL: x_CCD = x, y_CCD = 1032 + y
 ```
 
 Thus the physical vertical ordering is:
@@ -145,28 +145,17 @@ LU or RL current coordinates:
     current upper amplifier = +y
 ```
 
-These are equivalent relative-coordinate descriptions of the same reflection.
+These legacy relative-coordinate descriptions do not define the materialized
+CCD transform; the canonical upper image is already oriented correctly.
 
-The legacy use of:
-
-```text
-2064 - y
-```
-
-rather than the canonical array-index transform:
-
-```text
-2063 - y
-```
-
-is pre-refactor characterization evidence from a one-indexed interpretation.
-It is not an alternative coordinate convention.
+The prior reflected expressions are characterization evidence from legacy code,
+not the materialized coordinate convention.
 
 When materializing a physical `2064 × 1032` CCD image, VIRUSFlow must verify:
 
 - the pixel-center convention;
 - whether the CCD seam contains a physical or coordinate gap;
-- that the indexed image transform is exactly `2063 - y`.
+- that upper rows map by `1032 + y` with no inversion.
 
 This is a required implementation-validation test, not an open convention.
 

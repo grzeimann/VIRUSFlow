@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .models import DitherPolicy, EffectiveExposurePolicy, VersionedConfiguration
-from ..ontology.coordinates import UPPER_AMPLIFIER_REFLECTION_INDEX
+from ..ontology.coordinates import UPPER_AMPLIFIER_Y_OFFSET
 
 
 ORIENTATION_CONFIGURATION = VersionedConfiguration(
@@ -14,8 +14,8 @@ ORIENTATION_CONFIGURATION = VersionedConfiguration(
 
 CCD_TRANSFORM_CONFIGURATION = VersionedConfiguration(
     kind="ccd_transform",
-    version="indexed-1",
-    value={"upper_reflection_index": UPPER_AMPLIFIER_REFLECTION_INDEX},
+    version="indexed-2",
+    value={"upper_y_offset": UPPER_AMPLIFIER_Y_OFFSET},
     evidence_state="verified",
     source="approved migration decision",
 )

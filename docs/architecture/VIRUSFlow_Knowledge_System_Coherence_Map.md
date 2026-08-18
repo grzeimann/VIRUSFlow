@@ -813,17 +813,17 @@ The legacy scatter code resolves the orientation relationship:
 ```text
 Left CCD:
     LL lower, unchanged y
-    LU upper, reflected y
+    LU upper, translated y
 
 Right CCD:
     RU lower, unchanged y
-    RL upper, reflected y
+    RL upper, translated y
 ```
 
 with `x` unchanged and the upper member represented exactly by:
 
 ```text
-y_CCD = 2063 - y
+y_CCD = 1032 + y
 ```
 
 The indexed seam convention is resolved. Endpoint, round-trip, row-coverage,

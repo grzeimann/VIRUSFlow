@@ -123,7 +123,7 @@ flowchart TB
     subgraph L2["Physical-CCD correction — repeated for LL+LU and RU+RL pairs"]
         GPair{"Both partner amplifiers reduced<br/>and both traces available?"}:::guard
         ETracePair["Evidence: paired trace maps<br/>+ physical CCD transform"]:::evidence
-        AAssemble(["Action: assemble zero-indexed physical CCD<br/>reflect upper amplifier with y = 2063 - y"]):::action
+        AAssemble(["Action: assemble zero-indexed physical CCD<br/>translate upper amplifier with y = 1032 + y"]):::action
         SCCD[["Run-local: physical CCD image<br/>variance + mask + seam/source maps"]]:::state
         AScatter(["Action: select inter-trace gap samples<br/>hold out chunks; robust degree-2 fit<br/>subtract fitted scattered-light surface"]):::action
         PScatter[("Product: ccd_scattered_light_model<br/>scope: PHYSICAL_CCD")]:::product

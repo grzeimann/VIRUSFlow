@@ -23,7 +23,7 @@ def _seed(conn, zipcode, frame_type, count, *, lamp=None, exptime=30.0):
         )
         conn.execute(
             "INSERT INTO raw_files(exposure_id, frame_type, path, tar_member, storage_backend, amp_key) VALUES(?,?,?,?,?,?)",
-            (exposure_id, frame_type, f"/{exposure_id}.fits", None, "filesystem", zipcode.key()),
+            (exposure_id, frame_type, f"/{zipcode.amp}/{exposure_id}.fits", None, "filesystem", zipcode.key()),
         )
         conn.execute(
             "INSERT OR IGNORE INTO exposure_details(exposure_id,exptime,pexptime,lamp) VALUES(?,?,?,?)",
@@ -35,8 +35,9 @@ class _Loader:
     def load(self, path, tar_member=None):
         yy, xx = np.indices((1032, 32))
         data = (100.0 + xx + yy).astype(float)
+        amp = str(path).split("/")[-2]
         header = {
-            "GAIN": 1.0, "RDNOISE": 3.0, "CCDPOS": "L", "CCDHALF": "L",
+            "GAIN": 1.0, "RDNOISE": 3.0, "CCDPOS": amp[0], "CCDHALF": amp[1],
             "EXPTIME": 30.0,
         }
         return RawFrameData(data, header, path, tar_member)

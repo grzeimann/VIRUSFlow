@@ -137,5 +137,5 @@ def test_configuration_baselines_preserve_unknown_and_provisional_evidence():
     zc = ZipCode("013", "043", "412", "LL", "S_N_0021")
     refs = ConfigurationService().amplifier_references(zc)
     assert any(ref.kind == "gain_fallback" and ref.evidence_state == "unknown" for ref in refs)
-    assert CCD_TRANSFORM_CONFIGURATION.value == {"upper_reflection_index": 2063}
+    assert CCD_TRANSFORM_CONFIGURATION.value == {"upper_y_offset": 1032}
     assert EFFECTIVE_EXPOSURE_POLICY.effective_seconds(exptime=None, pexptime=100.0, parallel=True) == 92.0

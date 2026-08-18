@@ -8,11 +8,11 @@ from typing import Optional
 import numpy as np
 
 from ..core.algo_result import AlgoResult
-from ..ontology.coordinates import UPPER_AMPLIFIER_REFLECTION_INDEX
+from ..ontology.coordinates import UPPER_AMPLIFIER_Y_OFFSET
 
 
-ALGORITHM_VERSION = "physical-ccd-gap-polynomial-1.0"
-TRANSFORM_VERSION = "indexed-1"
+ALGORITHM_VERSION = "physical-ccd-gap-polynomial-1.1"
+TRANSFORM_VERSION = "indexed-2"
 PAIRING = {"left": ("LL", "LU"), "right": ("RU", "RL")}
 
 
@@ -84,15 +84,32 @@ def scattered_light_model_from_payload(payload: dict[str, np.ndarray]) -> Scatte
 
 
 def upper_y(y):
-    """Map a zero-indexed upper-amplifier row into physical-CCD coordinates."""
+    """Translate a zero-indexed upper-amplifier row into physical-CCD coordinates."""
 
-    return UPPER_AMPLIFIER_REFLECTION_INDEX - np.asarray(y)
+    return UPPER_AMPLIFIER_Y_OFFSET + np.asarray(y)
 
 
 def inverse_upper_y(y):
-    """Inverse of :func:`upper_y`; the approved reflection is self-inverse."""
+    """Map a physical-CCD upper row back to its zero-indexed amplifier row."""
 
-    return UPPER_AMPLIFIER_REFLECTION_INDEX - np.asarray(y)
+    return np.asarray(y) - UPPER_AMPLIFIER_Y_OFFSET
+
+
+def amplifier_from_physical(physical_array, amp: str) -> np.ndarray:
+    """Project one amplifier from a physical CCD without changing row order."""
+
+    data = np.asarray(physical_array)
+    if data.ndim < 1 or data.shape[0] != 2 * UPPER_AMPLIFIER_Y_OFFSET:
+        raise ValueError(
+            "physical CCD array must have "
+            f"{2 * UPPER_AMPLIFIER_Y_OFFSET} rows, got {data.shape}"
+        )
+    amp = str(amp).upper()
+    if amp in {"LL", "RU"}:
+        return data[:UPPER_AMPLIFIER_Y_OFFSET]
+    if amp in {"LU", "RL"}:
+        return data[UPPER_AMPLIFIER_Y_OFFSET:]
+    raise ValueError(f"unknown amplifier {amp!r}")
 
 
 def _validate_pair(side: str, lower_amp: str, upper_amp: str, lower, upper) -> tuple[np.ndarray, np.ndarray]:
@@ -105,9 +122,9 @@ def _validate_pair(side: str, lower_amp: str, upper_amp: str, lower, upper) -> t
     up = np.asarray(upper)
     if lo.ndim != 2 or up.ndim != 2 or lo.shape != up.shape:
         raise ValueError("paired amplifier arrays must be shape-matched 2D arrays")
-    if lo.shape[0] * 2 != UPPER_AMPLIFIER_REFLECTION_INDEX + 1:
+    if lo.shape[0] != UPPER_AMPLIFIER_Y_OFFSET:
         raise ValueError(
-            f"paired amplifier height must be {(UPPER_AMPLIFIER_REFLECTION_INDEX + 1) // 2}, got {lo.shape[0]}"
+            f"paired amplifier height must be {UPPER_AMPLIFIER_Y_OFFSET}, got {lo.shape[0]}"
         )
     return lo, up
 
@@ -130,7 +147,7 @@ def assemble_physical_ccd(
     height, width = lo.shape
     image = np.empty((2 * height, width), dtype=np.result_type(lo, up))
     image[:height] = lo
-    image[height:] = up[::-1]
+    image[height:] = up
 
     def paired(a, b, *, dtype=None, fill=0):
         if a is None:
@@ -142,7 +159,7 @@ def assemble_physical_ccd(
             raise ValueError("variance and mask arrays must match their amplifier image")
         out = np.empty(image.shape, dtype=dtype or np.result_type(aa, bb))
         out[:height] = aa
-        out[height:] = bb[::-1]
+        out[height:] = bb
         return out
 
     variance = paired(lower_variance, upper_variance, dtype=np.float32, fill=np.nan)
@@ -155,7 +172,7 @@ def assemble_physical_ccd(
     source_y = np.broadcast_to(np.arange(height, dtype=np.int16)[:, None], lo.shape)
     source_y_coordinate = np.empty(image.shape, dtype=np.int16)
     source_y_coordinate[:height] = source_y
-    source_y_coordinate[height:] = source_y[::-1]
+    source_y_coordinate[height:] = source_y
 
     seam_mask = np.zeros(image.shape, dtype=np.uint8)
     seam_mask[height - 1 : height + 1] = 1
@@ -174,7 +191,7 @@ def assemble_physical_ccd(
             "side": str(side).lower(),
             "lower_amp": lower_amp,
             "upper_amp": upper_amp,
-            "upper_transform": "upper_y = 2063 - y",
+            "upper_transform": "upper_y = 1032 + y",
             "transform_version": TRANSFORM_VERSION,
             "seam_between_rows": [height - 1, height],
             "inter_amplifier_gap_rows": 0,

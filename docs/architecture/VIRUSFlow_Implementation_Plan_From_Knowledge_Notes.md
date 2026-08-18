@@ -184,11 +184,11 @@ The legacy scattered-light code provides the baseline transform:
 ```text
 Left CCD:
     LL lower
-    LU upper and y-reflected
+    LU upper and y-translated
 
 Right CCD:
     RU lower
-    RL upper and y-reflected
+    RL upper and y-translated
 ```
 
 with:
@@ -200,19 +200,18 @@ lower amplifier:
     y_CCD = y
 
 upper amplifier:
-    y_CCD = 2063 - y
+    y_CCD = 1032 + y
 ```
 
-Implementation must characterize the canonical indexed-array convention at the
-seam. Materialized image and trace indices use exactly:
+The canonical indexed-array convention at the seam is a translation.
+Materialized image and trace indices use exactly:
 
 ```text
-2063 - y
+1032 + y
 ```
 
-The historical `2064 - y` expression is retained only as pre-refactor
-characterization evidence and is not an alternative convention. This is no
-longer a blocker to architecture or task implementation.
+The upper amplifier is already in canonical orientation, so it is not
+reflected. This is no longer a blocker to architecture or task implementation.
 
 ## 5.4 Acceptance criteria
 
@@ -860,7 +859,7 @@ The amplifier ordering and reflection are now inferred from legacy code:
 LL below LU
 RU below RL
 x unchanged
-upper amplifier reflected in y
+upper amplifier translated by 1032 rows in y
 ```
 
 The remaining confirmation is the exact pixel-center and array-index convention

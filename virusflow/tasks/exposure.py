@@ -40,6 +40,7 @@ from ..algorithms.extraction import (
 )
 from ..algorithms.physical_ccd import (
     ALGORITHM_VERSION as CONTRIBUTION_CORRECTION_VERSION,
+    amplifier_from_physical,
 )
 from ..algorithms.response import (
     RESPONSE_VERSION,
@@ -663,9 +664,7 @@ class ExposureTask(_SciencePublisher):
 
     @staticmethod
     def _amp_from_physical(array, amp: str):
-        data = np.asarray(array)
-        half = data.shape[0] // 2
-        return data[:half] if amp in {"LL", "RU"} else data[half:][::-1]
+        return amplifier_from_physical(array, amp)
 
     def _assemble_global_fiber_frame(
         self,

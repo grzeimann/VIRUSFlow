@@ -578,25 +578,25 @@ Do not ask questions already answered by the repository or notes.
 
 ## Physical CCD transform
 
-The legacy scatter logic implies:
+The approved physical-CCD mapping is:
 
 ```text
 Left CCD:
 LL lower
-LU upper and reflected in y
+LU upper, translated in y
 
 Right CCD:
 RU lower
-RL upper and reflected in y
+RL upper, translated in y
 ```
 
-with historical one-indexed behavior resembling:
+using zero-indexed coordinates:
 
 ```text
-upper_y = 2064 - y
+upper_y = 1032 + y
 ```
 
-This historical expression is characterization evidence only. The reviewed zero-indexed image and trace transform is exactly `2063 - y`; `2064 - y` is not an alternative convention.
+The upper images and traces are already in their canonical orientation, so no y inversion is applied.  The seam lies between rows 1031 and 1032.
 
 Do not treat amplifier ordering as unknown.
 

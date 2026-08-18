@@ -25,6 +25,7 @@ from ..algorithms.master_spectrum import extract_master_spectrum
 from ..algorithms.physical_ccd import (
     ALGORITHM_VERSION as SCATTER_ALGORITHM_VERSION,
     TRANSFORM_VERSION,
+    amplifier_from_physical,
     assemble_physical_ccd,
     compact_scattered_light_payload,
     fit_gap_scattered_light,
@@ -716,15 +717,12 @@ class _ExtractedMasterSpectrumTask(_CanonicalTask):
             scatter.get_array("scatter_subtracted_image"), dtype=np.float32
         )
         physical_mask = np.asarray(assembly.get_array("pixel_mask"), dtype=np.uint8)
-        half = physical_image.shape[0] // 2
         if zipcode.amp in {"LL", "RU"}:
-            master_image = physical_image[:half]
-            pixel_mask = physical_mask[:half]
             trace_row = lower_trace_row
         else:
-            master_image = physical_image[half:][::-1]
-            pixel_mask = physical_mask[half:][::-1]
             trace_row = upper_trace_row
+        master_image = amplifier_from_physical(physical_image, zipcode.amp)
+        pixel_mask = amplifier_from_physical(physical_mask, zipcode.amp)
         master_row = master_rows[zipcode.key()]
         master_id, trace_id = _artifact_id(master_row), _artifact_id(trace_row)
         params = dict(MASTER_SCI_EXTRACTION_CONFIGURATION.value)

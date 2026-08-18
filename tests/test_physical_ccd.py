@@ -7,9 +7,12 @@ import numpy as np
 import pytest
 
 from virusflow.algorithms.physical_ccd import (
+    TRANSFORM_VERSION,
+    amplifier_from_physical,
     assemble_physical_ccd,
     fit_gap_scattered_light,
     inverse_upper_y,
+    physical_trace_map,
     upper_y,
 )
 from virusflow.artifacts import ArtifactService, Scope, Validity
@@ -36,11 +39,20 @@ def _pair(side="left", nx=24):
 
 
 def test_upper_transform_endpoints_roundtrip_and_complete_row_coverage():
-    rows = np.arange(2064)
-    np.testing.assert_array_equal(upper_y(np.array([0, 2063])), [2063, 0])
+    rows = np.arange(1032)
+    np.testing.assert_array_equal(upper_y(np.array([0, 1031])), [1032, 2063])
     np.testing.assert_array_equal(inverse_upper_y(upper_y(rows)), rows)
     mapped = np.concatenate((np.arange(1032), upper_y(np.arange(1032))))
-    np.testing.assert_array_equal(np.sort(mapped), rows)
+    np.testing.assert_array_equal(np.sort(mapped), np.arange(2064))
+    assert TRANSFORM_VERSION == "indexed-2"
+
+
+def test_physical_amplifier_projection_preserves_upper_row_order():
+    image = np.arange(2064 * 2, dtype=np.int32).reshape(2064, 2)
+    np.testing.assert_array_equal(amplifier_from_physical(image, "LL"), image[:1032])
+    np.testing.assert_array_equal(amplifier_from_physical(image, "RU"), image[:1032])
+    np.testing.assert_array_equal(amplifier_from_physical(image, "LU"), image[1032:])
+    np.testing.assert_array_equal(amplifier_from_physical(image, "RL"), image[1032:])
 
 
 @pytest.mark.parametrize("side,amps", [("left", ("LL", "LU")), ("right", ("RU", "RL"))])
@@ -49,14 +61,17 @@ def test_physical_ccd_assembly_has_explicit_seam_gap_and_source_coordinates(side
     image = result.get_array("image")
     assert image.shape == (2064, 24)
     assert image[1031, 0] == 1031
-    assert image[1032, 0] == 11031
-    assert image[2063, 0] == 10000
+    assert image[1032, 0] == 10000
+    assert image[2063, 0] == 11031
     assert result.get_array("seam_mask").sum() == 48
     assert result.get_array("inter_amplifier_gap_mask").sum() == 0
-    assert result.meta["upper_transform"] == "upper_y = 2063 - y"
+    assert result.meta["upper_transform"] == "upper_y = 1032 + y"
     source_y = result.get_array("source_y_coordinate")[:, 0]
     np.testing.assert_array_equal(source_y[:1032], np.arange(1032))
-    np.testing.assert_array_equal(source_y[1032:], np.arange(1031, -1, -1))
+    np.testing.assert_array_equal(source_y[1032:], np.arange(1032))
+
+    trace = np.asarray([[0.0, 1.0], [1030.0, 1031.0]])
+    np.testing.assert_array_equal(physical_trace_map(trace, trace)[2:], trace + 1032)
 
 
 def test_missing_or_mismatched_pairs_fail_explicitly():
@@ -71,17 +86,15 @@ def test_gap_scatter_fit_retains_masks_holdout_and_residual_evidence():
     nx = 40
     yy, xx = np.indices((2064, nx), dtype=float)
     truth = 15.0 + 0.004 * yy + 0.03 * xx + 0.000001 * yy * yy
-    lower, upper_physical = truth[:1032].copy(), truth[1032:].copy()
-    upper = upper_physical[::-1]
     traces = np.array([[100.0] * nx, [108.0] * nx, [420.0] * nx, [428.0] * nx, [800.0] * nx, [808.0] * nx])
-    physical_traces = np.vstack((traces, 2063.0 - traces))
+    physical_traces = np.vstack((traces, 1032.0 + traces))
     image = truth.copy()
     for trace in physical_traces:
         for x in range(nx):
             y = int(round(trace[x]))
             image[max(0, y - 2):min(2064, y + 3), x] += 500.0
     assembly = assemble_physical_ccd(
-        image[:1032], image[1032:][::-1], side="left", lower_amp="LL", upper_amp="LU",
+        image[:1032], image[1032:], side="left", lower_amp="LL", upper_amp="LU",
         lower_variance=np.ones((1032, nx)), upper_variance=np.ones((1032, nx)),
     )
     result = fit_gap_scattered_light(assembly, traces, traces)

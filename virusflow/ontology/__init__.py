@@ -7,7 +7,7 @@ from .artifact_kinds import (
     kind_spec,
 )
 from .assumptions import ASSUMPTIONS, AssumptionSpec, EvidenceState
-from .coordinates import CoordinateConvention, UPPER_AMPLIFIER_REFLECTION_INDEX
+from .coordinates import CoordinateConvention, UPPER_AMPLIFIER_Y_OFFSET
 from .entities import (AmplifierIdentity, DitherSetIdentity, ExposureIdentity,
                        MeasurementGroup, MeasurementGroupSlot, ObservationIdentity,
                        PhysicalCCDIdentity)
@@ -26,7 +26,7 @@ __all__ = [
     "AssumptionSpec",
     "EvidenceState",
     "CoordinateConvention",
-    "UPPER_AMPLIFIER_REFLECTION_INDEX",
+    "UPPER_AMPLIFIER_Y_OFFSET",
     "AmplifierIdentity",
     "DitherSetIdentity",
     "ExposureIdentity",

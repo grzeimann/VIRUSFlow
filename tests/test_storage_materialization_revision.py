@@ -115,7 +115,7 @@ def test_compact_scatter_model_reconstructs_dense_surface_with_small_payload():
     truth = 7 + 0.02 * xx + 0.003 * yy + 1e-6 * yy**2
     trace = np.asarray([[100.0] * nx, [108.0] * nx, [500.0] * nx, [508.0] * nx])
     assembly = assemble_physical_ccd(
-        truth[:1032], truth[1032:][::-1], side="left", lower_amp="LL", upper_amp="LU",
+        truth[:1032], truth[1032:], side="left", lower_amp="LL", upper_amp="LU",
         lower_variance=np.ones((1032, nx)), upper_variance=np.ones((1032, nx)),
     )
     result = fit_gap_scattered_light(assembly, trace, trace)
