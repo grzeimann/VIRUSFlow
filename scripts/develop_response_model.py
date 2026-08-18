@@ -377,6 +377,7 @@ class LocalProfileMap:
     bin_scatter: np.ndarray
     bin_used: np.ndarray
     peak_u: np.ndarray
+    centroid_offset: np.ndarray
     left_valley_u: np.ndarray
     right_valley_u: np.ndarray
     left_inflection_u: np.ndarray
@@ -624,30 +625,35 @@ def fit_constrained_profile(
     level = max(3.0 * noise, 0.003 * peak)
     left_active = np.flatnonzero((np.arange(centers.size) < peak_index) & (provisional >= level))
     right_active = np.flatnonzero((np.arange(centers.size) > peak_index) & (provisional >= level))
-    left_index = max(0, int(left_active[0]) - 1) if left_active.size else 0
-    right_index = min(centers.size - 1, int(right_active[-1]) + 1) if right_active.size else centers.size - 1
-    left_valley = float(centers[left_index])
-    right_valley = float(centers[right_index])
+    left_valley_index = max(0, int(left_active[0]) - 1) if left_active.size else 0
+    right_valley_index = min(centers.size - 1, int(right_active[-1]) + 1) if right_active.size else centers.size - 1
+    # These are inferred inter-fiber valley locations for diagnostics and
+    # overlap constraints.  They are not individual-profile endpoints.
+    left_valley_u = float(centers[left_valley_index])
+    right_valley_u = float(centers[right_valley_index])
+    left_support_u = float(centers[0])
+    right_support_u = float(centers[-1])
     peak_u = float(centers[peak_index])
-    if not (left_valley < peak_u < right_valley):
-        raise ValueError("local profile valley locations do not bracket the peak")
+    if not (left_support_u < peak_u < right_support_u):
+        raise ValueError("local profile support does not bracket the peak")
     fit_u = centers[used]
     fit_values = np.clip(median[used], 0.0, None)
     fit_weights = weights
 
     def branch_model(theta: np.ndarray, coordinate: np.ndarray) -> np.ndarray:
-        height = np.exp(theta[0])
-        left_a, left_b, right_a, right_b = 1.0 + np.exp(theta[1:])
-        result = np.zeros_like(coordinate, dtype=float)
-        left = (coordinate >= left_valley) & (coordinate <= peak_u)
-        right = (coordinate > peak_u) & (coordinate <= right_valley)
-        result[left] = height * betainc(left_a, left_b, (coordinate[left] - left_valley) / (peak_u - left_valley))
-        result[right] = height * betainc(right_a, right_b, (right_valley - coordinate[right]) / (right_valley - peak_u))
-        return result
+        from scipy.ndimage import gaussian_filter1d
+        height, radius, sigma = np.exp(theta[:3])
+        center = peak_u + theta[3]
+        step = max(bin_width / 4.0, 0.01)
+        grid = np.arange(left_support_u, right_support_u + step / 2.0, step)
+        core = np.sqrt(np.clip(radius ** 2 - (grid - center) ** 2, 0.0, None))
+        blurred = gaussian_filter1d(core, sigma / step, mode="constant", truncate=5.0)
+        blurred /= max(float(np.max(blurred)), np.finfo(float).tiny)
+        return np.where((coordinate >= left_support_u) & (coordinate <= right_support_u), height * np.interp(coordinate, grid, blurred), 0.0)
 
-    initial = np.log([max(peak, noise), 1.0, 1.0, 1.0, 1.0])
-    lower = np.log([max(peak * 0.25, noise), 0.02, 0.02, 0.02, 0.02])
-    upper = np.log([max(peak * 4.0, noise * 4.0), 20.0, 20.0, 20.0, 20.0])
+    initial = np.r_[np.log([max(peak, noise), 2.0, 0.8]), 0.0]
+    lower = np.r_[np.log([max(peak * 0.25, noise), 0.15, 0.03]), -0.5]
+    upper = np.r_[np.log([max(peak * 4.0, noise * 4.0), support, support / 2.0]), 0.5]
     result = least_squares(
         lambda theta: (branch_model(theta, fit_u) - fit_values) * fit_weights,
         initial, bounds=(lower, upper), loss="soft_l1",
@@ -657,14 +663,17 @@ def fit_constrained_profile(
     if not np.isfinite(integral) or integral <= 0.0:
         raise ValueError("constrained local profile has non-positive integral")
     regularized /= integral
+    du = float(result.x[3])
     peak_index = int(np.argmax(regularized))
-    left_a, left_b, right_a, right_b = 1.0 + np.exp(result.x[1:])
-    left_transition = left_valley + (peak_u - left_valley) * (left_a - 1.0) / (left_a + left_b - 2.0)
-    right_transition = right_valley - (right_valley - peak_u) * (right_a - 1.0) / (right_a + right_b - 2.0)
+    left_transition = left_valley_u
+    right_transition = right_valley_u
     topology = {
-        "peak_u": peak_u,
-        "left_valley_u": left_valley,
-        "right_valley_u": right_valley,
+        "peak_u": peak_u + du,
+        "centroid_offset": du,
+        "left_valley_u": left_valley_u,
+        "right_valley_u": right_valley_u,
+        "left_support_u": left_support_u,
+        "right_support_u": right_support_u,
         "left_inflection_u": float(left_transition),
         "right_inflection_u": float(right_transition),
     }
@@ -779,6 +788,7 @@ def measure_local_profiles(
     bin_scatter = np.full_like(profiles, np.nan)
     bin_used = np.zeros_like(profiles, dtype=bool)
     peak_u = np.full((len(chunks), len(groups)), np.nan)
+    centroid_offset = np.full_like(peak_u, np.nan)
     left_valley_u = np.full_like(peak_u, np.nan)
     right_valley_u = np.full_like(peak_u, np.nan)
     left_inflection_u = np.full_like(peak_u, np.nan)
@@ -814,6 +824,7 @@ def measure_local_profiles(
                     bin_scatter[chunk_index, group_index] = scatter
                     bin_used[chunk_index, group_index] = used
                     peak_u[chunk_index, group_index] = topology["peak_u"]
+                    centroid_offset[chunk_index, group_index] = topology["centroid_offset"]
                     left_valley_u[chunk_index, group_index] = topology["left_valley_u"]
                     right_valley_u[chunk_index, group_index] = topology["right_valley_u"]
                     left_inflection_u[chunk_index, group_index] = topology["left_inflection_u"]
@@ -821,8 +832,8 @@ def measure_local_profiles(
                 except ValueError:
                     if previous is not None:
                         updated[chunk_index, group_index] = previous.density[chunk_index, group_index]
-        profiles, bin_count, bin_scatter, bin_used, peak_u, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u = _fill_missing_local_profiles(
-            updated, bin_count, bin_scatter, bin_used, peak_u, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u,
+        profiles, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u = _fill_missing_local_profiles(
+            updated, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u,
         )
         current = LocalProfileMap(
             u_grid=u_grid, density=profiles,
@@ -830,7 +841,8 @@ def measure_local_profiles(
             group_bounds=np.asarray([(int(group[0]), int(group[-1])) for group in groups], dtype=np.int32),
             fiber_group=fiber_group, sample_count=sample_count, valley_constraint_count=valley_count,
             bin_count=bin_count, bin_scatter=bin_scatter, bin_used=bin_used,
-            peak_u=peak_u, left_valley_u=left_valley_u, right_valley_u=right_valley_u,
+            peak_u=peak_u, centroid_offset=centroid_offset,
+            left_valley_u=left_valley_u, right_valley_u=right_valley_u,
             left_inflection_u=left_inflection_u, right_inflection_u=right_inflection_u,
         )
         captured = aperture_capture(trace, detector_rows, current, aperture_width)
@@ -972,12 +984,14 @@ def plot_profile_diagnostics(
     compact_total: np.ndarray,
     path: Path,
     support: float,
+    bin_width: float,
+    valley_weight: int,
 ) -> None:
     """Show all fixed detector evidence constraining five local profiles."""
     nx = trace.shape[1]
     ny = int(np.ceil(np.nanmax(trace))) + 1
     targets = [(nx // 2, ny // 2), (nx // 8, ny // 8), (7 * nx // 8, ny // 8), (nx // 8, 7 * ny // 8), (7 * nx // 8, 7 * ny // 8)]
-    fig, axes = plt.subplots(1, 5, figsize=(19, 3.6), sharey=True)
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4.2), sharey=True)
     for axis, (x0, y0) in zip(axes, targets):
         fiber = int(np.nanargmin(np.abs(trace[:, x0] - y0)))
         chunk, group = profiles.indices(fiber, x0)
@@ -987,15 +1001,27 @@ def plot_profile_diagnostics(
         uu = evidence.u[selected]
         vv = _profile_sample_values(evidence, selected, compact_total, profiles)
         valley_u, valley_v = _valley_constraints(evidence, chunk, group, compact_total, profiles)
+        fit_u = np.r_[uu, np.repeat(valley_u, max(1, int(valley_weight)))]
+        fit_v = np.r_[vv, np.repeat(valley_v, max(1, int(valley_weight)))]
+        bin_u, bin_median, bin_scatter, bin_count = robust_profile_bins(
+            fit_u, fit_v, support=support, bin_width=bin_width,
+        )
+        bin_used = profiles.bin_used[chunk, group] & np.isfinite(bin_median)
+        bin_rejected = (bin_count > 0) & np.isfinite(bin_median) & ~bin_used
         axis.plot(uu, vv, ".", ms=1.0, alpha=0.035, color="tab:blue", label="all detector samples")
         if valley_u.size:
             axis.plot(valley_u, valley_v, "x", ms=2.5, alpha=0.55, color="tab:orange", label="valley constraints")
+        if np.any(bin_rejected):
+            axis.plot(bin_u[bin_rejected], bin_median[bin_rejected], "o", ms=2.5, mfc="none", mec="0.45", alpha=0.8, label="rejected robust bins")
+        if np.any(bin_used):
+            bin_error = bin_scatter[bin_used] / np.sqrt(np.maximum(bin_count[bin_used], 1))
+            axis.errorbar(bin_u[bin_used], bin_median[bin_used], yerr=bin_error, fmt="o", ms=2.5, color="tab:purple", ecolor="tab:purple", elinewidth=0.55, capsize=0, alpha=0.85, label="accepted robust bins")
         axis.plot(profiles.u_grid, profiles.density[chunk, group], color="black", lw=1.5, label="constrained fit")
         axis.axvline(profiles.peak_u[chunk, group], color="0.35", lw=0.7, ls="--")
         axis.axvline(profiles.left_valley_u[chunk, group], color="0.6", lw=0.6, ls=":")
         axis.axvline(profiles.right_valley_u[chunk, group], color="0.6", lw=0.6, ls=":")
         axis.set(
-            title=(f"x={x0}, fiber={fiber}\nchunk {start}-{stop}, group {first_fiber}-{last_fiber}; n={uu.size}"),
+            title=(f"x={x0}, fiber={fiber}\nchunk {start}-{stop}, group {first_fiber}-{last_fiber}\ndu={profiles.centroid_offset[chunk, group]:+.3f} px; n={uu.size}"),
             xlabel="u (pixel)", xlim=(-support, support),
         )
         axis.grid(alpha=0.2)
@@ -1038,11 +1064,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--aperture-width", type=float, default=5.0)
     parser.add_argument("--profile-support", type=float, default=8.0)
-    parser.add_argument("--profile-bin-width", type=float, default=0.05)
+    parser.add_argument("--profile-bin-width", type=float, default=0.4)
     parser.add_argument("--profile-chunk-width", type=int, default=100)
     parser.add_argument("--profile-group-size", type=int, default=16)
     parser.add_argument("--profile-deblend-iterations", type=int, default=6, help="Maximum post-seed capture/deblend refinements; exits early once stable")
-    parser.add_argument("--profile-valley-weight", type=int, default=1)
+    parser.add_argument("--profile-valley-weight", type=int, default=0)
     parser.add_argument("--ldls-smoothing-window", type=int, default=101)
     parser.add_argument("--arc-smoothing-window", type=int, default=51)
     parser.add_argument("--halo-core-half-width", type=float, default=8.0)
@@ -1138,6 +1164,7 @@ def main(argv: list[str] | None = None) -> int:
         profile_bin_scatter=profiles.bin_scatter,
         profile_bin_used=profiles.bin_used,
         profile_peak_u=profiles.peak_u,
+        profile_centroid_offset=profiles.centroid_offset,
         profile_left_valley_u=profiles.left_valley_u,
         profile_right_valley_u=profiles.right_valley_u,
         profile_left_inflection_u=profiles.left_inflection_u,
@@ -1159,7 +1186,10 @@ def main(argv: list[str] | None = None) -> int:
         valley_chunk=evidence.valley_chunk, valley_group=evidence.valley_group,
         valley_first_u=evidence.valley_first_u, valley_second_u=evidence.valley_second_u,
     )
-    plot_profile_diagnostics(traces, evidence, profiles, compact_total, output / "02_ldls_profile_samples.png", args.profile_support)
+    plot_profile_diagnostics(
+        traces, evidence, profiles, compact_total, output / "02_ldls_profile_samples.png",
+        args.profile_support, args.profile_bin_width, args.profile_valley_weight,
+    )
     write_json(output / "02_aperture_capture.json", {
         "aperture_width_pixels": args.aperture_width,
         "capture_median": float(np.nanmedian(captured)),
