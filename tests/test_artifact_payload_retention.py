@@ -95,12 +95,13 @@ def _pass_qa(service: ArtifactService, *artifacts) -> None:
         )
 
 
-def _validated_arc_chain(tmp_path: Path):
+def _validated_rebuildable_lamp_chain(tmp_path: Path):
     service, publisher = _fixture(tmp_path)
-    arc = _publish(publisher, "master_arc")
+    lamp = _publish(publisher, "master_hg")
+    arc = _publish(publisher, "master_arc", parents=[lamp.id])
     wave = _publish(publisher, "wavelength_map", parents=[arc.id])
-    _pass_qa(service, arc, wave)
-    return service, arc, wave
+    _pass_qa(service, lamp, arc, wave)
+    return service, lamp, wave
 
 
 def test_permanently_retained_kind_refuses_payload_eviction(tmp_path: Path):
@@ -118,13 +119,15 @@ def test_permanently_retained_kind_refuses_payload_eviction(tmp_path: Path):
 
 def test_eviction_requires_validated_downstream_products(tmp_path: Path):
     service, publisher = _fixture(tmp_path)
-    arc = _publish(publisher, "master_arc")
-    _pass_qa(service, arc)
+    lamp = _publish(publisher, "master_hg")
+    _pass_qa(service, lamp)
 
-    with pytest.raises(ValueError, match="wavelength_map"):
-        service.evict_payload(arc.id)
+    with pytest.raises(ValueError, match="master_arc"):
+        service.evict_payload(lamp.id)
 
+    arc = _publish(publisher, "master_arc", parents=[lamp.id])
     wave = _publish(publisher, "wavelength_map", parents=[arc.id])
+    _pass_qa(service, arc)
     service.adapter.set_qa_bundle(
         wave.id,
         facts={},
@@ -133,14 +136,14 @@ def test_eviction_requires_validated_downstream_products(tmp_path: Path):
         policy_version="test",
     )
     with pytest.raises(ValueError, match="invalid IDs"):
-        service.evict_payload(arc.id)
-    assert service.payload_status(arc.id) == "present"
+        service.evict_payload(lamp.id)
+    assert service.payload_status(lamp.id) == "present"
 
 
 def test_eviction_requires_verified_component_complete_descendant_evidence(
     tmp_path: Path,
 ):
-    service, arc, wave = _validated_arc_chain(tmp_path)
+    service, lamp, wave = _validated_rebuildable_lamp_chain(tmp_path)
     line_evidence = next(
         component for component in service.describe(wave.id)["components"]
         if component["name"] == "arc_line_evidence"
@@ -148,21 +151,21 @@ def test_eviction_requires_verified_component_complete_descendant_evidence(
     Path(line_evidence["path"]).write_bytes(b"not the registered evidence")
 
     with pytest.raises(ValueError, match="unverifiable payload evidence"):
-        service.evict_payload(arc.id)
+        service.evict_payload(lamp.id)
 
-    assert service.payload_status(arc.id) == "present"
+    assert service.payload_status(lamp.id) == "present"
 
 
 def test_intentional_eviction_retains_registry_evidence_and_is_discoverable(
     tmp_path: Path,
 ):
-    service, arc, _ = _validated_arc_chain(tmp_path)
-    before = service.describe(arc.id)
+    service, lamp, _ = _validated_rebuildable_lamp_chain(tmp_path)
+    before = service.describe(lamp.id)
     component_before = before["components"][0]
 
-    removed = service.evict_payload(arc.id)
+    removed = service.evict_payload(lamp.id)
 
-    after = service.describe(arc.id)
+    after = service.describe(lamp.id)
     component_after = after["components"][0]
     assert removed > 0
     assert after["state"] == "active"
@@ -178,12 +181,12 @@ def test_intentional_eviction_retains_registry_evidence_and_is_discoverable(
     assert component_after["eviction"]["retained_description_files"] == [
         {"path": str(sidecar), "bytes": sidecar.stat().st_size}
     ]
-    assert any(row["id"] == arc.id for row in service.find_artifacts(kind="master_arc"))
+    assert any(row["id"] == lamp.id for row in service.find_artifacts(kind="master_hg"))
     with pytest.raises(ArtifactPayloadEvictedError, match="intentionally evicted"):
-        service.load_component(arc.id, "master_arc")
+        service.load_component(lamp.id, "master_hg")
     with pytest.raises(ArtifactPayloadEvictedError, match="intentionally evicted"):
-        service.load_payload(service.adapter.get_row(arc.id))
-    assert service.evict_payload(arc.id) == 0
+        service.load_payload(service.adapter.get_row(lamp.id))
+    assert service.evict_payload(lamp.id) == 0
 
 
 def test_ldls_eviction_preserves_evidentiary_mask(tmp_path: Path):
@@ -214,7 +217,7 @@ def test_ldls_eviction_preserves_evidentiary_mask(tmp_path: Path):
     assert service.load_component(ldls.id, "flat_response_mask")["data"].shape == (3, 4)
 
 
-def test_wavelength_map_stage_evicts_arc_and_lamp_ancestors(tmp_path: Path):
+def test_wavelength_map_stage_evicts_lamp_ancestors_but_retains_arc(tmp_path: Path):
     service, publisher = _fixture(tmp_path)
     hg = _publish(publisher, "master_hg")
     cd = _publish(publisher, "master_cd")
@@ -224,13 +227,15 @@ def test_wavelength_map_stage_evicts_arc_and_lamp_ancestors(tmp_path: Path):
 
     report = service.evict_payloads_triggered_by(wave.id)
 
-    assert set(report["evicted_artifact_ids"]) == {hg.id, cd.id, arc.id}
+    assert set(report["evicted_artifact_ids"]) == {hg.id, cd.id}
     assert report["removed_bytes"] > 0
     assert report["refused"] == []
     assert service.payload_status(hg.id) == "evicted_rebuildable"
     assert service.payload_status(cd.id) == "evicted_rebuildable"
-    assert service.payload_status(arc.id) == "evicted_rebuildable"
+    assert service.payload_status(arc.id) == "present"
     assert service.payload_status(wave.id) == "present"
+    with pytest.raises(ValueError, match="permanently retained"):
+        service.evict_payload(arc.id)
 
 
 def test_fiber_response_stage_evicts_only_dense_flat_payloads(tmp_path: Path):
@@ -350,7 +355,7 @@ def test_calibration_publication_runs_retention_hook_only_after_qa(
 
 
 def test_explicit_cache_cleanup_backfills_completed_calibration_runs(tmp_path: Path):
-    service, arc, _ = _validated_arc_chain(tmp_path)
+    service, lamp, _ = _validated_rebuildable_lamp_chain(tmp_path)
     bias = _publish(
         DefaultPublicationService(
             svc=service,
@@ -363,16 +368,16 @@ def test_explicit_cache_cleanup_backfills_completed_calibration_runs(tmp_path: P
 
     preview = cleanup_cache(service.db_path)
     assert preview.dry_run
-    assert preview.artifact_ids == (arc.id,)
+    assert preview.artifact_ids == (lamp.id,)
     assert preview.candidate_bytes > 0
-    assert service.payload_status(arc.id) == "present"
+    assert service.payload_status(lamp.id) == "present"
 
     result = cleanup_cache(service.db_path, execute=True)
     assert not result.dry_run
     assert result.affected == 1
     assert result.removed_bytes > 0
     assert result.refusals == ()
-    assert service.payload_status(arc.id) == "evicted_rebuildable"
+    assert service.payload_status(lamp.id) == "evicted_rebuildable"
     assert service.payload_status(bias.id) == "present"
 
 
@@ -397,15 +402,15 @@ def test_unexpectedly_missing_payload_is_not_mislabeled_as_evicted(tmp_path: Pat
 
 
 def test_database_failure_restores_staged_payload(tmp_path: Path, monkeypatch):
-    service, arc, _ = _validated_arc_chain(tmp_path)
-    path = Path(service.describe(arc.id)["components"][0]["path"])
+    service, lamp, _ = _validated_rebuildable_lamp_chain(tmp_path)
+    path = Path(service.describe(lamp.id)["components"][0]["path"])
 
     def fail_update(*args, **kwargs):
         raise RuntimeError("database write failed")
 
     monkeypatch.setattr(service.adapter, "set_component_payload_states", fail_update)
     with pytest.raises(RuntimeError, match="database write failed"):
-        service.evict_payload(arc.id)
+        service.evict_payload(lamp.id)
 
     assert path.is_file()
 
@@ -470,21 +475,22 @@ def test_triggered_eviction_cannot_cross_amplifier_scope(tmp_path: Path):
 
     report = service.evict_payloads_triggered_by(wave.id)
 
-    assert report["candidate_count"] == 3
-    assert set(report["evicted_artifact_ids"]) == {hg.id, cd.id, arc.id}
+    assert report["candidate_count"] == 2
+    assert set(report["evicted_artifact_ids"]) == {hg.id, cd.id}
+    assert service.payload_status(arc.id) == "present"
     assert service.payload_status(unrelated_hg.id) == "present"
 
 
 def test_eviction_batches_descendant_payload_validation_and_is_cheap_to_repeat(
     tmp_path: Path, monkeypatch
 ):
-    service, arc, _ = _validated_arc_chain(tmp_path)
+    service, lamp, _ = _validated_rebuildable_lamp_chain(tmp_path)
 
     def legacy_n_plus_one(*args, **kwargs):
         raise AssertionError("descendant validation must not call payload_status")
 
     monkeypatch.setattr(service, "payload_status", legacy_n_plus_one)
-    assert service.evict_payload(arc.id) > 0
+    assert service.evict_payload(lamp.id) > 0
     monkeypatch.setattr(
         service,
         "_require_eviction_descendants",
@@ -492,7 +498,7 @@ def test_eviction_batches_descendant_payload_validation_and_is_cheap_to_repeat(
             AssertionError("already-evicted payload must return before graph validation")
         ),
     )
-    assert service.evict_payload(arc.id) == 0
+    assert service.evict_payload(lamp.id) == 0
 
 
 def test_calibration_retention_has_a_first_class_timing_phase(tmp_path: Path):

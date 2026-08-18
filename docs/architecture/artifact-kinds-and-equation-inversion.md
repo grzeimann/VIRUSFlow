@@ -435,7 +435,7 @@ published. `ArtifactService` rejects permanent publication of every S kind.
 | `master_ldls` | amplifier / C | Detector-corrected robust LDLS evidence for traces, masks, and fine relative response. | Production calibration Product with bias/dark parents and explicit correction convention. Its dense component is releasable only after QA-valid trace, compact physical-CCD scatter, extracted-spectrum, and response descendants each have all required checksum-verified payload components; the LDLS mask remains. |
 | `master_hg` | amplifier / C | Hg lamp evidence for $\lambda_p$. | Production calibration Product; dense release requires QA-valid `master_arc` and `wavelength_map` descendants with every required component present and checksum-verified, including mandatory line evidence. |
 | `master_cd` | amplifier / C | Cd lamp evidence for $\lambda_p$. | Production calibration Product; same component-complete retention boundary as Hg. |
-| `master_arc` | amplifier / C | Composed Hg+Cd evidence used to infer $\lambda_p$. | Production calibration Product; its rebuildable dense component is releasable only after a QA-valid, component-complete, checksum-verified `wavelength_map`. |
+| `master_arc` | amplifier / C | Composed Hg+Cd evidence used to infer $\lambda_p$. | Production calibration Product retained for response-model diagnostics; its Hg/Cd parents may be released after a QA-valid, component-complete, checksum-verified `wavelength_map`. |
 | `master_twilight` | amplifier / C | Detector-corrected twilight illumination evidence anchoring broad fiber response and amplifier level. | Production calibration Product with bias/dark lineage; dense release requires QA-valid compact physical-CCD scatter, exact-aperture extracted-spectrum, and factorization-complete response descendants with verified required components. |
 | `master_sci` | amplifier / C | Detector-corrected science-like illumination evidence used as an independent response/mask validation measurement. | Optional production calibration Product; it does not fit the response. Dense release requires QA-valid compact physical-CCD scatter, exact-aperture extracted-spectrum, and terminal spectral-mask descendants with verified required components. |
 | `extracted_master_ldls_spectrum` | fiber / C | Mask-aware aperture-extracted, scatter-subtracted LDLS evidence constraining fine $R^{\mathrm{fiber}}$. | Production calibration Product retaining spectrum, valid-pixel fraction, effective aperture width, extraction-valid mask, exact compact start-row/contributing-row/boundary-weight evidence, and compact scatter lineage. |
@@ -509,8 +509,8 @@ dense electron master, dark-pixel mask, required reference exposure time and
 bias convention, registry record, raw-parent lineage, and checksums.
 
 The implemented retention service treats only the dense payload components of
-`master_hg`, `master_cd`, `master_arc`, `master_twilight`, `master_ldls`, and
-`master_sci` as rebuildable. It keeps their registry records, provenance, QA,
+`master_hg`, `master_cd`, `master_twilight`, `master_ldls`, and `master_sci`
+as rebuildable. It keeps their registry records, provenance, QA,
 checksums, component descriptions, and non-evictable components such as the
 LDLS response mask. It also requires active descendants whose QA is completed
 and neither failed nor unusable. For each gated descendant kind, one such
@@ -521,7 +521,6 @@ match that checksum. The current descendant gates are:
 | Dense payload | Current validated-descendant gate |
 |---|---|
 | `master_hg`, `master_cd` | `master_arc` and `wavelength_map` |
-| `master_arc` | `wavelength_map` |
 | `master_twilight` | `ccd_scattered_light_model`, `extracted_master_twilight_spectrum`, and `within_amp_fiber_normalization` |
 | `master_ldls` | `trace_map`, `ccd_scattered_light_model`, `extracted_master_ldls_spectrum`, and `within_amp_fiber_normalization` |
 | `master_sci` | `ccd_scattered_light_model`, `extracted_master_sci_spectrum`, and `fiber_wavelength_spectral_mask` |

@@ -25,9 +25,6 @@ CACHEABLE_CALIBRATION_PAYLOADS: dict[str, PayloadRetentionRule] = {
     "master_cd": PayloadRetentionRule(
         ("master_cd",), ("master_arc", "wavelength_map"), "wavelength_map"
     ),
-    "master_arc": PayloadRetentionRule(
-        ("master_arc",), ("wavelength_map",), "wavelength_map"
-    ),
     "master_twilight": PayloadRetentionRule(
         ("master_twilight",),
         (

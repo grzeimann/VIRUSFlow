@@ -84,7 +84,8 @@ virusflow cleanup cache --db ./run/registry.sqlite3 --execute
 
 The first command in each pair is a dry-run inventory. See [troubleshooting](troubleshooting.md) before retiring legacy payloads.
 Calibration runs evict cacheable dense masters as soon as their terminal evidence
-Product passes QA: wavelength maps release arc/Hg/Cd masters, amplifier fiber
+Product passes QA: wavelength maps release the rebuildable Hg/Cd masters while
+retaining the composed Master Arc for response-model diagnostics; amplifier fiber
 responses release dense LDLS/twilight masters, and spectral masks release science
 masters. `cleanup cache` applies the same guarded retention policy to Products
 created by runs that completed before automatic stage eviction was enabled;
