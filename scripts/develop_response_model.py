@@ -362,6 +362,54 @@ def trapezoidal_integral(values: np.ndarray, coordinates: np.ndarray) -> float:
     return float(np.sum(0.5 * (values[1:] + values[:-1]) * np.diff(coordinates)))
 
 
+def gauss_hermite_convolved_circular_fiber_profile(
+    coordinate: np.ndarray,
+    *,
+    height: float,
+    radius: float,
+    sigma: float,
+    h3: float,
+    h4: float,
+    center: float,
+    left_support_u: float,
+    right_support_u: float,
+    step: float,
+) -> np.ndarray | None:
+    """Return a circular-fiber profile blurred by a normalized GH kernel.
+
+    The kernel uses normalized probabilists' Hermite polynomials, so ``h3``
+    is odd (skewness-like) and ``h4`` is even (kurtosis-like).  A non-negative
+    sampled kernel is required for this compact optical-blur experiment.
+    """
+    from scipy.ndimage import convolve1d
+
+    if radius <= 0.0 or sigma <= 0.0 or step <= 0.0:
+        raise ValueError("radius, sigma, and step must be positive")
+    grid = np.arange(left_support_u, right_support_u + step / 2.0, step)
+    # Fixed q=0 circular-aperture source model.
+    core = np.sqrt(np.clip(radius ** 2 - (grid - center) ** 2, 0.0, None))
+    kernel_half_width = int(np.ceil(5.0 * sigma / step))
+    kernel_coordinate = np.arange(-kernel_half_width, kernel_half_width + 1) * step
+    standardized = kernel_coordinate / sigma
+    hermite3 = (standardized ** 3 - 3.0 * standardized) / np.sqrt(6.0)
+    hermite4 = (standardized ** 4 - 6.0 * standardized ** 2 + 3.0) / np.sqrt(24.0)
+    kernel = np.exp(-0.5 * standardized ** 2) * (1.0 + h3 * hermite3 + h4 * hermite4)
+    if not np.all(np.isfinite(kernel)) or np.any(kernel < 0.0):
+        return None
+    kernel_sum = float(np.sum(kernel))
+    if not np.isfinite(kernel_sum) or kernel_sum <= 0.0:
+        return None
+    kernel /= kernel_sum
+    blurred = convolve1d(core, kernel, mode="constant", cval=0.0)
+    blurred /= max(float(np.max(blurred)), np.finfo(float).tiny)
+    coordinate = np.asarray(coordinate, dtype=float)
+    return np.where(
+        (coordinate >= left_support_u) & (coordinate <= right_support_u),
+        height * np.interp(coordinate, grid, blurred),
+        0.0,
+    )
+
+
 @dataclass(frozen=True)
 class LocalProfileMap:
     """Empirical LDLS profiles indexed by dispersion chunk and fiber group."""
@@ -378,6 +426,17 @@ class LocalProfileMap:
     bin_used: np.ndarray
     peak_u: np.ndarray
     centroid_offset: np.ndarray
+    height: np.ndarray
+    radius: np.ndarray
+    sigma: np.ndarray
+    profile_integral: np.ndarray
+    h3: np.ndarray
+    h4: np.ndarray
+    bin_model_rms: np.ndarray
+    bin_model_weighted_rms: np.ndarray
+    optimizer_status: np.ndarray
+    optimizer_cost: np.ndarray
+    parameter_at_bound: np.ndarray
     left_valley_u: np.ndarray
     right_valley_u: np.ndarray
     left_inflection_u: np.ndarray
@@ -589,14 +648,13 @@ def fit_constrained_profile(
     *,
     support: float,
     bin_width: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float]]:
-    """Regularize robust bins into an asymmetric, one-peak compact profile.
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float | int | bool]]:
+    """Regularize robust bins with a circular source and GH optical blur.
 
     A weighted smoothing spline absorbs bin-level noise and supplies the
-    peak/valley locations.  Separate beta-CDF branches are then fit to that
-    local empirical shape.  They are non-negative, C1 at the peak and valley,
-    asymmetric, monotone, and have exactly one data-fitted inflection per
-    branch without assuming a Gaussian profile.
+    provisional peak and valley locations.  The compact fit retains the
+    circular-aperture source while allowing only low-order, non-negative
+    Gauss-Hermite perturbations of the optical blur.
     """
     centers, median, scatter, count = robust_profile_bins(u, values, support=support, bin_width=bin_width)
     finite = np.isfinite(median) & np.isfinite(scatter) & (count >= 8)
@@ -640,36 +698,98 @@ def fit_constrained_profile(
     fit_values = np.clip(median[used], 0.0, None)
     fit_weights = weights
 
-    def branch_model(theta: np.ndarray, coordinate: np.ndarray) -> np.ndarray:
-        from scipy.ndimage import gaussian_filter1d
+    def branch_model(theta: np.ndarray, coordinate: np.ndarray) -> np.ndarray | None:
         height, radius, sigma = np.exp(theta[:3])
         center = peak_u + theta[3]
+        h3, h4 = theta[4:6]
         step = max(bin_width / 4.0, 0.01)
-        grid = np.arange(left_support_u, right_support_u + step / 2.0, step)
-        core = np.sqrt(np.clip(radius ** 2 - (grid - center) ** 2, 0.0, None))
-        blurred = gaussian_filter1d(core, sigma / step, mode="constant", truncate=5.0)
-        blurred /= max(float(np.max(blurred)), np.finfo(float).tiny)
-        return np.where((coordinate >= left_support_u) & (coordinate <= right_support_u), height * np.interp(coordinate, grid, blurred), 0.0)
+        fine_grid = np.arange(left_support_u, right_support_u + step / 2.0, step)
+        continuous = gauss_hermite_convolved_circular_fiber_profile(
+            fine_grid,
+            height=height,
+            radius=radius,
+            sigma=sigma,
+            h3=h3,
+            h4=h4,
+            center=center,
+            left_support_u=left_support_u,
+            right_support_u=right_support_u,
+            step=step,
+        )
+        if continuous is None:
+            return None
+        # Integrate the continuous optical profile over the one-pixel detector
+        # response before sampling at trace-relative pixel centers.  Cell
+        # overlaps give a unit-area top-hat even when ``step`` does not divide
+        # a pixel width exactly.
+        from scipy.ndimage import convolve1d
+        half_width = int(np.ceil(0.5 / step))
+        offsets = np.arange(-half_width, half_width + 1) * step
+        pixel_kernel = np.clip(
+            np.minimum(offsets + step / 2.0, 0.5)
+            - np.maximum(offsets - step / 2.0, -0.5),
+            0.0,
+            None,
+        )
+        pixel_kernel /= np.sum(pixel_kernel)
+        pixel_integrated = convolve1d(continuous, pixel_kernel, mode="constant", cval=0.0)
+        return np.interp(coordinate, fine_grid, pixel_integrated, left=0.0, right=0.0)
 
-    initial = np.r_[np.log([max(peak, noise), 2.0, 0.8]), 0.0]
-    lower = np.r_[np.log([max(peak * 0.25, noise), 0.15, 0.03]), -0.5]
-    upper = np.r_[np.log([max(peak * 4.0, noise * 4.0), support, support / 2.0]), 0.5]
+    # Keep the existing height, R, sigma, and du parameters.  The circular
+    # source is fixed at q=0; h3 and h4 perturb only the optical blur kernel.
+    initial = np.r_[np.log([max(peak, noise), 2.0, 0.8]), 0.0, 0.0, 0.0]
+    lower = np.r_[np.log([max(peak * 0.25, noise), 0.15, 0.03]), -0.5, -0.2, -0.2]
+    upper = np.r_[np.log([max(peak * 4.0, noise * 4.0), support, support / 2.0]), 0.5, 0.2, 0.2]
+
+    def residual(theta: np.ndarray) -> np.ndarray:
+        model = branch_model(theta, fit_u)
+        if model is None:
+            # Invalid Gauss-Hermite kernels are deliberately outside the fit.
+            return np.full(fit_values.shape, 1e12, dtype=float)
+        return (model - fit_values) * fit_weights
+
     result = least_squares(
-        lambda theta: (branch_model(theta, fit_u) - fit_values) * fit_weights,
+        residual,
         initial, bounds=(lower, upper), loss="soft_l1",
     )
     regularized = branch_model(result.x, centers)
+    if regularized is None:
+        raise ValueError("constrained local profile has a negative Gauss-Hermite blur kernel")
     integral = trapezoidal_integral(regularized, centers)
     if not np.isfinite(integral) or integral <= 0.0:
         raise ValueError("constrained local profile has non-positive integral")
-    regularized /= integral
+    # Commented out normalization to avoid fit to integration inconsistencies
+    #regularized /= integral
     du = float(result.x[3])
+    h3, h4 = map(float, result.x[4:6])
+    model_at_bins = np.interp(fit_u, centers, regularized)
+    bin_residual = model_at_bins - fit_values
+    bin_model_rms = float(np.sqrt(np.mean(bin_residual ** 2)))
+    bin_model_weighted_rms = float(
+        np.sqrt(np.sum((fit_weights * bin_residual) ** 2) / np.sum(fit_weights ** 2))
+    )
+    parameter_at_bound = bool(
+        np.any(result.active_mask != 0)
+        or np.any(np.isclose(result.x, lower, rtol=0.0, atol=1e-8))
+        or np.any(np.isclose(result.x, upper, rtol=0.0, atol=1e-8))
+    )
     peak_index = int(np.argmax(regularized))
     left_transition = left_valley_u
     right_transition = right_valley_u
     topology = {
         "peak_u": peak_u + du,
         "centroid_offset": du,
+        "height": float(np.exp(result.x[0])),
+        "radius": float(np.exp(result.x[1])),
+        "sigma": float(np.exp(result.x[2])),
+        "profile_integral": integral,
+        "h3": h3,
+        "h4": h4,
+        "bin_model_rms": bin_model_rms,
+        "bin_model_weighted_rms": bin_model_weighted_rms,
+        "optimizer_status": int(result.status),
+        "optimizer_cost": float(result.cost),
+        "parameter_at_bound": parameter_at_bound,
         "left_valley_u": left_valley_u,
         "right_valley_u": right_valley_u,
         "left_support_u": left_support_u,
@@ -764,6 +884,34 @@ def _valley_constraints(
     )
 
 
+def _profile_fit_inputs(
+    evidence: ProfileEvidence,
+    selection: np.ndarray,
+    compact_total: np.ndarray,
+    neighbor_profiles: LocalProfileMap | None,
+    *,
+    chunk: int,
+    group: int,
+    valley_weight: int,
+    seed_core_only: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build the exact detector and valley samples supplied to one profile fit."""
+    detector_u = evidence.u[selection]
+    detector_values = _profile_sample_values(
+        evidence, selection, compact_total, neighbor_profiles,
+    )
+    if seed_core_only:
+        core = evidence.seed_core[selection]
+        detector_u = detector_u[core]
+        detector_values = detector_values[core]
+    valley_u, valley_values = _valley_constraints(
+        evidence, chunk, group, compact_total, neighbor_profiles,
+    )
+    fit_u = np.r_[detector_u, np.repeat(valley_u, max(1, int(valley_weight)))]
+    fit_values = np.r_[detector_values, np.repeat(valley_values, max(1, int(valley_weight)))]
+    return detector_u, detector_values, valley_u, valley_values, fit_u, fit_values
+
+
 def measure_local_profiles(
     evidence: ProfileEvidence,
     trace: np.ndarray,
@@ -777,7 +925,7 @@ def measure_local_profiles(
     group_size: int,
     iterations: int,
     valley_weight: int,
-) -> tuple[LocalProfileMap, np.ndarray, int, bool, float, float]:
+) -> tuple[LocalProfileMap, LocalProfileMap, np.ndarray, int, bool, float, float, list[dict[str, float | int]]]:
     """Fit local maps from fixed evidence, updating only its interpretation."""
     chunks, groups, fiber_group = _profile_layout(trace, support=support, chunk_width=chunk_width, group_size=group_size)
     u_grid = np.arange(-support + bin_width / 2.0, support, bin_width)
@@ -789,6 +937,17 @@ def measure_local_profiles(
     bin_used = np.zeros_like(profiles, dtype=bool)
     peak_u = np.full((len(chunks), len(groups)), np.nan)
     centroid_offset = np.full_like(peak_u, np.nan)
+    height = np.full_like(peak_u, np.nan)
+    radius = np.full_like(peak_u, np.nan)
+    sigma = np.full_like(peak_u, np.nan)
+    profile_integral = np.full_like(peak_u, np.nan)
+    h3 = np.full_like(peak_u, np.nan)
+    h4 = np.full_like(peak_u, np.nan)
+    bin_model_rms = np.full_like(peak_u, np.nan)
+    bin_model_weighted_rms = np.full_like(peak_u, np.nan)
+    optimizer_status = np.zeros(peak_u.shape, dtype=np.int16)
+    optimizer_cost = np.full_like(peak_u, np.nan)
+    parameter_at_bound = np.zeros(peak_u.shape, dtype=bool)
     left_valley_u = np.full_like(peak_u, np.nan)
     right_valley_u = np.full_like(peak_u, np.nan)
     left_inflection_u = np.full_like(peak_u, np.nan)
@@ -799,6 +958,7 @@ def measure_local_profiles(
     converged = False
     capture_change = float("inf")
     shape_change = float("inf")
+    iteration_integral_stats: list[dict[str, float | int]] = []
     for iteration in range(max(1, int(iterations) + 1)):
         completed_iterations = iteration + 1
         updated = np.full_like(profiles, np.nan)
@@ -806,25 +966,34 @@ def measure_local_profiles(
             for group_index in range(len(groups)):
                 selected = (evidence.chunk == chunk_index) & (evidence.group == group_index)
                 sample_count[chunk_index, group_index] = int(selected.sum())
-                values = _profile_sample_values(evidence, selected, compact_total, previous)
-                sample_u = evidence.u[selected]
-                if previous is None:
-                    core = evidence.seed_core[selected]
-                    sample_u = sample_u[core]
-                    values = values[core]
-                valley_u, valley_values = _valley_constraints(evidence, chunk_index, group_index, compact_total, previous)
+                _, _, valley_u, _, sample_u, values = _profile_fit_inputs(
+                    evidence, selected, compact_total, previous,
+                    chunk=chunk_index, group=group_index,
+                    valley_weight=valley_weight, seed_core_only=previous is None,
+                )
                 valley_count[chunk_index, group_index] = valley_u.size
-                if valley_u.size:
-                    sample_u = np.r_[sample_u, np.repeat(valley_u, max(1, int(valley_weight)))]
-                    values = np.r_[values, np.repeat(valley_values, max(1, int(valley_weight)))]
                 try:
                     fitted_u, fitted, counts, scatter, used, topology = fit_constrained_profile(sample_u, values, support=support, bin_width=bin_width)
-                    updated[chunk_index, group_index] = np.interp(u_grid, fitted_u, fitted, left=0.0, right=0.0)
+                    integral = topology["profile_integral"]
+                    updated[chunk_index, group_index] = np.interp(
+                        u_grid, fitted_u, fitted / integral, left=0.0, right=0.0,
+                    )
                     bin_count[chunk_index, group_index] = counts
                     bin_scatter[chunk_index, group_index] = scatter
                     bin_used[chunk_index, group_index] = used
                     peak_u[chunk_index, group_index] = topology["peak_u"]
                     centroid_offset[chunk_index, group_index] = topology["centroid_offset"]
+                    height[chunk_index, group_index] = topology["height"]
+                    radius[chunk_index, group_index] = topology["radius"]
+                    sigma[chunk_index, group_index] = topology["sigma"]
+                    profile_integral[chunk_index, group_index] = integral
+                    h3[chunk_index, group_index] = topology["h3"]
+                    h4[chunk_index, group_index] = topology["h4"]
+                    bin_model_rms[chunk_index, group_index] = topology["bin_model_rms"]
+                    bin_model_weighted_rms[chunk_index, group_index] = topology["bin_model_weighted_rms"]
+                    optimizer_status[chunk_index, group_index] = topology["optimizer_status"]
+                    optimizer_cost[chunk_index, group_index] = topology["optimizer_cost"]
+                    parameter_at_bound[chunk_index, group_index] = topology["parameter_at_bound"]
                     left_valley_u[chunk_index, group_index] = topology["left_valley_u"]
                     right_valley_u[chunk_index, group_index] = topology["right_valley_u"]
                     left_inflection_u[chunk_index, group_index] = topology["left_inflection_u"]
@@ -832,8 +1001,8 @@ def measure_local_profiles(
                 except ValueError:
                     if previous is not None:
                         updated[chunk_index, group_index] = previous.density[chunk_index, group_index]
-        profiles, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u = _fill_missing_local_profiles(
-            updated, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u,
+        profiles, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, height, radius, sigma, profile_integral, h3, h4, bin_model_rms, bin_model_weighted_rms, optimizer_status, optimizer_cost, parameter_at_bound, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u = _fill_missing_local_profiles(
+            updated, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, height, radius, sigma, profile_integral, h3, h4, bin_model_rms, bin_model_weighted_rms, optimizer_status, optimizer_cost, parameter_at_bound, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u,
         )
         current = LocalProfileMap(
             u_grid=u_grid, density=profiles,
@@ -842,11 +1011,34 @@ def measure_local_profiles(
             fiber_group=fiber_group, sample_count=sample_count, valley_constraint_count=valley_count,
             bin_count=bin_count, bin_scatter=bin_scatter, bin_used=bin_used,
             peak_u=peak_u, centroid_offset=centroid_offset,
+            height=height, radius=radius, sigma=sigma, profile_integral=profile_integral,
+            h3=h3, h4=h4,
+            bin_model_rms=bin_model_rms,
+            bin_model_weighted_rms=bin_model_weighted_rms,
+            optimizer_status=optimizer_status, optimizer_cost=optimizer_cost,
+            parameter_at_bound=parameter_at_bound,
             left_valley_u=left_valley_u, right_valley_u=right_valley_u,
             left_inflection_u=left_inflection_u, right_inflection_u=right_inflection_u,
         )
-        captured = aperture_capture(trace, detector_rows, current, aperture_width)
-        updated_total = np.divide(five_pixel_normalization, captured, out=compact_total.copy(), where=np.isfinite(captured) & (captured > 0.0))
+        # ``current`` contains only P=M/I, so both the capture calculation and
+        # next pass's neighbor subtraction use a physical unit-integral map.
+        aperture_capture(trace, detector_rows, current, aperture_width)
+        updated_total = compact_total.copy()
+        for chunk_index, columns in enumerate(chunks):
+            for group_index, fibers in enumerate(groups):
+                integral = profile_integral[chunk_index, group_index]
+                if np.isfinite(integral) and integral > 0.0:
+                    updated_total[np.ix_(fibers, columns)] *= integral
+        finite_integrals = profile_integral[np.isfinite(profile_integral) & (profile_integral > 0.0)]
+        iteration_integral_stats.append({
+            "iteration": iteration + 1,
+            "count": int(finite_integrals.size),
+            "minimum": float(np.min(finite_integrals)),
+            "p05": float(np.percentile(finite_integrals, 5)),
+            "median": float(np.median(finite_integrals)),
+            "p95": float(np.percentile(finite_integrals, 95)),
+            "maximum": float(np.max(finite_integrals)),
+        })
         if previous is not None:
             capture_change = np.nanmedian(np.abs(updated_total - compact_total) / np.maximum(np.abs(compact_total), 1e-12))
             shape_change = np.nanmedian(np.abs(current.density - previous.density) / np.maximum(previous.density, 1e-8))
@@ -858,12 +1050,104 @@ def measure_local_profiles(
             compact_total = updated_total
         previous = current
 
-    final_capture = aperture_capture(trace, detector_rows, current, aperture_width)
-    final_total = np.divide(
-        five_pixel_normalization, final_capture, out=compact_total.copy(),
-        where=np.isfinite(final_capture) & (final_capture > 0.0),
+    # The outer loop has just updated compact_total from ``current``.  Freeze
+    # both before a final diagnostic/profile closure fit: each refit sees the
+    # same neighbor profiles and compact totals, and no capture normalization
+    # is updated from this pass.
+    frozen_total = compact_total.copy()
+    frozen_neighbors = current
+    closure_density = current.density.copy()
+    closure_bin_count = current.bin_count.copy()
+    closure_bin_scatter = current.bin_scatter.copy()
+    closure_bin_used = current.bin_used.copy()
+    closure_peak_u = current.peak_u.copy()
+    closure_centroid_offset = current.centroid_offset.copy()
+    closure_height = current.height.copy()
+    closure_radius = current.radius.copy()
+    closure_sigma = current.sigma.copy()
+    closure_profile_integral = current.profile_integral.copy()
+    closure_h3 = current.h3.copy()
+    closure_h4 = current.h4.copy()
+    closure_bin_model_rms = current.bin_model_rms.copy()
+    closure_bin_model_weighted_rms = current.bin_model_weighted_rms.copy()
+    closure_optimizer_status = current.optimizer_status.copy()
+    closure_optimizer_cost = current.optimizer_cost.copy()
+    closure_parameter_at_bound = current.parameter_at_bound.copy()
+    closure_left_valley_u = current.left_valley_u.copy()
+    closure_right_valley_u = current.right_valley_u.copy()
+    closure_left_inflection_u = current.left_inflection_u.copy()
+    closure_right_inflection_u = current.right_inflection_u.copy()
+    closure_valley_count = current.valley_constraint_count.copy()
+    for chunk_index in range(len(chunks)):
+        for group_index in range(len(groups)):
+            selected = (evidence.chunk == chunk_index) & (evidence.group == group_index)
+            _, _, valley_u, _, fit_u, fit_values = _profile_fit_inputs(
+                evidence, selected, frozen_total, frozen_neighbors,
+                chunk=chunk_index, group=group_index,
+                valley_weight=valley_weight, seed_core_only=False,
+            )
+            closure_valley_count[chunk_index, group_index] = valley_u.size
+            try:
+                fitted_u, fitted, counts, scatter, used, topology = fit_constrained_profile(
+                    fit_u, fit_values, support=support, bin_width=bin_width,
+                )
+            except ValueError:
+                # Preserve a usable prior map for extraction, while marking
+                # the corresponding diagnostic panel as an unavailable fit.
+                closure_optimizer_status[chunk_index, group_index] = -99
+                closure_optimizer_cost[chunk_index, group_index] = np.nan
+                closure_bin_model_rms[chunk_index, group_index] = np.nan
+                closure_bin_model_weighted_rms[chunk_index, group_index] = np.nan
+                closure_parameter_at_bound[chunk_index, group_index] = False
+                continue
+            integral = topology["profile_integral"]
+            closure_density[chunk_index, group_index] = np.interp(
+                u_grid, fitted_u, fitted / integral, left=0.0, right=0.0,
+            )
+            closure_bin_count[chunk_index, group_index] = counts
+            closure_bin_scatter[chunk_index, group_index] = scatter
+            closure_bin_used[chunk_index, group_index] = used
+            closure_peak_u[chunk_index, group_index] = topology["peak_u"]
+            closure_centroid_offset[chunk_index, group_index] = topology["centroid_offset"]
+            closure_height[chunk_index, group_index] = topology["height"]
+            closure_radius[chunk_index, group_index] = topology["radius"]
+            closure_sigma[chunk_index, group_index] = topology["sigma"]
+            closure_profile_integral[chunk_index, group_index] = integral
+            closure_h3[chunk_index, group_index] = topology["h3"]
+            closure_h4[chunk_index, group_index] = topology["h4"]
+            closure_bin_model_rms[chunk_index, group_index] = topology["bin_model_rms"]
+            closure_bin_model_weighted_rms[chunk_index, group_index] = topology["bin_model_weighted_rms"]
+            closure_optimizer_status[chunk_index, group_index] = topology["optimizer_status"]
+            closure_optimizer_cost[chunk_index, group_index] = topology["optimizer_cost"]
+            closure_parameter_at_bound[chunk_index, group_index] = topology["parameter_at_bound"]
+            closure_left_valley_u[chunk_index, group_index] = topology["left_valley_u"]
+            closure_right_valley_u[chunk_index, group_index] = topology["right_valley_u"]
+            closure_left_inflection_u[chunk_index, group_index] = topology["left_inflection_u"]
+            closure_right_inflection_u[chunk_index, group_index] = topology["right_inflection_u"]
+    current = LocalProfileMap(
+        u_grid=current.u_grid, density=closure_density,
+        chunk_columns=current.chunk_columns, group_bounds=current.group_bounds,
+        fiber_group=current.fiber_group, sample_count=current.sample_count,
+        valley_constraint_count=closure_valley_count,
+        bin_count=closure_bin_count, bin_scatter=closure_bin_scatter,
+        bin_used=closure_bin_used, peak_u=closure_peak_u,
+        centroid_offset=closure_centroid_offset, height=closure_height,
+        radius=closure_radius, sigma=closure_sigma,
+        profile_integral=closure_profile_integral, h3=closure_h3, h4=closure_h4,
+        bin_model_rms=closure_bin_model_rms,
+        bin_model_weighted_rms=closure_bin_model_weighted_rms,
+        optimizer_status=closure_optimizer_status,
+        optimizer_cost=closure_optimizer_cost,
+        parameter_at_bound=closure_parameter_at_bound,
+        left_valley_u=closure_left_valley_u,
+        right_valley_u=closure_right_valley_u,
+        left_inflection_u=closure_left_inflection_u,
+        right_inflection_u=closure_right_inflection_u,
     )
-    return current, final_total, completed_iterations, converged, float(capture_change), float(shape_change)
+    return (
+        current, frozen_neighbors, frozen_total, completed_iterations, converged,
+        float(capture_change), float(shape_change), iteration_integral_stats,
+    )
 
 
 def profile_integral(u_grid: np.ndarray, profile: np.ndarray, left: np.ndarray, right: np.ndarray) -> np.ndarray:
@@ -981,31 +1265,38 @@ def plot_profile_diagnostics(
     trace: np.ndarray,
     evidence: ProfileEvidence,
     profiles: LocalProfileMap,
+    neighbor_profiles: LocalProfileMap,
     compact_total: np.ndarray,
     path: Path,
     support: float,
     bin_width: float,
     valley_weight: int,
 ) -> None:
-    """Show all fixed detector evidence constraining five local profiles."""
+    """Show fixed local-profile evidence in detector-spatial panel order."""
     nx = trace.shape[1]
     ny = int(np.ceil(np.nanmax(trace))) + 1
-    targets = [(nx // 2, ny // 2), (nx // 8, ny // 8), (7 * nx // 8, ny // 8), (nx // 8, 7 * ny // 8), (7 * nx // 8, 7 * ny // 8)]
-    fig, axes = plt.subplots(1, 5, figsize=(20, 4.2), sharey=True)
-    for axis, (x0, y0) in zip(axes, targets):
+    x_locations = (nx // 8, nx // 2, 7 * nx // 8)
+    y_locations = (ny // 8, ny // 2, 7 * ny // 8)
+    targets = [(x0, y0) for y0 in y_locations for x0 in x_locations]
+    fig, axes = plt.subplots(3, 3, figsize=(18, 14.4), sharex=True, sharey=True)
+    for axis, (x0, y0) in zip(axes.flat, targets):
         fiber = int(np.nanargmin(np.abs(trace[:, x0] - y0)))
         chunk, group = profiles.indices(fiber, x0)
         start, stop = profiles.chunk_columns[chunk]
         first_fiber, last_fiber = profiles.group_bounds[group]
         selected = (evidence.chunk == chunk) & (evidence.group == group)
-        uu = evidence.u[selected]
-        vv = _profile_sample_values(evidence, selected, compact_total, profiles)
-        valley_u, valley_v = _valley_constraints(evidence, chunk, group, compact_total, profiles)
-        fit_u = np.r_[uu, np.repeat(valley_u, max(1, int(valley_weight)))]
-        fit_v = np.r_[vv, np.repeat(valley_v, max(1, int(valley_weight)))]
+        uu, vv, valley_u, valley_v, fit_u, fit_v = _profile_fit_inputs(
+            evidence, selected, compact_total, neighbor_profiles,
+            chunk=chunk, group=group, valley_weight=valley_weight,
+            seed_core_only=False,
+        )
         bin_u, bin_median, bin_scatter, bin_count = robust_profile_bins(
             fit_u, fit_v, support=support, bin_width=bin_width,
         )
+        if profiles.optimizer_status[chunk, group] == -99:
+            raise RuntimeError("profile diagnostic closure refit is unavailable")
+        if not np.array_equal(bin_count, profiles.bin_count[chunk, group]):
+            raise RuntimeError("profile diagnostic bins do not match the frozen closure fit")
         bin_used = profiles.bin_used[chunk, group] & np.isfinite(bin_median)
         bin_rejected = (bin_count > 0) & np.isfinite(bin_median) & ~bin_used
         axis.plot(uu, vv, ".", ms=1.0, alpha=0.035, color="tab:blue", label="all detector samples")
@@ -1021,13 +1312,27 @@ def plot_profile_diagnostics(
         axis.axvline(profiles.left_valley_u[chunk, group], color="0.6", lw=0.6, ls=":")
         axis.axvline(profiles.right_valley_u[chunk, group], color="0.6", lw=0.6, ls=":")
         axis.set(
-            title=(f"x={x0}, fiber={fiber}\nchunk {start}-{stop}, group {first_fiber}-{last_fiber}\ndu={profiles.centroid_offset[chunk, group]:+.3f} px; n={uu.size}"),
-            xlabel="u (pixel)", xlim=(-support, support),
+            title=(
+                f"x={x0}, fiber={fiber}\nchunk {start}-{stop}, group {first_fiber}-{last_fiber}\n"
+                f"du={profiles.centroid_offset[chunk, group]:+.3f} px; "
+                f"H={profiles.height[chunk, group]:.3g}; R={profiles.radius[chunk, group]:.3f}; "
+                f"sigma={profiles.sigma[chunk, group]:.3f}\n"
+                f"h3={profiles.h3[chunk, group]:+.3f}; h4={profiles.h4[chunk, group]:+.3f}; "
+                f"RMS={profiles.bin_model_rms[chunk, group]:.3g}; "
+                f"wRMS={profiles.bin_model_weighted_rms[chunk, group]:.3g}\n"
+                f"status={profiles.optimizer_status[chunk, group]}; "
+                f"cost={profiles.optimizer_cost[chunk, group]:.3g}; "
+                f"bound={'yes' if profiles.parameter_at_bound[chunk, group] else 'no'}; n={uu.size}"
+            ),
+            xlim=(-support, support),
         )
         axis.grid(alpha=0.2)
-    axes[0].set_ylabel("LDLS pixel / estimated compact total flux")
-    axes[0].legend(frameon=False, fontsize=7, loc="upper right")
-    fig.suptitle("All fixed local LDLS evidence, distinct valley constraints, and constrained profiles")
+    for axis in axes[-1, :]:
+        axis.set_xlabel("u (pixel)")
+    for axis in axes[:, 0]:
+        axis.set_ylabel("LDLS pixel / estimated compact total flux")
+    axes[0, 0].legend(frameon=False, fontsize=7, loc="upper right")
+    fig.suptitle("Local LDLS evidence and constrained profiles by detector position")
     fig.tight_layout()
     fig.savefig(path, dpi=170)
     plt.close(fig)
@@ -1067,8 +1372,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile-bin-width", type=float, default=0.4)
     parser.add_argument("--profile-chunk-width", type=int, default=100)
     parser.add_argument("--profile-group-size", type=int, default=16)
-    parser.add_argument("--profile-deblend-iterations", type=int, default=6, help="Maximum post-seed capture/deblend refinements; exits early once stable")
-    parser.add_argument("--profile-valley-weight", type=int, default=0)
+    parser.add_argument("--profile-deblend-iterations", type=int, default=3, help="Maximum post-seed capture/deblend refinements; exits early once stable")
+    parser.add_argument("--profile-valley-weight", type=int, default=1)
     parser.add_argument("--ldls-smoothing-window", type=int, default=101)
     parser.add_argument("--arc-smoothing-window", type=int, default=51)
     parser.add_argument("--halo-core-half-width", type=float, default=8.0)
@@ -1144,7 +1449,7 @@ def main(argv: list[str] | None = None) -> int:
         ldls, traces, preliminary, ldls_mask, support=args.profile_support,
         chunks=profile_chunks, groups=profile_groups, fiber_group=profile_fiber_group,
     )
-    profiles, compact_total, profile_iterations, profile_converged, capture_change, profile_change = measure_local_profiles(
+    profiles, diagnostic_neighbors, compact_total, profile_iterations, profile_converged, capture_change, profile_change, profile_integral_iterations = measure_local_profiles(
         evidence, traces, preliminary, detector_rows=ldls.shape[0], aperture_width=args.aperture_width,
         support=args.profile_support, bin_width=args.profile_bin_width,
         chunk_width=args.profile_chunk_width, group_size=args.profile_group_size,
@@ -1165,6 +1470,18 @@ def main(argv: list[str] | None = None) -> int:
         profile_bin_used=profiles.bin_used,
         profile_peak_u=profiles.peak_u,
         profile_centroid_offset=profiles.centroid_offset,
+        profile_height=profiles.height,
+        profile_radius=profiles.radius,
+        profile_sigma=profiles.sigma,
+        profile_integral=profiles.profile_integral,
+        profile_h3=profiles.h3,
+        profile_h4=profiles.h4,
+        profile_bin_model_rms=profiles.bin_model_rms,
+        profile_bin_model_weighted_rms=profiles.bin_model_weighted_rms,
+        profile_optimizer_status=profiles.optimizer_status,
+        profile_optimizer_cost=profiles.optimizer_cost,
+        profile_parameter_at_bound=profiles.parameter_at_bound,
+        profile_closure_neighbor_density=diagnostic_neighbors.density,
         profile_left_valley_u=profiles.left_valley_u,
         profile_right_valley_u=profiles.right_valley_u,
         profile_left_inflection_u=profiles.left_inflection_u,
@@ -1187,7 +1504,8 @@ def main(argv: list[str] | None = None) -> int:
         valley_first_u=evidence.valley_first_u, valley_second_u=evidence.valley_second_u,
     )
     plot_profile_diagnostics(
-        traces, evidence, profiles, compact_total, output / "02_ldls_profile_samples.png",
+        traces, evidence, profiles, diagnostic_neighbors, compact_total,
+        output / "02_ldls_profile_samples.png",
         args.profile_support, args.profile_bin_width, args.profile_valley_weight,
     )
     write_json(output / "02_aperture_capture.json", {
@@ -1202,6 +1520,7 @@ def main(argv: list[str] | None = None) -> int:
             "group_count": int(profiles.density.shape[1]),
             "normalization_iterations": profile_iterations,
             "normalization_converged": profile_converged,
+            "profile_integral_iterations": profile_integral_iterations,
             "final_capture_relative_change": capture_change,
             "final_profile_relative_change": profile_change,
             "detector_sample_count": int(evidence.u.size),
@@ -1211,7 +1530,7 @@ def main(argv: list[str] | None = None) -> int:
             "valley_constraint_count": int(profiles.valley_constraint_count.sum()),
             "topology": "non-negative, one-peak, monotone asymmetric beta-CDF branches fitted from smoothing-spline peak/valley evidence",
         },
-        "interpretation": "total compact flux = fractional-aperture flux / the local P(u; x_chunk, fiber_group) capture fraction",
+        "interpretation": "after each fit, compact_total is multiplied by I=integral(M), while P=M/I is used for deblending and aperture capture",
     })
 
     arc_extract = extract_fractional_aperture(arc, np.zeros_like(arc), traces, pixel_mask=arc_mask, width=args.aperture_width)
