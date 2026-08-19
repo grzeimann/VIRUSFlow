@@ -50,6 +50,7 @@ from virusflow.algorithms.physical_ccd import (
 from virusflow.algorithms.wave import REFERENCE_ARC_WAVELENGTHS
 from virusflow.artifacts import ArtifactService
 from virusflow.core.identity import ZipCode, parse_zipcode_key
+from virusflow.ontology.coordinates import UPPER_AMPLIFIER_Y_OFFSET
 
 
 PAIR = {
@@ -1590,6 +1591,104 @@ def plot_profile_width_maps(
     plt.close(fig)
 
 
+def summarize_du_by_x_amplifier(
+    profile_map_x: np.ndarray,
+    profile_map_y: np.ndarray,
+    du: np.ndarray,
+    fit_valid: np.ndarray,
+    parameter_at_bound: np.ndarray,
+    *,
+    detector_columns: int,
+    amplifier_y_boundary: float,
+    amplifier_labels: tuple[str, str],
+    bin_count: int = 16,
+) -> dict[str, np.ndarray]:
+    """Summarize final independent ``du`` fits by X and physical amplifier half."""
+    edges = np.linspace(0.0, float(detector_columns), max(1, int(bin_count)) + 1)
+    x_center = 0.5 * (edges[:-1] + edges[1:])
+    labels: list[str] = []
+    centers: list[float] = []
+    median: list[float] = []
+    mad: list[float] = []
+    count: list[int] = []
+    bound_excluded_count: list[int] = []
+    valid = (
+        fit_valid & np.isfinite(profile_map_x) & np.isfinite(profile_map_y)
+        & np.isfinite(du)
+    )
+    lower_half = profile_map_y < amplifier_y_boundary
+    for half, label in enumerate(amplifier_labels):
+        in_half = lower_half if half == 0 else ~lower_half
+        for index, center in enumerate(x_center):
+            in_x_bin = (profile_map_x >= edges[index]) & (
+                profile_map_x < edges[index + 1] if index + 1 < x_center.size
+                else profile_map_x <= edges[index + 1]
+            )
+            fitted = valid & in_half & in_x_bin
+            usable = fitted & ~parameter_at_bound
+            values = du[usable]
+            location = float(np.median(values)) if values.size else float("nan")
+            labels.append(label)
+            centers.append(float(center))
+            median.append(location)
+            mad.append(float(np.median(np.abs(values - location))) if values.size else float("nan"))
+            count.append(int(values.size))
+            bound_excluded_count.append(int(np.count_nonzero(fitted & parameter_at_bound)))
+    return {
+        "x_center": np.asarray(centers, dtype=float),
+        "median": np.asarray(median, dtype=float),
+        "mad": np.asarray(mad, dtype=float),
+        "count": np.asarray(count, dtype=np.int32),
+        "parameter_bound_excluded_count": np.asarray(bound_excluded_count, dtype=np.int32),
+        "amplifier_half": np.asarray(labels),
+        "x_bin_edges": edges,
+        "amplifier_y_boundary": np.asarray(amplifier_y_boundary, dtype=float),
+    }
+
+
+def plot_du_vs_x_by_amplifier(
+    summary: dict[str, np.ndarray],
+    path: Path,
+) -> None:
+    """Plot robust final-fit ``du`` summaries without fitting a correction."""
+    labels = np.unique(summary["amplifier_half"])
+    fig, axes = plt.subplots(len(labels), 1, figsize=(11, 7), sharex=True, squeeze=False)
+    for axis, label in zip(axes[:, 0], labels):
+        selected = summary["amplifier_half"] == label
+        x = summary["x_center"][selected]
+        median = summary["median"][selected]
+        mad = summary["mad"][selected]
+        count = summary["count"][selected]
+        bound_count = summary["parameter_bound_excluded_count"][selected]
+        usable = np.isfinite(median) & np.isfinite(mad) & (count > 0)
+        axis.axhline(0.0, color="0.35", lw=0.8, ls="--")
+        if np.any(usable):
+            axis.errorbar(
+                x[usable], median[usable], yerr=mad[usable], fmt="o-",
+                color="tab:blue", ms=4, lw=1.0, capsize=2.5,
+                label="median du ± MAD (unbounded fits)",
+            )
+        counts_axis = axis.twinx()
+        counts_axis.bar(x, count, width=np.diff(summary["x_bin_edges"])[0] * 0.75,
+                        color="0.65", alpha=0.28, label="contributing cells")
+        counts_axis.set_ylabel("independent cell count", color="0.35")
+        counts_axis.tick_params(axis="y", colors="0.35")
+        if np.any(bound_count):
+            axis.plot(x, median, "x", color="tab:orange", ms=5,
+                      label="X bins with parameter-bound fits excluded")
+        axis.set(ylabel="du (pixel)", title=f"{label}: final adaptive-cell du versus detector X")
+        axis.grid(alpha=0.2)
+        handles, names = axis.get_legend_handles_labels()
+        count_handles, count_names = counts_axis.get_legend_handles_labels()
+        if handles or count_handles:
+            axis.legend(handles + count_handles, names + count_names, frameon=False, fontsize=8, loc="best")
+    axes[-1, 0].set_xlabel("detector X (column)")
+    fig.suptitle("Robust final independently fitted du by physical amplifier half")
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
 def plot_profile_radius_sigma_tradeoff(
     profile_map_x: np.ndarray,
     profile_map_y: np.ndarray,
@@ -1773,6 +1872,13 @@ def main(argv: list[str] | None = None) -> int:
         & np.isfinite(profiles.sigma)
         & np.isfinite(profiles.centroid_offset)
     )
+    du_x_summary = summarize_du_by_x_amplifier(
+        profile_map_x, profile_map_y, profiles.centroid_offset,
+        profile_map_fit_valid, profiles.parameter_at_bound,
+        detector_columns=ldls.shape[1],
+        amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
+        amplifier_labels=(lower_zipcode.amp, upper_zipcode.amp),
+    )
     np.savez_compressed(
         output / "02_ldls_profile_data.npz",
         profile_u=profiles.u_grid, profile_density=profiles.density,
@@ -1810,6 +1916,14 @@ def main(argv: list[str] | None = None) -> int:
         du=profiles.centroid_offset,
         profile_map_fit_valid=profile_map_fit_valid,
         profile_map_parameter_at_bound=profiles.parameter_at_bound,
+        du_x_center=du_x_summary["x_center"],
+        du_x_median=du_x_summary["median"],
+        du_x_mad=du_x_summary["mad"],
+        du_x_count=du_x_summary["count"],
+        du_x_parameter_bound_excluded_count=du_x_summary["parameter_bound_excluded_count"],
+        du_x_amplifier_half=du_x_summary["amplifier_half"],
+        du_x_bin_edges=du_x_summary["x_bin_edges"],
+        du_x_amplifier_y_boundary=du_x_summary["amplifier_y_boundary"],
         profile_closure_neighbor_density=diagnostic_neighbors.density,
         profile_left_valley_u=profiles.left_valley_u,
         profile_right_valley_u=profiles.right_valley_u,
@@ -1860,6 +1974,9 @@ def main(argv: list[str] | None = None) -> int:
         profile_map_x, profile_map_y, profiles.radius, profiles.sigma,
         profile_map_fit_valid, profiles.parameter_at_bound,
         output / "02_ldls_profile_width_maps.png",
+    )
+    plot_du_vs_x_by_amplifier(
+        du_x_summary, output / "02_ldls_du_vs_x_by_amp.png",
     )
     plot_profile_radius_sigma_tradeoff(
         profile_map_x, profile_map_y, profiles.radius, profiles.sigma,
