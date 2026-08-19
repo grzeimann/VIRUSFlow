@@ -2116,17 +2116,22 @@ def dense_profile_informed_trace_measurements(
                 snr = fitted_amplitude / amplitude_error if amplitude_error > 0.0 else float("inf")
                 current[target] = (fitted_delta, fitted_uncertainty, fitted_amplitude, snr, rms, int(values_array.size), 1)
                 if np.isfinite(fitted_delta) and abs(fitted_delta) <= 1.5 and snr >= 3.0:
-                    next_offsets[target] = np.clip(fitted_delta, -0.75, 0.75)
+                    # ``fitted_delta`` is relative to this iteration's
+                    # already-shifted center.  Keep the cumulative offset
+                    # from T0 so a second centering pass refines rather than
+                    # erases the first measurement.
+                    next_offsets[target] = np.clip(offsets[target] + fitted_delta, -0.75, 0.75)
             offsets = next_offsets
             final = current
         for target, (fitted_delta, fitted_uncertainty, fitted_amplitude, snr, rms, count, _ok) in final.items():
-            delta[target, block] = fitted_delta
+            total_delta = offsets[target]
+            delta[target, block] = total_delta
             uncertainty[target, block] = fitted_uncertainty
             amplitude[target, block] = fitted_amplitude
             amplitude_snr[target, block] = snr
             sample_count[target, block] = count
             residual_rms[target, block] = rms
-            status[target, block] = 1 if np.isfinite(fitted_delta) and abs(fitted_delta) <= 1.5 and snr >= 3.0 else -2
+            status[target, block] = 1 if np.isfinite(total_delta) and abs(total_delta) <= 1.5 and snr >= 3.0 else -2
     measured = trace[:, centers] + delta
     return {
         "column": centers, "column_ranges": np.asarray(ranges, dtype=np.int32),
