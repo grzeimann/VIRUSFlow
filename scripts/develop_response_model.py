@@ -2372,7 +2372,7 @@ def plot_refined_trace_profile_closure(
     image: np.ndarray,
     mask: np.ndarray,
     refined_trace: np.ndarray,
-    preliminary: np.ndarray,
+    compact_total: np.ndarray,
     width_fields: tuple[RobustSurface, RobustSurface],
     fraction_fields: tuple[RobustSurface, RobustSurface],
     *,
@@ -2380,7 +2380,7 @@ def plot_refined_trace_profile_closure(
     amplifier_y_boundary: float,
     path: Path,
 ) -> np.ndarray:
-    """Plot LDLS samples against the fixed smooth profile centered on T_refined."""
+    """Plot compact-total-normalized LDLS samples against fixed smooth profiles."""
     ny, nx = image.shape
     targets = [(x, y) for y in (ny // 8, ny // 2, 7 * ny // 8) for x in (nx // 8, nx // 2, 7 * nx // 8)]
     residuals: list[tuple[int, int, float]] = []
@@ -2388,19 +2388,24 @@ def plot_refined_trace_profile_closure(
     for axis, (center_column, y_target) in zip(axes.flat, targets):
         fiber = int(np.nanargmin(np.abs(refined_trace[:, center_column] - y_target)))
         columns = np.arange(max(0, center_column - 4), min(nx, center_column + 5))
-        xcoord = np.full(refined_trace.shape[0], center_column, dtype=float)
-        _, _, radius, sigma = evaluate_smooth_profile_fields(
-            width_fields, fraction_fields, xcoord, refined_trace[:, center_column],
-            amplifier_y_boundary=amplifier_y_boundary,
-        )
-        shapes = [fourier_compact_profile(float(rr), float(ss)) if np.isfinite(rr) and np.isfinite(ss) else None for rr, ss in zip(radius, sigma)]
         uu: list[np.ndarray] = []
         values: list[np.ndarray] = []
+        model_values: list[np.ndarray] = []
         design: list[np.ndarray] = []
         raw: list[np.ndarray] = []
         for column in columns:
+            xcoord = np.full(refined_trace.shape[0], column, dtype=float)
+            _, _, radius, sigma = evaluate_smooth_profile_fields(
+                width_fields, fraction_fields, xcoord, refined_trace[:, column],
+                amplifier_y_boundary=amplifier_y_boundary,
+            )
+            shapes = [
+                fourier_compact_profile(float(rr), float(ss))
+                if np.isfinite(rr) and np.isfinite(ss) else None
+                for rr, ss in zip(radius, sigma)
+            ]
             center = refined_trace[fiber, column]
-            normalization = preliminary[fiber, column]
+            normalization = compact_total[fiber, column]
             if not (np.isfinite(center) and np.isfinite(normalization) and normalization > 0.0 and shapes[fiber] is not None):
                 continue
             rows = np.arange(max(0, int(np.floor(center - support))), min(ny, int(np.ceil(center + support)) + 1))
@@ -2412,19 +2417,21 @@ def plot_refined_trace_profile_closure(
             for neighbor in (fiber - 1, fiber + 1):
                 if neighbor < 0 or neighbor >= refined_trace.shape[0] or shapes[neighbor] is None:
                     continue
-                neighbor_norm = preliminary[neighbor, column]
+                neighbor_norm = compact_total[neighbor, column]
                 if np.isfinite(neighbor_norm) and neighbor_norm > 0.0:
                     signal -= neighbor_norm * shapes[neighbor].evaluate(rows - refined_trace[neighbor, column])[0]
             u = rows - center
             profile, derivative = shapes[fiber].evaluate(u)
-            uu.append(u); values.append(signal / normalization)
+            uu.append(u); values.append(signal / normalization); model_values.append(profile)
             design.append(np.column_stack((profile, -derivative))); raw.append(signal / normalization)
         if not uu:
             axis.set(title=f"x={center_column}, fiber={fiber}: unavailable")
             continue
         u = np.concatenate(uu); normalized = np.concatenate(values)
         bins, median, scatter, count = robust_profile_bins(u, normalized, support=support, bin_width=0.4)
-        model, derivative = shapes[fiber].evaluate(bins)
+        _, model, _, _ = robust_profile_bins(
+            u, np.concatenate(model_values), support=support, bin_width=0.4,
+        )
         try:
             coefficient, _covariance, _rms = robust_linear_profile_fit(np.vstack(design), np.concatenate(raw))
             residual_delta = float(coefficient[1] / coefficient[0]) if coefficient[0] > 0.0 else float("nan")
@@ -2435,6 +2442,18 @@ def plot_refined_trace_profile_closure(
         axis.plot(u, normalized, ".", ms=1, alpha=0.025, color="tab:blue")
         axis.errorbar(bins[use], median[use], yerr=scatter[use] / np.sqrt(np.maximum(count[use], 1)), fmt="o", ms=2.5, color="tab:purple", capsize=0)
         axis.plot(bins, model, color="black", lw=1.4, label="fixed smooth P(T_refined)")
+        core = (
+            (np.abs(bins) <= 2.0) & np.isfinite(median) & np.isfinite(model)
+            & (model > 0.05 * np.nanmax(model))
+        )
+        outer = (np.abs(bins) >= 6.0) & np.isfinite(median)
+        core_ratio = float(np.nanmedian(median[core] / model[core])) if np.any(core) else float("nan")
+        outer_median = float(np.nanmedian(median[outer])) if np.any(outer) else float("nan")
+        print(
+            "refined-trace profile closure "
+            f"x={center_column} fiber={fiber}: normalization=compact_total_spectrum, "
+            f"core/model={core_ratio:.3f}, outer_median={outer_median:+.4g}"
+        )
         axis.set(title=f"x={center_column}, fiber={fiber}; residual du={residual_delta:+.3f}", xlim=(-support, support))
         axis.grid(alpha=0.2)
     for axis in axes[-1]: axis.set_xlabel("u from T_refined (pixel)")
@@ -2866,7 +2885,7 @@ def main(argv: list[str] | None = None) -> int:
         output / "02_ldls_refined_trace_residual_centroids.png",
     )
     closure_panel_residuals = plot_refined_trace_profile_closure(
-        ldls, ldls_mask, refined_trace, refined_preliminary, width_fields, fraction_fields,
+        ldls, ldls_mask, refined_trace, compact_total, width_fields, fraction_fields,
         support=args.profile_support, amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
         path=output / "02_ldls_refined_trace_profile_closure.png",
     )
