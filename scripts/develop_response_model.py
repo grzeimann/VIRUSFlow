@@ -412,13 +412,13 @@ def gauss_hermite_convolved_circular_fiber_profile(
 
 @dataclass(frozen=True)
 class LocalProfileMap:
-    """Empirical LDLS profiles indexed by dispersion chunk and fiber group."""
+    """Empirical LDLS profiles indexed by trace-geometry detector cells."""
 
     u_grid: np.ndarray
     density: np.ndarray
-    chunk_columns: np.ndarray
-    group_bounds: np.ndarray
-    fiber_group: np.ndarray
+    cell_columns: np.ndarray
+    cell_fibers: np.ndarray
+    cell_index: np.ndarray
     sample_count: np.ndarray
     valley_constraint_count: np.ndarray
     bin_count: np.ndarray
@@ -442,14 +442,26 @@ class LocalProfileMap:
     left_inflection_u: np.ndarray
     right_inflection_u: np.ndarray
 
-    def indices(self, fiber: int, column: int) -> tuple[int, int]:
-        group = int(self.fiber_group[int(fiber)])
-        chunk = int(np.searchsorted(self.chunk_columns[:, 1], int(column), side="left"))
-        return min(chunk, self.density.shape[0] - 1), group
+    def indices(self, fiber: int, column: int) -> int:
+        return int(self.cell_index[int(fiber), int(column)])
 
     def profile(self, fiber: int, column: int) -> np.ndarray:
-        chunk, group = self.indices(fiber, column)
-        return self.density[chunk, group]
+        return self.density[self.indices(fiber, column)]
+
+
+@dataclass(frozen=True)
+class ProfileGrid:
+    """A trace-only partition of physical detector coordinates."""
+
+    cell_columns: np.ndarray
+    cell_fibers: np.ndarray
+    cell_index: np.ndarray
+    trace_excursion: np.ndarray
+    separation_variation: np.ndarray
+    separation_x_variation: np.ndarray
+    separation_fiber_variation: np.ndarray
+    reached_minimum_size: np.ndarray
+    mode: str
 
 
 @dataclass(frozen=True)
@@ -460,8 +472,7 @@ class ProfileEvidence:
     signal: np.ndarray
     fiber: np.ndarray
     column: np.ndarray
-    chunk: np.ndarray
-    group: np.ndarray
+    cell: np.ndarray
     five_pixel_normalization: np.ndarray
     seed_core: np.ndarray
     neighbor_fiber: np.ndarray
@@ -471,29 +482,121 @@ class ProfileEvidence:
     valley_first_fiber: np.ndarray
     valley_second_fiber: np.ndarray
     valley_column: np.ndarray
-    valley_chunk: np.ndarray
-    valley_group: np.ndarray
+    valley_cell: np.ndarray
     valley_first_u: np.ndarray
     valley_second_u: np.ndarray
 
 
-def _profile_layout(trace: np.ndarray, *, support: float, chunk_width: int, group_size: int) -> tuple[list[np.ndarray], list[np.ndarray], np.ndarray]:
-    """Build fixed local chunks and groups, splitting groups at physical gaps."""
-    nx = trace.shape[1]
-    chunks = [np.arange(start, min(nx, start + int(chunk_width))) for start in range(0, nx, int(chunk_width))]
-    groups: list[np.ndarray] = []
-    group_start = 0
+def _hard_fiber_boundaries(trace: np.ndarray, *, support: float, amplifier_boundary: int | None) -> np.ndarray:
+    """Return exclusive fiber boundaries that no profile cell may cross."""
+    boundaries = {0, trace.shape[0]}
+    # The paired physical CCD is assembled as lower amplifier followed by upper
+    # amplifier.  Keep that provenance boundary even if their traces happen to
+    # lie close together in the physical coordinate system.
+    if amplifier_boundary is None:
+        amplifier_boundary = trace.shape[0] // 2 if trace.shape[0] % 2 == 0 else None
+    if amplifier_boundary is not None and 0 < amplifier_boundary < trace.shape[0]:
+        boundaries.add(int(amplifier_boundary))
     for fiber in range(1, trace.shape[0]):
         separation = np.abs(trace[fiber] - trace[fiber - 1])
-        has_gap = bool(np.nanmedian(separation) > 2.0 * support)
-        if fiber - group_start >= int(group_size) or has_gap:
-            groups.append(np.arange(group_start, fiber))
-            group_start = fiber
-    groups.append(np.arange(group_start, trace.shape[0]))
-    fiber_group = np.empty(trace.shape[0], dtype=np.int16)
-    for group_index, fibers in enumerate(groups):
-        fiber_group[fibers] = group_index
-    return chunks, groups, fiber_group
+        if np.isfinite(separation).any() and float(np.nanmedian(separation)) > 2.0 * support:
+            boundaries.add(fiber)
+    return np.asarray(sorted(boundaries), dtype=np.int32)
+
+
+def _cell_trace_metrics(trace: np.ndarray, x_start: int, x_stop: int, fiber_start: int, fiber_stop: int) -> tuple[float, float, float, float]:
+    """Measure one candidate cell using only its known trace geometry."""
+    columns = np.arange(x_start, x_stop, dtype=int)
+    if columns.size == 0:
+        return float("inf"), float("inf"), float("inf"), float("inf")
+    center_column = int(columns[columns.size // 2])
+    positions = np.asarray(trace[fiber_start:fiber_stop, x_start:x_stop], dtype=float)
+    center = np.asarray(trace[fiber_start:fiber_stop, center_column], dtype=float)[:, None]
+    with np.errstate(invalid="ignore"):
+        trace_excursion = float(np.nanmax(np.abs(positions - center)))
+    if fiber_stop - fiber_start < 2:
+        return trace_excursion, 0.0, 0.0, 0.0
+    separation = np.abs(np.diff(positions, axis=0))
+    center_separation = np.abs(np.diff(center[:, 0]))[:, None]
+    with np.errstate(invalid="ignore"):
+        separation_x_variation = float(np.nanmax(np.abs(separation - center_separation)))
+        separation_fiber_variation = float(np.nanmax(
+            np.nanmax(separation, axis=0) - np.nanmin(separation, axis=0)
+        ))
+    separation_variation = max(separation_x_variation, separation_fiber_variation)
+    return trace_excursion, separation_variation, separation_x_variation, separation_fiber_variation
+
+
+def _profile_grid(
+    trace: np.ndarray,
+    *,
+    support: float,
+    mode: str,
+    chunk_width: int,
+    group_size: int,
+    trace_tolerance: float,
+    separation_tolerance: float,
+    minimum_chunk_width: int,
+    minimum_group_size: int,
+    amplifier_boundary: int | None = None,
+) -> ProfileGrid:
+    """Build fixed or recursively refined trace-geometry profile cells."""
+    if min(chunk_width, group_size, minimum_chunk_width, minimum_group_size) < 1:
+        raise ValueError("profile cell sizes must be positive")
+    if trace_tolerance < 0.0 or separation_tolerance < 0.0:
+        raise ValueError("profile geometry tolerances must be non-negative")
+    nx = trace.shape[1]
+    hard_boundaries = _hard_fiber_boundaries(
+        trace, support=support, amplifier_boundary=amplifier_boundary,
+    )
+    pending: list[tuple[int, int, int, int]] = []
+    for boundary_start, boundary_stop in zip(hard_boundaries[:-1], hard_boundaries[1:]):
+        for fiber_start in range(int(boundary_start), int(boundary_stop), group_size):
+            fiber_stop = min(int(boundary_stop), fiber_start + group_size)
+            for x_start in range(0, nx, chunk_width):
+                pending.append((x_start, min(nx, x_start + chunk_width), fiber_start, fiber_stop))
+
+    cells: list[tuple[int, int, int, int, float, float, float, float, bool]] = []
+    while pending:
+        x_start, x_stop, fiber_start, fiber_stop = pending.pop()
+        excursion, separation_variation, separation_x, separation_fiber = _cell_trace_metrics(
+            trace, x_start, x_stop, fiber_start, fiber_stop,
+        )
+        refine_x = (
+            excursion > trace_tolerance or separation_x > separation_tolerance
+        ) and x_stop - x_start > minimum_chunk_width
+        refine_fiber = (
+            separation_fiber > separation_tolerance
+        ) and fiber_stop - fiber_start > minimum_group_size
+        if mode == "adaptive" and (refine_x or refine_fiber):
+            x_ranges = ((x_start, (x_start + x_stop) // 2), ((x_start + x_stop) // 2, x_stop)) if refine_x else ((x_start, x_stop),)
+            fiber_ranges = ((fiber_start, (fiber_start + fiber_stop) // 2), ((fiber_start + fiber_stop) // 2, fiber_stop)) if refine_fiber else ((fiber_start, fiber_stop),)
+            pending.extend((left, right, first, last) for left, right in x_ranges for first, last in fiber_ranges)
+            continue
+        reached_minimum = mode == "adaptive" and bool(
+            (excursion > trace_tolerance or separation_x > separation_tolerance)
+            and x_stop - x_start <= minimum_chunk_width
+            or separation_fiber > separation_tolerance and fiber_stop - fiber_start <= minimum_group_size
+        )
+        cells.append((x_start, x_stop, fiber_start, fiber_stop, excursion, separation_variation, separation_x, separation_fiber, reached_minimum))
+
+    cells.sort(key=lambda item: (item[0], item[2], item[1], item[3]))
+    cell_columns = np.asarray([(start, stop - 1) for start, stop, *_ in cells], dtype=np.int32)
+    cell_fibers = np.asarray([(start, stop - 1) for _, _, start, stop, *_ in cells], dtype=np.int32)
+    cell_index = np.full(trace.shape, -1, dtype=np.int32)
+    for index, (x_start, x_stop, fiber_start, fiber_stop, *_metrics) in enumerate(cells):
+        cell_index[fiber_start:fiber_stop, x_start:x_stop] = index
+    if np.any(cell_index < 0):
+        raise RuntimeError("profile grid does not cover every trace coordinate")
+    return ProfileGrid(
+        cell_columns=cell_columns, cell_fibers=cell_fibers, cell_index=cell_index,
+        trace_excursion=np.asarray([cell[4] for cell in cells], dtype=float),
+        separation_variation=np.asarray([cell[5] for cell in cells], dtype=float),
+        separation_x_variation=np.asarray([cell[6] for cell in cells], dtype=float),
+        separation_fiber_variation=np.asarray([cell[7] for cell in cells], dtype=float),
+        reached_minimum_size=np.asarray([cell[8] for cell in cells], dtype=bool),
+        mode=mode,
+    )
 
 
 def collect_profile_evidence(
@@ -503,15 +606,10 @@ def collect_profile_evidence(
     mask: np.ndarray,
     *,
     support: float,
-    chunks: list[np.ndarray],
-    groups: list[np.ndarray],
-    fiber_group: np.ndarray,
+    grid: ProfileGrid,
 ) -> ProfileEvidence:
     """Collect every valid profile pixel and overlap/valley fact exactly once."""
     ny, nx = image.shape
-    chunk_for_column = np.empty(nx, dtype=np.int16)
-    for chunk_index, columns in enumerate(chunks):
-        chunk_for_column[columns] = chunk_index
     pair_overlap = np.zeros((trace.shape[0] - 1, nx), dtype=bool)
     valley_row = np.full((trace.shape[0] - 1, nx), np.nan, dtype=float)
     for first in range(trace.shape[0] - 1):
@@ -530,7 +628,7 @@ def collect_profile_evidence(
                 valley_row[first, column] = float(rows[usable][np.argmin(image[rows[usable], column])])
 
     values: dict[str, list[np.ndarray]] = {name: [] for name in (
-        "u", "signal", "fiber", "column", "chunk", "group", "normalization", "seed_core",
+        "u", "signal", "fiber", "column", "cell", "normalization", "seed_core",
         "neighbor_fiber", "neighbor_u", "neighbor_overlaps",
     )}
     for fiber in range(trace.shape[0]):
@@ -569,8 +667,7 @@ def collect_profile_evidence(
             values["signal"].append(np.asarray(image[rows, column], dtype=np.float32))
             values["fiber"].append(np.full(rows.size, fiber, dtype=np.int16))
             values["column"].append(np.full(rows.size, column, dtype=np.int16))
-            values["chunk"].append(np.full(rows.size, chunk_for_column[column], dtype=np.int16))
-            values["group"].append(np.full(rows.size, fiber_group[fiber], dtype=np.int16))
+            values["cell"].append(np.full(rows.size, grid.cell_index[fiber, column], dtype=np.int32))
             values["normalization"].append(np.full(rows.size, normalization, dtype=np.float32))
             values["seed_core"].append(core)
             values["neighbor_fiber"].append(neighbor_fiber)
@@ -578,13 +675,17 @@ def collect_profile_evidence(
             values["neighbor_overlaps"].append(neighbor_overlaps)
 
     valley_values: dict[str, list[float | int]] = {name: [] for name in (
-        "signal", "first", "second", "column", "chunk", "group", "first_u", "second_u",
+        "signal", "first", "second", "column", "cell", "first_u", "second_u",
     )}
     for first in range(trace.shape[0] - 1):
         second = first + 1
-        if fiber_group[first] != fiber_group[second]:
-            continue
         for column in range(nx):
+            cell = grid.cell_index[first, column]
+            # As in the fixed layout, a valley is a constraint only when both
+            # fibers share the same local profile cell.  Hard gaps and cell
+            # boundaries therefore remain non-coupling boundaries.
+            if cell != grid.cell_index[second, column]:
+                continue
             row = valley_row[first, column]
             if not np.isfinite(row):
                 continue
@@ -596,15 +697,14 @@ def collect_profile_evidence(
             valley_values["first"].append(first)
             valley_values["second"].append(second)
             valley_values["column"].append(column)
-            valley_values["chunk"].append(int(chunk_for_column[column]))
-            valley_values["group"].append(int(fiber_group[first]))
+            valley_values["cell"].append(int(cell))
             valley_values["first_u"].append(float(row - trace[first, column]))
             valley_values["second_u"].append(float(row - trace[second, column]))
 
     return ProfileEvidence(
         u=np.concatenate(values["u"]), signal=np.concatenate(values["signal"]),
         fiber=np.concatenate(values["fiber"]), column=np.concatenate(values["column"]),
-        chunk=np.concatenate(values["chunk"]), group=np.concatenate(values["group"]),
+        cell=np.concatenate(values["cell"]),
         five_pixel_normalization=np.concatenate(values["normalization"]),
         seed_core=np.concatenate(values["seed_core"]),
         neighbor_fiber=np.concatenate(values["neighbor_fiber"]),
@@ -614,8 +714,7 @@ def collect_profile_evidence(
         valley_first_fiber=np.asarray(valley_values["first"], dtype=np.int16),
         valley_second_fiber=np.asarray(valley_values["second"], dtype=np.int16),
         valley_column=np.asarray(valley_values["column"], dtype=np.int16),
-        valley_chunk=np.asarray(valley_values["chunk"], dtype=np.int16),
-        valley_group=np.asarray(valley_values["group"], dtype=np.int16),
+        valley_cell=np.asarray(valley_values["cell"], dtype=np.int32),
         valley_first_u=np.asarray(valley_values["first_u"], dtype=np.float32),
         valley_second_u=np.asarray(valley_values["second_u"], dtype=np.float32),
     )
@@ -653,8 +752,9 @@ def fit_constrained_profile(
 
     A weighted smoothing spline absorbs bin-level noise and supplies the
     provisional peak and valley locations.  The compact fit retains the
-    circular-aperture source while allowing only low-order, non-negative
-    Gauss-Hermite perturbations of the optical blur.
+    circular-aperture source and a Gaussian optical blur.  The underlying
+    Gauss-Hermite profile function is retained for future experiments, but its
+    h3 and h4 perturbations are fixed at zero for this fit.
     """
     centers, median, scatter, count = robust_profile_bins(u, values, support=support, bin_width=bin_width)
     finite = np.isfinite(median) & np.isfinite(scatter) & (count >= 8)
@@ -701,7 +801,6 @@ def fit_constrained_profile(
     def branch_model(theta: np.ndarray, coordinate: np.ndarray) -> np.ndarray | None:
         height, radius, sigma = np.exp(theta[:3])
         center = peak_u + theta[3]
-        h3, h4 = theta[4:6]
         step = max(bin_width / 4.0, 0.01)
         fine_grid = np.arange(left_support_u, right_support_u + step / 2.0, step)
         continuous = gauss_hermite_convolved_circular_fiber_profile(
@@ -709,8 +808,8 @@ def fit_constrained_profile(
             height=height,
             radius=radius,
             sigma=sigma,
-            h3=h3,
-            h4=h4,
+            h3=0.0,
+            h4=0.0,
             center=center,
             left_support_u=left_support_u,
             right_support_u=right_support_u,
@@ -735,16 +834,16 @@ def fit_constrained_profile(
         pixel_integrated = convolve1d(continuous, pixel_kernel, mode="constant", cval=0.0)
         return np.interp(coordinate, fine_grid, pixel_integrated, left=0.0, right=0.0)
 
-    # Keep the existing height, R, sigma, and du parameters.  The circular
-    # source is fixed at q=0; h3 and h4 perturb only the optical blur kernel.
-    initial = np.r_[np.log([max(peak, noise), 2.0, 0.8]), 0.0, 0.0, 0.0]
-    lower = np.r_[np.log([max(peak * 0.25, noise), 0.15, 0.03]), -0.5, -0.2, -0.2]
-    upper = np.r_[np.log([max(peak * 4.0, noise * 4.0), support, support / 2.0]), 0.5, 0.2, 0.2]
+    # Fit height, R, sigma, and du only.  The circular source is fixed at
+    # q=0 and the optional h3/h4 optical-blur terms are fixed at zero.
+    initial = np.r_[np.log([max(peak, noise), 2.0, 0.8]), 0.0]
+    lower = np.r_[np.log([max(peak * 0.25, noise), 0.15, 0.03]), -0.5]
+    upper = np.r_[np.log([max(peak * 4.0, noise * 4.0), support, support / 2.0]), 0.5]
 
     def residual(theta: np.ndarray) -> np.ndarray:
         model = branch_model(theta, fit_u)
         if model is None:
-            # Invalid Gauss-Hermite kernels are deliberately outside the fit.
+            # Invalid blur kernels are deliberately outside the fit.
             return np.full(fit_values.shape, 1e12, dtype=float)
         return (model - fit_values) * fit_weights
 
@@ -754,14 +853,14 @@ def fit_constrained_profile(
     )
     regularized = branch_model(result.x, centers)
     if regularized is None:
-        raise ValueError("constrained local profile has a negative Gauss-Hermite blur kernel")
+        raise ValueError("constrained local profile has an invalid blur kernel")
     integral = trapezoidal_integral(regularized, centers)
     if not np.isfinite(integral) or integral <= 0.0:
         raise ValueError("constrained local profile has non-positive integral")
     # Commented out normalization to avoid fit to integration inconsistencies
     #regularized /= integral
     du = float(result.x[3])
-    h3, h4 = map(float, result.x[4:6])
+    h3 = h4 = 0.0
     model_at_bins = np.interp(fit_u, centers, regularized)
     bin_residual = model_at_bins - fit_values
     bin_model_rms = float(np.sqrt(np.mean(bin_residual ** 2)))
@@ -800,19 +899,24 @@ def fit_constrained_profile(
     return centers, regularized, count, scatter, used, topology
 
 
-def _fill_missing_local_profiles(profiles: np.ndarray, *arrays: np.ndarray) -> tuple[np.ndarray, ...]:
+def _fill_missing_local_profiles(
+    profiles: np.ndarray, cell_columns: np.ndarray, cell_fibers: np.ndarray, *arrays: np.ndarray,
+) -> tuple[np.ndarray, ...]:
     """Borrow only the nearest chunk/group profile when a local fit is sparse."""
     result = profiles.copy()
     results = [array.copy() for array in arrays]
     available = np.isfinite(result).all(axis=-1)
     if not np.any(available):
         raise ValueError("no usable local LDLS profile fits")
-    for chunk, group in np.argwhere(~available):
-        distances = np.abs(np.argwhere(available) - np.asarray([chunk, group])).sum(axis=1)
-        nearest_chunk, nearest_group = np.argwhere(available)[int(np.argmin(distances))]
-        result[chunk, group] = result[nearest_chunk, nearest_group]
+    centers_x = np.mean(cell_columns, axis=1)
+    centers_fiber = np.mean(cell_fibers, axis=1)
+    for cell in np.flatnonzero(~available):
+        candidates = np.flatnonzero(available)
+        distances = np.abs(centers_x[candidates] - centers_x[cell]) + np.abs(centers_fiber[candidates] - centers_fiber[cell])
+        nearest = int(candidates[int(np.argmin(distances))])
+        result[cell] = result[nearest]
         for array in results:
-            array[chunk, group] = array[nearest_chunk, nearest_group]
+            array[cell] = array[nearest]
     return (result, *results)
 
 
@@ -831,14 +935,17 @@ def _profile_sample_values(
             overlaps = evidence.neighbor_overlaps[indices, slot] & (neighbor >= 0)
             if not np.any(overlaps):
                 continue
-            for neighbor_group in np.unique(profiles.fiber_group[neighbor[overlaps]]):
-                use = overlaps & (profiles.fiber_group[np.maximum(neighbor, 0)] == neighbor_group)
+            neighbor_cell = np.full(neighbor.shape, -1, dtype=np.int32)
+            neighbor_cell[overlaps] = profiles.cell_index[
+                neighbor[overlaps], evidence.column[indices[overlaps]],
+            ]
+            for cell in np.unique(neighbor_cell[overlaps]):
+                use = overlaps & (neighbor_cell == cell)
                 if not np.any(use):
                     continue
-                chunk = int(evidence.chunk[indices[use][0]])
                 shape = np.interp(
                     evidence.neighbor_u[indices[use], slot], profiles.u_grid,
-                    profiles.density[chunk, int(neighbor_group)], left=0.0, right=0.0,
+                    profiles.density[int(cell)], left=0.0, right=0.0,
                 )
                 value[use] -= compact_total[neighbor[use], evidence.column[indices[use]]] * shape
     normalization = compact_total[evidence.fiber[indices], evidence.column[indices]]
@@ -847,30 +954,22 @@ def _profile_sample_values(
 
 def _valley_constraints(
     evidence: ProfileEvidence,
-    chunk: int,
-    group: int,
+    cell: int,
     compact_total: np.ndarray,
     profiles: LocalProfileMap | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Split the fixed observed valleys according to the current local maps."""
     if profiles is None:
         return np.empty(0, dtype=float), np.empty(0, dtype=float)
-    use = (evidence.valley_chunk == chunk) & (evidence.valley_group == group)
+    use = evidence.valley_cell == cell
     if not np.any(use):
         return np.empty(0, dtype=float), np.empty(0, dtype=float)
     first = evidence.valley_first_fiber[use]
     second = evidence.valley_second_fiber[use]
     column = evidence.valley_column[use]
-    first_group = profiles.fiber_group[first]
-    second_group = profiles.fiber_group[second]
-    first_profile = np.empty(first.size, dtype=float)
-    second_profile = np.empty(second.size, dtype=float)
-    for profile_group in np.unique(first_group):
-        selected = first_group == profile_group
-        first_profile[selected] = np.interp(evidence.valley_first_u[use][selected], profiles.u_grid, profiles.density[chunk, profile_group], left=0.0, right=0.0)
-    for profile_group in np.unique(second_group):
-        selected = second_group == profile_group
-        second_profile[selected] = np.interp(evidence.valley_second_u[use][selected], profiles.u_grid, profiles.density[chunk, profile_group], left=0.0, right=0.0)
+    # Both fibers are in ``cell`` by construction in collect_profile_evidence.
+    first_profile = np.interp(evidence.valley_first_u[use], profiles.u_grid, profiles.density[cell], left=0.0, right=0.0)
+    second_profile = np.interp(evidence.valley_second_u[use], profiles.u_grid, profiles.density[cell], left=0.0, right=0.0)
     first_total = compact_total[first, column]
     second_total = compact_total[second, column]
     denominator = first_total * first_profile + second_total * second_profile
@@ -890,8 +989,7 @@ def _profile_fit_inputs(
     compact_total: np.ndarray,
     neighbor_profiles: LocalProfileMap | None,
     *,
-    chunk: int,
-    group: int,
+    cell: int,
     valley_weight: int,
     seed_core_only: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -905,7 +1003,7 @@ def _profile_fit_inputs(
         detector_u = detector_u[core]
         detector_values = detector_values[core]
     valley_u, valley_values = _valley_constraints(
-        evidence, chunk, group, compact_total, neighbor_profiles,
+        evidence, cell, compact_total, neighbor_profiles,
     )
     fit_u = np.r_[detector_u, np.repeat(valley_u, max(1, int(valley_weight)))]
     fit_values = np.r_[detector_values, np.repeat(valley_values, max(1, int(valley_weight)))]
@@ -921,21 +1019,19 @@ def measure_local_profiles(
     aperture_width: float,
     support: float,
     bin_width: float,
-    chunk_width: int,
-    group_size: int,
+    grid: ProfileGrid,
     iterations: int,
     valley_weight: int,
 ) -> tuple[LocalProfileMap, LocalProfileMap, np.ndarray, int, bool, float, float, list[dict[str, float | int]]]:
     """Fit local maps from fixed evidence, updating only its interpretation."""
-    chunks, groups, fiber_group = _profile_layout(trace, support=support, chunk_width=chunk_width, group_size=group_size)
     u_grid = np.arange(-support + bin_width / 2.0, support, bin_width)
-    profiles = np.full((len(chunks), len(groups), u_grid.size), np.nan, dtype=float)
-    sample_count = np.zeros((len(chunks), len(groups)), dtype=np.int32)
-    valley_count = np.zeros((len(chunks), len(groups)), dtype=np.int32)
+    profiles = np.full((grid.cell_columns.shape[0], u_grid.size), np.nan, dtype=float)
+    sample_count = np.zeros(grid.cell_columns.shape[0], dtype=np.int32)
+    valley_count = np.zeros(grid.cell_columns.shape[0], dtype=np.int32)
     bin_count = np.zeros_like(profiles, dtype=np.int32)
     bin_scatter = np.full_like(profiles, np.nan)
     bin_used = np.zeros_like(profiles, dtype=bool)
-    peak_u = np.full((len(chunks), len(groups)), np.nan)
+    peak_u = np.full(grid.cell_columns.shape[0], np.nan)
     centroid_offset = np.full_like(peak_u, np.nan)
     height = np.full_like(peak_u, np.nan)
     radius = np.full_like(peak_u, np.nan)
@@ -962,53 +1058,51 @@ def measure_local_profiles(
     for iteration in range(max(1, int(iterations) + 1)):
         completed_iterations = iteration + 1
         updated = np.full_like(profiles, np.nan)
-        for chunk_index in range(len(chunks)):
-            for group_index in range(len(groups)):
-                selected = (evidence.chunk == chunk_index) & (evidence.group == group_index)
-                sample_count[chunk_index, group_index] = int(selected.sum())
-                _, _, valley_u, _, sample_u, values = _profile_fit_inputs(
-                    evidence, selected, compact_total, previous,
-                    chunk=chunk_index, group=group_index,
-                    valley_weight=valley_weight, seed_core_only=previous is None,
+        for cell in range(grid.cell_columns.shape[0]):
+            selected = evidence.cell == cell
+            sample_count[cell] = int(selected.sum())
+            _, _, valley_u, _, sample_u, values = _profile_fit_inputs(
+                evidence, selected, compact_total, previous,
+                cell=cell,
+                valley_weight=valley_weight, seed_core_only=previous is None,
+            )
+            valley_count[cell] = valley_u.size
+            try:
+                fitted_u, fitted, counts, scatter, used, topology = fit_constrained_profile(sample_u, values, support=support, bin_width=bin_width)
+                integral = topology["profile_integral"]
+                updated[cell] = np.interp(
+                    u_grid, fitted_u, fitted / integral, left=0.0, right=0.0,
                 )
-                valley_count[chunk_index, group_index] = valley_u.size
-                try:
-                    fitted_u, fitted, counts, scatter, used, topology = fit_constrained_profile(sample_u, values, support=support, bin_width=bin_width)
-                    integral = topology["profile_integral"]
-                    updated[chunk_index, group_index] = np.interp(
-                        u_grid, fitted_u, fitted / integral, left=0.0, right=0.0,
-                    )
-                    bin_count[chunk_index, group_index] = counts
-                    bin_scatter[chunk_index, group_index] = scatter
-                    bin_used[chunk_index, group_index] = used
-                    peak_u[chunk_index, group_index] = topology["peak_u"]
-                    centroid_offset[chunk_index, group_index] = topology["centroid_offset"]
-                    height[chunk_index, group_index] = topology["height"]
-                    radius[chunk_index, group_index] = topology["radius"]
-                    sigma[chunk_index, group_index] = topology["sigma"]
-                    profile_integral[chunk_index, group_index] = integral
-                    h3[chunk_index, group_index] = topology["h3"]
-                    h4[chunk_index, group_index] = topology["h4"]
-                    bin_model_rms[chunk_index, group_index] = topology["bin_model_rms"]
-                    bin_model_weighted_rms[chunk_index, group_index] = topology["bin_model_weighted_rms"]
-                    optimizer_status[chunk_index, group_index] = topology["optimizer_status"]
-                    optimizer_cost[chunk_index, group_index] = topology["optimizer_cost"]
-                    parameter_at_bound[chunk_index, group_index] = topology["parameter_at_bound"]
-                    left_valley_u[chunk_index, group_index] = topology["left_valley_u"]
-                    right_valley_u[chunk_index, group_index] = topology["right_valley_u"]
-                    left_inflection_u[chunk_index, group_index] = topology["left_inflection_u"]
-                    right_inflection_u[chunk_index, group_index] = topology["right_inflection_u"]
-                except ValueError:
-                    if previous is not None:
-                        updated[chunk_index, group_index] = previous.density[chunk_index, group_index]
+                bin_count[cell] = counts
+                bin_scatter[cell] = scatter
+                bin_used[cell] = used
+                peak_u[cell] = topology["peak_u"]
+                centroid_offset[cell] = topology["centroid_offset"]
+                height[cell] = topology["height"]
+                radius[cell] = topology["radius"]
+                sigma[cell] = topology["sigma"]
+                profile_integral[cell] = integral
+                h3[cell] = topology["h3"]
+                h4[cell] = topology["h4"]
+                bin_model_rms[cell] = topology["bin_model_rms"]
+                bin_model_weighted_rms[cell] = topology["bin_model_weighted_rms"]
+                optimizer_status[cell] = topology["optimizer_status"]
+                optimizer_cost[cell] = topology["optimizer_cost"]
+                parameter_at_bound[cell] = topology["parameter_at_bound"]
+                left_valley_u[cell] = topology["left_valley_u"]
+                right_valley_u[cell] = topology["right_valley_u"]
+                left_inflection_u[cell] = topology["left_inflection_u"]
+                right_inflection_u[cell] = topology["right_inflection_u"]
+            except ValueError:
+                if previous is not None:
+                    updated[cell] = previous.density[cell]
         profiles, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, height, radius, sigma, profile_integral, h3, h4, bin_model_rms, bin_model_weighted_rms, optimizer_status, optimizer_cost, parameter_at_bound, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u = _fill_missing_local_profiles(
-            updated, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, height, radius, sigma, profile_integral, h3, h4, bin_model_rms, bin_model_weighted_rms, optimizer_status, optimizer_cost, parameter_at_bound, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u,
+            updated, grid.cell_columns, grid.cell_fibers, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, height, radius, sigma, profile_integral, h3, h4, bin_model_rms, bin_model_weighted_rms, optimizer_status, optimizer_cost, parameter_at_bound, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u,
         )
         current = LocalProfileMap(
             u_grid=u_grid, density=profiles,
-            chunk_columns=np.asarray([(int(chunk[0]), int(chunk[-1])) for chunk in chunks], dtype=np.int32),
-            group_bounds=np.asarray([(int(group[0]), int(group[-1])) for group in groups], dtype=np.int32),
-            fiber_group=fiber_group, sample_count=sample_count, valley_constraint_count=valley_count,
+            cell_columns=grid.cell_columns, cell_fibers=grid.cell_fibers,
+            cell_index=grid.cell_index, sample_count=sample_count, valley_constraint_count=valley_count,
             bin_count=bin_count, bin_scatter=bin_scatter, bin_used=bin_used,
             peak_u=peak_u, centroid_offset=centroid_offset,
             height=height, radius=radius, sigma=sigma, profile_integral=profile_integral,
@@ -1024,11 +1118,10 @@ def measure_local_profiles(
         # next pass's neighbor subtraction use a physical unit-integral map.
         aperture_capture(trace, detector_rows, current, aperture_width)
         updated_total = compact_total.copy()
-        for chunk_index, columns in enumerate(chunks):
-            for group_index, fibers in enumerate(groups):
-                integral = profile_integral[chunk_index, group_index]
-                if np.isfinite(integral) and integral > 0.0:
-                    updated_total[np.ix_(fibers, columns)] *= integral
+        for cell, ((x_start, x_stop), (fiber_start, fiber_stop)) in enumerate(zip(grid.cell_columns, grid.cell_fibers)):
+            integral = profile_integral[cell]
+            if np.isfinite(integral) and integral > 0.0:
+                updated_total[fiber_start:fiber_stop + 1, x_start:x_stop + 1] *= integral
         finite_integrals = profile_integral[np.isfinite(profile_integral) & (profile_integral > 0.0)]
         iteration_integral_stats.append({
             "iteration": iteration + 1,
@@ -1078,56 +1171,55 @@ def measure_local_profiles(
     closure_left_inflection_u = current.left_inflection_u.copy()
     closure_right_inflection_u = current.right_inflection_u.copy()
     closure_valley_count = current.valley_constraint_count.copy()
-    for chunk_index in range(len(chunks)):
-        for group_index in range(len(groups)):
-            selected = (evidence.chunk == chunk_index) & (evidence.group == group_index)
-            _, _, valley_u, _, fit_u, fit_values = _profile_fit_inputs(
-                evidence, selected, frozen_total, frozen_neighbors,
-                chunk=chunk_index, group=group_index,
-                valley_weight=valley_weight, seed_core_only=False,
+    for cell in range(grid.cell_columns.shape[0]):
+        selected = evidence.cell == cell
+        _, _, valley_u, _, fit_u, fit_values = _profile_fit_inputs(
+            evidence, selected, frozen_total, frozen_neighbors,
+            cell=cell,
+            valley_weight=valley_weight, seed_core_only=False,
+        )
+        closure_valley_count[cell] = valley_u.size
+        try:
+            fitted_u, fitted, counts, scatter, used, topology = fit_constrained_profile(
+                fit_u, fit_values, support=support, bin_width=bin_width,
             )
-            closure_valley_count[chunk_index, group_index] = valley_u.size
-            try:
-                fitted_u, fitted, counts, scatter, used, topology = fit_constrained_profile(
-                    fit_u, fit_values, support=support, bin_width=bin_width,
-                )
-            except ValueError:
-                # Preserve a usable prior map for extraction, while marking
-                # the corresponding diagnostic panel as an unavailable fit.
-                closure_optimizer_status[chunk_index, group_index] = -99
-                closure_optimizer_cost[chunk_index, group_index] = np.nan
-                closure_bin_model_rms[chunk_index, group_index] = np.nan
-                closure_bin_model_weighted_rms[chunk_index, group_index] = np.nan
-                closure_parameter_at_bound[chunk_index, group_index] = False
-                continue
-            integral = topology["profile_integral"]
-            closure_density[chunk_index, group_index] = np.interp(
-                u_grid, fitted_u, fitted / integral, left=0.0, right=0.0,
-            )
-            closure_bin_count[chunk_index, group_index] = counts
-            closure_bin_scatter[chunk_index, group_index] = scatter
-            closure_bin_used[chunk_index, group_index] = used
-            closure_peak_u[chunk_index, group_index] = topology["peak_u"]
-            closure_centroid_offset[chunk_index, group_index] = topology["centroid_offset"]
-            closure_height[chunk_index, group_index] = topology["height"]
-            closure_radius[chunk_index, group_index] = topology["radius"]
-            closure_sigma[chunk_index, group_index] = topology["sigma"]
-            closure_profile_integral[chunk_index, group_index] = integral
-            closure_h3[chunk_index, group_index] = topology["h3"]
-            closure_h4[chunk_index, group_index] = topology["h4"]
-            closure_bin_model_rms[chunk_index, group_index] = topology["bin_model_rms"]
-            closure_bin_model_weighted_rms[chunk_index, group_index] = topology["bin_model_weighted_rms"]
-            closure_optimizer_status[chunk_index, group_index] = topology["optimizer_status"]
-            closure_optimizer_cost[chunk_index, group_index] = topology["optimizer_cost"]
-            closure_parameter_at_bound[chunk_index, group_index] = topology["parameter_at_bound"]
-            closure_left_valley_u[chunk_index, group_index] = topology["left_valley_u"]
-            closure_right_valley_u[chunk_index, group_index] = topology["right_valley_u"]
-            closure_left_inflection_u[chunk_index, group_index] = topology["left_inflection_u"]
-            closure_right_inflection_u[chunk_index, group_index] = topology["right_inflection_u"]
+        except ValueError:
+            # Preserve a usable prior map for extraction, while marking
+            # the corresponding diagnostic panel as an unavailable fit.
+            closure_optimizer_status[cell] = -99
+            closure_optimizer_cost[cell] = np.nan
+            closure_bin_model_rms[cell] = np.nan
+            closure_bin_model_weighted_rms[cell] = np.nan
+            closure_parameter_at_bound[cell] = False
+            continue
+        integral = topology["profile_integral"]
+        closure_density[cell] = np.interp(
+            u_grid, fitted_u, fitted / integral, left=0.0, right=0.0,
+        )
+        closure_bin_count[cell] = counts
+        closure_bin_scatter[cell] = scatter
+        closure_bin_used[cell] = used
+        closure_peak_u[cell] = topology["peak_u"]
+        closure_centroid_offset[cell] = topology["centroid_offset"]
+        closure_height[cell] = topology["height"]
+        closure_radius[cell] = topology["radius"]
+        closure_sigma[cell] = topology["sigma"]
+        closure_profile_integral[cell] = integral
+        closure_h3[cell] = topology["h3"]
+        closure_h4[cell] = topology["h4"]
+        closure_bin_model_rms[cell] = topology["bin_model_rms"]
+        closure_bin_model_weighted_rms[cell] = topology["bin_model_weighted_rms"]
+        closure_optimizer_status[cell] = topology["optimizer_status"]
+        closure_optimizer_cost[cell] = topology["optimizer_cost"]
+        closure_parameter_at_bound[cell] = topology["parameter_at_bound"]
+        closure_left_valley_u[cell] = topology["left_valley_u"]
+        closure_right_valley_u[cell] = topology["right_valley_u"]
+        closure_left_inflection_u[cell] = topology["left_inflection_u"]
+        closure_right_inflection_u[cell] = topology["right_inflection_u"]
     current = LocalProfileMap(
         u_grid=current.u_grid, density=closure_density,
-        chunk_columns=current.chunk_columns, group_bounds=current.group_bounds,
-        fiber_group=current.fiber_group, sample_count=current.sample_count,
+        cell_columns=current.cell_columns, cell_fibers=current.cell_fibers,
+        cell_index=current.cell_index, sample_count=current.sample_count,
         valley_constraint_count=closure_valley_count,
         bin_count=closure_bin_count, bin_scatter=closure_bin_scatter,
         bin_used=closure_bin_used, peak_u=closure_peak_u,
@@ -1164,13 +1256,16 @@ def aperture_capture(trace: np.ndarray, detector_rows: int, profiles: LocalProfi
     left = np.maximum(rows.astype(float) - trace[..., None], -width / 2.0)
     right = np.minimum(rows.astype(float) + 1.0 - trace[..., None], width / 2.0)
     captured = np.full(trace.shape, np.nan, dtype=float)
-    for fiber in range(trace.shape[0]):
-        for chunk, (start, stop) in enumerate(profiles.chunk_columns):
-            profile = profiles.density[chunk, profiles.fiber_group[fiber]]
-            captured[fiber, start:stop + 1] = np.sum(
-                profile_integral(profiles.u_grid, profile, left[fiber, start:stop + 1], right[fiber, start:stop + 1])
-                * (weights[fiber, start:stop + 1] > 0.0), axis=-1,
-            )
+    for cell, ((start, stop), (first_fiber, last_fiber)) in enumerate(zip(profiles.cell_columns, profiles.cell_fibers)):
+        profile = profiles.density[cell]
+        captured[first_fiber:last_fiber + 1, start:stop + 1] = np.sum(
+            profile_integral(
+                profiles.u_grid, profile,
+                left[first_fiber:last_fiber + 1, start:stop + 1],
+                right[first_fiber:last_fiber + 1, start:stop + 1],
+            ) * (weights[first_fiber:last_fiber + 1, start:stop + 1] > 0.0),
+            axis=-1,
+        )
     return np.where(valid, captured, np.nan)
 
 
@@ -1281,23 +1376,23 @@ def plot_profile_diagnostics(
     fig, axes = plt.subplots(3, 3, figsize=(18, 14.4), sharex=True, sharey=True)
     for axis, (x0, y0) in zip(axes.flat, targets):
         fiber = int(np.nanargmin(np.abs(trace[:, x0] - y0)))
-        chunk, group = profiles.indices(fiber, x0)
-        start, stop = profiles.chunk_columns[chunk]
-        first_fiber, last_fiber = profiles.group_bounds[group]
-        selected = (evidence.chunk == chunk) & (evidence.group == group)
+        cell = profiles.indices(fiber, x0)
+        start, stop = profiles.cell_columns[cell]
+        first_fiber, last_fiber = profiles.cell_fibers[cell]
+        selected = evidence.cell == cell
         uu, vv, valley_u, valley_v, fit_u, fit_v = _profile_fit_inputs(
             evidence, selected, compact_total, neighbor_profiles,
-            chunk=chunk, group=group, valley_weight=valley_weight,
+            cell=cell, valley_weight=valley_weight,
             seed_core_only=False,
         )
         bin_u, bin_median, bin_scatter, bin_count = robust_profile_bins(
             fit_u, fit_v, support=support, bin_width=bin_width,
         )
-        if profiles.optimizer_status[chunk, group] == -99:
+        if profiles.optimizer_status[cell] == -99:
             raise RuntimeError("profile diagnostic closure refit is unavailable")
-        if not np.array_equal(bin_count, profiles.bin_count[chunk, group]):
+        if not np.array_equal(bin_count, profiles.bin_count[cell]):
             raise RuntimeError("profile diagnostic bins do not match the frozen closure fit")
-        bin_used = profiles.bin_used[chunk, group] & np.isfinite(bin_median)
+        bin_used = profiles.bin_used[cell] & np.isfinite(bin_median)
         bin_rejected = (bin_count > 0) & np.isfinite(bin_median) & ~bin_used
         axis.plot(uu, vv, ".", ms=1.0, alpha=0.035, color="tab:blue", label="all detector samples")
         if valley_u.size:
@@ -1307,22 +1402,22 @@ def plot_profile_diagnostics(
         if np.any(bin_used):
             bin_error = bin_scatter[bin_used] / np.sqrt(np.maximum(bin_count[bin_used], 1))
             axis.errorbar(bin_u[bin_used], bin_median[bin_used], yerr=bin_error, fmt="o", ms=2.5, color="tab:purple", ecolor="tab:purple", elinewidth=0.55, capsize=0, alpha=0.85, label="accepted robust bins")
-        axis.plot(profiles.u_grid, profiles.density[chunk, group], color="black", lw=1.5, label="constrained fit")
-        axis.axvline(profiles.peak_u[chunk, group], color="0.35", lw=0.7, ls="--")
-        axis.axvline(profiles.left_valley_u[chunk, group], color="0.6", lw=0.6, ls=":")
-        axis.axvline(profiles.right_valley_u[chunk, group], color="0.6", lw=0.6, ls=":")
+        axis.plot(profiles.u_grid, profiles.density[cell], color="black", lw=1.5, label="constrained fit")
+        axis.axvline(profiles.peak_u[cell], color="0.35", lw=0.7, ls="--")
+        axis.axvline(profiles.left_valley_u[cell], color="0.6", lw=0.6, ls=":")
+        axis.axvline(profiles.right_valley_u[cell], color="0.6", lw=0.6, ls=":")
         axis.set(
             title=(
-                f"x={x0}, fiber={fiber}\nchunk {start}-{stop}, group {first_fiber}-{last_fiber}\n"
-                f"du={profiles.centroid_offset[chunk, group]:+.3f} px; "
-                f"H={profiles.height[chunk, group]:.3g}; R={profiles.radius[chunk, group]:.3f}; "
-                f"sigma={profiles.sigma[chunk, group]:.3f}\n"
-                f"h3={profiles.h3[chunk, group]:+.3f}; h4={profiles.h4[chunk, group]:+.3f}; "
-                f"RMS={profiles.bin_model_rms[chunk, group]:.3g}; "
-                f"wRMS={profiles.bin_model_weighted_rms[chunk, group]:.3g}\n"
-                f"status={profiles.optimizer_status[chunk, group]}; "
-                f"cost={profiles.optimizer_cost[chunk, group]:.3g}; "
-                f"bound={'yes' if profiles.parameter_at_bound[chunk, group] else 'no'}; n={uu.size}"
+                f"x={x0}, fiber={fiber}\ncell {cell}: x {start}-{stop}, fiber {first_fiber}-{last_fiber}\n"
+                f"du={profiles.centroid_offset[cell]:+.3f} px; "
+                f"H={profiles.height[cell]:.3g}; R={profiles.radius[cell]:.3f}; "
+                f"sigma={profiles.sigma[cell]:.3f}\n"
+                f"h3={profiles.h3[cell]:+.3f}; h4={profiles.h4[cell]:+.3f}; "
+                f"RMS={profiles.bin_model_rms[cell]:.3g}; "
+                f"wRMS={profiles.bin_model_weighted_rms[cell]:.3g}\n"
+                f"status={profiles.optimizer_status[cell]}; "
+                f"cost={profiles.optimizer_cost[cell]:.3g}; "
+                f"bound={'yes' if profiles.parameter_at_bound[cell] else 'no'}; n={uu.size}"
             ),
             xlim=(-support, support),
         )
@@ -1333,6 +1428,190 @@ def plot_profile_diagnostics(
         axis.set_ylabel("LDLS pixel / estimated compact total flux")
     axes[0, 0].legend(frameon=False, fontsize=7, loc="upper right")
     fig.suptitle("Local LDLS evidence and constrained profiles by detector position")
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
+def profile_map_coordinates(trace: np.ndarray, profiles: LocalProfileMap) -> tuple[np.ndarray, np.ndarray]:
+    """Return physical detector coordinates for each local-profile cell."""
+    coordinates_x = np.mean(profiles.cell_columns, axis=1, dtype=float)
+    coordinates_y = np.full(profiles.cell_columns.shape[0], np.nan, dtype=float)
+    trace_columns = np.arange(trace.shape[1], dtype=float)
+    for cell, ((first_fiber, last_fiber), x) in enumerate(zip(profiles.cell_fibers, coordinates_x)):
+        group_trace = np.asarray(trace[int(first_fiber):int(last_fiber) + 1], dtype=float)
+        positions: list[float] = []
+        for fiber_trace in group_trace:
+            finite = np.isfinite(fiber_trace)
+            if np.any(finite):
+                positions.append(float(np.interp(x, trace_columns[finite], fiber_trace[finite])))
+        if positions:
+            coordinates_y[cell] = float(np.median(positions))
+    return coordinates_x, coordinates_y
+
+
+def plot_profile_grid(trace: np.ndarray, grid: ProfileGrid, path: Path) -> None:
+    """Plot trace-only adaptive cell boundaries in physical CCD coordinates."""
+    fig, axis = plt.subplots(figsize=(14, 9))
+    columns = np.arange(trace.shape[1])
+    for fiber_trace in trace:
+        axis.plot(columns, fiber_trace, color="0.55", alpha=0.24, lw=0.45, zorder=1)
+    for cell, ((x_start, x_stop), (fiber_start, fiber_stop)) in enumerate(zip(grid.cell_columns, grid.cell_fibers)):
+        sample = trace[fiber_start:fiber_stop + 1, x_start:x_stop + 1]
+        if not np.isfinite(sample).any():
+            continue
+        y_start = float(np.nanmin(sample))
+        y_stop = float(np.nanmax(sample))
+        color = "tab:red" if grid.reached_minimum_size[cell] else "tab:blue"
+        rectangle = plt.Rectangle(
+            (x_start, y_start), x_stop - x_start + 1, max(y_stop - y_start, 0.5),
+            fill=False, edgecolor=color, linewidth=0.6, alpha=0.75, zorder=2,
+        )
+        axis.add_patch(rectangle)
+    axis.set(
+        xlabel="detector X (column)", ylabel="detector Y (row)",
+        title=(f"{grid.mode.capitalize()} trace-geometry profile grid: "
+               f"{grid.cell_columns.shape[0]} cells (red = refinement stopped at minimum size)"),
+    )
+    axis.grid(alpha=0.15)
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
+def plot_profile_parameter_maps(
+    profile_map_x: np.ndarray,
+    profile_map_y: np.ndarray,
+    radius: np.ndarray,
+    sigma: np.ndarray,
+    du: np.ndarray,
+    fit_valid: np.ndarray,
+    parameter_at_bound: np.ndarray,
+    path: Path,
+) -> None:
+    """Scatter independently fitted local-profile parameters on the CCD."""
+    parameters = (
+        (radius, "R", "R (pixel)", "viridis", False),
+        (sigma, "sigma", "sigma (pixel)", "viridis", False),
+        (du, "du", "du (pixel)", "coolwarm", True),
+    )
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.8), sharex=True, sharey=True)
+    for axis, (values, title, colorbar_label, cmap, symmetric) in zip(axes, parameters):
+        usable = fit_valid & np.isfinite(profile_map_x) & np.isfinite(profile_map_y) & np.isfinite(values)
+        if symmetric and np.any(usable):
+            limit = max(float(np.max(np.abs(values[usable]))), np.finfo(float).eps)
+            scatter = axis.scatter(
+                profile_map_x[usable], profile_map_y[usable], c=values[usable],
+                cmap=cmap, vmin=-limit, vmax=limit, s=42, linewidths=0.0,
+            )
+        else:
+            scatter = axis.scatter(
+                profile_map_x[usable], profile_map_y[usable], c=values[usable],
+                cmap=cmap, s=42, linewidths=0.0,
+            )
+        bounded = usable & parameter_at_bound
+        if np.any(bounded):
+            axis.scatter(
+                profile_map_x[bounded], profile_map_y[bounded], facecolors="none",
+                edgecolors="black", s=58, linewidths=0.75, label="parameter at bound",
+            )
+        colorbar = fig.colorbar(scatter, ax=axis)
+        colorbar.set_label(colorbar_label)
+        axis.set(title=title, xlabel="detector X (column)")
+        axis.grid(alpha=0.2)
+        if np.any(bounded):
+            axis.legend(frameon=False, fontsize=8, loc="best")
+    axes[0].set_ylabel("detector Y (row)")
+    fig.suptitle(
+        "Local LDLS profile parameters at fitted physical detector positions "
+        f"({int(np.count_nonzero(fit_valid))}/{fit_valid.size} independently fitted cells)"
+    )
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
+def plot_profile_width_maps(
+    profile_map_x: np.ndarray,
+    profile_map_y: np.ndarray,
+    radius: np.ndarray,
+    sigma: np.ndarray,
+    fit_valid: np.ndarray,
+    parameter_at_bound: np.ndarray,
+    path: Path,
+) -> None:
+    """Show fitted total-width and Gaussian-blur fractions on the CCD."""
+    core_variance = radius ** 2 / 4.0 + sigma ** 2
+    width = np.sqrt(core_variance + 1.0 / 12.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        blur_fraction = sigma ** 2 / core_variance
+    parameters = (
+        (width, "W", "W (pixel)", "viridis", {}),
+        (blur_fraction, "f_sigma", "f_sigma", "cividis", {}),
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.8), sharex=True, sharey=True)
+    for axis, (values, title, colorbar_label, cmap, limits) in zip(axes, parameters):
+        usable = fit_valid & np.isfinite(profile_map_x) & np.isfinite(profile_map_y) & np.isfinite(values)
+        scatter = axis.scatter(
+            profile_map_x[usable], profile_map_y[usable], c=values[usable],
+            cmap=cmap, s=42, linewidths=0.0, **limits,
+        )
+        bounded = usable & parameter_at_bound
+        if np.any(bounded):
+            axis.scatter(
+                profile_map_x[bounded], profile_map_y[bounded], facecolors="none",
+                edgecolors="black", s=58, linewidths=0.75, label="parameter at bound",
+            )
+            axis.legend(frameon=False, fontsize=8, loc="best")
+        colorbar = fig.colorbar(scatter, ax=axis)
+        colorbar.set_label(colorbar_label)
+        axis.set(title=title, xlabel="detector X (column)")
+        axis.grid(alpha=0.2)
+    axes[0].set_ylabel("detector Y (row)")
+    fig.suptitle("Effective local-profile width and Gaussian-blur fraction")
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
+def plot_profile_radius_sigma_tradeoff(
+    profile_map_x: np.ndarray,
+    profile_map_y: np.ndarray,
+    radius: np.ndarray,
+    sigma: np.ndarray,
+    fit_valid: np.ndarray,
+    parameter_at_bound: np.ndarray,
+    path: Path,
+) -> None:
+    """Show the R--sigma tradeoff colored by each physical detector coordinate."""
+    usable = (
+        fit_valid & np.isfinite(profile_map_x) & np.isfinite(profile_map_y)
+        & np.isfinite(radius) & np.isfinite(sigma)
+    )
+    coordinates = (
+        (profile_map_x, "detector X (column)", "viridis"),
+        (profile_map_y, "detector Y (row)", "plasma"),
+    )
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5.8), sharex=True, sharey=True)
+    for axis, (coordinate, colorbar_label, cmap) in zip(axes, coordinates):
+        scatter = axis.scatter(
+            radius[usable], sigma[usable], c=coordinate[usable], cmap=cmap,
+            s=42, linewidths=0.0,
+        )
+        bounded = usable & parameter_at_bound
+        if np.any(bounded):
+            axis.scatter(
+                radius[bounded], sigma[bounded], facecolors="none",
+                edgecolors="black", s=58, linewidths=0.75, label="parameter at bound",
+            )
+            axis.legend(frameon=False, fontsize=8, loc="best")
+        colorbar = fig.colorbar(scatter, ax=axis)
+        colorbar.set_label(colorbar_label)
+        axis.set(xlabel="R (pixel)", ylabel="sigma (pixel)")
+        axis.grid(alpha=0.2)
+    axes[0].set_title("R versus sigma colored by X")
+    axes[1].set_title("R versus sigma colored by Y")
+    fig.suptitle("Local-profile radius / Gaussian-width tradeoff")
     fig.tight_layout()
     fig.savefig(path, dpi=170)
     plt.close(fig)
@@ -1370,8 +1649,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--aperture-width", type=float, default=5.0)
     parser.add_argument("--profile-support", type=float, default=8.0)
     parser.add_argument("--profile-bin-width", type=float, default=0.4)
-    parser.add_argument("--profile-chunk-width", type=int, default=100)
-    parser.add_argument("--profile-group-size", type=int, default=16)
+    parser.add_argument("--profile-grid", choices=("adaptive", "fixed"), default="adaptive", help="Trace-only adaptive profile grid, or the temporary fixed comparison grid")
+    parser.add_argument("--profile-chunk-width", type=int, default=200, help="Initial/fixed profile cell width in detector columns")
+    parser.add_argument("--profile-group-size", type=int, default=32, help="Initial/fixed profile cell height in fibers")
+    parser.add_argument("--profile-trace-tolerance", type=float, default=0.5, help="Maximum trace excursion within an adaptive cell (pixels)")
+    parser.add_argument("--profile-separation-tolerance", type=float, default=0.25, help="Maximum local neighboring-fiber separation variation within an adaptive cell (pixels)")
+    parser.add_argument("--profile-min-chunk-width", type=int, default=25, help="Minimum adaptive cell width in detector columns")
+    parser.add_argument("--profile-min-group-size", type=int, default=4, help="Minimum adaptive cell height in fibers")
     parser.add_argument("--profile-deblend-iterations", type=int, default=3, help="Maximum post-seed capture/deblend refinements; exits early once stable")
     parser.add_argument("--profile-valley-weight", type=int, default=1)
     parser.add_argument("--ldls-smoothing-window", type=int, default=101)
@@ -1426,7 +1710,9 @@ def main(argv: list[str] | None = None) -> int:
     ldls, _, ldls_mask = assemble_pair(service, lower, upper, "master_ldls", subtract_gap_baseline=True)
     sci, _, sci_mask = assemble_pair(service, lower, upper, "master_sci", subtract_gap_baseline=True)
     arc, _, arc_mask = assemble_pair(service, lower, upper, "master_arc", subtract_gap_baseline=False)
-    traces = physical_trace_map(load(service, lower.trace_map, "fiber_trace_map"), load(service, upper.trace_map, "fiber_trace_map"))
+    lower_traces = load(service, lower.trace_map, "fiber_trace_map")
+    upper_traces = load(service, upper.trace_map, "fiber_trace_map")
+    traces = physical_trace_map(lower_traces, upper_traces)
     waves = np.vstack((load(service, lower.wavelength_map, "wavelength_map"), load(service, upper.wavelength_map, "wavelength_map"))).astype(float)
     fits.writeto(output / "01_assembled_ldls_baseline_subtracted.fits", ldls, overwrite=True)
     fits.writeto(output / "01_assembled_science_baseline_subtracted.fits", sci, overwrite=True)
@@ -1441,28 +1727,48 @@ def main(argv: list[str] | None = None) -> int:
         width=args.aperture_width,
     ).get_array("spectrum"), dtype=float)
     preliminary = smooth_spectra(preliminary, args.ldls_smoothing_window)
-    profile_chunks, profile_groups, profile_fiber_group = _profile_layout(
-        traces, support=args.profile_support,
+    profile_grid = _profile_grid(
+        traces, support=args.profile_support, mode=args.profile_grid,
         chunk_width=args.profile_chunk_width, group_size=args.profile_group_size,
+        trace_tolerance=args.profile_trace_tolerance,
+        separation_tolerance=args.profile_separation_tolerance,
+        minimum_chunk_width=args.profile_min_chunk_width,
+        minimum_group_size=args.profile_min_group_size,
+        amplifier_boundary=np.asarray(lower_traces).shape[0],
     )
     evidence = collect_profile_evidence(
         ldls, traces, preliminary, ldls_mask, support=args.profile_support,
-        chunks=profile_chunks, groups=profile_groups, fiber_group=profile_fiber_group,
+        grid=profile_grid,
     )
     profiles, diagnostic_neighbors, compact_total, profile_iterations, profile_converged, capture_change, profile_change, profile_integral_iterations = measure_local_profiles(
         evidence, traces, preliminary, detector_rows=ldls.shape[0], aperture_width=args.aperture_width,
-        support=args.profile_support, bin_width=args.profile_bin_width,
-        chunk_width=args.profile_chunk_width, group_size=args.profile_group_size,
+        support=args.profile_support, bin_width=args.profile_bin_width, grid=profile_grid,
         iterations=args.profile_deblend_iterations,
         valley_weight=args.profile_valley_weight,
     )
     captured = aperture_capture(traces, ldls.shape[0], profiles, args.aperture_width)
+    profile_map_x, profile_map_y = profile_map_coordinates(traces, profiles)
+    # A cell is valid only when the final frozen closure pass fitted it
+    # directly.  Closure failures retain a borrowed extraction profile, but
+    # are excluded from the parameter-map measurements below.
+    profile_map_fit_valid = (
+        (profiles.optimizer_status != -99)
+        & np.isfinite(profiles.radius)
+        & np.isfinite(profiles.sigma)
+        & np.isfinite(profiles.centroid_offset)
+    )
     np.savez_compressed(
         output / "02_ldls_profile_data.npz",
         profile_u=profiles.u_grid, profile_density=profiles.density,
-        profile_chunk_columns=profiles.chunk_columns,
-        profile_group_bounds=profiles.group_bounds,
-        fiber_profile_group=profiles.fiber_group,
+        profile_cell_columns=profiles.cell_columns,
+        profile_cell_fibers=profiles.cell_fibers,
+        profile_cell_index=profiles.cell_index,
+        profile_grid_mode=profile_grid.mode,
+        profile_trace_excursion=profile_grid.trace_excursion,
+        profile_fiber_separation_variation=profile_grid.separation_variation,
+        profile_fiber_separation_x_variation=profile_grid.separation_x_variation,
+        profile_fiber_separation_fiber_variation=profile_grid.separation_fiber_variation,
+        profile_grid_reached_minimum_size=profile_grid.reached_minimum_size,
         profile_sample_count=profiles.sample_count,
         valley_constraint_count=profiles.valley_constraint_count,
         profile_bin_count=profiles.bin_count,
@@ -1481,6 +1787,13 @@ def main(argv: list[str] | None = None) -> int:
         profile_optimizer_status=profiles.optimizer_status,
         profile_optimizer_cost=profiles.optimizer_cost,
         profile_parameter_at_bound=profiles.parameter_at_bound,
+        profile_map_x=profile_map_x,
+        profile_map_y=profile_map_y,
+        R=profiles.radius,
+        sigma=profiles.sigma,
+        du=profiles.centroid_offset,
+        profile_map_fit_valid=profile_map_fit_valid,
+        profile_map_parameter_at_bound=profiles.parameter_at_bound,
         profile_closure_neighbor_density=diagnostic_neighbors.density,
         profile_left_valley_u=profiles.left_valley_u,
         profile_right_valley_u=profiles.right_valley_u,
@@ -1490,7 +1803,7 @@ def main(argv: list[str] | None = None) -> int:
         compact_total_spectrum=compact_total,
         evidence_u=evidence.u, evidence_signal=evidence.signal,
         evidence_fiber=evidence.fiber, evidence_column=evidence.column,
-        evidence_chunk=evidence.chunk, evidence_group=evidence.group,
+        evidence_cell=evidence.cell,
         evidence_five_pixel_normalization=evidence.five_pixel_normalization,
         evidence_seed_core=evidence.seed_core,
         evidence_neighbor_fiber=evidence.neighbor_fiber,
@@ -1500,8 +1813,42 @@ def main(argv: list[str] | None = None) -> int:
         valley_first_fiber=evidence.valley_first_fiber,
         valley_second_fiber=evidence.valley_second_fiber,
         valley_column=evidence.valley_column,
-        valley_chunk=evidence.valley_chunk, valley_group=evidence.valley_group,
+        valley_cell=evidence.valley_cell,
         valley_first_u=evidence.valley_first_u, valley_second_u=evidence.valley_second_u,
+    )
+    write_json(output / "02_profile_grid_cells.json", {
+        "grid_mode": profile_grid.mode,
+        "cells": [
+            {
+                "cell": int(cell),
+                "x_range_columns": [int(x_start), int(x_stop)],
+                "fiber_range": [int(fiber_start), int(fiber_stop)],
+                "trace_excursion_pixels": float(profile_grid.trace_excursion[cell]),
+                "fiber_separation_variation_pixels": float(profile_grid.separation_variation[cell]),
+                "fiber_separation_x_variation_pixels": float(profile_grid.separation_x_variation[cell]),
+                "fiber_separation_direction_variation_pixels": float(profile_grid.separation_fiber_variation[cell]),
+                "reached_minimum_size": bool(profile_grid.reached_minimum_size[cell]),
+            }
+            for cell, ((x_start, x_stop), (fiber_start, fiber_stop)) in enumerate(
+                zip(profile_grid.cell_columns, profile_grid.cell_fibers)
+            )
+        ],
+    })
+    plot_profile_grid(traces, profile_grid, output / "02_ldls_profile_grid.png")
+    plot_profile_parameter_maps(
+        profile_map_x, profile_map_y, profiles.radius, profiles.sigma,
+        profiles.centroid_offset, profile_map_fit_valid,
+        profiles.parameter_at_bound, output / "02_ldls_profile_parameter_maps.png",
+    )
+    plot_profile_width_maps(
+        profile_map_x, profile_map_y, profiles.radius, profiles.sigma,
+        profile_map_fit_valid, profiles.parameter_at_bound,
+        output / "02_ldls_profile_width_maps.png",
+    )
+    plot_profile_radius_sigma_tradeoff(
+        profile_map_x, profile_map_y, profiles.radius, profiles.sigma,
+        profile_map_fit_valid, profiles.parameter_at_bound,
+        output / "02_ldls_profile_radius_sigma_tradeoff.png",
     )
     plot_profile_diagnostics(
         traces, evidence, profiles, diagnostic_neighbors, compact_total,
@@ -1514,10 +1861,15 @@ def main(argv: list[str] | None = None) -> int:
         "capture_p05": float(np.nanpercentile(captured, 5)),
         "capture_p95": float(np.nanpercentile(captured, 95)),
         "profile_map": {
-            "chunk_width_columns": args.profile_chunk_width,
-            "group_size_fibers": args.profile_group_size,
-            "chunk_count": int(profiles.density.shape[0]),
-            "group_count": int(profiles.density.shape[1]),
+            "grid_mode": profile_grid.mode,
+            "initial_chunk_width_columns": args.profile_chunk_width,
+            "initial_group_size_fibers": args.profile_group_size,
+            "trace_excursion_tolerance_pixels": args.profile_trace_tolerance,
+            "fiber_separation_tolerance_pixels": args.profile_separation_tolerance,
+            "minimum_chunk_width_columns": args.profile_min_chunk_width,
+            "minimum_group_size_fibers": args.profile_min_group_size,
+            "cell_count": int(profiles.density.shape[0]),
+            "cells_at_minimum_size": int(np.count_nonzero(profile_grid.reached_minimum_size)),
             "normalization_iterations": profile_iterations,
             "normalization_converged": profile_converged,
             "profile_integral_iterations": profile_integral_iterations,
