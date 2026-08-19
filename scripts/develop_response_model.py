@@ -836,9 +836,9 @@ def fit_constrained_profile(
 
     # Fit height, R, sigma, and du only.  The circular source is fixed at
     # q=0 and the optional h3/h4 optical-blur terms are fixed at zero.
-    initial = np.r_[np.log([max(peak, noise), 2.0, 0.8]), 0.0]
-    lower = np.r_[np.log([max(peak * 0.25, noise), 0.15, 0.03]), -0.5]
-    upper = np.r_[np.log([max(peak * 4.0, noise * 4.0), support, support / 2.0]), 0.5]
+    initial = np.r_[np.log([max(peak, noise), 3.2, 0.8]), 0.0]
+    lower = np.r_[np.log([max(peak * 0.25, noise), 2.5, 0.3]), -0.5]
+    upper = np.r_[np.log([max(peak * 4.0, noise * 4.0), 4.0, 2.0]), 0.5]
 
     def residual(theta: np.ndarray) -> np.ndarray:
         model = branch_model(theta, fit_u)
@@ -1388,11 +1388,16 @@ def plot_profile_diagnostics(
         bin_u, bin_median, bin_scatter, bin_count = robust_profile_bins(
             fit_u, fit_v, support=support, bin_width=bin_width,
         )
-        if profiles.optimizer_status[cell] == -99:
-            raise RuntimeError("profile diagnostic closure refit is unavailable")
-        if not np.array_equal(bin_count, profiles.bin_count[cell]):
+        closure_available = profiles.optimizer_status[cell] != -99
+        if closure_available and not np.array_equal(bin_count, profiles.bin_count[cell]):
             raise RuntimeError("profile diagnostic bins do not match the frozen closure fit")
-        bin_used = profiles.bin_used[cell] & np.isfinite(bin_median)
+        # A failed frozen closure refit intentionally retains the prior usable
+        # map for extraction.  It is a diagnostic exclusion, not a reason to
+        # abort the entire developmental workbench.
+        bin_used = (
+            profiles.bin_used[cell] & np.isfinite(bin_median)
+            if closure_available else np.zeros(bin_median.shape, dtype=bool)
+        )
         bin_rejected = (bin_count > 0) & np.isfinite(bin_median) & ~bin_used
         axis.plot(uu, vv, ".", ms=1.0, alpha=0.035, color="tab:blue", label="all detector samples")
         if valley_u.size:
@@ -1402,7 +1407,10 @@ def plot_profile_diagnostics(
         if np.any(bin_used):
             bin_error = bin_scatter[bin_used] / np.sqrt(np.maximum(bin_count[bin_used], 1))
             axis.errorbar(bin_u[bin_used], bin_median[bin_used], yerr=bin_error, fmt="o", ms=2.5, color="tab:purple", ecolor="tab:purple", elinewidth=0.55, capsize=0, alpha=0.85, label="accepted robust bins")
-        axis.plot(profiles.u_grid, profiles.density[cell], color="black", lw=1.5, label="constrained fit")
+        axis.plot(
+            profiles.u_grid, profiles.density[cell], color="black", lw=1.5,
+            label="constrained fit" if closure_available else "prior map retained",
+        )
         axis.axvline(profiles.peak_u[cell], color="0.35", lw=0.7, ls="--")
         axis.axvline(profiles.left_valley_u[cell], color="0.6", lw=0.6, ls=":")
         axis.axvline(profiles.right_valley_u[cell], color="0.6", lw=0.6, ls=":")
@@ -1417,7 +1425,8 @@ def plot_profile_diagnostics(
                 f"wRMS={profiles.bin_model_weighted_rms[cell]:.3g}\n"
                 f"status={profiles.optimizer_status[cell]}; "
                 f"cost={profiles.optimizer_cost[cell]:.3g}; "
-                f"bound={'yes' if profiles.parameter_at_bound[cell] else 'no'}; n={uu.size}"
+                f"bound={'yes' if profiles.parameter_at_bound[cell] else 'no'}; n={uu.size}\n"
+                f"closure={'available' if closure_available else 'unavailable; prior map shown'}"
             ),
             xlim=(-support, support),
         )
@@ -1479,6 +1488,18 @@ def plot_profile_grid(trace: np.ndarray, grid: ProfileGrid, path: Path) -> None:
     plt.close(fig)
 
 
+def percentile_color_limits(values: np.ndarray) -> tuple[float | None, float | None]:
+    """Return robust display limits from the 2nd and 98th percentiles."""
+    finite = np.asarray(values, dtype=float)[np.isfinite(values)]
+    if finite.size == 0:
+        return None, None
+    vmin, vmax = map(float, np.percentile(finite, (2.0, 98.0)))
+    if vmax <= vmin:
+        padding = max(abs(vmin) * 1e-6, np.finfo(float).eps)
+        return vmin - padding, vmax + padding
+    return vmin, vmax
+
+
 def plot_profile_parameter_maps(
     profile_map_x: np.ndarray,
     profile_map_y: np.ndarray,
@@ -1491,29 +1512,23 @@ def plot_profile_parameter_maps(
 ) -> None:
     """Scatter independently fitted local-profile parameters on the CCD."""
     parameters = (
-        (radius, "R", "R (pixel)", "viridis", False),
-        (sigma, "sigma", "sigma (pixel)", "viridis", False),
-        (du, "du", "du (pixel)", "coolwarm", True),
+        (radius, "R", "R (pixel)", "viridis"),
+        (sigma, "sigma", "sigma (pixel)", "viridis"),
+        (du, "du", "du (pixel)", "coolwarm"),
     )
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.8), sharex=True, sharey=True)
-    for axis, (values, title, colorbar_label, cmap, symmetric) in zip(axes, parameters):
+    for axis, (values, title, colorbar_label, cmap) in zip(axes, parameters):
         usable = fit_valid & np.isfinite(profile_map_x) & np.isfinite(profile_map_y) & np.isfinite(values)
-        if symmetric and np.any(usable):
-            limit = max(float(np.max(np.abs(values[usable]))), np.finfo(float).eps)
-            scatter = axis.scatter(
-                profile_map_x[usable], profile_map_y[usable], c=values[usable],
-                cmap=cmap, vmin=-limit, vmax=limit, s=42, linewidths=0.0,
-            )
-        else:
-            scatter = axis.scatter(
-                profile_map_x[usable], profile_map_y[usable], c=values[usable],
-                cmap=cmap, s=42, linewidths=0.0,
-            )
+        vmin, vmax = percentile_color_limits(values[usable])
+        scatter = axis.scatter(
+            profile_map_x[usable], profile_map_y[usable], c=values[usable],
+            cmap=cmap, vmin=vmin, vmax=vmax, s=14, linewidths=0.0,
+        )
         bounded = usable & parameter_at_bound
         if np.any(bounded):
             axis.scatter(
                 profile_map_x[bounded], profile_map_y[bounded], facecolors="none",
-                edgecolors="black", s=58, linewidths=0.75, label="parameter at bound",
+                edgecolors="black", s=20, linewidths=0.75, label="parameter at bound",
             )
         colorbar = fig.colorbar(scatter, ax=axis)
         colorbar.set_label(colorbar_label)
@@ -1546,21 +1561,22 @@ def plot_profile_width_maps(
     with np.errstate(divide="ignore", invalid="ignore"):
         blur_fraction = sigma ** 2 / core_variance
     parameters = (
-        (width, "W", "W (pixel)", "viridis", {}),
-        (blur_fraction, "f_sigma", "f_sigma", "cividis", {}),
+        (width, "W", "W (pixel)", "viridis"),
+        (blur_fraction, "f_sigma", "f_sigma", "cividis"),
     )
     fig, axes = plt.subplots(1, 2, figsize=(12, 5.8), sharex=True, sharey=True)
-    for axis, (values, title, colorbar_label, cmap, limits) in zip(axes, parameters):
+    for axis, (values, title, colorbar_label, cmap) in zip(axes, parameters):
         usable = fit_valid & np.isfinite(profile_map_x) & np.isfinite(profile_map_y) & np.isfinite(values)
+        vmin, vmax = percentile_color_limits(values[usable])
         scatter = axis.scatter(
             profile_map_x[usable], profile_map_y[usable], c=values[usable],
-            cmap=cmap, s=42, linewidths=0.0, **limits,
+            cmap=cmap, vmin=vmin, vmax=vmax, s=14, linewidths=0.0,
         )
         bounded = usable & parameter_at_bound
         if np.any(bounded):
             axis.scatter(
                 profile_map_x[bounded], profile_map_y[bounded], facecolors="none",
-                edgecolors="black", s=58, linewidths=0.75, label="parameter at bound",
+                edgecolors="black", s=20, linewidths=0.75, label="parameter at bound",
             )
             axis.legend(frameon=False, fontsize=8, loc="best")
         colorbar = fig.colorbar(scatter, ax=axis)
@@ -1647,15 +1663,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--zipcode", required=True, help="IFUSLOT+IFUID+SPECID+AMP+CONTROLLER")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--aperture-width", type=float, default=5.0)
-    parser.add_argument("--profile-support", type=float, default=8.0)
+    parser.add_argument("--profile-support", type=float, default=9.0)
     parser.add_argument("--profile-bin-width", type=float, default=0.4)
     parser.add_argument("--profile-grid", choices=("adaptive", "fixed"), default="adaptive", help="Trace-only adaptive profile grid, or the temporary fixed comparison grid")
     parser.add_argument("--profile-chunk-width", type=int, default=200, help="Initial/fixed profile cell width in detector columns")
     parser.add_argument("--profile-group-size", type=int, default=32, help="Initial/fixed profile cell height in fibers")
     parser.add_argument("--profile-trace-tolerance", type=float, default=0.5, help="Maximum trace excursion within an adaptive cell (pixels)")
     parser.add_argument("--profile-separation-tolerance", type=float, default=0.25, help="Maximum local neighboring-fiber separation variation within an adaptive cell (pixels)")
-    parser.add_argument("--profile-min-chunk-width", type=int, default=25, help="Minimum adaptive cell width in detector columns")
-    parser.add_argument("--profile-min-group-size", type=int, default=4, help="Minimum adaptive cell height in fibers")
+    parser.add_argument("--profile-min-chunk-width", type=int, default=12, help="Minimum adaptive cell width in detector columns")
+    parser.add_argument("--profile-min-group-size", type=int, default=2, help="Minimum adaptive cell height in fibers")
     parser.add_argument("--profile-deblend-iterations", type=int, default=3, help="Maximum post-seed capture/deblend refinements; exits early once stable")
     parser.add_argument("--profile-valley-weight", type=int, default=1)
     parser.add_argument("--ldls-smoothing-window", type=int, default=101)
