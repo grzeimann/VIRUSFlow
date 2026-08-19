@@ -488,6 +488,27 @@ class ProfileEvidence:
     valley_second_u: np.ndarray
 
 
+@dataclass(frozen=True)
+class ProfileMeasurement:
+    """One converged local-profile measurement made about one trace state."""
+
+    trace: np.ndarray
+    preliminary: np.ndarray
+    evidence: ProfileEvidence
+    profiles: LocalProfileMap
+    neighbor_profiles: LocalProfileMap
+    compact_total: np.ndarray
+    iterations: int
+    converged: bool
+    capture_change: float
+    profile_change: float
+    integral_iterations: list[dict[str, float | int]]
+    captured_fraction: np.ndarray | None
+    map_x: np.ndarray
+    map_y: np.ndarray
+    fit_valid: np.ndarray
+
+
 def _hard_fiber_boundaries(trace: np.ndarray, *, support: float, amplifier_boundary: int | None) -> np.ndarray:
     """Return exclusive fiber boundaries that no profile cell may cross."""
     boundaries = {0, trace.shape[0]}
@@ -1460,6 +1481,61 @@ def profile_map_coordinates(trace: np.ndarray, profiles: LocalProfileMap) -> tup
     return coordinates_x, coordinates_y
 
 
+def measure_profiles_on_trace(
+    image: np.ndarray,
+    mask: np.ndarray,
+    trace: np.ndarray,
+    grid: ProfileGrid,
+    *,
+    aperture_width: float,
+    support: float,
+    bin_width: float,
+    smoothing_window: int,
+    deblend_iterations: int,
+    valley_weight: int,
+    retain_capture: bool,
+) -> ProfileMeasurement:
+    """Repeat the settled local-profile measurement for one fixed trace state."""
+    preliminary = np.asarray(extract_fractional_aperture(
+        image, np.zeros_like(image), trace, pixel_mask=mask, width=aperture_width,
+    ).get_array("spectrum"), dtype=float)
+    preliminary = smooth_spectra(preliminary, smoothing_window)
+    evidence = collect_profile_evidence(image, trace, preliminary, mask, support=support, grid=grid)
+    profiles, neighbor_profiles, compact_total, iterations, converged, capture_change, profile_change, integral_iterations = measure_local_profiles(
+        evidence, trace, preliminary, detector_rows=image.shape[0], aperture_width=aperture_width,
+        support=support, bin_width=bin_width, grid=grid,
+        iterations=deblend_iterations, valley_weight=valley_weight,
+    )
+    map_x, map_y = profile_map_coordinates(trace, profiles)
+    fit_valid = (
+        (profiles.optimizer_status != -99) & ~profiles.parameter_at_bound
+        & np.isfinite(profiles.radius) & np.isfinite(profiles.sigma)
+    )
+    captured_fraction = (
+        aperture_capture(trace, image.shape[0], profiles, aperture_width)
+        if retain_capture else None
+    )
+    return ProfileMeasurement(
+        trace=trace, preliminary=preliminary, evidence=evidence, profiles=profiles,
+        neighbor_profiles=neighbor_profiles, compact_total=compact_total,
+        iterations=iterations, converged=converged, capture_change=capture_change,
+        profile_change=profile_change, integral_iterations=integral_iterations,
+        captured_fraction=captured_fraction, map_x=map_x, map_y=map_y,
+        fit_valid=fit_valid,
+    )
+
+
+def directly_fitted_profile_cells(measurement: ProfileMeasurement) -> np.ndarray:
+    """Cells fitted in the final frozen closure pass, including bound diagnostics."""
+    profiles = measurement.profiles
+    return (
+        (profiles.optimizer_status != -99)
+        & np.isfinite(profiles.radius)
+        & np.isfinite(profiles.sigma)
+        & np.isfinite(profiles.centroid_offset)
+    )
+
+
 def plot_profile_grid(trace: np.ndarray, grid: ProfileGrid, path: Path) -> None:
     """Plot trace-only adaptive cell boundaries in physical CCD coordinates."""
     fig, axis = plt.subplots(figsize=(14, 9))
@@ -1832,6 +1908,80 @@ def evaluate_smooth_profile_fields(
 
 
 @dataclass(frozen=True)
+class SmoothProfileField:
+    """The W/f_sigma response field associated with one profile measurement."""
+
+    width_fields: tuple[RobustSurface, RobustSurface]
+    fraction_fields: tuple[RobustSurface, RobustSurface]
+    measured_width: np.ndarray
+    measured_fraction: np.ndarray
+    valid: np.ndarray
+    smooth_width: np.ndarray
+    smooth_fraction: np.ndarray
+    smooth_radius: np.ndarray
+    smooth_sigma: np.ndarray
+
+
+@dataclass(frozen=True)
+class SmoothFieldComparison:
+    """Old and updated smooth fields sampled at the same refined-profile cells."""
+
+    old_width: np.ndarray
+    old_fraction: np.ndarray
+    valid: np.ndarray
+    delta_width: np.ndarray
+    delta_fraction: np.ndarray
+
+
+def build_smooth_profile_field(
+    measurement: ProfileMeasurement,
+    *,
+    detector_shape: tuple[int, int],
+    amplifier_y_boundary: float,
+) -> SmoothProfileField:
+    """Transform local R/sigma fits and robustly smooth W/f_sigma by CCD half."""
+    width_fields, fraction_fields, measured_width, measured_fraction, valid = smooth_profile_fields(
+        measurement.map_x, measurement.map_y,
+        measurement.profiles.radius, measurement.profiles.sigma,
+        measurement.fit_valid, measurement.profiles.parameter_at_bound,
+        detector_shape=detector_shape, amplifier_y_boundary=amplifier_y_boundary,
+    )
+    smooth_width, smooth_fraction, smooth_radius, smooth_sigma = evaluate_smooth_profile_fields(
+        width_fields, fraction_fields, measurement.map_x, measurement.map_y,
+        amplifier_y_boundary=amplifier_y_boundary,
+    )
+    return SmoothProfileField(
+        width_fields=width_fields, fraction_fields=fraction_fields,
+        measured_width=measured_width, measured_fraction=measured_fraction,
+        valid=valid, smooth_width=smooth_width, smooth_fraction=smooth_fraction,
+        smooth_radius=smooth_radius, smooth_sigma=smooth_sigma,
+    )
+
+
+def compare_smooth_profile_fields(
+    old: SmoothProfileField,
+    updated: SmoothProfileField,
+    measurement: ProfileMeasurement,
+    *,
+    amplifier_y_boundary: float,
+) -> SmoothFieldComparison:
+    """Evaluate the original field at refined cells before comparing field states."""
+    old_width, old_fraction, _old_radius, _old_sigma = evaluate_smooth_profile_fields(
+        old.width_fields, old.fraction_fields, measurement.map_x, measurement.map_y,
+        amplifier_y_boundary=amplifier_y_boundary,
+    )
+    valid = (
+        updated.valid & np.isfinite(old_width) & np.isfinite(old_fraction)
+        & np.isfinite(updated.smooth_width) & np.isfinite(updated.smooth_fraction)
+    )
+    return SmoothFieldComparison(
+        old_width=old_width, old_fraction=old_fraction, valid=valid,
+        delta_width=updated.smooth_width - old_width,
+        delta_fraction=updated.smooth_fraction - old_fraction,
+    )
+
+
+@dataclass(frozen=True)
 class FourierCompactProfile:
     """Unit-integral pixel-integrated circular-fiber profile and derivative."""
 
@@ -1984,6 +2134,44 @@ def plot_smooth_profile_field_scatter(
             axis.plot(limits, limits, color="0.3", lw=0.8, ls="--")
         axis.set(xlabel=f"measured {label}", ylabel=f"smooth {label}", title=f"{label}: local versus smooth")
         axis.grid(alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
+def plot_refined_smooth_field_changes(
+    x: np.ndarray,
+    y: np.ndarray,
+    old_width: np.ndarray,
+    new_width: np.ndarray,
+    old_fraction: np.ndarray,
+    new_fraction: np.ndarray,
+    usable: np.ndarray,
+    path: Path,
+) -> None:
+    """Map the change from the original to the T_refined response fields."""
+    fields = (
+        (old_width, new_width, "W (pixel)"),
+        (old_fraction, new_fraction, "f_sigma"),
+    )
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10), sharex=True, sharey=True)
+    for row, (old, new, label) in enumerate(fields):
+        values = (old, new, new - old)
+        titles = (f"original smooth {label}", f"T_refined smooth {label}", f"Δ{label}: refined − original")
+        cmaps = ("viridis", "viridis", "coolwarm")
+        for axis, value, title, cmap in zip(axes[row], values, titles, cmaps):
+            selected = usable & np.isfinite(value)
+            vmin, vmax = percentile_color_limits(value[selected])
+            scatter = axis.scatter(
+                x[selected], y[selected], c=value[selected], cmap=cmap,
+                vmin=vmin, vmax=vmax, s=16, linewidths=0.0,
+            )
+            fig.colorbar(scatter, ax=axis).set_label(label if "Δ" not in title else f"Δ{label}")
+            axis.set(title=title, xlabel="detector X (column)")
+            axis.grid(alpha=0.18)
+    axes[0, 0].set_ylabel("detector Y (row)")
+    axes[1, 0].set_ylabel("detector Y (row)")
+    fig.suptitle("Smooth compact-response change after T_refined local-profile remeasurement")
     fig.tight_layout()
     fig.savefig(path, dpi=170)
     plt.close(fig)
@@ -2388,6 +2576,13 @@ def plot_refined_trace_profile_closure(
     for axis, (center_column, y_target) in zip(axes.flat, targets):
         fiber = int(np.nanargmin(np.abs(refined_trace[:, center_column] - y_target)))
         columns = np.arange(max(0, center_column - 4), min(nx, center_column + 5))
+        _, _, panel_radius, panel_sigma = evaluate_smooth_profile_fields(
+            width_fields, fraction_fields,
+            np.asarray([center_column], dtype=float),
+            np.asarray([refined_trace[fiber, center_column]], dtype=float),
+            amplifier_y_boundary=amplifier_y_boundary,
+        )
+        panel_shape = fourier_compact_profile(float(panel_radius[0]), float(panel_sigma[0]))
         uu: list[np.ndarray] = []
         values: list[np.ndarray] = []
         model_values: list[np.ndarray] = []
@@ -2441,7 +2636,9 @@ def plot_refined_trace_profile_closure(
         use = np.isfinite(median)
         axis.plot(u, normalized, ".", ms=1, alpha=0.025, color="tab:blue")
         axis.errorbar(bins[use], median[use], yerr=scatter[use] / np.sqrt(np.maximum(count[use], 1)), fmt="o", ms=2.5, color="tab:purple", capsize=0)
-        axis.plot(bins, model, color="black", lw=1.4, label="fixed smooth P(T_refined)")
+        dense_u = np.linspace(-support, support, 901)
+        dense_model, _ = panel_shape.evaluate(dense_u)
+        axis.plot(dense_u, dense_model, color="black", lw=1.4, label="fixed smooth P(T_refined)")
         core = (
             (np.abs(bins) <= 2.0) & np.isfinite(median) & np.isfinite(model)
             & (model > 0.05 * np.nanmax(model))
@@ -2451,7 +2648,7 @@ def plot_refined_trace_profile_closure(
         outer_median = float(np.nanmedian(median[outer])) if np.any(outer) else float("nan")
         print(
             "refined-trace profile closure "
-            f"x={center_column} fiber={fiber}: normalization=compact_total_spectrum, "
+            f"x={center_column} fiber={fiber}: normalization=converged_refined_compact_total, "
             f"core/model={core_ratio:.3f}, outer_median={outer_median:+.4g}"
         )
         axis.set(title=f"x={center_column}, fiber={fiber}; residual du={residual_delta:+.3f}", xlim=(-support, support))
@@ -2533,6 +2730,412 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
 
 
+def write_initial_profile_diagnostics(
+    measurement: ProfileMeasurement,
+    grid: ProfileGrid,
+    output: Path,
+    *,
+    support: float,
+    bin_width: float,
+    valley_weight: int,
+    detector_columns: int,
+    amplifier_y_boundary: float,
+    amplifier_labels: tuple[str, str],
+) -> dict[str, np.ndarray]:
+    """Persist the settled initial local-profile state and its direct diagnostics."""
+    profiles, evidence = measurement.profiles, measurement.evidence
+    fitted = directly_fitted_profile_cells(measurement)
+    du_x_summary = summarize_du_by_x_amplifier(
+        measurement.map_x, measurement.map_y, profiles.centroid_offset,
+        fitted, profiles.parameter_at_bound, detector_columns=detector_columns,
+        amplifier_y_boundary=amplifier_y_boundary, amplifier_labels=amplifier_labels,
+    )
+    np.savez_compressed(
+        output / "02_ldls_profile_data.npz",
+        profile_u=profiles.u_grid, profile_density=profiles.density,
+        profile_cell_columns=profiles.cell_columns, profile_cell_fibers=profiles.cell_fibers,
+        profile_cell_index=profiles.cell_index, profile_grid_mode=grid.mode,
+        profile_trace_excursion=grid.trace_excursion,
+        profile_fiber_separation_variation=grid.separation_variation,
+        profile_fiber_separation_x_variation=grid.separation_x_variation,
+        profile_fiber_separation_fiber_variation=grid.separation_fiber_variation,
+        profile_grid_reached_minimum_size=grid.reached_minimum_size,
+        profile_sample_count=profiles.sample_count, valley_constraint_count=profiles.valley_constraint_count,
+        profile_bin_count=profiles.bin_count, profile_bin_scatter=profiles.bin_scatter,
+        profile_bin_used=profiles.bin_used, profile_peak_u=profiles.peak_u,
+        profile_centroid_offset=profiles.centroid_offset, profile_height=profiles.height,
+        profile_radius=profiles.radius, profile_sigma=profiles.sigma,
+        profile_integral=profiles.profile_integral, profile_h3=profiles.h3, profile_h4=profiles.h4,
+        profile_bin_model_rms=profiles.bin_model_rms,
+        profile_bin_model_weighted_rms=profiles.bin_model_weighted_rms,
+        profile_optimizer_status=profiles.optimizer_status, profile_optimizer_cost=profiles.optimizer_cost,
+        profile_parameter_at_bound=profiles.parameter_at_bound,
+        profile_map_x=measurement.map_x, profile_map_y=measurement.map_y,
+        R=profiles.radius, sigma=profiles.sigma, du=profiles.centroid_offset,
+        profile_map_fit_valid=fitted, profile_map_parameter_at_bound=profiles.parameter_at_bound,
+        du_x_center=du_x_summary["x_center"], du_x_median=du_x_summary["median"],
+        du_x_mad=du_x_summary["mad"], du_x_count=du_x_summary["count"],
+        du_x_parameter_bound_excluded_count=du_x_summary["parameter_bound_excluded_count"],
+        du_x_amplifier_half=du_x_summary["amplifier_half"], du_x_bin_edges=du_x_summary["x_bin_edges"],
+        du_x_amplifier_y_boundary=du_x_summary["amplifier_y_boundary"],
+        profile_closure_neighbor_density=measurement.neighbor_profiles.density,
+        profile_left_valley_u=profiles.left_valley_u, profile_right_valley_u=profiles.right_valley_u,
+        profile_left_inflection_u=profiles.left_inflection_u,
+        profile_right_inflection_u=profiles.right_inflection_u,
+        aperture_capture=measurement.captured_fraction, preliminary_spectrum=measurement.preliminary,
+        compact_total_spectrum=measurement.compact_total,
+        evidence_u=evidence.u, evidence_signal=evidence.signal, evidence_fiber=evidence.fiber,
+        evidence_column=evidence.column, evidence_cell=evidence.cell,
+        evidence_five_pixel_normalization=evidence.five_pixel_normalization,
+        evidence_seed_core=evidence.seed_core, evidence_neighbor_fiber=evidence.neighbor_fiber,
+        evidence_neighbor_u=evidence.neighbor_u, evidence_neighbor_overlaps=evidence.neighbor_overlaps,
+        valley_signal=evidence.valley_signal, valley_first_fiber=evidence.valley_first_fiber,
+        valley_second_fiber=evidence.valley_second_fiber, valley_column=evidence.valley_column,
+        valley_cell=evidence.valley_cell, valley_first_u=evidence.valley_first_u,
+        valley_second_u=evidence.valley_second_u,
+    )
+    write_json(output / "02_profile_grid_cells.json", {
+        "grid_mode": grid.mode,
+        "cells": [
+            {"cell": int(cell), "x_range_columns": [int(x_start), int(x_stop)],
+             "fiber_range": [int(fiber_start), int(fiber_stop)],
+             "trace_excursion_pixels": float(grid.trace_excursion[cell]),
+             "fiber_separation_variation_pixels": float(grid.separation_variation[cell]),
+             "fiber_separation_x_variation_pixels": float(grid.separation_x_variation[cell]),
+             "fiber_separation_direction_variation_pixels": float(grid.separation_fiber_variation[cell]),
+             "reached_minimum_size": bool(grid.reached_minimum_size[cell])}
+            for cell, ((x_start, x_stop), (fiber_start, fiber_stop)) in enumerate(zip(grid.cell_columns, grid.cell_fibers))
+        ],
+    })
+    plot_profile_grid(measurement.trace, grid, output / "02_ldls_profile_grid.png")
+    plot_profile_parameter_maps(measurement.map_x, measurement.map_y, profiles.radius, profiles.sigma,
+                                profiles.centroid_offset, fitted, profiles.parameter_at_bound,
+                                output / "02_ldls_profile_parameter_maps.png")
+    plot_profile_width_maps(measurement.map_x, measurement.map_y, profiles.radius, profiles.sigma,
+                            fitted, profiles.parameter_at_bound, output / "02_ldls_profile_width_maps.png")
+    plot_du_vs_x_by_amplifier(du_x_summary, output / "02_ldls_du_vs_x_by_amp.png")
+    plot_profile_radius_sigma_tradeoff(measurement.map_x, measurement.map_y, profiles.radius, profiles.sigma,
+                                       fitted, profiles.parameter_at_bound,
+                                       output / "02_ldls_profile_radius_sigma_tradeoff.png")
+    plot_profile_diagnostics(measurement.trace, evidence, profiles, measurement.neighbor_profiles,
+                             measurement.compact_total, output / "02_ldls_profile_samples.png",
+                             support, bin_width, valley_weight)
+    return du_x_summary
+
+
+def write_initial_smooth_field_diagnostics(
+    measurement: ProfileMeasurement,
+    field: SmoothProfileField,
+    output: Path,
+    *,
+    amplifier_y_boundary: float,
+) -> None:
+    """Write the initial W/f_sigma field and preserve the Fourier validation."""
+    width_residual = field.measured_width - field.smooth_width
+    fraction_residual = field.measured_fraction - field.smooth_fraction
+    validation = validate_fourier_compact_profiles(field.smooth_radius[field.valid], field.smooth_sigma[field.valid])
+    np.savez_compressed(
+        output / "02_ldls_smooth_profile_field.npz",
+        profile_map_x=measurement.map_x, profile_map_y=measurement.map_y, smooth_field_valid=field.valid,
+        measured_W=field.measured_width, smooth_W=field.smooth_width, residual_W=width_residual,
+        measured_f_sigma=field.measured_fraction, smooth_f_sigma=field.smooth_fraction,
+        residual_f_sigma=fraction_residual, smooth_R=field.smooth_radius, smooth_sigma=field.smooth_sigma,
+        W_surface_coefficients=np.stack([surface.coefficients for surface in field.width_fields]),
+        f_sigma_surface_coefficients=np.stack([surface.coefficients for surface in field.fraction_fields]),
+        surface_degree=np.asarray(field.width_fields[0].degree, dtype=np.int16),
+        surface_x_center=np.asarray([surface.x_center for surface in field.width_fields]),
+        surface_x_scale=np.asarray([surface.x_scale for surface in field.width_fields]),
+        surface_y_center=np.asarray([surface.y_center for surface in field.width_fields]),
+        surface_y_scale=np.asarray([surface.y_scale for surface in field.width_fields]),
+        W_surface_residual_mad=np.asarray([surface.residual_mad for surface in field.width_fields]),
+        f_sigma_surface_residual_mad=np.asarray([surface.residual_mad for surface in field.fraction_fields]),
+        amplifier_y_boundary=np.asarray(amplifier_y_boundary, dtype=float),
+    )
+    write_json(output / "02_ldls_smooth_profile_field.json", {
+        "representation": "independent robust ridge-regularized tensor-Legendre surfaces by physical amplifier half",
+        "coordinates": {"W": "sqrt(R^2 / 4 + sigma^2 + 1 / 12)", "f_sigma": "sigma^2 / (R^2 / 4 + sigma^2)"},
+        "physical_domain": "V = W^2 - 1/12 > 0; 0 < f_sigma < 1",
+        "usable_local_fit_count": int(np.count_nonzero(field.valid)),
+        "W_residual": smooth_field_residual_statistics(width_residual[field.valid]),
+        "f_sigma_residual": smooth_field_residual_statistics(fraction_residual[field.valid]),
+        "fourier_validation": validation,
+    })
+    plot_smooth_profile_field_diagnostics(measurement.map_x, measurement.map_y,
+                                          field.measured_width, field.smooth_width,
+                                          field.measured_fraction, field.smooth_fraction, field.valid,
+                                          output / "02_ldls_smooth_profile_fields.png")
+    plot_smooth_profile_field_scatter(field.measured_width, field.smooth_width,
+                                      field.measured_fraction, field.smooth_fraction, field.valid,
+                                      output / "02_ldls_smooth_profile_field_scatter.png")
+
+
+def write_initial_trace_diagnostics(
+    measurements: dict[str, np.ndarray],
+    output: Path,
+    *,
+    amplifier_y_boundary: float,
+    amplifier_labels: tuple[str, str],
+) -> dict[str, np.ndarray]:
+    """Write the dense-centroid evidence used to construct T_refined."""
+    summary = plot_trace_measurement_diagnostics(
+        measurements, amplifier_y_boundary, amplifier_labels,
+        output / "02_ldls_profile_informed_trace_evidence.png",
+    )
+    plot_individual_trace_delta_curves(
+        measurements, amplifier_y_boundary, output / "02_ldls_profile_informed_trace_fiber_curves.png",
+    )
+    np.savez_compressed(
+        output / "02_ldls_profile_informed_trace_measurements.npz", **measurements,
+        delta_x_center=summary["x_center"], delta_x_median=summary["median"],
+        delta_x_mad=summary["mad"], delta_x_count=summary["count"],
+        delta_x_amplifier_half=summary["amplifier_half"], delta_x_bin_edges=summary["x_bin_edges"],
+        amplifier_y_boundary=np.asarray(amplifier_y_boundary, dtype=float),
+    )
+    return summary
+
+
+def write_refined_trace_diagnostics(
+    measurements: dict[str, np.ndarray],
+    original_trace: np.ndarray,
+    output: Path,
+    *,
+    amplifier_y_boundary: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Fit ΔT(x), retain its evidence, and return the development-only refined trace."""
+    refined_trace, correction, coefficients, residual_mad = fit_refined_trace_corrections(measurements, original_trace)
+    dense_residual = measurements["delta"] - correction[:, measurements["column"]]
+    valid = measurements["status"] == 1
+    np.savez_compressed(
+        output / "02_ldls_refined_trace_closure.npz",
+        trace_original=original_trace, trace_refined=refined_trace, trace_correction=correction,
+        trace_correction_coefficients=coefficients, trace_correction_residual_mad=residual_mad,
+        dense_measurement_column=measurements["column"], dense_measurement_delta=measurements["delta"],
+        dense_correction_residual=dense_residual, dense_measurement_valid=valid,
+    )
+    plot_refined_trace_correction_diagnostics(measurements, correction, residual_mad,
+                                              amplifier_y_boundary, output / "02_ldls_refined_trace_correction.png")
+    plot_refined_trace_fiber_examples(measurements, correction, amplifier_y_boundary,
+                                     output / "02_ldls_refined_trace_fiber_examples.png")
+    return refined_trace, correction, coefficients, residual_mad, dense_residual, valid
+
+
+def write_refined_field_diagnostics(
+    measurement: ProfileMeasurement,
+    field: SmoothProfileField,
+    comparison: SmoothFieldComparison,
+    output: Path,
+    *,
+    amplifier_y_boundary: float,
+) -> dict[str, dict[str, float | int]]:
+    """Persist the refit response field and explicit old-versus-updated maps."""
+    plot_smooth_profile_field_diagnostics(
+        measurement.map_x, measurement.map_y, field.measured_width, field.smooth_width,
+        field.measured_fraction, field.smooth_fraction, field.valid,
+        output / "02_ldls_refined_trace_smooth_profile_fields.png",
+    )
+    plot_refined_smooth_field_changes(
+        measurement.map_x, measurement.map_y, comparison.old_width, field.smooth_width,
+        comparison.old_fraction, field.smooth_fraction, comparison.valid,
+        output / "02_ldls_refined_trace_profile_field_comparison.png",
+    )
+    np.savez_compressed(
+        output / "02_ldls_refined_trace_smooth_profile_field.npz",
+        profile_map_x=measurement.map_x, profile_map_y=measurement.map_y, smooth_field_valid=field.valid,
+        measured_W=field.measured_width, old_smooth_W=comparison.old_width, new_smooth_W=field.smooth_width,
+        measured_f_sigma=field.measured_fraction, old_smooth_f_sigma=comparison.old_fraction,
+        new_smooth_f_sigma=field.smooth_fraction, delta_W=comparison.delta_width,
+        delta_f_sigma=comparison.delta_fraction, smooth_R=field.smooth_radius,
+        smooth_sigma=field.smooth_sigma,
+        W_surface_coefficients=np.stack([surface.coefficients for surface in field.width_fields]),
+        f_sigma_surface_coefficients=np.stack([surface.coefficients for surface in field.fraction_fields]),
+        surface_degree=np.asarray(field.width_fields[0].degree, dtype=np.int16),
+        surface_x_center=np.asarray([surface.x_center for surface in field.width_fields]),
+        surface_x_scale=np.asarray([surface.x_scale for surface in field.width_fields]),
+        surface_y_center=np.asarray([surface.y_center for surface in field.width_fields]),
+        surface_y_scale=np.asarray([surface.y_scale for surface in field.width_fields]),
+        W_surface_residual_mad=np.asarray([surface.residual_mad for surface in field.width_fields]),
+        f_sigma_surface_residual_mad=np.asarray([surface.residual_mad for surface in field.fraction_fields]),
+        compact_total_spectrum=measurement.compact_total,
+        amplifier_y_boundary=np.asarray(amplifier_y_boundary, dtype=float),
+    )
+    np.savez_compressed(
+        output / "02_ldls_refined_trace_profile_remeasurement.npz",
+        profile_map_x=measurement.map_x, profile_map_y=measurement.map_y,
+        remeasured_W=field.measured_width, old_smooth_W=comparison.old_width,
+        new_smooth_W=field.smooth_width, remeasured_f_sigma=field.measured_fraction,
+        old_smooth_f_sigma=comparison.old_fraction, new_smooth_f_sigma=field.smooth_fraction,
+        W_change=comparison.delta_width, f_sigma_change=comparison.delta_fraction,
+        remeasured_fit_valid=measurement.fit_valid, remeasured_radius=measurement.profiles.radius,
+        remeasured_sigma=measurement.profiles.sigma, compact_total_spectrum=measurement.compact_total,
+    )
+    stats = {
+        "delta_W": smooth_field_residual_statistics(comparison.delta_width[comparison.valid]),
+        "delta_f_sigma": smooth_field_residual_statistics(comparison.delta_fraction[comparison.valid]),
+        "local_W_minus_new_smooth": smooth_field_residual_statistics((field.measured_width - field.smooth_width)[field.valid]),
+        "local_f_sigma_minus_new_smooth": smooth_field_residual_statistics((field.measured_fraction - field.smooth_fraction)[field.valid]),
+    }
+    write_json(output / "02_ldls_refined_trace_smooth_profile_field.json", {
+        "representation": "same independent robust ridge-regularized tensor-Legendre W and f_sigma surfaces, refit from T_refined local profiles",
+        "usable_local_fit_count": int(np.count_nonzero(field.valid)), **stats,
+    })
+    return stats
+
+
+def write_refined_closure_diagnostics(
+    image: np.ndarray,
+    mask: np.ndarray,
+    refined_measurement: ProfileMeasurement,
+    refined_field: SmoothProfileField,
+    output: Path,
+    *,
+    support: float,
+    block_width: int,
+    centering_iterations: int,
+    amplifier_y_boundary: float,
+    amplifier_labels: tuple[str, str],
+    trace_coefficients: np.ndarray,
+    trace_residual_mad: np.ndarray,
+    initial_dense_residual: np.ndarray,
+    initial_dense_valid: np.ndarray,
+    initial_trace: np.ndarray,
+    field_statistics: dict[str, dict[str, float | int]],
+) -> dict[str, np.ndarray]:
+    """Test the matched refined trace/field state, without applying a new trace fit."""
+    convergence = dense_profile_informed_trace_measurements(
+        image, mask, refined_measurement.trace, refined_field.width_fields, refined_field.fraction_fields,
+        amplifier_y_boundary=amplifier_y_boundary, block_width=block_width,
+        support=support, iterations=centering_iterations,
+    )
+    convergence_summary = plot_trace_measurement_diagnostics(
+        convergence, amplifier_y_boundary, amplifier_labels,
+        output / "02_ldls_refined_trace_residual_centroids.png",
+    )
+    panel_residuals = plot_refined_trace_profile_closure(
+        image, mask, refined_measurement.trace, refined_measurement.compact_total,
+        refined_field.width_fields, refined_field.fraction_fields,
+        support=support, amplifier_y_boundary=amplifier_y_boundary,
+        path=output / "02_ldls_refined_trace_profile_closure.png",
+    )
+    np.savez_compressed(
+        output / "02_ldls_refined_trace_residual_measurements.npz", **convergence,
+        residual_x_center=convergence_summary["x_center"], residual_x_median=convergence_summary["median"],
+        residual_x_mad=convergence_summary["mad"], residual_x_count=convergence_summary["count"],
+        residual_x_amplifier_half=convergence_summary["amplifier_half"],
+        closure_panel_profile_defined_du=panel_residuals,
+        T2_minus_T_refined=convergence["delta"],
+    )
+    write_json(output / "02_ldls_refined_trace_closure.json", {
+        "trace_representation": "independent per-fiber degree-4 robust Legendre correction ΔT(x); no cross-fiber regularization",
+        "response_fields": "refit from the converged T_refined local-profile measurement; no second trace update applied",
+        "fibers_with_correction": int(np.count_nonzero(np.isfinite(trace_coefficients[:, 0]))),
+        "fibers_without_adequate_dense_measurements": int(np.count_nonzero(~np.isfinite(trace_coefficients[:, 0]))),
+        "dense_correction_residual": smooth_field_residual_statistics(initial_dense_residual[initial_dense_valid]),
+        "dense_correction_residual_by_amplifier": {
+            amplifier_labels[0]: smooth_field_residual_statistics(initial_dense_residual[
+                initial_dense_valid & (initial_trace[:, 0, None] < amplifier_y_boundary)
+            ]),
+            amplifier_labels[1]: smooth_field_residual_statistics(initial_dense_residual[
+                initial_dense_valid & (initial_trace[:, 0, None] >= amplifier_y_boundary)
+            ]),
+        },
+        "per_fiber_correction_residual_mad_pixels": trace_residual_mad.tolist(),
+        "T2_minus_T_refined": smooth_field_residual_statistics(convergence["delta"][convergence["status"] == 1]),
+        "profile_defined_panel_residual_du": smooth_field_residual_statistics(panel_residuals[:, 2]),
+        "refined_profile_iterations": refined_measurement.iterations,
+        "refined_profile_converged": refined_measurement.converged,
+        "refined_capture_relative_change": refined_measurement.capture_change,
+        "refined_profile_relative_change": refined_measurement.profile_change,
+        "refined_profile_integral_iterations": refined_measurement.integral_iterations,
+        **field_statistics,
+    })
+    return convergence
+
+
+def develop_ldls_profile_and_trace(
+    ldls: np.ndarray,
+    ldls_mask: np.ndarray,
+    traces: np.ndarray,
+    output: Path,
+    args: argparse.Namespace,
+    *,
+    lower_trace_count: int,
+    amplifier_y_boundary: float,
+    amplifier_labels: tuple[str, str],
+) -> ProfileMeasurement:
+    """Run the settled development-only LDLS profile/trace sequence."""
+    # 1. Trace geometry alone defines the local profile sampling cells.
+    grid = _profile_grid(
+        traces, support=args.profile_support, mode=args.profile_grid,
+        chunk_width=args.profile_chunk_width, group_size=args.profile_group_size,
+        trace_tolerance=args.profile_trace_tolerance, separation_tolerance=args.profile_separation_tolerance,
+        minimum_chunk_width=args.profile_min_chunk_width, minimum_group_size=args.profile_min_group_size,
+        amplifier_boundary=lower_trace_count,
+    )
+    # 2. Initial trace -> converged local compact profiles and compact totals.
+    initial = measure_profiles_on_trace(
+        ldls, ldls_mask, traces, grid, aperture_width=args.aperture_width,
+        support=args.profile_support, bin_width=args.profile_bin_width,
+        smoothing_window=args.ldls_smoothing_window, deblend_iterations=args.profile_deblend_iterations,
+        valley_weight=args.profile_valley_weight, retain_capture=True,
+    )
+    # 3. Preserve the independently fitted profile evidence before smoothing it.
+    write_initial_profile_diagnostics(
+        initial, grid, output, support=args.profile_support, bin_width=args.profile_bin_width,
+        valley_weight=args.profile_valley_weight, detector_columns=ldls.shape[1],
+        amplifier_y_boundary=amplifier_y_boundary, amplifier_labels=amplifier_labels,
+    )
+    # 4. Initial local R/sigma -> W/f_sigma -> smooth response field.
+    initial_field = build_smooth_profile_field(
+        initial, detector_shape=ldls.shape, amplifier_y_boundary=amplifier_y_boundary,
+    )
+    # 5. Validate the Fourier representation and write field residual diagnostics.
+    write_initial_smooth_field_diagnostics(initial, initial_field, output, amplifier_y_boundary=amplifier_y_boundary)
+    # 6. Fixed initial field -> dense P/P' centroid evidence.
+    dense = dense_profile_informed_trace_measurements(
+        ldls, ldls_mask, traces, initial_field.width_fields, initial_field.fraction_fields,
+        amplifier_y_boundary=amplifier_y_boundary, block_width=args.trace_measurement_block_width,
+        support=args.profile_support, iterations=args.trace_centering_iterations,
+    )
+    # 7. Persist the dense evidence before fitting independent per-fiber corrections.
+    write_initial_trace_diagnostics(dense, output, amplifier_y_boundary=amplifier_y_boundary,
+                                    amplifier_labels=amplifier_labels)
+    # 8. Dense centroids -> smooth independent ΔT(x) -> T_refined.
+    refined_trace, correction, coefficients, correction_mad, dense_residual, dense_valid = write_refined_trace_diagnostics(
+        dense, traces, output, amplifier_y_boundary=amplifier_y_boundary,
+    )
+    # 9. Remeasure local profiles about T_refined with the same settled iteration.
+    refined = measure_profiles_on_trace(
+        ldls, ldls_mask, refined_trace, grid, aperture_width=args.aperture_width,
+        support=args.profile_support, bin_width=args.profile_bin_width,
+        smoothing_window=args.ldls_smoothing_window, deblend_iterations=args.profile_deblend_iterations,
+        valley_weight=args.profile_valley_weight, retain_capture=False,
+    )
+    # 10. Rebuild the matched response field from the refined local fits.
+    refined_field = build_smooth_profile_field(
+        refined, detector_shape=ldls.shape, amplifier_y_boundary=amplifier_y_boundary,
+    )
+    field_comparison = compare_smooth_profile_fields(
+        initial_field, refined_field, refined, amplifier_y_boundary=amplifier_y_boundary,
+    )
+    # 11. Map and summarize the old-versus-updated field structure.
+    field_statistics = write_refined_field_diagnostics(
+        refined, refined_field, field_comparison, output, amplifier_y_boundary=amplifier_y_boundary,
+    )
+    # 12. Matched T_refined/field closure, followed only by the T2 convergence diagnostic.
+    write_refined_closure_diagnostics(
+        ldls, ldls_mask, refined, refined_field, output, support=args.profile_support,
+        block_width=args.trace_measurement_block_width, centering_iterations=args.trace_centering_iterations,
+        amplifier_y_boundary=amplifier_y_boundary, amplifier_labels=amplifier_labels,
+        trace_coefficients=coefficients, trace_residual_mad=correction_mad,
+        initial_dense_residual=dense_residual, initial_dense_valid=dense_valid,
+        initial_trace=dense["trace_original"],
+        field_statistics=field_statistics,
+    )
+    # 13. Keep the original compact capture for the later, separate halo experiment.
+    assert initial.captured_fraction is not None
+    return initial
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db", required=True, help="Artifact SQLite database (read only)")
@@ -2612,380 +3215,14 @@ def main(argv: list[str] | None = None) -> int:
     fits.writeto(output / "01_assembled_science_baseline_subtracted.fits", sci, overwrite=True)
     fits.writeto(output / "01_assembled_arc_extended_light_retained.fits", arc, overwrite=True)
 
-    # The profile normalizer must use the same compact aperture geometry as the
-    # later flux correction.  A 15-pixel aperture has gap-dependent neighbor
-    # contamination, which makes edge fibers such as 111 incomparable with
-    # normally spaced fibers in a shared local profile fit.
-    preliminary = np.asarray(extract_fractional_aperture(
-        ldls, np.zeros_like(ldls), traces, pixel_mask=ldls_mask,
-        width=args.aperture_width,
-    ).get_array("spectrum"), dtype=float)
-    preliminary = smooth_spectra(preliminary, args.ldls_smoothing_window)
-    profile_grid = _profile_grid(
-        traces, support=args.profile_support, mode=args.profile_grid,
-        chunk_width=args.profile_chunk_width, group_size=args.profile_group_size,
-        trace_tolerance=args.profile_trace_tolerance,
-        separation_tolerance=args.profile_separation_tolerance,
-        minimum_chunk_width=args.profile_min_chunk_width,
-        minimum_group_size=args.profile_min_group_size,
-        amplifier_boundary=np.asarray(lower_traces).shape[0],
-    )
-    evidence = collect_profile_evidence(
-        ldls, traces, preliminary, ldls_mask, support=args.profile_support,
-        grid=profile_grid,
-    )
-    profiles, diagnostic_neighbors, compact_total, profile_iterations, profile_converged, capture_change, profile_change, profile_integral_iterations = measure_local_profiles(
-        evidence, traces, preliminary, detector_rows=ldls.shape[0], aperture_width=args.aperture_width,
-        support=args.profile_support, bin_width=args.profile_bin_width, grid=profile_grid,
-        iterations=args.profile_deblend_iterations,
-        valley_weight=args.profile_valley_weight,
-    )
-    captured = aperture_capture(traces, ldls.shape[0], profiles, args.aperture_width)
-    profile_map_x, profile_map_y = profile_map_coordinates(traces, profiles)
-    # A cell is valid only when the final frozen closure pass fitted it
-    # directly.  Closure failures retain a borrowed extraction profile, but
-    # are excluded from the parameter-map measurements below.
-    profile_map_fit_valid = (
-        (profiles.optimizer_status != -99)
-        & np.isfinite(profiles.radius)
-        & np.isfinite(profiles.sigma)
-        & np.isfinite(profiles.centroid_offset)
-    )
-    du_x_summary = summarize_du_by_x_amplifier(
-        profile_map_x, profile_map_y, profiles.centroid_offset,
-        profile_map_fit_valid, profiles.parameter_at_bound,
-        detector_columns=ldls.shape[1],
+    profile_trace = develop_ldls_profile_and_trace(
+        ldls, ldls_mask, traces, output, args,
+        lower_trace_count=np.asarray(lower_traces).shape[0],
         amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
         amplifier_labels=(lower_zipcode.amp, upper_zipcode.amp),
     )
-    np.savez_compressed(
-        output / "02_ldls_profile_data.npz",
-        profile_u=profiles.u_grid, profile_density=profiles.density,
-        profile_cell_columns=profiles.cell_columns,
-        profile_cell_fibers=profiles.cell_fibers,
-        profile_cell_index=profiles.cell_index,
-        profile_grid_mode=profile_grid.mode,
-        profile_trace_excursion=profile_grid.trace_excursion,
-        profile_fiber_separation_variation=profile_grid.separation_variation,
-        profile_fiber_separation_x_variation=profile_grid.separation_x_variation,
-        profile_fiber_separation_fiber_variation=profile_grid.separation_fiber_variation,
-        profile_grid_reached_minimum_size=profile_grid.reached_minimum_size,
-        profile_sample_count=profiles.sample_count,
-        valley_constraint_count=profiles.valley_constraint_count,
-        profile_bin_count=profiles.bin_count,
-        profile_bin_scatter=profiles.bin_scatter,
-        profile_bin_used=profiles.bin_used,
-        profile_peak_u=profiles.peak_u,
-        profile_centroid_offset=profiles.centroid_offset,
-        profile_height=profiles.height,
-        profile_radius=profiles.radius,
-        profile_sigma=profiles.sigma,
-        profile_integral=profiles.profile_integral,
-        profile_h3=profiles.h3,
-        profile_h4=profiles.h4,
-        profile_bin_model_rms=profiles.bin_model_rms,
-        profile_bin_model_weighted_rms=profiles.bin_model_weighted_rms,
-        profile_optimizer_status=profiles.optimizer_status,
-        profile_optimizer_cost=profiles.optimizer_cost,
-        profile_parameter_at_bound=profiles.parameter_at_bound,
-        profile_map_x=profile_map_x,
-        profile_map_y=profile_map_y,
-        R=profiles.radius,
-        sigma=profiles.sigma,
-        du=profiles.centroid_offset,
-        profile_map_fit_valid=profile_map_fit_valid,
-        profile_map_parameter_at_bound=profiles.parameter_at_bound,
-        du_x_center=du_x_summary["x_center"],
-        du_x_median=du_x_summary["median"],
-        du_x_mad=du_x_summary["mad"],
-        du_x_count=du_x_summary["count"],
-        du_x_parameter_bound_excluded_count=du_x_summary["parameter_bound_excluded_count"],
-        du_x_amplifier_half=du_x_summary["amplifier_half"],
-        du_x_bin_edges=du_x_summary["x_bin_edges"],
-        du_x_amplifier_y_boundary=du_x_summary["amplifier_y_boundary"],
-        profile_closure_neighbor_density=diagnostic_neighbors.density,
-        profile_left_valley_u=profiles.left_valley_u,
-        profile_right_valley_u=profiles.right_valley_u,
-        profile_left_inflection_u=profiles.left_inflection_u,
-        profile_right_inflection_u=profiles.right_inflection_u,
-        aperture_capture=captured, preliminary_spectrum=preliminary,
-        compact_total_spectrum=compact_total,
-        evidence_u=evidence.u, evidence_signal=evidence.signal,
-        evidence_fiber=evidence.fiber, evidence_column=evidence.column,
-        evidence_cell=evidence.cell,
-        evidence_five_pixel_normalization=evidence.five_pixel_normalization,
-        evidence_seed_core=evidence.seed_core,
-        evidence_neighbor_fiber=evidence.neighbor_fiber,
-        evidence_neighbor_u=evidence.neighbor_u,
-        evidence_neighbor_overlaps=evidence.neighbor_overlaps,
-        valley_signal=evidence.valley_signal,
-        valley_first_fiber=evidence.valley_first_fiber,
-        valley_second_fiber=evidence.valley_second_fiber,
-        valley_column=evidence.valley_column,
-        valley_cell=evidence.valley_cell,
-        valley_first_u=evidence.valley_first_u, valley_second_u=evidence.valley_second_u,
-    )
-    write_json(output / "02_profile_grid_cells.json", {
-        "grid_mode": profile_grid.mode,
-        "cells": [
-            {
-                "cell": int(cell),
-                "x_range_columns": [int(x_start), int(x_stop)],
-                "fiber_range": [int(fiber_start), int(fiber_stop)],
-                "trace_excursion_pixels": float(profile_grid.trace_excursion[cell]),
-                "fiber_separation_variation_pixels": float(profile_grid.separation_variation[cell]),
-                "fiber_separation_x_variation_pixels": float(profile_grid.separation_x_variation[cell]),
-                "fiber_separation_direction_variation_pixels": float(profile_grid.separation_fiber_variation[cell]),
-                "reached_minimum_size": bool(profile_grid.reached_minimum_size[cell]),
-            }
-            for cell, ((x_start, x_stop), (fiber_start, fiber_stop)) in enumerate(
-                zip(profile_grid.cell_columns, profile_grid.cell_fibers)
-            )
-        ],
-    })
-    plot_profile_grid(traces, profile_grid, output / "02_ldls_profile_grid.png")
-    plot_profile_parameter_maps(
-        profile_map_x, profile_map_y, profiles.radius, profiles.sigma,
-        profiles.centroid_offset, profile_map_fit_valid,
-        profiles.parameter_at_bound, output / "02_ldls_profile_parameter_maps.png",
-    )
-    plot_profile_width_maps(
-        profile_map_x, profile_map_y, profiles.radius, profiles.sigma,
-        profile_map_fit_valid, profiles.parameter_at_bound,
-        output / "02_ldls_profile_width_maps.png",
-    )
-    plot_du_vs_x_by_amplifier(
-        du_x_summary, output / "02_ldls_du_vs_x_by_amp.png",
-    )
-    plot_profile_radius_sigma_tradeoff(
-        profile_map_x, profile_map_y, profiles.radius, profiles.sigma,
-        profile_map_fit_valid, profiles.parameter_at_bound,
-        output / "02_ldls_profile_radius_sigma_tradeoff.png",
-    )
-    plot_profile_diagnostics(
-        traces, evidence, profiles, diagnostic_neighbors, compact_total,
-        output / "02_ldls_profile_samples.png",
-        args.profile_support, args.profile_bin_width, args.profile_valley_weight,
-    )
-    width_fields, fraction_fields, measured_width, measured_fraction, smooth_field_valid = smooth_profile_fields(
-        profile_map_x, profile_map_y, profiles.radius, profiles.sigma,
-        profile_map_fit_valid, profiles.parameter_at_bound,
-        detector_shape=ldls.shape, amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
-    )
-    smooth_width, smooth_fraction, smooth_radius, smooth_sigma = evaluate_smooth_profile_fields(
-        width_fields, fraction_fields, profile_map_x, profile_map_y,
-        amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
-    )
-    width_residual = measured_width - smooth_width
-    fraction_residual = measured_fraction - smooth_fraction
-    fourier_validation = validate_fourier_compact_profiles(
-        smooth_radius[smooth_field_valid], smooth_sigma[smooth_field_valid],
-    )
-    np.savez_compressed(
-        output / "02_ldls_smooth_profile_field.npz",
-        profile_map_x=profile_map_x, profile_map_y=profile_map_y,
-        smooth_field_valid=smooth_field_valid,
-        measured_W=measured_width, smooth_W=smooth_width, residual_W=width_residual,
-        measured_f_sigma=measured_fraction, smooth_f_sigma=smooth_fraction,
-        residual_f_sigma=fraction_residual,
-        smooth_R=smooth_radius, smooth_sigma=smooth_sigma,
-        W_surface_coefficients=np.stack([field.coefficients for field in width_fields]),
-        f_sigma_surface_coefficients=np.stack([field.coefficients for field in fraction_fields]),
-        surface_degree=np.asarray(width_fields[0].degree, dtype=np.int16),
-        surface_x_center=np.asarray([field.x_center for field in width_fields]),
-        surface_x_scale=np.asarray([field.x_scale for field in width_fields]),
-        surface_y_center=np.asarray([field.y_center for field in width_fields]),
-        surface_y_scale=np.asarray([field.y_scale for field in width_fields]),
-        W_surface_residual_mad=np.asarray([field.residual_mad for field in width_fields]),
-        f_sigma_surface_residual_mad=np.asarray([field.residual_mad for field in fraction_fields]),
-        amplifier_y_boundary=np.asarray(UPPER_AMPLIFIER_Y_OFFSET, dtype=float),
-    )
-    write_json(output / "02_ldls_smooth_profile_field.json", {
-        "representation": "independent robust ridge-regularized tensor-Legendre surfaces by physical amplifier half",
-        "coordinates": {"W": "sqrt(R^2 / 4 + sigma^2 + 1 / 12)", "f_sigma": "sigma^2 / (R^2 / 4 + sigma^2)"},
-        "physical_domain": "V = W^2 - 1/12 > 0; 0 < f_sigma < 1",
-        "usable_local_fit_count": int(np.count_nonzero(smooth_field_valid)),
-        "W_residual": smooth_field_residual_statistics(width_residual[smooth_field_valid]),
-        "f_sigma_residual": smooth_field_residual_statistics(fraction_residual[smooth_field_valid]),
-        "fourier_validation": fourier_validation,
-    })
-    plot_smooth_profile_field_diagnostics(
-        profile_map_x, profile_map_y, measured_width, smooth_width,
-        measured_fraction, smooth_fraction, smooth_field_valid,
-        output / "02_ldls_smooth_profile_fields.png",
-    )
-    plot_smooth_profile_field_scatter(
-        measured_width, smooth_width, measured_fraction, smooth_fraction,
-        smooth_field_valid, output / "02_ldls_smooth_profile_field_scatter.png",
-    )
-    trace_measurements = dense_profile_informed_trace_measurements(
-        ldls, ldls_mask, traces, width_fields, fraction_fields,
-        amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
-        block_width=args.trace_measurement_block_width,
-        support=args.profile_support, iterations=args.trace_centering_iterations,
-    )
-    trace_delta_summary = plot_trace_measurement_diagnostics(
-        trace_measurements, float(UPPER_AMPLIFIER_Y_OFFSET),
-        (lower_zipcode.amp, upper_zipcode.amp),
-        output / "02_ldls_profile_informed_trace_evidence.png",
-    )
-    plot_individual_trace_delta_curves(
-        trace_measurements, float(UPPER_AMPLIFIER_Y_OFFSET),
-        output / "02_ldls_profile_informed_trace_fiber_curves.png",
-    )
-    np.savez_compressed(
-        output / "02_ldls_profile_informed_trace_measurements.npz",
-        **trace_measurements,
-        delta_x_center=trace_delta_summary["x_center"],
-        delta_x_median=trace_delta_summary["median"],
-        delta_x_mad=trace_delta_summary["mad"],
-        delta_x_count=trace_delta_summary["count"],
-        delta_x_amplifier_half=trace_delta_summary["amplifier_half"],
-        delta_x_bin_edges=trace_delta_summary["x_bin_edges"],
-        amplifier_y_boundary=np.asarray(UPPER_AMPLIFIER_Y_OFFSET, dtype=float),
-    )
-    refined_trace, trace_correction, trace_correction_coefficients, trace_correction_residual_mad = fit_refined_trace_corrections(
-        trace_measurements, traces,
-    )
-    dense_correction_residual = trace_measurements["delta"] - trace_correction[:, trace_measurements["column"]]
-    correction_valid = trace_measurements["status"] == 1
-    np.savez_compressed(
-        output / "02_ldls_refined_trace_closure.npz",
-        trace_original=traces, trace_refined=refined_trace,
-        trace_correction=trace_correction,
-        trace_correction_coefficients=trace_correction_coefficients,
-        trace_correction_residual_mad=trace_correction_residual_mad,
-        dense_measurement_column=trace_measurements["column"],
-        dense_measurement_delta=trace_measurements["delta"],
-        dense_correction_residual=dense_correction_residual,
-        dense_measurement_valid=correction_valid,
-    )
-    plot_refined_trace_correction_diagnostics(
-        trace_measurements, trace_correction, trace_correction_residual_mad,
-        float(UPPER_AMPLIFIER_Y_OFFSET), output / "02_ldls_refined_trace_correction.png",
-    )
-    plot_refined_trace_fiber_examples(
-        trace_measurements, trace_correction, float(UPPER_AMPLIFIER_Y_OFFSET),
-        output / "02_ldls_refined_trace_fiber_examples.png",
-    )
-    refined_preliminary = np.asarray(extract_fractional_aperture(
-        ldls, np.zeros_like(ldls), refined_trace, pixel_mask=ldls_mask,
-        width=args.aperture_width,
-    ).get_array("spectrum"), dtype=float)
-    refined_preliminary = smooth_spectra(refined_preliminary, args.ldls_smoothing_window)
-    closure_residual_measurements = dense_profile_informed_trace_measurements(
-        ldls, ldls_mask, refined_trace, width_fields, fraction_fields,
-        amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
-        block_width=args.trace_measurement_block_width,
-        support=args.profile_support, iterations=args.trace_centering_iterations,
-    )
-    closure_residual_summary = plot_trace_measurement_diagnostics(
-        closure_residual_measurements, float(UPPER_AMPLIFIER_Y_OFFSET),
-        (lower_zipcode.amp, upper_zipcode.amp),
-        output / "02_ldls_refined_trace_residual_centroids.png",
-    )
-    closure_panel_residuals = plot_refined_trace_profile_closure(
-        ldls, ldls_mask, refined_trace, compact_total, width_fields, fraction_fields,
-        support=args.profile_support, amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
-        path=output / "02_ldls_refined_trace_profile_closure.png",
-    )
-    np.savez_compressed(
-        output / "02_ldls_refined_trace_residual_measurements.npz",
-        **closure_residual_measurements,
-        residual_x_center=closure_residual_summary["x_center"],
-        residual_x_median=closure_residual_summary["median"],
-        residual_x_mad=closure_residual_summary["mad"],
-        residual_x_count=closure_residual_summary["count"],
-        residual_x_amplifier_half=closure_residual_summary["amplifier_half"],
-        closure_panel_profile_defined_du=closure_panel_residuals,
-    )
-    refined_evidence = collect_profile_evidence(
-        ldls, refined_trace, refined_preliminary, ldls_mask,
-        support=args.profile_support, grid=profile_grid,
-    )
-    refined_profiles, _refined_neighbors, _refined_total, *_refined_measurement_info = measure_local_profiles(
-        refined_evidence, refined_trace, refined_preliminary,
-        detector_rows=ldls.shape[0], aperture_width=args.aperture_width,
-        support=args.profile_support, bin_width=args.profile_bin_width, grid=profile_grid,
-        iterations=0, valley_weight=args.profile_valley_weight,
-    )
-    refined_map_x, refined_map_y = profile_map_coordinates(refined_trace, refined_profiles)
-    refined_fit_valid = (
-        (refined_profiles.optimizer_status != -99) & ~refined_profiles.parameter_at_bound
-        & np.isfinite(refined_profiles.radius) & np.isfinite(refined_profiles.sigma)
-    )
-    refined_variance = refined_profiles.radius ** 2 / 4.0 + refined_profiles.sigma ** 2
-    refined_width = np.sqrt(refined_variance + 1.0 / 12.0)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        refined_fraction = refined_profiles.sigma ** 2 / refined_variance
-    fixed_width_at_refined, fixed_fraction_at_refined, _fixed_radius, _fixed_sigma = evaluate_smooth_profile_fields(
-        width_fields, fraction_fields, refined_map_x, refined_map_y,
-        amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
-    )
-    plot_smooth_profile_field_diagnostics(
-        refined_map_x, refined_map_y, refined_width, fixed_width_at_refined,
-        refined_fraction, fixed_fraction_at_refined, refined_fit_valid,
-        output / "02_ldls_refined_trace_profile_field_comparison.png",
-    )
-    np.savez_compressed(
-        output / "02_ldls_refined_trace_profile_remeasurement.npz",
-        profile_map_x=refined_map_x, profile_map_y=refined_map_y,
-        remeasured_W=refined_width, fixed_W=fixed_width_at_refined,
-        remeasured_f_sigma=refined_fraction, fixed_f_sigma=fixed_fraction_at_refined,
-        W_change=refined_width - fixed_width_at_refined,
-        f_sigma_change=refined_fraction - fixed_fraction_at_refined,
-        remeasured_fit_valid=refined_fit_valid,
-        remeasured_radius=refined_profiles.radius, remeasured_sigma=refined_profiles.sigma,
-    )
-    write_json(output / "02_ldls_refined_trace_closure.json", {
-        "trace_representation": "independent per-fiber degree-4 robust Legendre correction ΔT(x); no cross-fiber regularization",
-        "fixed_response_fields": True,
-        "fibers_with_correction": int(np.count_nonzero(np.isfinite(trace_correction_coefficients[:, 0]))),
-        "fibers_without_adequate_dense_measurements": int(np.count_nonzero(~np.isfinite(trace_correction_coefficients[:, 0]))),
-        "dense_correction_residual": smooth_field_residual_statistics(dense_correction_residual[correction_valid]),
-        "dense_correction_residual_by_amplifier": {
-            lower_zipcode.amp: smooth_field_residual_statistics(dense_correction_residual[
-                correction_valid & (trace_measurements["trace_original"] < UPPER_AMPLIFIER_Y_OFFSET)
-            ]),
-            upper_zipcode.amp: smooth_field_residual_statistics(dense_correction_residual[
-                correction_valid & (trace_measurements["trace_original"] >= UPPER_AMPLIFIER_Y_OFFSET)
-            ]),
-        },
-        "per_fiber_correction_residual_mad_pixels": trace_correction_residual_mad.tolist(),
-        "post_refinement_centroid_residual": smooth_field_residual_statistics(closure_residual_measurements["delta"][closure_residual_measurements["status"] == 1]),
-        "profile_defined_panel_residual_du": smooth_field_residual_statistics(closure_panel_residuals[:, 2]),
-        "remeasurement_W_change": smooth_field_residual_statistics((refined_width - fixed_width_at_refined)[refined_fit_valid]),
-        "remeasurement_f_sigma_change": smooth_field_residual_statistics((refined_fraction - fixed_fraction_at_refined)[refined_fit_valid]),
-    })
-    write_json(output / "02_aperture_capture.json", {
-        "aperture_width_pixels": args.aperture_width,
-        "capture_median": float(np.nanmedian(captured)),
-        "capture_p05": float(np.nanpercentile(captured, 5)),
-        "capture_p95": float(np.nanpercentile(captured, 95)),
-        "profile_map": {
-            "grid_mode": profile_grid.mode,
-            "initial_chunk_width_columns": args.profile_chunk_width,
-            "initial_group_size_fibers": args.profile_group_size,
-            "trace_excursion_tolerance_pixels": args.profile_trace_tolerance,
-            "fiber_separation_tolerance_pixels": args.profile_separation_tolerance,
-            "minimum_chunk_width_columns": args.profile_min_chunk_width,
-            "minimum_group_size_fibers": args.profile_min_group_size,
-            "cell_count": int(profiles.density.shape[0]),
-            "cells_at_minimum_size": int(np.count_nonzero(profile_grid.reached_minimum_size)),
-            "normalization_iterations": profile_iterations,
-            "normalization_converged": profile_converged,
-            "profile_integral_iterations": profile_integral_iterations,
-            "final_capture_relative_change": capture_change,
-            "final_profile_relative_change": profile_change,
-            "detector_sample_count": int(evidence.u.size),
-            "seed_core_sample_count": int(evidence.seed_core.sum()),
-            "final_constraining_sample_count": int(profiles.sample_count.sum()),
-            "robust_bin_count": int(profiles.bin_used.sum()),
-            "valley_constraint_count": int(profiles.valley_constraint_count.sum()),
-            "topology": "non-negative, one-peak, monotone asymmetric beta-CDF branches fitted from smoothing-spline peak/valley evidence",
-        },
-        "interpretation": "after each fit, compact_total is multiplied by I=integral(M), while P=M/I is used for deblending and aperture capture",
-    })
+    captured = profile_trace.captured_fraction
+    assert captured is not None
 
     arc_extract = extract_fractional_aperture(arc, np.zeros_like(arc), traces, pixel_mask=arc_mask, width=args.aperture_width)
     arc_spectrum = np.asarray(arc_extract.get_array("spectrum"), dtype=float)
