@@ -2228,6 +2228,225 @@ def plot_individual_trace_delta_curves(
     plt.close(fig)
 
 
+@dataclass(frozen=True)
+class RobustTraceCorrection:
+    """Development-only low-complexity correction ΔT(x) for one fiber."""
+
+    coefficients: np.ndarray
+    x_center: float
+    x_scale: float
+    residual_mad: float
+    valid_count: int
+
+    def evaluate(self, x: np.ndarray) -> np.ndarray:
+        normalized = (np.asarray(x, dtype=float) - self.x_center) / self.x_scale
+        return np.polynomial.legendre.legval(normalized, self.coefficients)
+
+
+def fit_robust_trace_correction(
+    x: np.ndarray,
+    delta: np.ndarray,
+    uncertainty: np.ndarray,
+    *,
+    detector_columns: int,
+    degree: int = 4,
+) -> RobustTraceCorrection:
+    """Fit only ΔT(x), using uncertainty and Huber rejection of dense outliers."""
+    valid = np.isfinite(x) & np.isfinite(delta) & np.isfinite(uncertainty) & (uncertainty > 0.0)
+    x, delta, uncertainty = np.asarray(x)[valid], np.asarray(delta)[valid], np.asarray(uncertainty)[valid]
+    if x.size < max(2 * (degree + 1), 12):
+        raise ValueError("insufficient quality dense centroids for per-fiber correction")
+    center = 0.5 * (detector_columns - 1)
+    scale = max(center, 1.0)
+    design = np.polynomial.legendre.legvander((x - center) / scale, degree)
+    inverse_variance = 1.0 / np.maximum(uncertainty, 0.002) ** 2
+    weights = inverse_variance / np.median(inverse_variance)
+    coefficients = np.zeros(degree + 1, dtype=float)
+    for _ in range(8):
+        normal = design.T @ (weights[:, None] * design)
+        ridge = max(float(np.trace(normal)) / normal.shape[0], 1.0) * 1e-5
+        penalty = np.diag(np.arange(degree + 1, dtype=float) ** 2)
+        coefficients = np.linalg.solve(normal + ridge * penalty, design.T @ (weights * delta))
+        residual = delta - design @ coefficients
+        robust = max(robust_mad(residual), 0.002)
+        huber = np.minimum(1.0, 1.5 * robust / np.maximum(np.abs(residual), np.finfo(float).eps))
+        weights = inverse_variance * huber / np.median(inverse_variance * huber)
+    residual = delta - design @ coefficients
+    return RobustTraceCorrection(coefficients, center, scale, robust_mad(residual), int(x.size))
+
+
+def fit_refined_trace_corrections(
+    measurements: dict[str, np.ndarray],
+    original_trace: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Fit independent correction curves and return the development-only refined trace."""
+    columns = measurements["column"]
+    valid = (measurements["status"] == 1) & np.isfinite(measurements["residual_rms"])
+    refined = np.asarray(original_trace, dtype=float).copy()
+    correction = np.zeros_like(refined)
+    coefficients = np.full((original_trace.shape[0], 5), np.nan, dtype=float)
+    residual_mad = np.full(original_trace.shape[0], np.nan)
+    for fiber in range(original_trace.shape[0]):
+        use = valid[fiber]
+        try:
+            curve = fit_robust_trace_correction(
+                columns[use], measurements["delta"][fiber, use], measurements["delta_uncertainty"][fiber, use],
+                detector_columns=original_trace.shape[1],
+            )
+        except ValueError:
+            continue
+        correction[fiber] = curve.evaluate(np.arange(original_trace.shape[1]))
+        refined[fiber] += correction[fiber]
+        coefficients[fiber] = curve.coefficients
+        residual_mad[fiber] = curve.residual_mad
+    return refined, correction, coefficients, residual_mad
+
+
+def plot_refined_trace_correction_diagnostics(
+    measurements: dict[str, np.ndarray],
+    correction: np.ndarray,
+    residual_mad: np.ndarray,
+    amplifier_y_boundary: float,
+    path: Path,
+) -> None:
+    """Show raw dense deltas, fitted corrections, and correction residuals."""
+    columns = measurements["column"]
+    original = measurements["trace_original"]
+    fitted = correction[:, columns]
+    residual = measurements["delta"] - fitted
+    valid = measurements["status"] == 1
+    x = np.broadcast_to(columns, valid.shape)
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    for axis, values, title, cmap in (
+        (axes[0, 0], fitted, "fitted ΔT(x)", "coolwarm"),
+        (axes[0, 1], residual, "dense delta − fitted ΔT", "coolwarm"),
+        (axes[1, 0], fitted, "T_refined − T0", "coolwarm"),
+    ):
+        use = valid & np.isfinite(values)
+        vmin, vmax = percentile_color_limits(values[use])
+        scatter = axis.scatter(x[use], original[use], c=values[use], s=7, linewidths=0.0, cmap=cmap, vmin=vmin, vmax=vmax)
+        fig.colorbar(scatter, ax=axis).set_label("pixel")
+        axis.axhline(amplifier_y_boundary, color="0.3", lw=0.8, ls="--")
+        axis.set(title=title, xlabel="detector X (column)", ylabel="detector Y (row)")
+        axis.grid(alpha=0.15)
+    fibers = np.arange(residual_mad.size)
+    axes[1, 1].plot(fibers, residual_mad, ".", ms=4)
+    axes[1, 1].set(title="per-fiber robust correction residual MAD", xlabel="fiber", ylabel="MAD (pixel)")
+    axes[1, 1].grid(alpha=0.2)
+    fig.suptitle("Development-only robust per-fiber refined-trace corrections")
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
+def plot_refined_trace_fiber_examples(
+    measurements: dict[str, np.ndarray],
+    correction: np.ndarray,
+    amplifier_y_boundary: float,
+    path: Path,
+) -> None:
+    """Overlay raw dense delta evidence and fitted correction for representative fibers."""
+    valid = measurements["status"] == 1
+    lower = measurements["trace_original"][:, 0] < amplifier_y_boundary
+    ranked: list[int] = []
+    for half in (lower, ~lower):
+        fibers = np.flatnonzero(half)
+        fibers = fibers[np.argsort(np.count_nonzero(valid[fibers], axis=1))[::-1]]
+        ranked.extend(fibers[:3].tolist())
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7), sharex=True, sharey=True)
+    for axis, fiber in zip(axes.flat, ranked):
+        use = valid[fiber]
+        axis.errorbar(measurements["column"][use], measurements["delta"][fiber, use],
+                      yerr=measurements["delta_uncertainty"][fiber, use], fmt="o", ms=2.5, capsize=1.5, label="dense delta")
+        axis.plot(np.arange(correction.shape[1]), correction[fiber], color="black", lw=1.2, label="robust ΔT fit")
+        axis.axhline(0.0, color="0.4", lw=0.7, ls="--")
+        axis.set(title=f"fiber {fiber}", xlabel="detector X", ylabel="correction (pixel)")
+        axis.grid(alpha=0.2)
+    axes[0, 0].legend(frameon=False, fontsize=7)
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
+def plot_refined_trace_profile_closure(
+    image: np.ndarray,
+    mask: np.ndarray,
+    refined_trace: np.ndarray,
+    preliminary: np.ndarray,
+    width_fields: tuple[RobustSurface, RobustSurface],
+    fraction_fields: tuple[RobustSurface, RobustSurface],
+    *,
+    support: float,
+    amplifier_y_boundary: float,
+    path: Path,
+) -> np.ndarray:
+    """Plot LDLS samples against the fixed smooth profile centered on T_refined."""
+    ny, nx = image.shape
+    targets = [(x, y) for y in (ny // 8, ny // 2, 7 * ny // 8) for x in (nx // 8, nx // 2, 7 * nx // 8)]
+    residuals: list[tuple[int, int, float]] = []
+    fig, axes = plt.subplots(3, 3, figsize=(16, 13), sharex=True, sharey=True)
+    for axis, (center_column, y_target) in zip(axes.flat, targets):
+        fiber = int(np.nanargmin(np.abs(refined_trace[:, center_column] - y_target)))
+        columns = np.arange(max(0, center_column - 4), min(nx, center_column + 5))
+        xcoord = np.full(refined_trace.shape[0], center_column, dtype=float)
+        _, _, radius, sigma = evaluate_smooth_profile_fields(
+            width_fields, fraction_fields, xcoord, refined_trace[:, center_column],
+            amplifier_y_boundary=amplifier_y_boundary,
+        )
+        shapes = [fourier_compact_profile(float(rr), float(ss)) if np.isfinite(rr) and np.isfinite(ss) else None for rr, ss in zip(radius, sigma)]
+        uu: list[np.ndarray] = []
+        values: list[np.ndarray] = []
+        design: list[np.ndarray] = []
+        raw: list[np.ndarray] = []
+        for column in columns:
+            center = refined_trace[fiber, column]
+            normalization = preliminary[fiber, column]
+            if not (np.isfinite(center) and np.isfinite(normalization) and normalization > 0.0 and shapes[fiber] is not None):
+                continue
+            rows = np.arange(max(0, int(np.floor(center - support))), min(ny, int(np.ceil(center + support)) + 1))
+            good = ~mask[rows, column] & np.isfinite(image[rows, column])
+            rows = rows[good]
+            if not rows.size:
+                continue
+            signal = np.asarray(image[rows, column], dtype=float)
+            for neighbor in (fiber - 1, fiber + 1):
+                if neighbor < 0 or neighbor >= refined_trace.shape[0] or shapes[neighbor] is None:
+                    continue
+                neighbor_norm = preliminary[neighbor, column]
+                if np.isfinite(neighbor_norm) and neighbor_norm > 0.0:
+                    signal -= neighbor_norm * shapes[neighbor].evaluate(rows - refined_trace[neighbor, column])[0]
+            u = rows - center
+            profile, derivative = shapes[fiber].evaluate(u)
+            uu.append(u); values.append(signal / normalization)
+            design.append(np.column_stack((profile, -derivative))); raw.append(signal / normalization)
+        if not uu:
+            axis.set(title=f"x={center_column}, fiber={fiber}: unavailable")
+            continue
+        u = np.concatenate(uu); normalized = np.concatenate(values)
+        bins, median, scatter, count = robust_profile_bins(u, normalized, support=support, bin_width=0.4)
+        model, derivative = shapes[fiber].evaluate(bins)
+        try:
+            coefficient, _covariance, _rms = robust_linear_profile_fit(np.vstack(design), np.concatenate(raw))
+            residual_delta = float(coefficient[1] / coefficient[0]) if coefficient[0] > 0.0 else float("nan")
+        except (ValueError, np.linalg.LinAlgError):
+            residual_delta = float("nan")
+        residuals.append((fiber, center_column, residual_delta))
+        use = np.isfinite(median)
+        axis.plot(u, normalized, ".", ms=1, alpha=0.025, color="tab:blue")
+        axis.errorbar(bins[use], median[use], yerr=scatter[use] / np.sqrt(np.maximum(count[use], 1)), fmt="o", ms=2.5, color="tab:purple", capsize=0)
+        axis.plot(bins, model, color="black", lw=1.4, label="fixed smooth P(T_refined)")
+        axis.set(title=f"x={center_column}, fiber={fiber}; residual du={residual_delta:+.3f}", xlim=(-support, support))
+        axis.grid(alpha=0.2)
+    for axis in axes[-1]: axis.set_xlabel("u from T_refined (pixel)")
+    for axis in axes[:, 0]: axis.set_ylabel("deblended LDLS / compact flux")
+    axes[0, 0].legend(frameon=False, fontsize=7)
+    fig.suptitle("Fixed smooth-profile closure at the refined trace (no additional local du applied)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+    return np.asarray(residuals, dtype=float).reshape(-1, 3)
+
+
 def plot_profile_radius_sigma_tradeoff(
     profile_map_x: np.ndarray,
     profile_map_y: np.ndarray,
@@ -2606,6 +2825,119 @@ def main(argv: list[str] | None = None) -> int:
         delta_x_bin_edges=trace_delta_summary["x_bin_edges"],
         amplifier_y_boundary=np.asarray(UPPER_AMPLIFIER_Y_OFFSET, dtype=float),
     )
+    refined_trace, trace_correction, trace_correction_coefficients, trace_correction_residual_mad = fit_refined_trace_corrections(
+        trace_measurements, traces,
+    )
+    dense_correction_residual = trace_measurements["delta"] - trace_correction[:, trace_measurements["column"]]
+    correction_valid = trace_measurements["status"] == 1
+    np.savez_compressed(
+        output / "02_ldls_refined_trace_closure.npz",
+        trace_original=traces, trace_refined=refined_trace,
+        trace_correction=trace_correction,
+        trace_correction_coefficients=trace_correction_coefficients,
+        trace_correction_residual_mad=trace_correction_residual_mad,
+        dense_measurement_column=trace_measurements["column"],
+        dense_measurement_delta=trace_measurements["delta"],
+        dense_correction_residual=dense_correction_residual,
+        dense_measurement_valid=correction_valid,
+    )
+    plot_refined_trace_correction_diagnostics(
+        trace_measurements, trace_correction, trace_correction_residual_mad,
+        float(UPPER_AMPLIFIER_Y_OFFSET), output / "02_ldls_refined_trace_correction.png",
+    )
+    plot_refined_trace_fiber_examples(
+        trace_measurements, trace_correction, float(UPPER_AMPLIFIER_Y_OFFSET),
+        output / "02_ldls_refined_trace_fiber_examples.png",
+    )
+    refined_preliminary = np.asarray(extract_fractional_aperture(
+        ldls, np.zeros_like(ldls), refined_trace, pixel_mask=ldls_mask,
+        width=args.aperture_width,
+    ).get_array("spectrum"), dtype=float)
+    refined_preliminary = smooth_spectra(refined_preliminary, args.ldls_smoothing_window)
+    closure_residual_measurements = dense_profile_informed_trace_measurements(
+        ldls, ldls_mask, refined_trace, width_fields, fraction_fields,
+        amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
+        block_width=args.trace_measurement_block_width,
+        support=args.profile_support, iterations=args.trace_centering_iterations,
+    )
+    closure_residual_summary = plot_trace_measurement_diagnostics(
+        closure_residual_measurements, float(UPPER_AMPLIFIER_Y_OFFSET),
+        (lower_zipcode.amp, upper_zipcode.amp),
+        output / "02_ldls_refined_trace_residual_centroids.png",
+    )
+    closure_panel_residuals = plot_refined_trace_profile_closure(
+        ldls, ldls_mask, refined_trace, refined_preliminary, width_fields, fraction_fields,
+        support=args.profile_support, amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
+        path=output / "02_ldls_refined_trace_profile_closure.png",
+    )
+    np.savez_compressed(
+        output / "02_ldls_refined_trace_residual_measurements.npz",
+        **closure_residual_measurements,
+        residual_x_center=closure_residual_summary["x_center"],
+        residual_x_median=closure_residual_summary["median"],
+        residual_x_mad=closure_residual_summary["mad"],
+        residual_x_count=closure_residual_summary["count"],
+        residual_x_amplifier_half=closure_residual_summary["amplifier_half"],
+        closure_panel_profile_defined_du=closure_panel_residuals,
+    )
+    refined_evidence = collect_profile_evidence(
+        ldls, refined_trace, refined_preliminary, ldls_mask,
+        support=args.profile_support, grid=profile_grid,
+    )
+    refined_profiles, _refined_neighbors, _refined_total, *_refined_measurement_info = measure_local_profiles(
+        refined_evidence, refined_trace, refined_preliminary,
+        detector_rows=ldls.shape[0], aperture_width=args.aperture_width,
+        support=args.profile_support, bin_width=args.profile_bin_width, grid=profile_grid,
+        iterations=0, valley_weight=args.profile_valley_weight,
+    )
+    refined_map_x, refined_map_y = profile_map_coordinates(refined_trace, refined_profiles)
+    refined_fit_valid = (
+        (refined_profiles.optimizer_status != -99) & ~refined_profiles.parameter_at_bound
+        & np.isfinite(refined_profiles.radius) & np.isfinite(refined_profiles.sigma)
+    )
+    refined_variance = refined_profiles.radius ** 2 / 4.0 + refined_profiles.sigma ** 2
+    refined_width = np.sqrt(refined_variance + 1.0 / 12.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        refined_fraction = refined_profiles.sigma ** 2 / refined_variance
+    fixed_width_at_refined, fixed_fraction_at_refined, _fixed_radius, _fixed_sigma = evaluate_smooth_profile_fields(
+        width_fields, fraction_fields, refined_map_x, refined_map_y,
+        amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
+    )
+    plot_smooth_profile_field_diagnostics(
+        refined_map_x, refined_map_y, refined_width, fixed_width_at_refined,
+        refined_fraction, fixed_fraction_at_refined, refined_fit_valid,
+        output / "02_ldls_refined_trace_profile_field_comparison.png",
+    )
+    np.savez_compressed(
+        output / "02_ldls_refined_trace_profile_remeasurement.npz",
+        profile_map_x=refined_map_x, profile_map_y=refined_map_y,
+        remeasured_W=refined_width, fixed_W=fixed_width_at_refined,
+        remeasured_f_sigma=refined_fraction, fixed_f_sigma=fixed_fraction_at_refined,
+        W_change=refined_width - fixed_width_at_refined,
+        f_sigma_change=refined_fraction - fixed_fraction_at_refined,
+        remeasured_fit_valid=refined_fit_valid,
+        remeasured_radius=refined_profiles.radius, remeasured_sigma=refined_profiles.sigma,
+    )
+    write_json(output / "02_ldls_refined_trace_closure.json", {
+        "trace_representation": "independent per-fiber degree-4 robust Legendre correction ΔT(x); no cross-fiber regularization",
+        "fixed_response_fields": True,
+        "fibers_with_correction": int(np.count_nonzero(np.isfinite(trace_correction_coefficients[:, 0]))),
+        "fibers_without_adequate_dense_measurements": int(np.count_nonzero(~np.isfinite(trace_correction_coefficients[:, 0]))),
+        "dense_correction_residual": smooth_field_residual_statistics(dense_correction_residual[correction_valid]),
+        "dense_correction_residual_by_amplifier": {
+            lower_zipcode.amp: smooth_field_residual_statistics(dense_correction_residual[
+                correction_valid & (trace_measurements["trace_original"] < UPPER_AMPLIFIER_Y_OFFSET)
+            ]),
+            upper_zipcode.amp: smooth_field_residual_statistics(dense_correction_residual[
+                correction_valid & (trace_measurements["trace_original"] >= UPPER_AMPLIFIER_Y_OFFSET)
+            ]),
+        },
+        "per_fiber_correction_residual_mad_pixels": trace_correction_residual_mad.tolist(),
+        "post_refinement_centroid_residual": smooth_field_residual_statistics(closure_residual_measurements["delta"][closure_residual_measurements["status"] == 1]),
+        "profile_defined_panel_residual_du": smooth_field_residual_statistics(closure_panel_residuals[:, 2]),
+        "remeasurement_W_change": smooth_field_residual_statistics((refined_width - fixed_width_at_refined)[refined_fit_valid]),
+        "remeasurement_f_sigma_change": smooth_field_residual_statistics((refined_fraction - fixed_fraction_at_refined)[refined_fit_valid]),
+    })
     write_json(output / "02_aperture_capture.json", {
         "aperture_width_pixels": args.aperture_width,
         "capture_median": float(np.nanmedian(captured)),
