@@ -34,7 +34,7 @@ from astropy.io import fits
 from scipy.ndimage import median_filter
 from scipy.interpolate import PchipInterpolator, UnivariateSpline
 from scipy.optimize import least_squares
-from scipy.special import betainc
+from scipy.special import betainc, j1
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -1689,6 +1689,540 @@ def plot_du_vs_x_by_amplifier(
     plt.close(fig)
 
 
+@dataclass(frozen=True)
+class RobustSurface:
+    """Small robust tensor-Legendre detector surface for one amplifier half."""
+
+    coefficients: np.ndarray
+    degree: int
+    x_center: float
+    x_scale: float
+    y_center: float
+    y_scale: float
+    residual_mad: float
+
+    def evaluate(self, x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        basis = tensor_legendre_basis(
+            (np.asarray(x, dtype=float) - self.x_center) / self.x_scale,
+            (np.asarray(y, dtype=float) - self.y_center) / self.y_scale,
+            self.degree,
+        )
+        return (basis @ self.coefficients).reshape(np.broadcast(x, y).shape)
+
+
+def tensor_legendre_basis(x: np.ndarray, y: np.ndarray, degree: int) -> np.ndarray:
+    """Return a low-complexity tensor-product Legendre basis."""
+    xx, yy = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+    x_terms = np.polynomial.legendre.legvander(xx.ravel(), degree)
+    y_terms = np.polynomial.legendre.legvander(yy.ravel(), degree)
+    return (x_terms[:, :, None] * y_terms[:, None, :]).reshape(xx.size, -1)
+
+
+def robust_mad(values: np.ndarray) -> float:
+    """Return the Gaussian-equivalent MAD, or zero for no finite variation."""
+    finite = np.asarray(values, dtype=float)[np.isfinite(values)]
+    if finite.size == 0:
+        return float("nan")
+    return float(1.4826 * np.median(np.abs(finite - np.median(finite))))
+
+
+def fit_robust_surface(
+    x: np.ndarray,
+    y: np.ndarray,
+    values: np.ndarray,
+    *,
+    x_limits: tuple[float, float],
+    y_limits: tuple[float, float],
+    degree: int = 3,
+    ridge: float = 2e-3,
+) -> RobustSurface:
+    """Fit a modest, Huber-reweighted smooth detector surface."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    values = np.asarray(values, dtype=float)
+    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(values)
+    x, y, values = x[finite], y[finite], values[finite]
+    parameter_count = (degree + 1) ** 2
+    if values.size < max(3 * parameter_count, 24):
+        raise ValueError("too few independent local profile fits for a smooth detector field")
+    x_center = 0.5 * sum(x_limits)
+    y_center = 0.5 * sum(y_limits)
+    x_scale = max(0.5 * (x_limits[1] - x_limits[0]), 1.0)
+    y_scale = max(0.5 * (y_limits[1] - y_limits[0]), 1.0)
+    design = tensor_legendre_basis((x - x_center) / x_scale, (y - y_center) / y_scale, degree)
+    penalty = np.eye(parameter_count)
+    penalty[0, 0] = 0.0
+    weights = np.ones(values.size, dtype=float)
+    coefficients = np.zeros(parameter_count, dtype=float)
+    for _ in range(8):
+        normal = design.T @ (weights[:, None] * design)
+        regularization = ridge * max(float(np.trace(normal)) / parameter_count, 1.0)
+        coefficients = np.linalg.solve(normal + regularization * penalty, design.T @ (weights * values))
+        residual = values - design @ coefficients
+        scale = max(robust_mad(residual), np.finfo(float).eps)
+        weights = np.minimum(1.0, 1.5 * scale / np.maximum(np.abs(residual), np.finfo(float).eps))
+    residual = values - design @ coefficients
+    return RobustSurface(coefficients, degree, x_center, x_scale, y_center, y_scale, robust_mad(residual))
+
+
+def smooth_profile_fields(
+    profile_map_x: np.ndarray,
+    profile_map_y: np.ndarray,
+    radius: np.ndarray,
+    sigma: np.ndarray,
+    fit_valid: np.ndarray,
+    parameter_at_bound: np.ndarray,
+    *,
+    detector_shape: tuple[int, int],
+    amplifier_y_boundary: float,
+) -> tuple[tuple[RobustSurface, RobustSurface], tuple[RobustSurface, RobustSurface], np.ndarray, np.ndarray, np.ndarray]:
+    """Fit independent smooth W and f_sigma fields for the physical CCD halves."""
+    variance = radius ** 2 / 4.0 + sigma ** 2
+    width = np.sqrt(variance + 1.0 / 12.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        blur_fraction = sigma ** 2 / variance
+    valid = (
+        fit_valid & ~parameter_at_bound & np.isfinite(profile_map_x) & np.isfinite(profile_map_y)
+        & np.isfinite(width) & np.isfinite(blur_fraction) & (variance > 0.0)
+        & (blur_fraction > 1e-3) & (blur_fraction < 1.0 - 1e-3)
+    )
+    ny, nx = detector_shape
+    width_fields: list[RobustSurface] = []
+    fraction_fields: list[RobustSurface] = []
+    for half in range(2):
+        lower = profile_map_y < amplifier_y_boundary
+        selected = valid & (lower if half == 0 else ~lower)
+        y_limits = (0.0, amplifier_y_boundary - 1.0) if half == 0 else (amplifier_y_boundary, float(ny - 1))
+        width_fields.append(fit_robust_surface(
+            profile_map_x[selected], profile_map_y[selected], width[selected],
+            x_limits=(0.0, float(nx - 1)), y_limits=y_limits,
+        ))
+        fraction_fields.append(fit_robust_surface(
+            profile_map_x[selected], profile_map_y[selected], blur_fraction[selected],
+            x_limits=(0.0, float(nx - 1)), y_limits=y_limits,
+        ))
+    return tuple(width_fields), tuple(fraction_fields), width, blur_fraction, valid
+
+
+def evaluate_smooth_profile_fields(
+    width_fields: tuple[RobustSurface, RobustSurface],
+    fraction_fields: tuple[RobustSurface, RobustSurface],
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    amplifier_y_boundary: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Evaluate smooth fields and recover physical R and sigma at arbitrary coordinates."""
+    x, y = np.broadcast_arrays(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+    width = np.full(x.shape, np.nan, dtype=float)
+    fraction = np.full(x.shape, np.nan, dtype=float)
+    lower = y < amplifier_y_boundary
+    for half, selected in enumerate((lower, ~lower)):
+        if np.any(selected):
+            width[selected] = width_fields[half].evaluate(x[selected], y[selected])
+            fraction[selected] = fraction_fields[half].evaluate(x[selected], y[selected])
+    variance = width ** 2 - 1.0 / 12.0
+    fraction = np.clip(fraction, 1e-4, 1.0 - 1e-4)
+    valid = np.isfinite(variance) & (variance > 0.0) & np.isfinite(fraction)
+    recovered_sigma = np.full(x.shape, np.nan, dtype=float)
+    recovered_radius = np.full(x.shape, np.nan, dtype=float)
+    recovered_sigma[valid] = np.sqrt(fraction[valid] * variance[valid])
+    recovered_radius[valid] = 2.0 * np.sqrt((1.0 - fraction[valid]) * variance[valid])
+    return width, fraction, recovered_radius, recovered_sigma
+
+
+@dataclass(frozen=True)
+class FourierCompactProfile:
+    """Unit-integral pixel-integrated circular-fiber profile and derivative."""
+
+    coordinate: np.ndarray
+    density: np.ndarray
+    derivative: np.ndarray
+
+    def evaluate(self, coordinate: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        coordinate = np.asarray(coordinate, dtype=float)
+        return (
+            np.interp(coordinate, self.coordinate, self.density, left=0.0, right=0.0),
+            np.interp(coordinate, self.coordinate, self.derivative, left=0.0, right=0.0),
+        )
+
+
+def fourier_compact_profile(radius: float, sigma: float, *, step: float = 0.02) -> FourierCompactProfile:
+    """Evaluate the validated circular-fiber/Gaussian/pixel model by FFT."""
+    if not (np.isfinite(radius) and np.isfinite(sigma) and radius > 0.0 and sigma > 0.0):
+        raise ValueError("Fourier compact profile requires positive finite R and sigma")
+    half_extent = max(18.0, radius + 7.0 * sigma + 3.0)
+    samples = 1 << int(np.ceil(np.log2(2.0 * half_extent / step)))
+    coordinate = (np.arange(samples) - samples // 2) * step
+    frequency = 2.0 * np.pi * np.fft.fftfreq(samples, d=step)
+    argument = frequency * radius
+    disk = np.ones_like(frequency)
+    nonzero = np.abs(argument) > 1e-12
+    disk[nonzero] = 2.0 * j1(argument[nonzero]) / argument[nonzero]
+    pixel = np.ones_like(frequency)
+    nonzero_frequency = np.abs(frequency) > 1e-12
+    pixel[nonzero_frequency] = 2.0 * np.sin(frequency[nonzero_frequency] / 2.0) / frequency[nonzero_frequency]
+    transform = disk * np.exp(-0.5 * (sigma * frequency) ** 2) * pixel
+    density = np.fft.fftshift(np.fft.ifft(transform).real) / step
+    derivative = np.fft.fftshift(np.fft.ifft(1j * frequency * transform).real) / step
+    normalization = trapezoidal_integral(density, coordinate)
+    density /= normalization
+    derivative /= normalization
+    return FourierCompactProfile(coordinate, density, derivative)
+
+
+def direct_compact_profile(coordinate: np.ndarray, radius: float, sigma: float) -> np.ndarray:
+    """Use the existing brute-force circular/Gaussian/pixel construction for checks."""
+    from scipy.ndimage import convolve1d
+    extent = max(18.0, radius + 7.0 * sigma + 3.0)
+    step = 0.01
+    grid = np.arange(-extent, extent + step / 2.0, step)
+    optical = gauss_hermite_convolved_circular_fiber_profile(
+        grid, height=1.0, radius=radius, sigma=sigma, h3=0.0, h4=0.0,
+        center=0.0, left_support_u=-extent, right_support_u=extent, step=step,
+    )
+    if optical is None:
+        raise ValueError("direct compact profile construction failed")
+    offsets = np.arange(-int(np.ceil(0.5 / step)), int(np.ceil(0.5 / step)) + 1) * step
+    pixel_kernel = np.clip(np.minimum(offsets + step / 2.0, 0.5) - np.maximum(offsets - step / 2.0, -0.5), 0.0, None)
+    pixel_kernel /= pixel_kernel.sum()
+    pixel_integrated = convolve1d(optical, pixel_kernel, mode="constant", cval=0.0)
+    pixel_integrated /= trapezoidal_integral(pixel_integrated, grid)
+    return np.interp(np.asarray(coordinate, dtype=float), grid, pixel_integrated, left=0.0, right=0.0)
+
+
+def validate_fourier_compact_profiles(radius: np.ndarray, sigma: np.ndarray) -> list[dict[str, float]]:
+    """Compare the FFT profile against the existing direct implementation."""
+    valid = np.isfinite(radius) & np.isfinite(sigma) & (radius > 0.0) & (sigma > 0.0)
+    if not np.any(valid):
+        raise ValueError("no valid local R/sigma values for Fourier-profile validation")
+    selected = np.percentile(np.flatnonzero(valid), (10, 50, 90)).astype(int)
+    checks: list[dict[str, float]] = []
+    for index, center in zip(selected, (-0.35, 0.0, 0.27)):
+        rr, ss = float(radius[index]), float(sigma[index])
+        coordinate = np.arange(-12.0, 12.001, 0.04) + center
+        fourier = fourier_compact_profile(rr, ss)
+        fourier_values, _ = fourier.evaluate(coordinate)
+        direct_values = direct_compact_profile(coordinate, rr, ss)
+        checks.append({
+            "radius": rr, "sigma": ss, "subpixel_center": float(center),
+            "fourier_normalization": trapezoidal_integral(fourier.density, fourier.coordinate),
+            "direct_normalization": trapezoidal_integral(direct_values, coordinate),
+            "max_abs_error": float(np.max(np.abs(fourier_values - direct_values))),
+            "rms_error": float(np.sqrt(np.mean((fourier_values - direct_values) ** 2))),
+        })
+    return checks
+
+
+def smooth_field_residual_statistics(residual: np.ndarray) -> dict[str, float | int]:
+    """Compact robust residual summary for an inspectable development result."""
+    finite = np.asarray(residual, dtype=float)[np.isfinite(residual)]
+    return {
+        "count": int(finite.size),
+        "median": float(np.median(finite)) if finite.size else float("nan"),
+        "mad": robust_mad(finite),
+        "p05": float(np.percentile(finite, 5)) if finite.size else float("nan"),
+        "p95": float(np.percentile(finite, 95)) if finite.size else float("nan"),
+    }
+
+
+def plot_smooth_profile_field_diagnostics(
+    x: np.ndarray,
+    y: np.ndarray,
+    measured_width: np.ndarray,
+    smooth_width: np.ndarray,
+    measured_fraction: np.ndarray,
+    smooth_fraction: np.ndarray,
+    usable: np.ndarray,
+    path: Path,
+) -> None:
+    """Compare local profile coordinates to their independent smooth fields."""
+    fields = (
+        (measured_width, smooth_width, "W (pixel)"),
+        (measured_fraction, smooth_fraction, "f_sigma"),
+    )
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10), sharex=True, sharey=True)
+    for row, (measured, smooth, label) in enumerate(fields):
+        residual = measured - smooth
+        values = (measured, smooth, residual)
+        titles = (f"measured {label}", f"smooth {label}", f"{label}: measured − smooth")
+        cmaps = ("viridis", "viridis", "coolwarm")
+        for axis, value, title, cmap in zip(axes[row], values, titles, cmaps):
+            selected = usable & np.isfinite(value)
+            vmin, vmax = percentile_color_limits(value[selected])
+            scatter = axis.scatter(x[selected], y[selected], c=value[selected], cmap=cmap,
+                                  vmin=vmin, vmax=vmax, s=16, linewidths=0.0)
+            fig.colorbar(scatter, ax=axis).set_label(label if "residual" not in title else f"Δ{label}")
+            axis.set(title=title, xlabel="detector X (column)")
+            axis.grid(alpha=0.18)
+    axes[0, 0].set_ylabel("detector Y (row)")
+    axes[1, 0].set_ylabel("detector Y (row)")
+    fig.suptitle("Independent local profile coordinates and robust smooth detector fields")
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
+def plot_smooth_profile_field_scatter(
+    measured_width: np.ndarray,
+    smooth_width: np.ndarray,
+    measured_fraction: np.ndarray,
+    smooth_fraction: np.ndarray,
+    usable: np.ndarray,
+    path: Path,
+) -> None:
+    """Show measured-versus-smooth field agreement without fitting another model."""
+    fig, axes = plt.subplots(1, 2, figsize=(11, 5))
+    for axis, measured, smooth, label in zip(
+        axes, (measured_width, measured_fraction), (smooth_width, smooth_fraction),
+        ("W (pixel)", "f_sigma"),
+    ):
+        selected = usable & np.isfinite(measured) & np.isfinite(smooth)
+        axis.plot(measured[selected], smooth[selected], ".", ms=3, alpha=0.45)
+        if np.any(selected):
+            limits = (float(np.min((measured[selected], smooth[selected]))), float(np.max((measured[selected], smooth[selected]))))
+            axis.plot(limits, limits, color="0.3", lw=0.8, ls="--")
+        axis.set(xlabel=f"measured {label}", ylabel=f"smooth {label}", title=f"{label}: local versus smooth")
+        axis.grid(alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
+def robust_linear_profile_fit(design: np.ndarray, data: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    """Huber-reweighted linear fit used only for local trace-evidence solves."""
+    design = np.asarray(design, dtype=float)
+    data = np.asarray(data, dtype=float)
+    if design.shape[0] < design.shape[1] + 8:
+        raise ValueError("too few pixels for overlapping-fiber centroid solve")
+    weights = np.ones(data.size, dtype=float)
+    coefficient = np.zeros(design.shape[1], dtype=float)
+    for _ in range(4):
+        normal = design.T @ (weights[:, None] * design)
+        diagonal = max(float(np.trace(normal)) / normal.shape[0], 1.0) * 1e-10
+        coefficient = np.linalg.solve(normal + diagonal * np.eye(normal.shape[0]), design.T @ (weights * data))
+        residual = data - design @ coefficient
+        scale = max(robust_mad(residual), np.finfo(float).eps)
+        weights = np.minimum(1.0, 1.5 * scale / np.maximum(np.abs(residual), np.finfo(float).eps))
+    residual = data - design @ coefficient
+    scale = max(robust_mad(residual), np.finfo(float).eps)
+    normal = design.T @ (weights[:, None] * design)
+    covariance = scale ** 2 * np.linalg.pinv(normal)
+    return coefficient, covariance, float(np.sqrt(np.mean(residual ** 2)))
+
+
+def dense_profile_informed_trace_measurements(
+    image: np.ndarray,
+    mask: np.ndarray,
+    trace: np.ndarray,
+    width_fields: tuple[RobustSurface, RobustSurface],
+    fraction_fields: tuple[RobustSurface, RobustSurface],
+    *,
+    amplifier_y_boundary: float,
+    block_width: int = 16,
+    support: float = 9.0,
+    iterations: int = 2,
+) -> dict[str, np.ndarray]:
+    """Measure dense LDLS centroids with local overlapping Fourier-profile solves."""
+    ny, nx = image.shape
+    ranges = [(start, min(nx, start + block_width)) for start in range(0, nx, block_width)]
+    centers = np.asarray([(start + stop - 1) // 2 for start, stop in ranges], dtype=np.int32)
+    fiber_count, block_count = trace.shape[0], len(ranges)
+    delta = np.full((fiber_count, block_count), np.nan, dtype=float)
+    uncertainty = np.full_like(delta, np.nan)
+    amplitude = np.full_like(delta, np.nan)
+    amplitude_snr = np.full_like(delta, np.nan)
+    residual_rms = np.full_like(delta, np.nan)
+    sample_count = np.zeros(delta.shape, dtype=np.int32)
+    status = np.full(delta.shape, -1, dtype=np.int16)
+    # The smooth fields vary continuously, but neighboring block solves often
+    # request indistinguishable profiles.  This cache is diagnostic-only and
+    # keeps the Fourier evaluation practical without changing either field.
+    profile_cache: dict[tuple[int, int], FourierCompactProfile] = {}
+    for block, ((start, stop), center_column) in enumerate(zip(ranges, centers)):
+        x_coordinate = np.full(fiber_count, center_column, dtype=float)
+        y_coordinate = trace[:, center_column]
+        _, _, radius, sigma = evaluate_smooth_profile_fields(
+            width_fields, fraction_fields, x_coordinate, y_coordinate,
+            amplifier_y_boundary=amplifier_y_boundary,
+        )
+        profile_shapes: list[FourierCompactProfile | None] = []
+        for rr, ss in zip(radius, sigma):
+            try:
+                key = (int(np.rint(float(rr) * 100.0)), int(np.rint(float(ss) * 100.0)))
+                profile = profile_cache.get(key)
+                if profile is None:
+                    profile = fourier_compact_profile(key[0] / 100.0, key[1] / 100.0)
+                    profile_cache[key] = profile
+                profile_shapes.append(profile)
+            except ValueError:
+                profile_shapes.append(None)
+        offsets = np.zeros(fiber_count, dtype=float)
+        final: dict[int, tuple[float, float, float, float, float, int, int]] = {}
+        for _ in range(max(1, int(iterations))):
+            next_offsets = offsets.copy()
+            current: dict[int, tuple[float, float, float, float, float, int, int]] = {}
+            for target in range(fiber_count):
+                if profile_shapes[target] is None:
+                    continue
+                components = [target]
+                for neighbor in (target - 1, target + 1):
+                    if neighbor < 0 or neighbor >= fiber_count or profile_shapes[neighbor] is None:
+                        continue
+                    same_half = (y_coordinate[neighbor] < amplifier_y_boundary) == (y_coordinate[target] < amplifier_y_boundary)
+                    separation = np.nanmedian(np.abs(trace[neighbor, start:stop] - trace[target, start:stop]))
+                    if same_half and np.isfinite(separation) and separation <= 2.0 * support:
+                        components.append(neighbor)
+                components.sort()
+                rows_design: list[np.ndarray] = []
+                values: list[np.ndarray] = []
+                for column in range(start, stop):
+                    positions = trace[components, column] + offsets[components]
+                    if not np.all(np.isfinite(positions)):
+                        continue
+                    low = max(0, int(np.floor(np.min(positions) - support)))
+                    high = min(ny, int(np.ceil(np.max(positions) + support)) + 1)
+                    rows = np.arange(low, high)
+                    good = ~mask[rows, column] & np.isfinite(image[rows, column])
+                    if not np.any(good):
+                        continue
+                    rows = rows[good]
+                    design = np.empty((rows.size, 2 * len(components)), dtype=float)
+                    for index, component in enumerate(components):
+                        profile, derivative = profile_shapes[component].evaluate(rows - positions[index])
+                        design[:, 2 * index] = profile
+                        design[:, 2 * index + 1] = -derivative
+                    rows_design.append(design)
+                    values.append(np.asarray(image[rows, column], dtype=float))
+                if not rows_design:
+                    continue
+                design = np.vstack(rows_design)
+                values_array = np.concatenate(values)
+                try:
+                    coefficient, covariance, rms = robust_linear_profile_fit(design, values_array)
+                except (ValueError, np.linalg.LinAlgError):
+                    continue
+                target_index = components.index(target)
+                fitted_amplitude = float(coefficient[2 * target_index])
+                fitted_shift_numerator = float(coefficient[2 * target_index + 1])
+                if not np.isfinite(fitted_amplitude) or fitted_amplitude <= 0.0:
+                    continue
+                fitted_delta = fitted_shift_numerator / fitted_amplitude
+                jacobian = np.zeros(coefficient.size, dtype=float)
+                jacobian[2 * target_index] = -fitted_shift_numerator / fitted_amplitude ** 2
+                jacobian[2 * target_index + 1] = 1.0 / fitted_amplitude
+                fitted_uncertainty = float(np.sqrt(max(float(jacobian @ covariance @ jacobian), 0.0)))
+                amplitude_error = float(np.sqrt(max(float(covariance[2 * target_index, 2 * target_index]), 0.0)))
+                snr = fitted_amplitude / amplitude_error if amplitude_error > 0.0 else float("inf")
+                current[target] = (fitted_delta, fitted_uncertainty, fitted_amplitude, snr, rms, int(values_array.size), 1)
+                if np.isfinite(fitted_delta) and abs(fitted_delta) <= 1.5 and snr >= 3.0:
+                    next_offsets[target] = np.clip(fitted_delta, -0.75, 0.75)
+            offsets = next_offsets
+            final = current
+        for target, (fitted_delta, fitted_uncertainty, fitted_amplitude, snr, rms, count, _ok) in final.items():
+            delta[target, block] = fitted_delta
+            uncertainty[target, block] = fitted_uncertainty
+            amplitude[target, block] = fitted_amplitude
+            amplitude_snr[target, block] = snr
+            sample_count[target, block] = count
+            residual_rms[target, block] = rms
+            status[target, block] = 1 if np.isfinite(fitted_delta) and abs(fitted_delta) <= 1.5 and snr >= 3.0 else -2
+    measured = trace[:, centers] + delta
+    return {
+        "column": centers, "column_ranges": np.asarray(ranges, dtype=np.int32),
+        "trace_original": trace[:, centers], "trace_measured": measured,
+        "delta": delta, "delta_uncertainty": uncertainty, "amplitude": amplitude,
+        "amplitude_snr": amplitude_snr, "residual_rms": residual_rms,
+        "sample_count": sample_count, "status": status,
+    }
+
+
+def plot_trace_measurement_diagnostics(
+    measurements: dict[str, np.ndarray],
+    amplifier_y_boundary: float,
+    amplifier_labels: tuple[str, str],
+    path: Path,
+) -> dict[str, np.ndarray]:
+    """Map dense trace evidence; this is intentionally not a refined trace fit."""
+    columns = measurements["column"]
+    original = measurements["trace_original"]
+    delta = measurements["delta"]
+    uncertainty = measurements["delta_uncertainty"]
+    snr = measurements["amplitude_snr"]
+    valid = measurements["status"] == 1
+    x = np.broadcast_to(columns, delta.shape).ravel()
+    y = original.ravel()
+    delta_flat = delta.ravel()
+    valid_flat = valid.ravel() & np.isfinite(x) & np.isfinite(y) & np.isfinite(delta_flat)
+    invalid_flat = (~valid.ravel()) & np.isfinite(x) & np.isfinite(y)
+    summary = summarize_du_by_x_amplifier(
+        x, y, delta_flat, valid_flat, np.zeros(valid_flat.shape, dtype=bool),
+        detector_columns=int(measurements["column_ranges"][-1, 1]),
+        amplifier_y_boundary=amplifier_y_boundary, amplifier_labels=amplifier_labels,
+    )
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    map_specs = (
+        (delta_flat, "delta(f, x)", "coolwarm"),
+        (delta_flat, "T_measured − T0", "coolwarm"),
+        (uncertainty.ravel(), "centroid uncertainty (pixel)", "magma"),
+        (snr.ravel(), "amplitude S/N", "viridis"),
+    )
+    for axis, (values, title, cmap) in zip((axes[0, 0], axes[0, 1], axes[1, 1]), (map_specs[0], map_specs[1], map_specs[3])):
+        selected = valid_flat & np.isfinite(values)
+        vmin, vmax = percentile_color_limits(values[selected])
+        scatter = axis.scatter(x[selected], y[selected], c=values[selected], cmap=cmap, vmin=vmin, vmax=vmax, s=7, linewidths=0.0)
+        fig.colorbar(scatter, ax=axis).set_label(title)
+        if np.any(invalid_flat):
+            axis.plot(x[invalid_flat], y[invalid_flat], "x", color="0.25", ms=1.6, alpha=0.25,
+                      label="rejected local measurement")
+        axis.axhline(amplifier_y_boundary, color="0.25", lw=0.8, ls="--")
+        axis.set(title=title, xlabel="detector X (column)", ylabel="detector Y (row)")
+        axis.grid(alpha=0.15)
+    summary_axis = axes[1, 0]
+    for label in amplifier_labels:
+        selected = summary["amplifier_half"] == label
+        usable = selected & np.isfinite(summary["median"]) & np.isfinite(summary["mad"]) & (summary["count"] > 0)
+        summary_axis.errorbar(summary["x_center"][usable], summary["median"][usable], yerr=summary["mad"][usable], fmt="o-", ms=3.5, capsize=2, label=f"{label}: median ± MAD")
+    summary_axis.axhline(0.0, color="0.35", lw=0.8, ls="--")
+    summary_axis.set(title="robust delta(X) by amplifier", xlabel="detector X (column)", ylabel="delta (pixel)")
+    summary_axis.grid(alpha=0.2)
+    summary_axis.legend(frameon=False, fontsize=8)
+    fig.suptitle("Dense profile-informed trace-centroid evidence (original trace retained)")
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+    return summary
+
+
+def plot_individual_trace_delta_curves(
+    measurements: dict[str, np.ndarray],
+    amplifier_y_boundary: float,
+    path: Path,
+) -> None:
+    """Show representative individual-fiber dense delta curves for inspection."""
+    original = measurements["trace_original"]
+    valid = measurements["status"] == 1
+    lower = original[:, 0] < amplifier_y_boundary
+    candidates: list[int] = []
+    for selection in (lower, ~lower):
+        ranked = np.flatnonzero(selection)
+        ranked = ranked[np.argsort(np.count_nonzero(valid[ranked], axis=1))[::-1]]
+        candidates.extend(ranked[:3].tolist())
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7), sharex=True, sharey=True)
+    for axis, fiber in zip(axes.flat, candidates):
+        selected = valid[fiber] & np.isfinite(measurements["delta"][fiber])
+        axis.errorbar(measurements["column"][selected], measurements["delta"][fiber, selected],
+                      yerr=measurements["delta_uncertainty"][fiber, selected], fmt="o-", ms=2.5,
+                      lw=0.8, capsize=1.5)
+        axis.axhline(0.0, color="0.35", lw=0.7, ls="--")
+        axis.set(title=f"fiber {fiber}", xlabel="detector X (column)", ylabel="delta (pixel)")
+        axis.grid(alpha=0.2)
+    fig.suptitle("Representative dense profile-informed trace offsets")
+    fig.tight_layout()
+    fig.savefig(path, dpi=170)
+    plt.close(fig)
+
+
 def plot_profile_radius_sigma_tradeoff(
     profile_map_x: np.ndarray,
     profile_map_y: np.ndarray,
@@ -1773,6 +2307,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile-min-group-size", type=int, default=4, help="Minimum adaptive cell height in fibers")
     parser.add_argument("--profile-deblend-iterations", type=int, default=3, help="Maximum post-seed capture/deblend refinements; exits early once stable")
     parser.add_argument("--profile-valley-weight", type=int, default=1)
+    parser.add_argument("--trace-measurement-block-width", type=int, default=16, help="Short LDLS X blocks for development-only dense profile-informed trace measurements")
+    parser.add_argument("--trace-centering-iterations", type=int, default=2, help="Local linearized-centering iterations for development-only trace evidence")
     parser.add_argument("--ldls-smoothing-window", type=int, default=101)
     parser.add_argument("--arc-smoothing-window", type=int, default=51)
     parser.add_argument("--halo-core-half-width", type=float, default=8.0)
@@ -1987,6 +2523,83 @@ def main(argv: list[str] | None = None) -> int:
         traces, evidence, profiles, diagnostic_neighbors, compact_total,
         output / "02_ldls_profile_samples.png",
         args.profile_support, args.profile_bin_width, args.profile_valley_weight,
+    )
+    width_fields, fraction_fields, measured_width, measured_fraction, smooth_field_valid = smooth_profile_fields(
+        profile_map_x, profile_map_y, profiles.radius, profiles.sigma,
+        profile_map_fit_valid, profiles.parameter_at_bound,
+        detector_shape=ldls.shape, amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
+    )
+    smooth_width, smooth_fraction, smooth_radius, smooth_sigma = evaluate_smooth_profile_fields(
+        width_fields, fraction_fields, profile_map_x, profile_map_y,
+        amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
+    )
+    width_residual = measured_width - smooth_width
+    fraction_residual = measured_fraction - smooth_fraction
+    fourier_validation = validate_fourier_compact_profiles(
+        smooth_radius[smooth_field_valid], smooth_sigma[smooth_field_valid],
+    )
+    np.savez_compressed(
+        output / "02_ldls_smooth_profile_field.npz",
+        profile_map_x=profile_map_x, profile_map_y=profile_map_y,
+        smooth_field_valid=smooth_field_valid,
+        measured_W=measured_width, smooth_W=smooth_width, residual_W=width_residual,
+        measured_f_sigma=measured_fraction, smooth_f_sigma=smooth_fraction,
+        residual_f_sigma=fraction_residual,
+        smooth_R=smooth_radius, smooth_sigma=smooth_sigma,
+        W_surface_coefficients=np.stack([field.coefficients for field in width_fields]),
+        f_sigma_surface_coefficients=np.stack([field.coefficients for field in fraction_fields]),
+        surface_degree=np.asarray(width_fields[0].degree, dtype=np.int16),
+        surface_x_center=np.asarray([field.x_center for field in width_fields]),
+        surface_x_scale=np.asarray([field.x_scale for field in width_fields]),
+        surface_y_center=np.asarray([field.y_center for field in width_fields]),
+        surface_y_scale=np.asarray([field.y_scale for field in width_fields]),
+        W_surface_residual_mad=np.asarray([field.residual_mad for field in width_fields]),
+        f_sigma_surface_residual_mad=np.asarray([field.residual_mad for field in fraction_fields]),
+        amplifier_y_boundary=np.asarray(UPPER_AMPLIFIER_Y_OFFSET, dtype=float),
+    )
+    write_json(output / "02_ldls_smooth_profile_field.json", {
+        "representation": "independent robust ridge-regularized tensor-Legendre surfaces by physical amplifier half",
+        "coordinates": {"W": "sqrt(R^2 / 4 + sigma^2 + 1 / 12)", "f_sigma": "sigma^2 / (R^2 / 4 + sigma^2)"},
+        "physical_domain": "V = W^2 - 1/12 > 0; 0 < f_sigma < 1",
+        "usable_local_fit_count": int(np.count_nonzero(smooth_field_valid)),
+        "W_residual": smooth_field_residual_statistics(width_residual[smooth_field_valid]),
+        "f_sigma_residual": smooth_field_residual_statistics(fraction_residual[smooth_field_valid]),
+        "fourier_validation": fourier_validation,
+    })
+    plot_smooth_profile_field_diagnostics(
+        profile_map_x, profile_map_y, measured_width, smooth_width,
+        measured_fraction, smooth_fraction, smooth_field_valid,
+        output / "02_ldls_smooth_profile_fields.png",
+    )
+    plot_smooth_profile_field_scatter(
+        measured_width, smooth_width, measured_fraction, smooth_fraction,
+        smooth_field_valid, output / "02_ldls_smooth_profile_field_scatter.png",
+    )
+    trace_measurements = dense_profile_informed_trace_measurements(
+        ldls, ldls_mask, traces, width_fields, fraction_fields,
+        amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
+        block_width=args.trace_measurement_block_width,
+        support=args.profile_support, iterations=args.trace_centering_iterations,
+    )
+    trace_delta_summary = plot_trace_measurement_diagnostics(
+        trace_measurements, float(UPPER_AMPLIFIER_Y_OFFSET),
+        (lower_zipcode.amp, upper_zipcode.amp),
+        output / "02_ldls_profile_informed_trace_evidence.png",
+    )
+    plot_individual_trace_delta_curves(
+        trace_measurements, float(UPPER_AMPLIFIER_Y_OFFSET),
+        output / "02_ldls_profile_informed_trace_fiber_curves.png",
+    )
+    np.savez_compressed(
+        output / "02_ldls_profile_informed_trace_measurements.npz",
+        **trace_measurements,
+        delta_x_center=trace_delta_summary["x_center"],
+        delta_x_median=trace_delta_summary["median"],
+        delta_x_mad=trace_delta_summary["mad"],
+        delta_x_count=trace_delta_summary["count"],
+        delta_x_amplifier_half=trace_delta_summary["amplifier_half"],
+        delta_x_bin_edges=trace_delta_summary["x_bin_edges"],
+        amplifier_y_boundary=np.asarray(UPPER_AMPLIFIER_Y_OFFSET, dtype=float),
     )
     write_json(output / "02_aperture_capture.json", {
         "aperture_width_pixels": args.aperture_width,
