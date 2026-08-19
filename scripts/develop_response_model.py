@@ -1493,7 +1493,7 @@ def percentile_color_limits(values: np.ndarray) -> tuple[float | None, float | N
     finite = np.asarray(values, dtype=float)[np.isfinite(values)]
     if finite.size == 0:
         return None, None
-    vmin, vmax = map(float, np.percentile(finite, (2.0, 98.0)))
+    vmin, vmax = map(float, np.percentile(finite, (4.0, 96.0)))
     if vmax <= vmin:
         padding = max(abs(vmin) * 1e-6, np.finfo(float).eps)
         return vmin - padding, vmax + padding
@@ -1670,8 +1670,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--profile-group-size", type=int, default=32, help="Initial/fixed profile cell height in fibers")
     parser.add_argument("--profile-trace-tolerance", type=float, default=0.5, help="Maximum trace excursion within an adaptive cell (pixels)")
     parser.add_argument("--profile-separation-tolerance", type=float, default=0.25, help="Maximum local neighboring-fiber separation variation within an adaptive cell (pixels)")
-    parser.add_argument("--profile-min-chunk-width", type=int, default=12, help="Minimum adaptive cell width in detector columns")
-    parser.add_argument("--profile-min-group-size", type=int, default=2, help="Minimum adaptive cell height in fibers")
+    parser.add_argument("--profile-min-chunk-width", type=int, default=25, help="Minimum adaptive cell width in detector columns")
+    parser.add_argument("--profile-min-group-size", type=int, default=4, help="Minimum adaptive cell height in fibers")
     parser.add_argument("--profile-deblend-iterations", type=int, default=3, help="Maximum post-seed capture/deblend refinements; exits early once stable")
     parser.add_argument("--profile-valley-weight", type=int, default=1)
     parser.add_argument("--ldls-smoothing-window", type=int, default=101)
