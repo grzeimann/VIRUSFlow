@@ -24,7 +24,8 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from time import perf_counter
+from typing import Any, Callable
 
 import matplotlib
 matplotlib.use("Agg")
@@ -1494,18 +1495,27 @@ def measure_profiles_on_trace(
     deblend_iterations: int,
     valley_weight: int,
     retain_capture: bool,
+    checkpoint: Callable[[str], None] | None = None,
 ) -> ProfileMeasurement:
     """Repeat the settled local-profile measurement for one fixed trace state."""
     preliminary = np.asarray(extract_fractional_aperture(
         image, np.zeros_like(image), trace, pixel_mask=mask, width=aperture_width,
     ).get_array("spectrum"), dtype=float)
+    if checkpoint is not None:
+        checkpoint("compact-aperture extraction [compute]")
     preliminary = smooth_spectra(preliminary, smoothing_window)
+    if checkpoint is not None:
+        checkpoint("preliminary-spectrum smoothing [compute]")
     evidence = collect_profile_evidence(image, trace, preliminary, mask, support=support, grid=grid)
+    if checkpoint is not None:
+        checkpoint("detector evidence collection [compute]")
     profiles, neighbor_profiles, compact_total, iterations, converged, capture_change, profile_change, integral_iterations = measure_local_profiles(
         evidence, trace, preliminary, detector_rows=image.shape[0], aperture_width=aperture_width,
         support=support, bin_width=bin_width, grid=grid,
         iterations=deblend_iterations, valley_weight=valley_weight,
     )
+    if checkpoint is not None:
+        checkpoint("local profile fitting, normalization, and deblending [compute]")
     map_x, map_y = profile_map_coordinates(trace, profiles)
     fit_valid = (
         (profiles.optimizer_status != -99) & ~profiles.parameter_at_bound
@@ -1515,6 +1525,8 @@ def measure_profiles_on_trace(
         aperture_capture(trace, image.shape[0], profiles, aperture_width)
         if retain_capture else None
     )
+    if checkpoint is not None:
+        checkpoint("profile-map coordinates and aperture capture [compute]")
     return ProfileMeasurement(
         trace=trace, preliminary=preliminary, evidence=evidence, profiles=profiles,
         neighbor_profiles=neighbor_profiles, compact_total=compact_total,
@@ -2741,6 +2753,7 @@ def write_initial_profile_diagnostics(
     detector_columns: int,
     amplifier_y_boundary: float,
     amplifier_labels: tuple[str, str],
+    checkpoint: Callable[[str], None] | None = None,
 ) -> dict[str, np.ndarray]:
     """Persist the settled initial local-profile state and its direct diagnostics."""
     profiles, evidence = measurement.profiles, measurement.evidence
@@ -2794,6 +2807,8 @@ def write_initial_profile_diagnostics(
         valley_cell=evidence.valley_cell, valley_first_u=evidence.valley_first_u,
         valley_second_u=evidence.valley_second_u,
     )
+    if checkpoint is not None:
+        checkpoint("initial profile NPZ [write]")
     write_json(output / "02_profile_grid_cells.json", {
         "grid_mode": grid.mode,
         "cells": [
@@ -2807,19 +2822,33 @@ def write_initial_profile_diagnostics(
             for cell, ((x_start, x_stop), (fiber_start, fiber_stop)) in enumerate(zip(grid.cell_columns, grid.cell_fibers))
         ],
     })
+    if checkpoint is not None:
+        checkpoint("adaptive-grid cell JSON [write]")
     plot_profile_grid(measurement.trace, grid, output / "02_ldls_profile_grid.png")
+    if checkpoint is not None:
+        checkpoint("adaptive-grid plot [plot]")
     plot_profile_parameter_maps(measurement.map_x, measurement.map_y, profiles.radius, profiles.sigma,
                                 profiles.centroid_offset, fitted, profiles.parameter_at_bound,
                                 output / "02_ldls_profile_parameter_maps.png")
+    if checkpoint is not None:
+        checkpoint("profile parameter maps [plot]")
     plot_profile_width_maps(measurement.map_x, measurement.map_y, profiles.radius, profiles.sigma,
                             fitted, profiles.parameter_at_bound, output / "02_ldls_profile_width_maps.png")
+    if checkpoint is not None:
+        checkpoint("profile width maps [plot]")
     plot_du_vs_x_by_amplifier(du_x_summary, output / "02_ldls_du_vs_x_by_amp.png")
+    if checkpoint is not None:
+        checkpoint("du-by-amplifier plot [plot]")
     plot_profile_radius_sigma_tradeoff(measurement.map_x, measurement.map_y, profiles.radius, profiles.sigma,
                                        fitted, profiles.parameter_at_bound,
                                        output / "02_ldls_profile_radius_sigma_tradeoff.png")
+    if checkpoint is not None:
+        checkpoint("R/sigma tradeoff plot [plot]")
     plot_profile_diagnostics(measurement.trace, evidence, profiles, measurement.neighbor_profiles,
                              measurement.compact_total, output / "02_ldls_profile_samples.png",
                              support, bin_width, valley_weight)
+    if checkpoint is not None:
+        checkpoint("profile-sample closure plot [plot]")
     return du_x_summary
 
 
@@ -2829,11 +2858,14 @@ def write_initial_smooth_field_diagnostics(
     output: Path,
     *,
     amplifier_y_boundary: float,
+    checkpoint: Callable[[str], None] | None = None,
 ) -> None:
     """Write the initial W/f_sigma field and preserve the Fourier validation."""
     width_residual = field.measured_width - field.smooth_width
     fraction_residual = field.measured_fraction - field.smooth_fraction
     validation = validate_fourier_compact_profiles(field.smooth_radius[field.valid], field.smooth_sigma[field.valid])
+    if checkpoint is not None:
+        checkpoint("Fourier/direct profile validation [compute]")
     np.savez_compressed(
         output / "02_ldls_smooth_profile_field.npz",
         profile_map_x=measurement.map_x, profile_map_y=measurement.map_y, smooth_field_valid=field.valid,
@@ -2851,6 +2883,8 @@ def write_initial_smooth_field_diagnostics(
         f_sigma_surface_residual_mad=np.asarray([surface.residual_mad for surface in field.fraction_fields]),
         amplifier_y_boundary=np.asarray(amplifier_y_boundary, dtype=float),
     )
+    if checkpoint is not None:
+        checkpoint("initial smooth-field NPZ [write]")
     write_json(output / "02_ldls_smooth_profile_field.json", {
         "representation": "independent robust ridge-regularized tensor-Legendre surfaces by physical amplifier half",
         "coordinates": {"W": "sqrt(R^2 / 4 + sigma^2 + 1 / 12)", "f_sigma": "sigma^2 / (R^2 / 4 + sigma^2)"},
@@ -2860,13 +2894,19 @@ def write_initial_smooth_field_diagnostics(
         "f_sigma_residual": smooth_field_residual_statistics(fraction_residual[field.valid]),
         "fourier_validation": validation,
     })
+    if checkpoint is not None:
+        checkpoint("initial smooth-field JSON [write]")
     plot_smooth_profile_field_diagnostics(measurement.map_x, measurement.map_y,
                                           field.measured_width, field.smooth_width,
                                           field.measured_fraction, field.smooth_fraction, field.valid,
                                           output / "02_ldls_smooth_profile_fields.png")
+    if checkpoint is not None:
+        checkpoint("initial smooth-field maps [plot]")
     plot_smooth_profile_field_scatter(field.measured_width, field.smooth_width,
                                       field.measured_fraction, field.smooth_fraction, field.valid,
                                       output / "02_ldls_smooth_profile_field_scatter.png")
+    if checkpoint is not None:
+        checkpoint("initial smooth-field scatter plot [plot]")
 
 
 def write_initial_trace_diagnostics(
@@ -2875,15 +2915,20 @@ def write_initial_trace_diagnostics(
     *,
     amplifier_y_boundary: float,
     amplifier_labels: tuple[str, str],
+    checkpoint: Callable[[str], None] | None = None,
 ) -> dict[str, np.ndarray]:
     """Write the dense-centroid evidence used to construct T_refined."""
     summary = plot_trace_measurement_diagnostics(
         measurements, amplifier_y_boundary, amplifier_labels,
         output / "02_ldls_profile_informed_trace_evidence.png",
     )
+    if checkpoint is not None:
+        checkpoint("dense-centroid evidence plot [plot]")
     plot_individual_trace_delta_curves(
         measurements, amplifier_y_boundary, output / "02_ldls_profile_informed_trace_fiber_curves.png",
     )
+    if checkpoint is not None:
+        checkpoint("individual-fiber centroid plots [plot]")
     np.savez_compressed(
         output / "02_ldls_profile_informed_trace_measurements.npz", **measurements,
         delta_x_center=summary["x_center"], delta_x_median=summary["median"],
@@ -2891,6 +2936,8 @@ def write_initial_trace_diagnostics(
         delta_x_amplifier_half=summary["amplifier_half"], delta_x_bin_edges=summary["x_bin_edges"],
         amplifier_y_boundary=np.asarray(amplifier_y_boundary, dtype=float),
     )
+    if checkpoint is not None:
+        checkpoint("dense-centroid NPZ [write]")
     return summary
 
 
@@ -2900,9 +2947,12 @@ def write_refined_trace_diagnostics(
     output: Path,
     *,
     amplifier_y_boundary: float,
+    checkpoint: Callable[[str], None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Fit ΔT(x), retain its evidence, and return the development-only refined trace."""
     refined_trace, correction, coefficients, residual_mad = fit_refined_trace_corrections(measurements, original_trace)
+    if checkpoint is not None:
+        checkpoint("per-fiber correction fits [compute]")
     dense_residual = measurements["delta"] - correction[:, measurements["column"]]
     valid = measurements["status"] == 1
     np.savez_compressed(
@@ -2912,10 +2962,16 @@ def write_refined_trace_diagnostics(
         dense_measurement_column=measurements["column"], dense_measurement_delta=measurements["delta"],
         dense_correction_residual=dense_residual, dense_measurement_valid=valid,
     )
+    if checkpoint is not None:
+        checkpoint("refined-trace closure NPZ [write]")
     plot_refined_trace_correction_diagnostics(measurements, correction, residual_mad,
                                               amplifier_y_boundary, output / "02_ldls_refined_trace_correction.png")
+    if checkpoint is not None:
+        checkpoint("refined-trace correction diagnostics [plot]")
     plot_refined_trace_fiber_examples(measurements, correction, amplifier_y_boundary,
                                      output / "02_ldls_refined_trace_fiber_examples.png")
+    if checkpoint is not None:
+        checkpoint("refined-trace fiber examples [plot]")
     return refined_trace, correction, coefficients, residual_mad, dense_residual, valid
 
 
@@ -2926,6 +2982,7 @@ def write_refined_field_diagnostics(
     output: Path,
     *,
     amplifier_y_boundary: float,
+    checkpoint: Callable[[str], None] | None = None,
 ) -> dict[str, dict[str, float | int]]:
     """Persist the refit response field and explicit old-versus-updated maps."""
     plot_smooth_profile_field_diagnostics(
@@ -2933,11 +2990,15 @@ def write_refined_field_diagnostics(
         field.measured_fraction, field.smooth_fraction, field.valid,
         output / "02_ldls_refined_trace_smooth_profile_fields.png",
     )
+    if checkpoint is not None:
+        checkpoint("refined local-versus-smooth field maps [plot]")
     plot_refined_smooth_field_changes(
         measurement.map_x, measurement.map_y, comparison.old_width, field.smooth_width,
         comparison.old_fraction, field.smooth_fraction, comparison.valid,
         output / "02_ldls_refined_trace_profile_field_comparison.png",
     )
+    if checkpoint is not None:
+        checkpoint("old-versus-refined field maps [plot]")
     np.savez_compressed(
         output / "02_ldls_refined_trace_smooth_profile_field.npz",
         profile_map_x=measurement.map_x, profile_map_y=measurement.map_y, smooth_field_valid=field.valid,
@@ -2958,6 +3019,8 @@ def write_refined_field_diagnostics(
         compact_total_spectrum=measurement.compact_total,
         amplifier_y_boundary=np.asarray(amplifier_y_boundary, dtype=float),
     )
+    if checkpoint is not None:
+        checkpoint("refined smooth-field NPZ [write]")
     np.savez_compressed(
         output / "02_ldls_refined_trace_profile_remeasurement.npz",
         profile_map_x=measurement.map_x, profile_map_y=measurement.map_y,
@@ -2968,6 +3031,8 @@ def write_refined_field_diagnostics(
         remeasured_fit_valid=measurement.fit_valid, remeasured_radius=measurement.profiles.radius,
         remeasured_sigma=measurement.profiles.sigma, compact_total_spectrum=measurement.compact_total,
     )
+    if checkpoint is not None:
+        checkpoint("refined local-profile remeasurement NPZ [write]")
     stats = {
         "delta_W": smooth_field_residual_statistics(comparison.delta_width[comparison.valid]),
         "delta_f_sigma": smooth_field_residual_statistics(comparison.delta_fraction[comparison.valid]),
@@ -2978,6 +3043,8 @@ def write_refined_field_diagnostics(
         "representation": "same independent robust ridge-regularized tensor-Legendre W and f_sigma surfaces, refit from T_refined local profiles",
         "usable_local_fit_count": int(np.count_nonzero(field.valid)), **stats,
     })
+    if checkpoint is not None:
+        checkpoint("refined smooth-field JSON [write]")
     return stats
 
 
@@ -2999,6 +3066,7 @@ def write_refined_closure_diagnostics(
     initial_dense_valid: np.ndarray,
     initial_trace: np.ndarray,
     field_statistics: dict[str, dict[str, float | int]],
+    checkpoint: Callable[[str], None] | None = None,
 ) -> dict[str, np.ndarray]:
     """Test the matched refined trace/field state, without applying a new trace fit."""
     convergence = dense_profile_informed_trace_measurements(
@@ -3006,16 +3074,22 @@ def write_refined_closure_diagnostics(
         amplifier_y_boundary=amplifier_y_boundary, block_width=block_width,
         support=support, iterations=centering_iterations,
     )
+    if checkpoint is not None:
+        checkpoint("T2 dense centroid convergence solve [compute]")
     convergence_summary = plot_trace_measurement_diagnostics(
         convergence, amplifier_y_boundary, amplifier_labels,
         output / "02_ldls_refined_trace_residual_centroids.png",
     )
+    if checkpoint is not None:
+        checkpoint("T2 centroid diagnostic plot [plot]")
     panel_residuals = plot_refined_trace_profile_closure(
         image, mask, refined_measurement.trace, refined_measurement.compact_total,
         refined_field.width_fields, refined_field.fraction_fields,
         support=support, amplifier_y_boundary=amplifier_y_boundary,
         path=output / "02_ldls_refined_trace_profile_closure.png",
     )
+    if checkpoint is not None:
+        checkpoint("matched profile-closure plot [plot]")
     np.savez_compressed(
         output / "02_ldls_refined_trace_residual_measurements.npz", **convergence,
         residual_x_center=convergence_summary["x_center"], residual_x_median=convergence_summary["median"],
@@ -3024,6 +3098,8 @@ def write_refined_closure_diagnostics(
         closure_panel_profile_defined_du=panel_residuals,
         T2_minus_T_refined=convergence["delta"],
     )
+    if checkpoint is not None:
+        checkpoint("closure residual NPZ [write]")
     write_json(output / "02_ldls_refined_trace_closure.json", {
         "trace_representation": "independent per-fiber degree-4 robust Legendre correction ΔT(x); no cross-fiber regularization",
         "response_fields": "refit from the converged T_refined local-profile measurement; no second trace update applied",
@@ -3048,6 +3124,8 @@ def write_refined_closure_diagnostics(
         "refined_profile_integral_iterations": refined_measurement.integral_iterations,
         **field_statistics,
     })
+    if checkpoint is not None:
+        checkpoint("closure summary JSON [write]")
     return convergence
 
 
@@ -3063,6 +3141,22 @@ def develop_ldls_profile_and_trace(
     amplifier_labels: tuple[str, str],
 ) -> ProfileMeasurement:
     """Run the settled development-only LDLS profile/trace sequence."""
+    started = last_marker = perf_counter()
+
+    def mark(step: str, label: str) -> None:
+        """Print a small wall-clock checkpoint without affecting the analysis."""
+        nonlocal last_marker
+        now = perf_counter()
+        print(
+            f"[LDLS profile/trace {step}] {label}: "
+            f"{now - last_marker:8.2f} s (total {now - started:8.2f} s)",
+            flush=True,
+        )
+        last_marker = now
+
+    def stage_checkpoint(step: str) -> Callable[[str], None]:
+        return lambda label: mark(step, label)
+
     # 1. Trace geometry alone defines the local profile sampling cells.
     grid = _profile_grid(
         traces, support=args.profile_support, mode=args.profile_grid,
@@ -3071,37 +3165,47 @@ def develop_ldls_profile_and_trace(
         minimum_chunk_width=args.profile_min_chunk_width, minimum_group_size=args.profile_min_group_size,
         amplifier_boundary=lower_trace_count,
     )
+    mark("01", "adaptive profile grid [compute]")
     # 2. Initial trace -> converged local compact profiles and compact totals.
     initial = measure_profiles_on_trace(
         ldls, ldls_mask, traces, grid, aperture_width=args.aperture_width,
         support=args.profile_support, bin_width=args.profile_bin_width,
         smoothing_window=args.ldls_smoothing_window, deblend_iterations=args.profile_deblend_iterations,
         valley_weight=args.profile_valley_weight, retain_capture=True,
+        checkpoint=stage_checkpoint("02"),
     )
     # 3. Preserve the independently fitted profile evidence before smoothing it.
     write_initial_profile_diagnostics(
         initial, grid, output, support=args.profile_support, bin_width=args.profile_bin_width,
         valley_weight=args.profile_valley_weight, detector_columns=ldls.shape[1],
         amplifier_y_boundary=amplifier_y_boundary, amplifier_labels=amplifier_labels,
+        checkpoint=stage_checkpoint("03"),
     )
     # 4. Initial local R/sigma -> W/f_sigma -> smooth response field.
     initial_field = build_smooth_profile_field(
         initial, detector_shape=ldls.shape, amplifier_y_boundary=amplifier_y_boundary,
     )
+    mark("04", "initial smooth response field [compute]")
     # 5. Validate the Fourier representation and write field residual diagnostics.
-    write_initial_smooth_field_diagnostics(initial, initial_field, output, amplifier_y_boundary=amplifier_y_boundary)
+    write_initial_smooth_field_diagnostics(
+        initial, initial_field, output, amplifier_y_boundary=amplifier_y_boundary,
+        checkpoint=stage_checkpoint("05"),
+    )
     # 6. Fixed initial field -> dense P/P' centroid evidence.
     dense = dense_profile_informed_trace_measurements(
         ldls, ldls_mask, traces, initial_field.width_fields, initial_field.fraction_fields,
         amplifier_y_boundary=amplifier_y_boundary, block_width=args.trace_measurement_block_width,
         support=args.profile_support, iterations=args.trace_centering_iterations,
     )
+    mark("06", "initial dense profile-informed centroids [compute]")
     # 7. Persist the dense evidence before fitting independent per-fiber corrections.
     write_initial_trace_diagnostics(dense, output, amplifier_y_boundary=amplifier_y_boundary,
-                                    amplifier_labels=amplifier_labels)
+                                    amplifier_labels=amplifier_labels,
+                                    checkpoint=stage_checkpoint("07"))
     # 8. Dense centroids -> smooth independent ΔT(x) -> T_refined.
     refined_trace, correction, coefficients, correction_mad, dense_residual, dense_valid = write_refined_trace_diagnostics(
         dense, traces, output, amplifier_y_boundary=amplifier_y_boundary,
+        checkpoint=stage_checkpoint("08"),
     )
     # 9. Remeasure local profiles about T_refined with the same settled iteration.
     refined = measure_profiles_on_trace(
@@ -3109,17 +3213,20 @@ def develop_ldls_profile_and_trace(
         support=args.profile_support, bin_width=args.profile_bin_width,
         smoothing_window=args.ldls_smoothing_window, deblend_iterations=args.profile_deblend_iterations,
         valley_weight=args.profile_valley_weight, retain_capture=False,
+        checkpoint=stage_checkpoint("09"),
     )
     # 10. Rebuild the matched response field from the refined local fits.
     refined_field = build_smooth_profile_field(
         refined, detector_shape=ldls.shape, amplifier_y_boundary=amplifier_y_boundary,
     )
+    mark("10", "refined smooth response field [compute]")
     field_comparison = compare_smooth_profile_fields(
         initial_field, refined_field, refined, amplifier_y_boundary=amplifier_y_boundary,
     )
     # 11. Map and summarize the old-versus-updated field structure.
     field_statistics = write_refined_field_diagnostics(
         refined, refined_field, field_comparison, output, amplifier_y_boundary=amplifier_y_boundary,
+        checkpoint=stage_checkpoint("11"),
     )
     # 12. Matched T_refined/field closure, followed only by the T2 convergence diagnostic.
     write_refined_closure_diagnostics(
@@ -3130,9 +3237,11 @@ def develop_ldls_profile_and_trace(
         initial_dense_residual=dense_residual, initial_dense_valid=dense_valid,
         initial_trace=dense["trace_original"],
         field_statistics=field_statistics,
+        checkpoint=stage_checkpoint("12"),
     )
     # 13. Keep the original compact capture for the later, separate halo experiment.
     assert initial.captured_fraction is not None
+    mark("13", "profile/trace sequence complete")
     return initial
 
 
