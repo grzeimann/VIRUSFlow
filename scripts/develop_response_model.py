@@ -496,23 +496,36 @@ class RuntimeProfile:
 
     label: str
     seconds: dict[str, float]
+    self_seconds: dict[str, float]
     calls: dict[str, int]
     metrics: dict[str, list[float]]
 
     def __init__(self, label: str):
         self.label = label
         self.seconds = {}
+        self.self_seconds = {}
         self.calls = {}
         self.metrics = {}
+        self._sections: list[dict[str, float | str]] = []
 
     @contextmanager
     def section(self, category: str):
         started = perf_counter()
+        frame: dict[str, float | str] = {"category": category, "children": 0.0}
+        self._sections.append(frame)
         try:
             yield
         finally:
-            self.seconds[category] = self.seconds.get(category, 0.0) + perf_counter() - started
+            elapsed = perf_counter() - started
+            completed = self._sections.pop()
+            if completed is not frame:
+                raise RuntimeError("runtime-profile section stack is unbalanced")
+            child_elapsed = float(frame["children"])
+            self.seconds[category] = self.seconds.get(category, 0.0) + elapsed
+            self.self_seconds[category] = self.self_seconds.get(category, 0.0) + elapsed - child_elapsed
             self.calls[category] = self.calls.get(category, 0) + 1
+            if self._sections:
+                self._sections[-1]["children"] = float(self._sections[-1]["children"]) + elapsed
 
     def add(self, metric: str, value: float) -> None:
         self.metrics.setdefault(metric, []).append(float(value))
@@ -528,7 +541,12 @@ class RuntimeProfile:
         print(f"\n=== Runtime profile: {self.label} ===", flush=True)
         for category, elapsed in sorted(self.seconds.items(), key=lambda item: item[1], reverse=True):
             calls = self.calls[category]
-            print(f"  {category:<58} {elapsed:8.3f} s  {calls:6d} calls  {elapsed / calls:8.5f} s/call", flush=True)
+            self_elapsed = self.self_seconds.get(category, 0.0)
+            print(
+                f"  {category:<58} inclusive={elapsed:8.3f} s  self={self_elapsed:8.3f} s  "
+                f"{calls:6d} calls  {elapsed / calls:8.5f} s/call",
+                flush=True,
+            )
         for metric, values in sorted(self.metrics.items()):
             array = np.asarray(values, dtype=float)
             total = float(np.sum(array))
