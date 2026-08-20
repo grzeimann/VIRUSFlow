@@ -33,7 +33,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from astropy.io import fits
-from scipy.ndimage import median_filter
+from scipy.ndimage import convolve1d, median_filter
 from scipy.interpolate import PchipInterpolator, UnivariateSpline
 from scipy.optimize import least_squares
 from scipy.special import betainc, j1
@@ -377,6 +377,7 @@ def gauss_hermite_convolved_circular_fiber_profile(
     left_support_u: float,
     right_support_u: float,
     step: float,
+    grid: np.ndarray | None = None,
 ) -> np.ndarray | None:
     """Return a circular-fiber profile blurred by a normalized GH kernel.
 
@@ -384,11 +385,13 @@ def gauss_hermite_convolved_circular_fiber_profile(
     is odd (skewness-like) and ``h4`` is even (kurtosis-like).  A non-negative
     sampled kernel is required for this compact optical-blur experiment.
     """
-    from scipy.ndimage import convolve1d
-
     if radius <= 0.0 or sigma <= 0.0 or step <= 0.0:
         raise ValueError("radius, sigma, and step must be positive")
-    grid = np.arange(left_support_u, right_support_u + step / 2.0, step)
+    # ``grid`` is optional so other direct-model callers retain the original
+    # construction.  Local optimizer fits pass their fixed per-cell grid to
+    # avoid constructing the identical coordinate array for every residual.
+    if grid is None:
+        grid = np.arange(left_support_u, right_support_u + step / 2.0, step)
     # Fixed q=0 circular-aperture source model.
     core = np.sqrt(np.clip(radius ** 2 - (grid - center) ** 2, 0.0, None))
     kernel_half_width = int(np.ceil(5.0 * sigma / step))
@@ -488,6 +491,36 @@ class ProfileEvidence:
     valley_cell: np.ndarray
     valley_first_u: np.ndarray
     valley_second_u: np.ndarray
+
+
+@dataclass(frozen=True)
+class RawProfileEvidence:
+    """Trace-independent detector facts retained for later profile reinterpretation."""
+
+    row: np.ndarray
+    signal: np.ndarray
+    valid: np.ndarray
+    offsets: np.ndarray
+
+    def samples(self, fiber: int, column: int, low: int, high: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return one exact inclusive/exclusive row interval from the retained chunk."""
+        start, stop = int(self.offsets[fiber, column]), int(self.offsets[fiber, column + 1])
+        if stop <= start:
+            raise RuntimeError("raw profile evidence has no requested detector chunk")
+        first_row = int(self.row[start])
+        begin = start + low - first_row
+        end = begin + high - low
+        if begin < start or end > stop:
+            raise RuntimeError("raw profile evidence does not cover the requested trace-relative rows")
+        return self.row[begin:end], self.signal[begin:end], self.valid[begin:end]
+
+
+@dataclass(frozen=True)
+class ProfileCellGeometry:
+    """Fixed per-cell evidence indexing for one interpreted trace state."""
+
+    sample_indices: tuple[np.ndarray, ...]
+    valley_indices: tuple[np.ndarray, ...]
 
 
 @dataclass
@@ -694,6 +727,54 @@ def _profile_grid(
     )
 
 
+def collect_raw_profile_evidence(
+    image: np.ndarray,
+    mask: np.ndarray,
+    trace: np.ndarray,
+    *,
+    support: float,
+    trace_margin: float = 1.0,
+    runtime_profile: RuntimeProfile | None = None,
+) -> RawProfileEvidence:
+    """Retain one inclusive detector-row envelope for both profile trace states.
+
+    The envelope is deliberately wider than a profile sample because an
+    overlapping pair's valley can fall almost ``2 * support`` from either
+    center.  Later interpretation applies the original exact row intervals;
+    the margin is a checked guard against a refined trace leaving this saved
+    state rather than a change to sample selection.
+    """
+    ny, nx = image.shape
+    fiber_count = trace.shape[0]
+    offsets = np.zeros((fiber_count, nx + 1), dtype=np.int64)
+    rows_parts: list[np.ndarray] = []
+    signal_parts: list[np.ndarray] = []
+    valid_parts: list[np.ndarray] = []
+    envelope = 2.0 * support + trace_margin
+    total = 0
+    with timed(runtime_profile, "immutable raw detector evidence collection [Python loops]"):
+        for fiber in range(fiber_count):
+            for column in range(nx):
+                offsets[fiber, column] = total
+                center = trace[fiber, column]
+                if np.isfinite(center):
+                    low = max(0, int(np.floor(center - envelope)))
+                    high = min(ny, int(np.ceil(center + envelope)) + 1)
+                    rows = np.arange(low, high, dtype=np.int16)
+                    rows_parts.append(rows)
+                    signal_parts.append(np.asarray(image[rows, column], dtype=np.float32))
+                    valid_parts.append((~mask[rows, column] & np.isfinite(image[rows, column])).astype(bool, copy=False))
+                    total += rows.size
+            offsets[fiber, nx] = total
+    if runtime_profile is not None:
+        runtime_profile.count("immutable_raw_evidence_rebuilds")
+        runtime_profile.add("raw_profile_sample_pixels", total)
+    return RawProfileEvidence(
+        row=np.concatenate(rows_parts), signal=np.concatenate(signal_parts), valid=np.concatenate(valid_parts),
+        offsets=offsets,
+    )
+
+
 def collect_profile_evidence(
     image: np.ndarray,
     trace: np.ndarray,
@@ -702,10 +783,15 @@ def collect_profile_evidence(
     *,
     support: float,
     grid: ProfileGrid,
+    raw: RawProfileEvidence | None = None,
     runtime_profile: RuntimeProfile | None = None,
 ) -> ProfileEvidence:
     """Collect every valid profile pixel and overlap/valley fact exactly once."""
     ny, nx = image.shape
+    if raw is None:
+        raw = collect_raw_profile_evidence(
+            image, mask, trace, support=support, runtime_profile=runtime_profile,
+        )
     pair_overlap = np.zeros((trace.shape[0] - 1, nx), dtype=bool)
     valley_row = np.full((trace.shape[0] - 1, nx), np.nan, dtype=float)
     with timed(runtime_profile, "overlap and valley search [Python loops]"):
@@ -719,10 +805,10 @@ def collect_profile_evidence(
                 high = min(ny, int(np.floor(max(first_center, second_center))) + 1)
                 if high - low < 2:
                     continue
-                rows = np.arange(low, high)
-                usable = ~mask[rows, column] & np.isfinite(image[rows, column])
+                rows, signal, valid = raw.samples(first, column, low, high)
+                usable = valid
                 if np.any(usable):
-                    valley_row[first, column] = float(rows[usable][np.argmin(image[rows[usable], column])])
+                    valley_row[first, column] = float(rows[usable][np.argmin(signal[usable])])
 
     values: dict[str, list[np.ndarray]] = {name: [] for name in (
         "u", "signal", "fiber", "column", "cell", "normalization", "seed_core",
@@ -737,11 +823,12 @@ def collect_profile_evidence(
                     continue
                 lo = max(0, int(np.floor(center - support)))
                 hi = min(ny, int(np.ceil(center + support)) + 1)
-                rows = np.arange(lo, hi)
-                good = ~mask[rows, column] & np.isfinite(image[rows, column])
+                rows, signal, valid = raw.samples(fiber, column, lo, hi)
+                good = valid
                 if not np.any(good):
                     continue
                 rows = rows[good]
+                signal = signal[good]
                 lower_valley = valley_row[fiber - 1, column] if fiber > 0 and pair_overlap[fiber - 1, column] else np.nan
                 upper_valley = valley_row[fiber, column] if fiber + 1 < trace.shape[0] and pair_overlap[fiber, column] else np.nan
                 core = np.ones(rows.size, dtype=bool)
@@ -762,7 +849,7 @@ def collect_profile_evidence(
                     neighbor_u[:, slot] = rows - trace[neighbor, column]
                     neighbor_overlaps[:, slot] = True
                 values["u"].append((rows - center).astype(np.float32))
-                values["signal"].append(np.asarray(image[rows, column], dtype=np.float32))
+                values["signal"].append(signal)
                 values["fiber"].append(np.full(rows.size, fiber, dtype=np.int16))
                 values["column"].append(np.full(rows.size, column, dtype=np.int16))
                 values["cell"].append(np.full(rows.size, grid.cell_index[fiber, column], dtype=np.int32))
@@ -792,7 +879,10 @@ def collect_profile_evidence(
                 second_norm = five_pixel_normalization[second, column]
                 if not (np.isfinite(first_norm) and np.isfinite(second_norm) and first_norm > 0.0 and second_norm > 0.0):
                     continue
-                valley_values["signal"].append(float(image[int(row), column]))
+                valley_rows, valley_signal, valley_valid = raw.samples(first, column, int(row), int(row) + 1)
+                if not valley_valid[0]:
+                    continue
+                valley_values["signal"].append(float(valley_signal[0]))
                 valley_values["first"].append(first)
                 valley_values["second"].append(second)
                 valley_values["column"].append(column)
@@ -905,6 +995,20 @@ def fit_constrained_profile(
     fit_u = centers[used]
     fit_values = np.clip(median[used], 0.0, None)
     fit_weights = weights
+    # These geometric arrays are invariant over every residual evaluation for
+    # this local fit.  Their construction previously occurred in both the
+    # closure and direct evaluator on every optimizer call.
+    step = max(bin_width / 4.0, 0.01)
+    fine_grid = np.arange(left_support_u, right_support_u + step / 2.0, step)
+    half_width = int(np.ceil(0.5 / step))
+    offsets = np.arange(-half_width, half_width + 1) * step
+    pixel_kernel = np.clip(
+        np.minimum(offsets + step / 2.0, 0.5)
+        - np.maximum(offsets - step / 2.0, -0.5),
+        0.0,
+        None,
+    )
+    pixel_kernel /= np.sum(pixel_kernel)
 
     def branch_model(theta: np.ndarray, coordinate: np.ndarray) -> np.ndarray | None:
         with timed(runtime_profile, "physical P(R, sigma, u) evaluation [NumPy/SciPy]"):
@@ -912,8 +1016,6 @@ def fit_constrained_profile(
                 runtime_profile.count("physical_profile_evaluations")
             height, radius, sigma = np.exp(theta[:3])
             center = peak_u + theta[3]
-            step = max(bin_width / 4.0, 0.01)
-            fine_grid = np.arange(left_support_u, right_support_u + step / 2.0, step)
             continuous = gauss_hermite_convolved_circular_fiber_profile(
                 fine_grid,
                 height=height,
@@ -925,6 +1027,7 @@ def fit_constrained_profile(
                 left_support_u=left_support_u,
                 right_support_u=right_support_u,
                 step=step,
+                grid=fine_grid,
             )
             if continuous is None:
                 return None
@@ -932,16 +1035,6 @@ def fit_constrained_profile(
             # response before sampling at trace-relative pixel centers.  Cell
             # overlaps give a unit-area top-hat even when ``step`` does not divide
             # a pixel width exactly.
-            from scipy.ndimage import convolve1d
-            half_width = int(np.ceil(0.5 / step))
-            offsets = np.arange(-half_width, half_width + 1) * step
-            pixel_kernel = np.clip(
-                np.minimum(offsets + step / 2.0, 0.5)
-                - np.maximum(offsets - step / 2.0, -0.5),
-                0.0,
-                None,
-            )
-            pixel_kernel /= np.sum(pixel_kernel)
             pixel_integrated = convolve1d(continuous, pixel_kernel, mode="constant", cval=0.0)
             return np.interp(coordinate, fine_grid, pixel_integrated, left=0.0, right=0.0)
 
@@ -1037,13 +1130,12 @@ def _fill_missing_local_profiles(
 
 def _profile_sample_values(
     evidence: ProfileEvidence,
-    selection: np.ndarray,
+    indices: np.ndarray,
     compact_total: np.ndarray,
     profiles: LocalProfileMap | None,
     runtime_profile: RuntimeProfile | None = None,
 ) -> np.ndarray:
     """Interpret fixed detector evidence with the current overlap model."""
-    indices = np.flatnonzero(selection)
     value = evidence.signal[indices].astype(float)
     if profiles is not None:
         with timed(runtime_profile, "neighbor profile evaluation and subtraction [NumPy/interp]"):
@@ -1074,64 +1166,76 @@ def _valley_constraints(
     cell: int,
     compact_total: np.ndarray,
     profiles: LocalProfileMap | None,
+    valley_indices: np.ndarray | None = None,
     runtime_profile: RuntimeProfile | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Split the fixed observed valleys according to the current local maps."""
     if profiles is None:
         return np.empty(0, dtype=float), np.empty(0, dtype=float)
-    use = evidence.valley_cell == cell
-    if not np.any(use):
+    indices = np.flatnonzero(evidence.valley_cell == cell) if valley_indices is None else valley_indices
+    if not indices.size:
         return np.empty(0, dtype=float), np.empty(0, dtype=float)
-    first = evidence.valley_first_fiber[use]
-    second = evidence.valley_second_fiber[use]
-    column = evidence.valley_column[use]
+    first = evidence.valley_first_fiber[indices]
+    second = evidence.valley_second_fiber[indices]
+    column = evidence.valley_column[indices]
     # Both fibers are in ``cell`` by construction in collect_profile_evidence.
     with timed(runtime_profile, "neighbor profile evaluation and subtraction [NumPy/interp]"):
-        first_profile = np.interp(evidence.valley_first_u[use], profiles.u_grid, profiles.density[cell], left=0.0, right=0.0)
-        second_profile = np.interp(evidence.valley_second_u[use], profiles.u_grid, profiles.density[cell], left=0.0, right=0.0)
+        first_profile = np.interp(evidence.valley_first_u[indices], profiles.u_grid, profiles.density[cell], left=0.0, right=0.0)
+        second_profile = np.interp(evidence.valley_second_u[indices], profiles.u_grid, profiles.density[cell], left=0.0, right=0.0)
     first_total = compact_total[first, column]
     second_total = compact_total[second, column]
     denominator = first_total * first_profile + second_total * second_profile
     valid = np.isfinite(denominator) & (denominator > 0.0)
     if not np.any(valid):
         return np.empty(0, dtype=float), np.empty(0, dtype=float)
-    observed = evidence.valley_signal[use][valid]
+    observed = evidence.valley_signal[indices][valid]
     return (
-        np.r_[evidence.valley_first_u[use][valid], evidence.valley_second_u[use][valid]],
+        np.r_[evidence.valley_first_u[indices][valid], evidence.valley_second_u[indices][valid]],
         np.r_[observed * first_profile[valid] / denominator[valid], observed * second_profile[valid] / denominator[valid]],
     )
 
 
 def _profile_fit_inputs(
     evidence: ProfileEvidence,
-    selection: np.ndarray,
+    indices: np.ndarray,
     compact_total: np.ndarray,
     neighbor_profiles: LocalProfileMap | None,
     *,
     cell: int,
     valley_weight: int,
     seed_core_only: bool,
+    valley_indices: np.ndarray | None = None,
     runtime_profile: RuntimeProfile | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Build the exact detector and valley samples supplied to one profile fit."""
+    if np.asarray(indices).dtype == bool:
+        indices = np.flatnonzero(indices)
     with timed(runtime_profile, "immutable sample reinterpretation [array selection]"):
-        detector_u = evidence.u[selection]
+        detector_u = evidence.u[indices]
     with timed(runtime_profile, "neighbor profile evaluation and subtraction [NumPy/interp]"):
         detector_values = _profile_sample_values(
-            evidence, selection, compact_total, neighbor_profiles,
+            evidence, indices, compact_total, neighbor_profiles,
         )
     if seed_core_only:
-        core = evidence.seed_core[selection]
+        core = evidence.seed_core[indices]
         detector_u = detector_u[core]
         detector_values = detector_values[core]
     with timed(runtime_profile, "neighbor profile evaluation and subtraction [NumPy/interp]"):
         valley_u, valley_values = _valley_constraints(
-            evidence, cell, compact_total, neighbor_profiles,
+            evidence, cell, compact_total, neighbor_profiles, valley_indices,
         )
     with timed(runtime_profile, "fit-input and weight preparation [NumPy]"):
         fit_u = np.r_[detector_u, np.repeat(valley_u, max(1, int(valley_weight)))]
         fit_values = np.r_[detector_values, np.repeat(valley_values, max(1, int(valley_weight)))]
     return detector_u, detector_values, valley_u, valley_values, fit_u, fit_values
+
+
+def _profile_cell_geometry(evidence: ProfileEvidence, cell_count: int, runtime_profile: RuntimeProfile | None = None) -> ProfileCellGeometry:
+    """Freeze exact existing cell memberships for all normalization iterations."""
+    with timed(runtime_profile, "static profile-cell indexing [NumPy]"):
+        sample_indices = tuple(np.flatnonzero(evidence.cell == cell) for cell in range(cell_count))
+        valley_indices = tuple(np.flatnonzero(evidence.valley_cell == cell) for cell in range(cell_count))
+    return ProfileCellGeometry(sample_indices=sample_indices, valley_indices=valley_indices)
 
 
 def measure_local_profiles(
@@ -1182,15 +1286,17 @@ def measure_local_profiles(
     iteration_integral_stats: list[dict[str, float | int]] = []
     if runtime_profile is not None:
         runtime_profile.add("adaptive_cells", grid.cell_columns.shape[0])
+    geometry = _profile_cell_geometry(evidence, grid.cell_columns.shape[0], runtime_profile)
     for iteration in range(max(1, int(iterations) + 1)):
         completed_iterations = iteration + 1
         updated = np.full_like(profiles, np.nan)
         for cell in range(grid.cell_columns.shape[0]):
-            selected = evidence.cell == cell
-            sample_count[cell] = int(selected.sum())
+            selected = geometry.sample_indices[cell]
+            sample_count[cell] = int(selected.size)
             _, _, valley_u, _, sample_u, values = _profile_fit_inputs(
                 evidence, selected, compact_total, previous,
                 cell=cell, valley_weight=valley_weight, seed_core_only=previous is None,
+                valley_indices=geometry.valley_indices[cell],
                 runtime_profile=runtime_profile,
             )
             valley_count[cell] = valley_u.size
@@ -1305,10 +1411,11 @@ def measure_local_profiles(
     closure_right_inflection_u = current.right_inflection_u.copy()
     closure_valley_count = current.valley_constraint_count.copy()
     for cell in range(grid.cell_columns.shape[0]):
-        selected = evidence.cell == cell
+        selected = geometry.sample_indices[cell]
         _, _, valley_u, _, fit_u, fit_values = _profile_fit_inputs(
             evidence, selected, frozen_total, frozen_neighbors,
             cell=cell, valley_weight=valley_weight, seed_core_only=False,
+            valley_indices=geometry.valley_indices[cell],
             runtime_profile=runtime_profile,
         )
         closure_valley_count[cell] = valley_u.size
@@ -1608,6 +1715,7 @@ def measure_profiles_on_trace(
     deblend_iterations: int,
     valley_weight: int,
     retain_capture: bool,
+    raw_evidence: RawProfileEvidence | None = None,
     checkpoint: Callable[[str], None] | None = None,
     runtime_profile: RuntimeProfile | None = None,
 ) -> ProfileMeasurement:
@@ -1622,6 +1730,7 @@ def measure_profiles_on_trace(
         checkpoint("preliminary-spectrum smoothing [compute]")
     evidence = collect_profile_evidence(
         image, trace, preliminary, mask, support=support, grid=grid,
+        raw=raw_evidence,
         runtime_profile=runtime_profile,
     )
     if checkpoint is not None:
@@ -2127,6 +2236,230 @@ class FourierCompactProfile:
         )
 
 
+@dataclass(frozen=True)
+class CentroidBlockState:
+    """Detector and trace facts shared by every local solve in one X block."""
+
+    rows: np.ndarray
+    signal: np.ndarray
+    valid: np.ndarray
+    trace_positions: np.ndarray
+    components: tuple[tuple[int, ...], ...]
+    profiles: tuple[FourierCompactProfile | None, ...]
+    profile_keys: tuple[tuple[int, int] | None, ...]
+
+
+@dataclass(frozen=True)
+class CentroidColumnSamples:
+    """The exact retained detector rows for one target/column local system."""
+
+    column: int
+    rows: np.ndarray
+    values: np.ndarray
+
+
+def _centroid_block_state(
+    image: np.ndarray,
+    mask: np.ndarray,
+    trace: np.ndarray,
+    *,
+    start: int,
+    stop: int,
+    y_coordinate: np.ndarray,
+    profiles: list[FourierCompactProfile | None],
+    profile_keys: list[tuple[int, int] | None],
+    amplifier_y_boundary: float,
+    support: float,
+    runtime_profile: RuntimeProfile | None,
+) -> CentroidBlockState:
+    """Freeze all X-block geometry that is independent of centering offsets."""
+    fiber_count = trace.shape[0]
+    with timed(runtime_profile, "centroid X-block detector/sample preassembly [NumPy]"):
+        # These are views into the CCD.  In particular, no target solve copies
+        # an overlapping detector window before its final good-row selection.
+        signal = image[:, start:stop]
+        valid = ~mask[:, start:stop] & np.isfinite(signal)
+        trace_positions = trace[:, start:stop]
+        rows = np.arange(image.shape[0])
+    components: list[tuple[int, ...]] = []
+    with timed(runtime_profile, "centroid X-block neighbor membership [NumPy]"):
+        for target in range(fiber_count):
+            target_components = [target]
+            for neighbor in (target - 1, target + 1):
+                if neighbor < 0 or neighbor >= fiber_count or profiles[neighbor] is None:
+                    continue
+                same_half = (y_coordinate[neighbor] < amplifier_y_boundary) == (y_coordinate[target] < amplifier_y_boundary)
+                separation = np.nanmedian(np.abs(trace_positions[neighbor] - trace_positions[target]))
+                if same_half and np.isfinite(separation) and separation <= 2.0 * support:
+                    target_components.append(neighbor)
+            components.append(tuple(sorted(target_components)))
+    return CentroidBlockState(
+        rows=rows, signal=signal, valid=valid, trace_positions=trace_positions,
+        components=tuple(components), profiles=tuple(profiles), profile_keys=tuple(profile_keys),
+    )
+
+
+def _centroid_iteration_samples(
+    state: CentroidBlockState,
+    offsets: np.ndarray,
+    *,
+    support: float,
+    runtime_profile: RuntimeProfile | None,
+) -> list[tuple[tuple[int, ...], list[CentroidColumnSamples]]]:
+    """Apply the original per-target detector-row rules using block views."""
+    target_samples: list[tuple[tuple[int, ...], list[CentroidColumnSamples]]] = []
+    with timed(runtime_profile, "local detector sample extraction / array allocation [block views]"):
+        for components in state.components:
+            if not components or state.profiles[components[0]] is None:
+                target_samples.append((components, []))
+                continue
+            samples: list[CentroidColumnSamples] = []
+            for column in range(state.trace_positions.shape[1]):
+                positions = state.trace_positions[np.asarray(components), column] + offsets[np.asarray(components)]
+                if not np.all(np.isfinite(positions)):
+                    continue
+                low = max(0, int(np.floor(np.min(positions) - support)))
+                high = min(state.rows.size, int(np.ceil(np.max(positions) + support)) + 1)
+                good = state.valid[low:high, column]
+                if not np.any(good):
+                    continue
+                rows = state.rows[low:high][good]
+                # Keep the old fancy-row selection and float conversion order.
+                values = np.asarray(state.signal[low:high, column][good], dtype=float)
+                samples.append(CentroidColumnSamples(column, rows, values))
+            target_samples.append((components, samples))
+    if runtime_profile is not None:
+        # One shared detector representation is traversed per block/centering
+        # pass, replacing the former per-target extraction plus concat pair.
+        runtime_profile.count("centroid_detector_extraction_calls")
+    return target_samples
+
+
+def _batched_centroid_profile_columns(
+    state: CentroidBlockState,
+    target_samples: list[tuple[tuple[int, ...], list[CentroidColumnSamples]]],
+    offsets: np.ndarray,
+    *,
+    validate: bool,
+    runtime_profile: RuntimeProfile | None,
+) -> dict[tuple[int, int], tuple[int, np.ndarray, np.ndarray]]:
+    """Evaluate each cached P/P' template once per X block and scatter by view.
+
+    A component-column envelope is the union of the exact local-system rows
+    that use it.  Its later indexed views therefore reproduce the former
+    per-target/per-column interpolation values without changing row membership.
+    """
+    envelopes: dict[tuple[int, int], tuple[int, int]] = {}
+    for components, samples in target_samples:
+        for sample in samples:
+            for component in components:
+                key = (component, sample.column)
+                low, high = int(sample.rows[0]), int(sample.rows[-1]) + 1
+                previous = envelopes.get(key)
+                envelopes[key] = (low, high) if previous is None else (min(previous[0], low), max(previous[1], high))
+    grouped: dict[tuple[int, int], list[tuple[tuple[int, int], np.ndarray]]] = {}
+    for request, (low, high) in envelopes.items():
+        component, column = request
+        template_key = state.profile_keys[component]
+        assert template_key is not None
+        coordinate = state.rows[low:high] - (state.trace_positions[component, column] + offsets[component])
+        grouped.setdefault(template_key, []).append((request, coordinate))
+    evaluated: dict[tuple[int, int], tuple[int, np.ndarray, np.ndarray]] = {}
+    with timed(runtime_profile, "Fourier/cached P and P' evaluation [batched np.interp]"):
+        for template_key, requests in grouped.items():
+            template = state.profiles[requests[0][0][0]]
+            assert template is not None
+            lengths = np.fromiter((coordinate.size for _, coordinate in requests), dtype=np.intp)
+            coordinates = np.concatenate([coordinate for _, coordinate in requests])
+            profile = np.interp(coordinates, template.coordinate, template.density, left=0.0, right=0.0)
+            derivative = np.interp(coordinates, template.coordinate, template.derivative, left=0.0, right=0.0)
+            if runtime_profile is not None:
+                runtime_profile.count("Fourier_P_Pprime_interpolation_calls", 2)
+                runtime_profile.count("Fourier_P_Pprime_interpolated_component_columns", len(requests))
+            split = np.cumsum(lengths)[:-1]
+            for (request, coordinate), values, slopes in zip(requests, np.split(profile, split), np.split(derivative, split)):
+                component, _column = request
+                if validate:
+                    old_profile, old_derivative = state.profiles[component].evaluate(coordinate)  # type: ignore[union-attr]
+                    if not (np.array_equal(values, old_profile) and np.array_equal(slopes, old_derivative)):
+                        difference = max(float(np.max(np.abs(values - old_profile))), float(np.max(np.abs(slopes - old_derivative))))
+                        raise RuntimeError(f"batched centroid interpolation changed P/P' values (max={difference:.3e})")
+                    if runtime_profile is not None:
+                        runtime_profile.count("batched_centroid_interpolation_validation_calls", 2)
+                low, _high = envelopes[request]
+                evaluated[request] = (low, values, slopes)
+    return evaluated
+
+
+def _legacy_centroid_local_systems(
+    image: np.ndarray,
+    mask: np.ndarray,
+    trace: np.ndarray,
+    profile_shapes: list[FourierCompactProfile | None],
+    y_coordinate: np.ndarray,
+    offsets: np.ndarray,
+    *,
+    start: int,
+    stop: int,
+    amplifier_y_boundary: float,
+    support: float,
+    runtime_profile: RuntimeProfile | None,
+):
+    """The pre-4A bookkeeping path, retained only for replay timing baselines."""
+    ny, fiber_count = image.shape[0], trace.shape[0]
+    for target in range(fiber_count):
+        if profile_shapes[target] is None:
+            continue
+        with timed(runtime_profile, "neighbor/design-matrix construction [Python loops/interp]"):
+            components = [target]
+            for neighbor in (target - 1, target + 1):
+                if neighbor < 0 or neighbor >= fiber_count or profile_shapes[neighbor] is None:
+                    continue
+                same_half = (y_coordinate[neighbor] < amplifier_y_boundary) == (y_coordinate[target] < amplifier_y_boundary)
+                separation = np.nanmedian(np.abs(trace[neighbor, start:stop] - trace[target, start:stop]))
+                if same_half and np.isfinite(separation) and separation <= 2.0 * support:
+                    components.append(neighbor)
+            components.sort()
+            if runtime_profile is not None:
+                runtime_profile.count("centroid_design_matrix_constructions")
+        rows_design: list[np.ndarray] = []
+        values: list[np.ndarray] = []
+        with timed(runtime_profile, "local detector sample extraction / array allocation [Python loops]"):
+            for column in range(start, stop):
+                positions = trace[components, column] + offsets[components]
+                if not np.all(np.isfinite(positions)):
+                    continue
+                low = max(0, int(np.floor(np.min(positions) - support)))
+                high = min(ny, int(np.ceil(np.max(positions) + support)) + 1)
+                rows = np.arange(low, high)
+                good = ~mask[rows, column] & np.isfinite(image[rows, column])
+                if not np.any(good):
+                    continue
+                rows = rows[good]
+                with timed(runtime_profile, "neighbor/design-matrix construction [Python loops/interp]"):
+                    design = np.empty((rows.size, 2 * len(components)), dtype=float)
+                    for index, component in enumerate(components):
+                        if runtime_profile is not None:
+                            runtime_profile.count("Fourier_P_Pprime_interpolations")
+                            runtime_profile.count("Fourier_P_Pprime_interpolation_calls", 2)
+                        with timed(runtime_profile, "Fourier/cached P and P' evaluation [np.interp]"):
+                            profile, derivative = profile_shapes[component].evaluate(rows - positions[index])
+                        design[:, 2 * index] = profile
+                        design[:, 2 * index + 1] = -derivative
+                    if runtime_profile is not None:
+                        runtime_profile.count("centroid_design_matrix_constructions")
+                rows_design.append(design)
+                values.append(np.asarray(image[rows, column], dtype=float))
+        if not rows_design:
+            continue
+        with timed(runtime_profile, "local detector sample extraction / array allocation [Python loops]"):
+            design = np.vstack(rows_design)
+            values_array = np.concatenate(values)
+            if runtime_profile is not None:
+                runtime_profile.count("centroid_detector_extraction_calls", 2)
+        yield target, components, design, values_array
+
+
 def fourier_compact_profile(radius: float, sigma: float, *, step: float = 0.02) -> FourierCompactProfile:
     """Evaluate the validated circular-fiber/Gaussian/pixel model by FFT."""
     if not (np.isfinite(radius) and np.isfinite(sigma) and radius > 0.0 and sigma > 0.0):
@@ -2153,7 +2486,6 @@ def fourier_compact_profile(radius: float, sigma: float, *, step: float = 0.02) 
 
 def direct_compact_profile(coordinate: np.ndarray, radius: float, sigma: float) -> np.ndarray:
     """Use the existing brute-force circular/Gaussian/pixel construction for checks."""
-    from scipy.ndimage import convolve1d
     extent = max(18.0, radius + 7.0 * sigma + 3.0)
     step = 0.01
     grid = np.arange(-extent, extent + step / 2.0, step)
@@ -2348,10 +2680,14 @@ def dense_profile_informed_trace_measurements(
     block_width: int = 16,
     support: float = 9.0,
     iterations: int = 2,
+    validate_batched_interpolation: bool = False,
+    bookkeeping_mode: str = "batched",
     runtime_profile: RuntimeProfile | None = None,
 ) -> dict[str, np.ndarray]:
     """Measure dense LDLS centroids with local overlapping Fourier-profile solves."""
     ny, nx = image.shape
+    if bookkeeping_mode not in ("batched", "legacy"):
+        raise ValueError(f"unknown centroid bookkeeping mode: {bookkeeping_mode}")
     ranges = [(start, min(nx, start + block_width)) for start in range(0, nx, block_width)]
     centers = np.asarray([(start + stop - 1) // 2 for start, stop in ranges], dtype=np.int32)
     fiber_count, block_count = trace.shape[0], len(ranges)
@@ -2378,6 +2714,7 @@ def dense_profile_informed_trace_measurements(
                 amplifier_y_boundary=amplifier_y_boundary,
             )
         profile_shapes: list[FourierCompactProfile | None] = []
+        profile_keys: list[tuple[int, int] | None] = []
         with timed(runtime_profile, "Fourier P/P' template generation or cache lookup"):
             for rr, ss in zip(radius, sigma):
                 try:
@@ -2391,8 +2728,16 @@ def dense_profile_informed_trace_measurements(
                     elif runtime_profile is not None:
                         runtime_profile.count("fourier_template_cache_hits")
                     profile_shapes.append(profile)
+                    profile_keys.append(key)
                 except ValueError:
                     profile_shapes.append(None)
+                    profile_keys.append(None)
+        block_state = None if bookkeeping_mode == "legacy" else _centroid_block_state(
+            image, mask, trace, start=start, stop=stop, y_coordinate=y_coordinate,
+            profiles=profile_shapes, profile_keys=profile_keys,
+            amplifier_y_boundary=amplifier_y_boundary, support=support,
+            runtime_profile=runtime_profile,
+        )
         offsets = np.zeros(fiber_count, dtype=float)
         final: dict[int, tuple[float, float, float, float, float, int, int]] = {}
         for centering_iteration in range(max(1, int(iterations))):
@@ -2403,49 +2748,46 @@ def dense_profile_informed_trace_measurements(
                 else "optional second centering iteration [total]"
             )
             with timed(runtime_profile, iteration_label):
-                for target in range(fiber_count):
-                    if profile_shapes[target] is None:
-                        continue
-                    with timed(runtime_profile, "neighbor/design-matrix construction [Python loops/interp]"):
-                        components = [target]
-                        for neighbor in (target - 1, target + 1):
-                            if neighbor < 0 or neighbor >= fiber_count or profile_shapes[neighbor] is None:
+                if bookkeeping_mode == "legacy":
+                    systems = _legacy_centroid_local_systems(
+                        image, mask, trace, profile_shapes, y_coordinate, offsets,
+                        start=start, stop=stop, amplifier_y_boundary=amplifier_y_boundary,
+                        support=support, runtime_profile=runtime_profile,
+                    )
+                else:
+                    assert block_state is not None
+                    target_samples = _centroid_iteration_samples(
+                        block_state, offsets, support=support, runtime_profile=runtime_profile,
+                    )
+                    columns = _batched_centroid_profile_columns(
+                        block_state, target_samples, offsets,
+                        validate=validate_batched_interpolation, runtime_profile=runtime_profile,
+                    )
+
+                    def batched_systems():
+                        for target, (components, samples) in enumerate(target_samples):
+                            if profile_shapes[target] is None or not samples:
                                 continue
-                            same_half = (y_coordinate[neighbor] < amplifier_y_boundary) == (y_coordinate[target] < amplifier_y_boundary)
-                            separation = np.nanmedian(np.abs(trace[neighbor, start:stop] - trace[target, start:stop]))
-                            if same_half and np.isfinite(separation) and separation <= 2.0 * support:
-                                components.append(neighbor)
-                        components.sort()
-                    rows_design: list[np.ndarray] = []
-                    values: list[np.ndarray] = []
-                    with timed(runtime_profile, "local detector sample extraction / array allocation [Python loops]"):
-                        for column in range(start, stop):
-                            positions = trace[components, column] + offsets[components]
-                            if not np.all(np.isfinite(positions)):
-                                continue
-                            low = max(0, int(np.floor(np.min(positions) - support)))
-                            high = min(ny, int(np.ceil(np.max(positions) + support)) + 1)
-                            rows = np.arange(low, high)
-                            good = ~mask[rows, column] & np.isfinite(image[rows, column])
-                            if not np.any(good):
-                                continue
-                            rows = rows[good]
-                            with timed(runtime_profile, "neighbor/design-matrix construction [Python loops/interp]"):
-                                design = np.empty((rows.size, 2 * len(components)), dtype=float)
-                                for index, component in enumerate(components):
-                                    if runtime_profile is not None:
-                                        runtime_profile.count("Fourier_P_Pprime_interpolations")
-                                    with timed(runtime_profile, "Fourier/cached P and P' evaluation [np.interp]"):
-                                        profile, derivative = profile_shapes[component].evaluate(rows - positions[index])
-                                    design[:, 2 * index] = profile
-                                    design[:, 2 * index + 1] = -derivative
-                            rows_design.append(design)
-                            values.append(np.asarray(image[rows, column], dtype=float))
-                    if not rows_design:
-                        continue
-                    with timed(runtime_profile, "local detector sample extraction / array allocation [Python loops]"):
-                        design = np.vstack(rows_design)
-                        values_array = np.concatenate(values)
+                            with timed(runtime_profile, "neighbor/design-matrix construction [preassembled P/P' columns]"):
+                                sample_sizes = [sample.rows.size for sample in samples]
+                                design = np.empty((sum(sample_sizes), 2 * len(components)), dtype=float)
+                                values_array = np.empty(sum(sample_sizes), dtype=float)
+                                cursor = 0
+                                for sample in samples:
+                                    next_cursor = cursor + sample.rows.size
+                                    for index, component in enumerate(components):
+                                        low, profile, derivative = columns[(component, sample.column)]
+                                        indices = sample.rows - low
+                                        design[cursor:next_cursor, 2 * index] = profile[indices]
+                                        design[cursor:next_cursor, 2 * index + 1] = -derivative[indices]
+                                    values_array[cursor:next_cursor] = sample.values
+                                    cursor = next_cursor
+                                if runtime_profile is not None:
+                                    runtime_profile.count("centroid_design_matrix_constructions")
+                            yield target, components, design, values_array
+
+                    systems = batched_systems()
+                for target, components, design, values_array in systems:
                     if runtime_profile is not None:
                         runtime_profile.count("centroid_solve_attempts")
                     try:
@@ -3187,7 +3529,16 @@ def write_refined_field_diagnostics(
         old_smooth_f_sigma=comparison.old_fraction, new_smooth_f_sigma=field.smooth_fraction,
         W_change=comparison.delta_width, f_sigma_change=comparison.delta_fraction,
         remeasured_fit_valid=measurement.fit_valid, remeasured_radius=measurement.profiles.radius,
-        remeasured_sigma=measurement.profiles.sigma, compact_total_spectrum=measurement.compact_total,
+        remeasured_sigma=measurement.profiles.sigma, remeasured_du=measurement.profiles.centroid_offset,
+        remeasured_profile_integral=measurement.profiles.profile_integral,
+        remeasured_profile_density=measurement.profiles.density,
+        compact_total_spectrum=measurement.compact_total,
+        evidence_u=measurement.evidence.u, evidence_signal=measurement.evidence.signal,
+        evidence_fiber=measurement.evidence.fiber, evidence_column=measurement.evidence.column,
+        evidence_cell=measurement.evidence.cell,
+        evidence_neighbor_fiber=measurement.evidence.neighbor_fiber,
+        evidence_neighbor_u=measurement.evidence.neighbor_u,
+        evidence_neighbor_overlaps=measurement.evidence.neighbor_overlaps,
     )
     if checkpoint is not None:
         checkpoint("refined local-profile remeasurement NPZ [write]")
@@ -3289,6 +3640,168 @@ def write_refined_closure_diagnostics(
     return convergence
 
 
+def _load_saved_smooth_fields(path: Path) -> tuple[tuple[RobustSurface, RobustSurface], tuple[RobustSurface, RobustSurface]]:
+    """Reconstruct the existing saved W/f_sigma surfaces for stage replay only."""
+    with np.load(path) as saved:
+        degree = int(np.asarray(saved["surface_degree"]).item())
+        common = zip(
+            saved["surface_x_center"], saved["surface_x_scale"],
+            saved["surface_y_center"], saved["surface_y_scale"],
+        )
+        geometry = list(common)
+        widths = tuple(
+            RobustSurface(coefficients, degree, float(x_center), float(x_scale), float(y_center), float(y_scale), float(mad))
+            for coefficients, (x_center, x_scale, y_center, y_scale), mad in zip(
+                saved["W_surface_coefficients"], geometry, saved["W_surface_residual_mad"],
+            )
+        )
+        fractions = tuple(
+            RobustSurface(coefficients, degree, float(x_center), float(x_scale), float(y_center), float(y_scale), float(mad))
+            for coefficients, (x_center, x_scale, y_center, y_scale), mad in zip(
+                saved["f_sigma_surface_coefficients"], geometry, saved["f_sigma_surface_residual_mad"],
+            )
+        )
+    return widths, fractions
+
+
+def _replay_array_comparison(name: str, actual: np.ndarray, expected: np.ndarray) -> dict[str, float | int | bool | list[int]]:
+    """Record an exact/numerical replay comparison without altering science."""
+    actual, expected = np.asarray(actual), np.asarray(expected)
+    same_shape = actual.shape == expected.shape
+    result: dict[str, float | int | bool | list[int]] = {
+        "same_shape": same_shape, "actual_shape": list(actual.shape), "expected_shape": list(expected.shape),
+    }
+    if not same_shape:
+        result.update({"exact": False, "numerically_equal": False, "max_abs_difference": float("inf")})
+        return result
+    if np.issubdtype(actual.dtype, np.number):
+        difference = np.asarray(actual, dtype=float) - np.asarray(expected, dtype=float)
+        finite = np.isfinite(difference)
+        max_abs = float(np.max(np.abs(difference[finite]))) if np.any(finite) else 0.0
+        numerically_equal = bool(np.allclose(actual, expected, rtol=5e-12, atol=5e-12, equal_nan=True))
+        result.update({
+            "exact": bool(np.array_equal(actual, expected, equal_nan=True)),
+            "numerically_equal": numerically_equal,
+            "max_abs_difference": max_abs,
+        })
+    else:
+        exact = bool(np.array_equal(actual, expected))
+        result.update({"exact": exact, "numerically_equal": exact, "max_abs_difference": 0.0 if exact else float("inf")})
+    return result
+
+
+def run_stage_replay(
+    stage: str,
+    replay_dir: Path,
+    output: Path,
+    image: np.ndarray,
+    mask: np.ndarray,
+    traces: np.ndarray,
+    args: argparse.Namespace,
+    *,
+    lower_trace_count: int,
+    amplifier_y_boundary: float,
+) -> None:
+    """Rerun one existing expensive scientific stage from saved development state.
+
+    This deliberately calls the normal profile/centroid functions and only
+    reconstructs their saved inputs.  It is a development debugging aid, not a
+    new persisted science product or a second implementation of any stage.
+    """
+    if not replay_dir.is_dir():
+        raise ValueError(f"stage replay directory does not exist: {replay_dir}")
+    if replay_dir.resolve() == output.resolve():
+        raise ValueError("stage replay output directory must differ from --replay-dir")
+    grid = _profile_grid(
+        traces, support=args.profile_support, mode=args.profile_grid,
+        chunk_width=args.profile_chunk_width, group_size=args.profile_group_size,
+        trace_tolerance=args.profile_trace_tolerance, separation_tolerance=args.profile_separation_tolerance,
+        minimum_chunk_width=args.profile_min_chunk_width, minimum_group_size=args.profile_min_group_size,
+        amplifier_boundary=lower_trace_count,
+    )
+    runtime = RuntimeProfile(f"stage replay: {stage}") if args.runtime_profile else None
+    comparisons: dict[str, dict[str, float | int | bool | list[int]]] = {}
+    if stage in ("initial-profile", "refined-profile"):
+        raw_evidence = collect_raw_profile_evidence(
+            image, mask, traces, support=args.profile_support, runtime_profile=runtime,
+        )
+        if stage == "initial-profile":
+            stage_trace = traces
+            expected_path = replay_dir / "02_ldls_profile_data.npz"
+            expected_keys = {
+                "evidence_u": "u", "evidence_signal": "signal", "evidence_fiber": "fiber",
+                "evidence_column": "column", "evidence_cell": "cell",
+                "evidence_neighbor_fiber": "neighbor_fiber", "evidence_neighbor_u": "neighbor_u",
+                "evidence_neighbor_overlaps": "neighbor_overlaps", "R": "radius", "sigma": "sigma",
+                "du": "centroid_offset", "profile_integral": "profile_integral",
+                "profile_density": "density", "compact_total_spectrum": "compact_total",
+            }
+        else:
+            with np.load(replay_dir / "02_ldls_refined_trace_closure.npz") as saved_trace:
+                stage_trace = np.asarray(saved_trace["trace_refined"], dtype=float)
+            expected_path = replay_dir / "02_ldls_refined_trace_profile_remeasurement.npz"
+            expected_keys = {
+                "remeasured_radius": "radius", "remeasured_sigma": "sigma",
+                "remeasured_du": "centroid_offset", "remeasured_profile_integral": "profile_integral",
+                "remeasured_profile_density": "density", "compact_total_spectrum": "compact_total",
+                "evidence_u": "u", "evidence_signal": "signal", "evidence_fiber": "fiber",
+                "evidence_column": "column", "evidence_cell": "cell",
+                "evidence_neighbor_fiber": "neighbor_fiber", "evidence_neighbor_u": "neighbor_u",
+                "evidence_neighbor_overlaps": "neighbor_overlaps",
+            }
+        measurement = measure_profiles_on_trace(
+            image, mask, stage_trace, grid, aperture_width=args.aperture_width,
+            support=args.profile_support, bin_width=args.profile_bin_width,
+            smoothing_window=args.ldls_smoothing_window, deblend_iterations=args.profile_deblend_iterations,
+            valley_weight=args.profile_valley_weight, retain_capture=False, raw_evidence=raw_evidence,
+            runtime_profile=runtime,
+        )
+        with np.load(expected_path) as expected:
+            for expected_key, actual_name in expected_keys.items():
+                if expected_key not in expected:
+                    continue
+                if actual_name == "compact_total":
+                    actual = measurement.compact_total
+                elif hasattr(measurement.evidence, actual_name):
+                    actual = getattr(measurement.evidence, actual_name)
+                else:
+                    actual = getattr(measurement.profiles, actual_name)
+                comparisons[expected_key] = _replay_array_comparison(expected_key, actual, expected[expected_key])
+    else:
+        if stage == "initial-centroid":
+            field_path = replay_dir / "02_ldls_smooth_profile_field.npz"
+            expected_path = replay_dir / "02_ldls_profile_informed_trace_measurements.npz"
+            stage_trace = traces
+        elif stage == "t2-centroid":
+            field_path = replay_dir / "02_ldls_refined_trace_smooth_profile_field.npz"
+            expected_path = replay_dir / "02_ldls_refined_trace_residual_measurements.npz"
+            with np.load(replay_dir / "02_ldls_refined_trace_closure.npz") as saved_trace:
+                stage_trace = np.asarray(saved_trace["trace_refined"], dtype=float)
+        else:
+            raise ValueError(f"unknown stage replay: {stage}")
+        width_fields, fraction_fields = _load_saved_smooth_fields(field_path)
+        measurements = dense_profile_informed_trace_measurements(
+            image, mask, stage_trace, width_fields, fraction_fields,
+            amplifier_y_boundary=amplifier_y_boundary,
+            block_width=args.trace_measurement_block_width, support=args.profile_support,
+            iterations=args.trace_centering_iterations,
+            validate_batched_interpolation=args.verify_batched_centroid_interpolation,
+            bookkeeping_mode=args.centroid_bookkeeping_mode,
+            runtime_profile=runtime,
+        )
+        with np.load(expected_path) as expected:
+            for key in ("delta", "delta_uncertainty", "amplitude", "amplitude_snr", "residual_rms", "sample_count", "status", "trace_measured"):
+                comparisons[key] = _replay_array_comparison(key, measurements[key], expected[key])
+    if runtime is not None:
+        runtime.report()
+    accepted = all(bool(item["numerically_equal"]) for item in comparisons.values())
+    report = {"stage": stage, "replay_dir": str(replay_dir), "accepted": accepted, "comparisons": comparisons}
+    write_json(output / f"stage_replay_{stage}.json", report)
+    print(f"Stage replay {stage}: {'MATCHED' if accepted else 'DIFFERED'}; {output / f'stage_replay_{stage}.json'}", flush=True)
+    if not accepted:
+        raise RuntimeError(f"stage replay did not reproduce saved {stage} results")
+
+
 def develop_ldls_profile_and_trace(
     ldls: np.ndarray,
     ldls_mask: np.ndarray,
@@ -3328,11 +3841,15 @@ def develop_ldls_profile_and_trace(
     mark("01", "adaptive profile grid [compute]")
     # 2. Initial trace -> converged local compact profiles and compact totals.
     initial_profile_runtime = RuntimeProfile("profile pass 1: initial trace") if args.runtime_profile else None
+    raw_evidence = collect_raw_profile_evidence(
+        ldls, ldls_mask, traces, support=args.profile_support, runtime_profile=initial_profile_runtime,
+    )
     initial = measure_profiles_on_trace(
         ldls, ldls_mask, traces, grid, aperture_width=args.aperture_width,
         support=args.profile_support, bin_width=args.profile_bin_width,
         smoothing_window=args.ldls_smoothing_window, deblend_iterations=args.profile_deblend_iterations,
         valley_weight=args.profile_valley_weight, retain_capture=True,
+        raw_evidence=raw_evidence,
         checkpoint=stage_checkpoint("02"),
         runtime_profile=initial_profile_runtime,
     )
@@ -3382,6 +3899,7 @@ def develop_ldls_profile_and_trace(
         support=args.profile_support, bin_width=args.profile_bin_width,
         smoothing_window=args.ldls_smoothing_window, deblend_iterations=args.profile_deblend_iterations,
         valley_weight=args.profile_valley_weight, retain_capture=False,
+        raw_evidence=raw_evidence,
         checkpoint=stage_checkpoint("09"),
         runtime_profile=refined_profile_runtime,
     )
@@ -3453,6 +3971,22 @@ def main(argv: list[str] | None = None) -> int:
         "--runtime-profile", action="store_true",
         help="Print fine-grained compute-only wall-clock counters for development profiling",
     )
+    parser.add_argument(
+        "--replay-stage", choices=("initial-profile", "refined-profile", "initial-centroid", "t2-centroid"),
+        help="Development-only: rerun one saved profile/centroid stage through its normal science function",
+    )
+    parser.add_argument(
+        "--replay-dir", type=Path,
+        help="Existing workbench output directory supplying saved state for --replay-stage",
+    )
+    parser.add_argument(
+        "--verify-batched-centroid-interpolation", action="store_true",
+        help="During a centroid replay, directly compare every batched P/P' column with its former interpolation",
+    )
+    parser.add_argument(
+        "--centroid-bookkeeping-mode", choices=("batched", "legacy"), default="batched",
+        help="Development replay timing only: run optimized bookkeeping (default) or the pre-4A baseline",
+    )
     parser.add_argument("--ldls-smoothing-window", type=int, default=101)
     parser.add_argument("--arc-smoothing-window", type=int, default=51)
     parser.add_argument("--halo-core-half-width", type=float, default=8.0)
@@ -3463,6 +3997,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Maximum allowed separation between coherent LDLS and Arc state centers",
     )
     args = parser.parse_args(argv)
+    if bool(args.replay_stage) != bool(args.replay_dir):
+        parser.error("--replay-stage and --replay-dir must be supplied together")
     requested = parse_zipcode_key(args.zipcode)
     if requested.amp not in PAIR:
         parser.error("zipcode amplifier must be one of LL, LU, RU, or RL")
@@ -3503,11 +4039,18 @@ def main(argv: list[str] | None = None) -> int:
     write_json(output / "00_selected_artifacts.json", records)
 
     ldls, _, ldls_mask = assemble_pair(service, lower, upper, "master_ldls", subtract_gap_baseline=True)
-    sci, _, sci_mask = assemble_pair(service, lower, upper, "master_sci", subtract_gap_baseline=True)
-    arc, _, arc_mask = assemble_pair(service, lower, upper, "master_arc", subtract_gap_baseline=False)
     lower_traces = load(service, lower.trace_map, "fiber_trace_map")
     upper_traces = load(service, upper.trace_map, "fiber_trace_map")
     traces = physical_trace_map(lower_traces, upper_traces)
+    if args.replay_stage:
+        run_stage_replay(
+            args.replay_stage, args.replay_dir, output, ldls, ldls_mask, traces, args,
+            lower_trace_count=np.asarray(lower_traces).shape[0],
+            amplifier_y_boundary=float(UPPER_AMPLIFIER_Y_OFFSET),
+        )
+        return 0
+    sci, _, sci_mask = assemble_pair(service, lower, upper, "master_sci", subtract_gap_baseline=True)
+    arc, _, arc_mask = assemble_pair(service, lower, upper, "master_arc", subtract_gap_baseline=False)
     waves = np.vstack((load(service, lower.wavelength_map, "wavelength_map"), load(service, upper.wavelength_map, "wavelength_map"))).astype(float)
     fits.writeto(output / "01_assembled_ldls_baseline_subtracted.fits", ldls, overwrite=True)
     fits.writeto(output / "01_assembled_science_baseline_subtracted.fits", sci, overwrite=True)
