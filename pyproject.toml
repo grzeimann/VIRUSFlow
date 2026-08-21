@@ -26,6 +26,10 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Astronomy",
 ]
 dependencies = [
+  "numpy>=1.24",
+  "astropy>=6",
+  "scipy>=1.11",
+  "matplotlib>=3.7",
   "PyYAML>=6.0.0",
   "scikit-learn",
   "astroquery",
