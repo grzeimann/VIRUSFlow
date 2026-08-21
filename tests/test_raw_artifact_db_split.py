@@ -110,10 +110,13 @@ def test_scan_date_window_filters_before_raw_registration(tmp_path: Path, capsys
     assert "skipped 2 source(s) outside the inclusive bounds" in output
 
 
-def test_scan_date_window_prunes_homogeneous_date_tar_root(tmp_path: Path, monkeypatch):
-    """A TACC date-tar interval must not open archives outside its bounds."""
+def test_scan_date_window_prunes_date_tar_root_with_unrelated_siblings(tmp_path: Path, monkeypatch):
+    """A bounded TACC scan must ignore configuration and other date archives."""
     root = tmp_path / "date_tars"
     root.mkdir()
+    config_fits = root / "virus_config" / "labflats" / "pixelflat_cam004_LL.fits"
+    config_fits.parent.mkdir(parents=True)
+    _write_raw(config_fits)
     source = tmp_path / "source.fits"
     _write_raw(source)
     for date in ("20260430", "20260501", "20260502", "20260503"):
@@ -141,6 +144,27 @@ def test_scan_date_window_prunes_homogeneous_date_tar_root(tmp_path: Path, monke
     assert {source.path.name for source in sources} == {"20260501.tar", "20260502.tar"}
     assert "20260430.tar" not in opened
     assert "20260503.tar" not in opened
+
+
+def test_scan_date_window_prunes_maverick_date_directories(tmp_path: Path):
+    root = tmp_path / "maverick"
+    root.mkdir()
+    config_fits = root / "virus_config" / "labflats" / "pixelflat_cam004_LL.fits"
+    config_fits.parent.mkdir(parents=True)
+    _write_raw(config_fits)
+    source = tmp_path / "source.fits"
+    _write_raw(source)
+    for date in ("20260430", "20260501", "20260502", "20260503"):
+        archive = root / date / "virus" / "virus0000001.tar"
+        archive.parent.mkdir(parents=True)
+        with tarfile.open(archive, mode="w") as tf:
+            tf.add(source, arcname=f"{date}T010000.0_074LL_sci.fits")
+
+    sources = list(FileSystemStorage(root).iter_raw_sources(
+        start_date="20260501", end_date="20260502",
+    ))
+
+    assert {source.path.parent.parent.name for source in sources} == {"20260501", "20260502"}
 
 
 def test_artifact_publication_writes_only_to_the_artifact_database(tmp_path: Path):
