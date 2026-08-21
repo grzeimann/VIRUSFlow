@@ -6,6 +6,7 @@ import re
 import sqlite3
 import tarfile
 import time
+from contextvars import ContextVar
 from threading import Lock
 from contextlib import contextmanager
 from datetime import datetime
@@ -27,6 +28,43 @@ DEFAULT_DB_PATH = os.environ.get("VIRUSFLOW_DB", str(Path.cwd() / "virusflow.sql
 DEFAULT_RAW_DB_PATH = os.environ.get("VIRUSFLOW_RAW_DB", str(Path.cwd() / "virusflow_raw.sqlite3"))
 _INITIALIZED_DATABASES: Dict[str, Tuple[int, int]] = {}
 _INITIALIZE_LOCK = Lock()
+_SCAN_PROFILE: ContextVar[Optional[dict]] = ContextVar("virusflow_scan_profile", default=None)
+
+
+@contextmanager
+def scan_profile(profile: Optional[dict]):
+    """Temporarily collect opt-in raw-scan timing diagnostics."""
+    token = _SCAN_PROFILE.set(profile)
+    try:
+        yield
+    finally:
+        _SCAN_PROFILE.reset(token)
+
+
+def _scan_profile_add(name: str, value: float = 0.0, count: int = 0) -> None:
+    profile = _SCAN_PROFILE.get()
+    if profile is None:
+        return
+    bucket = profile.get("active")
+    if bucket is None:
+        bucket = profile.setdefault("global", {})
+    bucket[name] = float(bucket.get(name, 0.0)) + float(value)
+    stage = profile.get("stage")
+    if name == "sqlite_seconds" and stage:
+        staged_name = f"sqlite_{stage}_seconds"
+        bucket[staged_name] = float(bucket.get(staged_name, 0.0)) + float(value)
+    if count:
+        count_name = f"{name}_count"
+        bucket[count_name] = int(bucket.get(count_name, 0)) + int(count)
+
+
+@contextmanager
+def _scan_profile_phase(name: str):
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        _scan_profile_add(name, time.perf_counter() - started)
 
 
 def _record_sql(sql: str, elapsed: float) -> None:
@@ -78,7 +116,9 @@ class _TimingConnection(sqlite3.Connection):
             with phase("database_query"):
                 return super().execute(sql, parameters)
         finally:
-            _record_sql(str(sql), time.perf_counter() - started)
+            elapsed = time.perf_counter() - started
+            _record_sql(str(sql), elapsed)
+            _scan_profile_add("sqlite_seconds", elapsed)
 
     def executemany(self, sql, seq_of_parameters, /):
         from ..performance import phase
@@ -87,7 +127,9 @@ class _TimingConnection(sqlite3.Connection):
             with phase("database_query"):
                 return super().executemany(sql, seq_of_parameters)
         finally:
-            _record_sql(str(sql), time.perf_counter() - started)
+            elapsed = time.perf_counter() - started
+            _record_sql(str(sql), elapsed)
+            _scan_profile_add("sqlite_seconds", elapsed)
 
     def executescript(self, sql_script, /):
         from ..performance import phase
@@ -96,7 +138,9 @@ class _TimingConnection(sqlite3.Connection):
             with phase("database_query"):
                 return super().executescript(sql_script)
         finally:
-            _record_sql(str(sql_script), time.perf_counter() - started)
+            elapsed = time.perf_counter() - started
+            _record_sql(str(sql_script), elapsed)
+            _scan_profile_add("sqlite_seconds", elapsed)
 
 # ---- Small internal helpers to keep SQL paths concise and consistent ----
 def _as_iso(dt: Optional[datetime]) -> Optional[str]:
@@ -154,8 +198,10 @@ def connect(db_path: str = DEFAULT_DB_PATH) -> Iterator[sqlite3.Connection]:
         yield conn
     finally:
         from ..performance import phase
+        started = time.perf_counter()
         with phase("database_transaction"):
             conn.commit()
+        _scan_profile_add("sqlite_commit_seconds", time.perf_counter() - started)
         conn.close()
 
 
@@ -707,12 +753,14 @@ def _read_ifuslot_metadata_from_tar(tar_path: str, member_name: str) -> Dict[str
 
     Keys: ifuid, specid, controller. Fallback to None on errors.
     """
+    _scan_profile_add("header_tar_opens", count=1)
     try:
         with tarfile.open(tar_path, mode="r") as tf:
             m = tf.getmember(member_name)
             ef = tf.extractfile(m) if m is not None else None
             if ef is None:
                 return {"ifuid": None, "specid": None, "controller": None}
+            _scan_profile_add("logical_member_bytes", float(m.size or 0))
             with fits.open(ef, memmap=False) as hdul:  # type: ignore[arg-type]
                 return _ifuslot_meta_from_header(hdul[0].header)
     except Exception:
@@ -732,6 +780,7 @@ def _read_ifuslot_metadata_from_date_tar(
             backend="date_tar", outer_tar_member=outer_tar_member,
         )
         blob = read_member_bytes(source)
+        _scan_profile_add("logical_member_bytes", float(len(blob)))
         with fits.open(io.BytesIO(blob), memmap=False) as hdul:
             return _ifuslot_meta_from_header(hdul[0].header)
     except Exception:
@@ -804,10 +853,15 @@ def _read_header_via_tar_offset(tar_path: str, offset: int):
     Avoids both the O(n) tarfile.getmember() scan and reading the member's pixel data.
     Returns None on any failure so callers can fall back to the slow path.
     """
+    _scan_profile_add("header_file_opens", count=1)
+    _scan_profile_add("header_seeks", count=1)
     try:
         with open(tar_path, "rb") as fh:
             fh.seek(offset)
-            return fits.Header.fromfile(fh, sep="", endcard=True, padding=True)
+            started = fh.tell()
+            header = fits.Header.fromfile(fh, sep="", endcard=True, padding=True)
+            _scan_profile_add("header_bytes_read", float(max(0, fh.tell() - started)))
+            return header
     except Exception:
         return None
 
@@ -868,12 +922,14 @@ def _read_exposure_header_fields_from_tar(
 
     Returns dict with keys: qobject, qprog, pexptime, date, qra, qdec.
     """
+    _scan_profile_add("header_tar_opens", count=1)
     try:
         with tarfile.open(tar_path, mode="r") as tf:
             m = tf.getmember(member_name)
             ef = tf.extractfile(m) if m is not None else None
             if ef is None:
                 return {"qobject": None, "qprog": None, "pexptime": None, "date": None, "qra": None, "qdec": None}
+            _scan_profile_add("logical_member_bytes", float(m.size or 0))
             with fits.open(ef, memmap=False) as hdul:  # type: ignore[arg-type]
                 hdr = hdul[0].header
                 return _exposure_header_fields(hdr, frame_type=frame_type)
@@ -893,6 +949,7 @@ def _read_exposure_header_fields_from_date_tar(
             backend="date_tar", outer_tar_member=outer_tar_member,
         )
         blob = read_member_bytes(source)
+        _scan_profile_add("logical_member_bytes", float(len(blob)))
         with fits.open(io.BytesIO(blob), memmap=False) as hdul:
             hdr = hdul[0].header
             return _exposure_header_fields(hdr, frame_type=frame_type)
@@ -998,14 +1055,16 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
         tar_path_abs = os.path.abspath(path)
         tar_offset = _lookup_tar_member_offset(tar_path_abs, tar_member, conn=conn, db_path=db_path)
         if tar_offset is not None:
-            shared_header = _read_header_via_tar_offset(path, tar_offset)
+            with _scan_profile_phase("fits_metadata_seconds"):
+                shared_header = _read_header_via_tar_offset(path, tar_offset)
     elif tar_member and outer_tar_member:
         date_tar_path_abs = os.path.abspath(path)
         date_tar_offset = _lookup_date_tar_member_offset(
             date_tar_path_abs, outer_tar_member, tar_member, conn=conn, db_path=db_path
         )
         if date_tar_offset is not None:
-            shared_header = _read_header_via_tar_offset(path, date_tar_offset)
+            with _scan_profile_phase("fits_metadata_seconds"):
+                shared_header = _read_header_via_tar_offset(path, date_tar_offset)
 
     # Build a full ZipCode using filename-derived IFUSLOT/AMP plus minimal header metadata read
     zipcode = None
@@ -1017,26 +1076,33 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
             if shared_header is not None:
                 meta = _ifuslot_meta_from_header(shared_header)
             elif outer_tar_member:
-                meta = _read_ifuslot_metadata_from_date_tar(path, outer_tar_member, tar_member)
+                with _scan_profile_phase("fits_metadata_seconds"):
+                    meta = _read_ifuslot_metadata_from_date_tar(path, outer_tar_member, tar_member)
             elif tar_member:
-                meta = _read_ifuslot_metadata_from_tar(path, tar_member)
+                with _scan_profile_phase("fits_metadata_seconds"):
+                    meta = _read_ifuslot_metadata_from_tar(path, tar_member)
             else:
-                meta = _read_ifuslot_metadata_from_file(path)
+                with _scan_profile_phase("fits_metadata_seconds"):
+                    meta = _read_ifuslot_metadata_from_file(path)
             _IFUSLOT_META_CACHE[ifuslot] = meta
         zipcode = _zipcode_from_amp_token(amp_token, meta)
 
     if shared_header is not None:
-        hdr_fields = _exposure_header_fields(shared_header, frame_type=frame_type)
+        with _scan_profile_phase("fits_metadata_seconds"):
+            hdr_fields = _exposure_header_fields(shared_header, frame_type=frame_type)
     elif outer_tar_member:
-        hdr_fields = _read_exposure_header_fields_from_date_tar(
-            path, outer_tar_member, tar_member, frame_type=frame_type
-        )
+        with _scan_profile_phase("fits_metadata_seconds"):
+            hdr_fields = _read_exposure_header_fields_from_date_tar(
+                path, outer_tar_member, tar_member, frame_type=frame_type
+            )
     elif tar_member:
-        hdr_fields = _read_exposure_header_fields_from_tar(
-            path, tar_member, frame_type=frame_type
-        )
+        with _scan_profile_phase("fits_metadata_seconds"):
+            hdr_fields = _read_exposure_header_fields_from_tar(
+                path, tar_member, frame_type=frame_type
+            )
     else:
-        hdr_fields = _read_exposure_header_fields_from_file(path, frame_type=frame_type)
+        with _scan_profile_phase("fits_metadata_seconds"):
+            hdr_fields = _read_exposure_header_fields_from_file(path, frame_type=frame_type)
     scientific = scientific_metadata_for_database(hdr_fields)
     exposure_details_key = (str(Path(db_path).resolve()), exposure_id)
     storage_backend = "date_tar" if outer_tar_member else ("tar" if tar_member else "filesystem")

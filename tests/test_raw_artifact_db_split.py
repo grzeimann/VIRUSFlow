@@ -273,11 +273,18 @@ def test_filesystem_and_tar_backends_still_enumerate_correctly(tmp_path: Path, c
 
     raw_db = tmp_path / "tar_raw.sqlite3"
     parser = build_parser()
-    args = parser.parse_args(["scan", "--raw-db", str(raw_db), str(tar_root)])
+    args = parser.parse_args([
+        "scan", "--raw-db", str(raw_db), "--profile-tars", str(tar_root),
+    ])
     args.func(args)
     output = capsys.readouterr().out
     assert f"Ingesting tar {tar_path.resolve()}" in output
     assert f"Finished tar {tar_path.resolve()}: 1 raw sources, 1 registered" in output
+    assert f"Tar profile {tar_path.resolve()}: size=" in output
+    assert "discovery/opening=" in output
+    assert "FITS/header/metadata=" in output
+    assert "SQLite lookup/write=" in output
+    assert "header file opens=1; seeks=1" in output
 
 
 def test_date_tar_backend_reads_nested_virus_tar(tmp_path: Path):

@@ -37,6 +37,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
     zipcode_keys = set()
     indexed_tars = set()
     indexed_date_tars = set()
+    profile_enabled = bool(getattr(args, "profile_tars", False))
+    profile = {"tars": {}, "active": None, "stage": None} if profile_enabled else None
 
     def tar_identity(source):
         if source.backend == "tar":
@@ -54,6 +56,52 @@ def cmd_scan(args: argparse.Namespace) -> None:
     active_tar_sources = 0
     active_tar_registered = 0
 
+    def profile_bucket(source_tar, source_tar_label, source):
+        if profile is None or source_tar is None:
+            return None
+        bucket = profile["tars"].setdefault(source_tar, {
+            "label": source_tar_label,
+            "size_bytes": os.stat(source.path).st_size,
+            "source_count": 0,
+            "registered": 0,
+            "discovery_seconds": 0.0,
+            "index_seconds": 0.0,
+            "register_seconds": 0.0,
+        })
+        return bucket
+
+    def finish_profile(bucket) -> None:
+        if bucket is None:
+            return
+        discovery = bucket["discovery_seconds"]
+        indexing = bucket["index_seconds"]
+        registration = bucket["register_seconds"]
+        fits_seconds = bucket.get("fits_metadata_seconds", 0.0)
+        sqlite_seconds = bucket.get("sqlite_register_seconds", 0.0)
+        accounted = discovery + indexing + registration
+        remaining = max(0.0, registration - fits_seconds - sqlite_seconds)
+        print(
+            f"Tar profile {bucket['label']}: size={bucket['size_bytes']} bytes, "
+            f"sources={bucket['source_count']}, elapsed={accounted:.3f} s",
+            flush=True,
+        )
+        print(
+            f"  discovery/opening={discovery:.3f} s; "
+            f"tar-index={indexing:.3f} s "
+            f"(SQLite index SQL={bucket.get('sqlite_index_seconds', 0.0):.3f} s); "
+            f"FITS/header/metadata={fits_seconds:.3f} s; "
+            f"SQLite lookup/write={sqlite_seconds:.3f} s; remaining={remaining:.3f} s",
+            flush=True,
+        )
+        print(
+            f"  header tar opens={int(bucket.get('header_tar_opens_count', 0))}; "
+            f"header file opens={int(bucket.get('header_file_opens_count', 0))}; "
+            f"seeks={int(bucket.get('header_seeks_count', 0))}; "
+            f"header bytes read={int(bucket.get('header_bytes_read', 0))}; "
+            f"logical member bytes={int(bucket.get('logical_member_bytes', 0))}",
+            flush=True,
+        )
+
     def finish_tar() -> None:
         nonlocal active_tar, active_tar_label, active_tar_sources
         nonlocal active_tar_registered
@@ -67,55 +115,101 @@ def cmd_scan(args: argparse.Namespace) -> None:
             f"in {elapsed:.1f} s ({rate:.1f} sources/s)",
             flush=True,
         )
+        if profile is not None:
+            finish_profile(profile.get("active"))
+            profile["active"] = None
         active_tar = None
         active_tar_label = None
         active_tar_sources = 0
         active_tar_registered = 0
 
-    # Unified iteration over both filesystem FITS and FITS inside tar archives
-    with db.connect(args.raw_db) as conn:
-        for src in storage.iter_raw_sources(
-            first_night=first_night, last_night=last_night,
-        ):
-            source_tar, source_tar_label = tar_identity(src)
-            if source_tar != active_tar:
-                finish_tar()
+    # Unified iteration over both filesystem FITS and FITS inside tar archives.
+    source_iter = iter(storage.iter_raw_sources(
+        first_night=first_night, last_night=last_night,
+    ))
+    with db.scan_profile(profile):
+        with db.connect(args.raw_db) as conn:
+            while True:
+                discovery_started = time.perf_counter()
+                try:
+                    src = next(source_iter)
+                except StopIteration:
+                    break
+                discovery_seconds = time.perf_counter() - discovery_started
+                source_tar, source_tar_label = tar_identity(src)
+                bucket = profile_bucket(source_tar, source_tar_label, src)
+                if source_tar != active_tar:
+                    finish_tar()
+                    if source_tar is not None:
+                        active_tar = source_tar
+                        active_tar_label = source_tar_label
+                        active_tar_started = discovery_started
+                        print(f"Ingesting tar {active_tar_label}", flush=True)
+                if bucket is not None:
+                    bucket["source_count"] += 1
+                    bucket["discovery_seconds"] += discovery_seconds
+                    profile["active"] = bucket
                 if source_tar is not None:
-                    active_tar = source_tar
-                    active_tar_label = source_tar_label
-                    active_tar_started = time.perf_counter()
-                    print(f"Ingesting tar {active_tar_label}", flush=True)
-            if source_tar is not None:
-                active_tar_sources += 1
-            # For tar-backed members, ensure we have a DB tar index built once per tar
-            if src.backend == "tar":
-                p = os.path.abspath(str(src.path))
-                if p not in indexed_tars:
-                    try:
-                        db.ensure_tar_index(p, conn=conn)
-                    except Exception:
-                        pass
-                    indexed_tars.add(p)
-            elif src.backend == "date_tar":
-                p = os.path.abspath(str(src.path))
-                key = (p, src.outer_tar_member)
-                if key not in indexed_date_tars:
-                    try:
-                        db.ensure_date_tar_index(p, src.outer_tar_member, conn=conn)
-                    except Exception:
-                        pass
-                    indexed_date_tars.add(key)
-            rid = db.register_raw_file(
-                str(src.path), db_path=args.raw_db, tar_member=src.tar_member,
-                outer_tar_member=src.outer_tar_member, conn=conn,
-            )
-            if rid is not None:
-                count += 1
-                if source_tar is not None:
-                    active_tar_registered += 1
-                if rid.zipcode is not None:
-                    zipcode_keys.add(rid.zipcode.key())
-        finish_tar()
+                    active_tar_sources += 1
+                # For tar-backed members, ensure we have a DB tar index built once per tar.
+                if src.backend == "tar":
+                    p = os.path.abspath(str(src.path))
+                    if p not in indexed_tars:
+                        started = time.perf_counter()
+                        if profile is not None:
+                            profile["stage"] = "index"
+                        try:
+                            db.ensure_tar_index(p, conn=conn)
+                        except Exception:
+                            pass
+                        finally:
+                            if profile is not None:
+                                profile["stage"] = None
+                        if bucket is not None:
+                            bucket["index_seconds"] += time.perf_counter() - started
+                        indexed_tars.add(p)
+                elif src.backend == "date_tar":
+                    p = os.path.abspath(str(src.path))
+                    key = (p, src.outer_tar_member)
+                    if key not in indexed_date_tars:
+                        started = time.perf_counter()
+                        if profile is not None:
+                            profile["stage"] = "index"
+                        try:
+                            db.ensure_date_tar_index(p, src.outer_tar_member, conn=conn)
+                        except Exception:
+                            pass
+                        finally:
+                            if profile is not None:
+                                profile["stage"] = None
+                        if bucket is not None:
+                            bucket["index_seconds"] += time.perf_counter() - started
+                        indexed_date_tars.add(key)
+                started = time.perf_counter()
+                if profile is not None:
+                    profile["stage"] = "register"
+                try:
+                    rid = db.register_raw_file(
+                        str(src.path), db_path=args.raw_db, tar_member=src.tar_member,
+                        outer_tar_member=src.outer_tar_member, conn=conn,
+                    )
+                finally:
+                    if profile is not None:
+                        profile["stage"] = None
+                if bucket is not None:
+                    bucket["register_seconds"] += time.perf_counter() - started
+                if rid is not None:
+                    count += 1
+                    if source_tar is not None:
+                        active_tar_registered += 1
+                    if bucket is not None and rid is not None:
+                        bucket["registered"] += 1
+                    if rid.zipcode is not None:
+                        zipcode_keys.add(rid.zipcode.key())
+            finish_tar()
+    if profile is not None:
+        commit_seconds = profile.get("global", {}).get("sqlite_commit_seconds", 0.0)
+        print(f"Scan profile SQLite commit (scan-wide): {commit_seconds:.3f} s", flush=True)
     print(f"Registered {count} raw FITS files from {args.root}")
     # Report unique ZipCodes discovered during this scan
     zc_count = len(zipcode_keys)
@@ -1038,6 +1132,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_raw_db(sp)
     sp.add_argument("--first-night", help="First inclusive HET observing-night container (YYYYMMDD)")
     sp.add_argument("--last-night", help="Last inclusive HET observing-night container (YYYYMMDD)")
+    sp.add_argument(
+        "--profile-tars", action="store_true",
+        help="Temporary per-tar scan timing diagnostics (development only)",
+    )
     sp.add_argument("root")
     sp.set_defaults(func=cmd_scan)
     sp = sub.add_parser("exposures", help="List scanned exposures")
