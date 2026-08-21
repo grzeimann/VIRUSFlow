@@ -228,6 +228,7 @@ class FileSystemStorage:
         for tar_path, members in self._iter_top_level_tars(
             subdir=subdir, start_date=start_date, end_date=end_date,
         ):
+            print(f"Working on {tar_path}")
             fits_members = [m for m in members if m.isfile() and m.name.endswith(".fits")]
             if fits_members:
                 for member in fits_members:
