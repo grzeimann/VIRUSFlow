@@ -226,7 +226,7 @@ def test_task_context_reads_raw_db_and_publishes_to_artifact_db(tmp_path: Path):
     assert not Path(artifact_db).exists() or "raw_files" not in _tables(artifact_db)
 
 
-def test_filesystem_and_tar_backends_still_enumerate_correctly(tmp_path: Path):
+def test_filesystem_and_tar_backends_still_enumerate_correctly(tmp_path: Path, capsys):
     fs_root = tmp_path / "fs"
     fs_root.mkdir()
     _write_raw(fs_root / "20260501T010000.0_074LL_sci.fits")
@@ -245,6 +245,14 @@ def test_filesystem_and_tar_backends_still_enumerate_correctly(tmp_path: Path):
     assert len(tar_sources) == 1
     assert tar_sources[0].backend == "tar"
     assert tar_sources[0].tar_member == "20260501T010000.0_074LL_sci.fits"
+
+    raw_db = tmp_path / "tar_raw.sqlite3"
+    parser = build_parser()
+    args = parser.parse_args(["scan", "--raw-db", str(raw_db), str(tar_root)])
+    args.func(args)
+    output = capsys.readouterr().out
+    assert f"Ingesting tar {tar_path.resolve()}" in output
+    assert f"Finished tar {tar_path.resolve()}: 1 raw sources, 1 registered, 0 excluded" in output
 
 
 def test_date_tar_backend_reads_nested_virus_tar(tmp_path: Path):

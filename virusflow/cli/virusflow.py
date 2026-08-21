@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -49,20 +50,71 @@ def cmd_scan(args: argparse.Namespace) -> None:
     indexed_tars = set()
     indexed_date_tars = set()
     reported_dates = set()
+
+    def tar_identity(source):
+        if source.backend == "tar":
+            path = os.path.abspath(str(source.path))
+            return (("tar", path, None), path)
+        if source.backend == "date_tar":
+            path = os.path.abspath(str(source.path))
+            member = str(source.outer_tar_member)
+            return (("date_tar", path, member), f"{path}::{member}")
+        return (None, None)
+
+    active_tar = None
+    active_tar_label = None
+    active_tar_started = 0.0
+    active_tar_sources = 0
+    active_tar_registered = 0
+    active_tar_excluded = 0
+
+    def finish_tar() -> None:
+        nonlocal active_tar, active_tar_label, active_tar_sources
+        nonlocal active_tar_registered, active_tar_excluded
+        if active_tar is None:
+            return
+        elapsed = time.perf_counter() - active_tar_started
+        rate = active_tar_sources / elapsed if elapsed else 0.0
+        print(
+            f"Finished tar {active_tar_label}: {active_tar_sources} raw sources, "
+            f"{active_tar_registered} registered, {active_tar_excluded} excluded "
+            f"in {elapsed:.1f} s ({rate:.1f} sources/s)",
+            flush=True,
+        )
+        active_tar = None
+        active_tar_label = None
+        active_tar_sources = 0
+        active_tar_registered = 0
+        active_tar_excluded = 0
+
     # Unified iteration over both filesystem FITS and FITS inside tar archives
     with db.connect(args.raw_db) as conn:
         for src in storage.iter_raw_sources(
             start_date=start_date, end_date=end_date,
         ):
+            source_tar, source_tar_label = tar_identity(src)
+            if source_tar != active_tar:
+                finish_tar()
+                if source_tar is not None:
+                    active_tar = source_tar
+                    active_tar_label = source_tar_label
+                    active_tar_started = time.perf_counter()
+                    print(f"Ingesting tar {active_tar_label}", flush=True)
+            if source_tar is not None:
+                active_tar_sources += 1
             if start_date or end_date:
                 exposure_id, _, _ = db._parse_filename_meta(str(src.tar_member or src.path))
                 source_date = exposure_id[:8]
                 if len(source_date) != 8 or not source_date.isdigit():
                     skipped_unparseable_date += 1
+                    if source_tar is not None:
+                        active_tar_excluded += 1
                     continue
                 if ((start_date and source_date < start_date)
                         or (end_date and source_date > end_date)):
                     skipped_outside_window += 1
+                    if source_tar is not None:
+                        active_tar_excluded += 1
                     continue
                 if source_date not in reported_dates:
                     print(f"Ingesting exposure date {source_date}")
@@ -91,8 +143,11 @@ def cmd_scan(args: argparse.Namespace) -> None:
             )
             if rid is not None:
                 count += 1
+                if source_tar is not None:
+                    active_tar_registered += 1
                 if rid.zipcode is not None:
                     zipcode_keys.add(rid.zipcode.key())
+        finish_tar()
     print(f"Registered {count} raw FITS files from {args.root}")
     # Report unique ZipCodes discovered during this scan
     zc_count = len(zipcode_keys)
