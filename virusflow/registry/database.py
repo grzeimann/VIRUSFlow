@@ -756,6 +756,7 @@ def _read_ifuslot_metadata_from_tar(tar_path: str, member_name: str) -> Dict[str
     _scan_profile_add("header_tar_opens", count=1)
     try:
         with tarfile.open(tar_path, mode="r") as tf:
+            _scan_profile_add("header_tar_member_scans", count=1)
             m = tf.getmember(member_name)
             ef = tf.extractfile(m) if m is not None else None
             if ef is None:
@@ -925,6 +926,7 @@ def _read_exposure_header_fields_from_tar(
     _scan_profile_add("header_tar_opens", count=1)
     try:
         with tarfile.open(tar_path, mode="r") as tf:
+            _scan_profile_add("header_tar_member_scans", count=1)
             m = tf.getmember(member_name)
             ef = tf.extractfile(m) if m is not None else None
             if ef is None:

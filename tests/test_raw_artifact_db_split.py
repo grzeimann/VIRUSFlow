@@ -330,6 +330,7 @@ def test_filesystem_and_tar_backends_still_enumerate_correctly(tmp_path: Path, c
     assert "FITS/header/metadata=" in output
     assert "SQLite lookup/write=" in output
     assert "header file opens=1; seeks=1" in output
+    assert "member-list scans=0" in output
 
 
 def test_date_tar_backend_reads_nested_virus_tar(tmp_path: Path):
@@ -404,6 +405,86 @@ def _build_date_tar(tmp_path: Path, *, amp_names: list[str], ifuslot: str) -> Pa
     return date_root
 
 
+def _build_production_tar(tmp_path: Path) -> Path:
+    tar_root = tmp_path / "tar_root"
+    tar_root.mkdir()
+    for amp in ("LL", "LU"):
+        path = tmp_path / f"20260501T010000.0_074{amp}_sci.fits"
+        _write_raw(
+            path,
+            DATE="2026-05-01T01:00:00.000",
+            AIRMASS=1.22,
+            AMBTEMP=12.5,
+            HUMIDITY=31.0,
+            PRESSURE=745.0,
+            QPROG="program-1",
+            OBJECT="Target_074_W",
+            QOBJECT="Target",
+            QRA=123.4,
+            QDEC=-45.6,
+            PEXPTIME=120.0,
+            EXPTIME=120.0,
+            RHO_STRT=1.0,
+            THE_STRT=2.0,
+            PHI_STRT=3.0,
+            X_STRT=4.0,
+            Y_STRT=5.0,
+            OBSBLOCK="block-1",
+            IFUID="043",
+            SPECID="412",
+            CONTID="S/N 0021",
+        )
+    tar_path = tar_root / "virus0000001.tar"
+    with tarfile.open(tar_path, "w") as tf:
+        for amp in ("LL", "LU"):
+            member_name = f"20260501T010000.0_074{amp}_sci.fits"
+            tf.add(tmp_path / member_name, arcname=member_name)
+    return tar_path
+
+
+def _register_production_tar(tar_path: Path, raw_db: Path, *, indexed: bool, profile=None):
+    db.init_raw_db(str(raw_db))
+    db._IFUSLOT_META_CACHE.clear()
+    db._POPULATED_EXPOSURE_DETAILS.clear()
+    sources = list(FileSystemStorage(tar_path.parent).iter_raw_sources())
+    with db.scan_profile(profile):
+        with db.connect(str(raw_db)) as conn:
+            if indexed:
+                db.ensure_tar_index(str(tar_path.resolve()), conn=conn)
+            for source in sources:
+                db.register_raw_file(
+                    str(source.path), db_path=str(raw_db), tar_member=source.tar_member,
+                    outer_tar_member=source.outer_tar_member, conn=conn,
+                )
+    return sources
+
+
+def test_indexed_tar_header_metadata_matches_fallback_without_member_scans(tmp_path: Path):
+    tar_path = _build_production_tar(tmp_path)
+    unindexed_db = tmp_path / "unindexed.sqlite3"
+    indexed_db = tmp_path / "indexed.sqlite3"
+    _register_production_tar(tar_path, unindexed_db, indexed=False)
+    profile = {"active": {}}
+    sources = _register_production_tar(tar_path, indexed_db, indexed=True, profile=profile)
+
+    assert len(sources) == 2
+    assert db.list_raw_files(db_path=str(unindexed_db)) == db.list_raw_files(db_path=str(indexed_db))
+    unindexed_metadata = db.get_exposure_metadata(
+        "20260501T010000.0", db_path=str(unindexed_db),
+    )
+    indexed_metadata = db.get_exposure_metadata(
+        "20260501T010000.0", db_path=str(indexed_db),
+    )
+    assert unindexed_metadata == indexed_metadata
+    with db.connect(str(indexed_db)) as conn:
+        assert conn.execute("SELECT count(*) FROM exposure_details").fetchone()[0] == 1
+
+    bucket = profile["active"]
+    assert bucket.get("header_tar_opens_count", 0) == 0
+    assert bucket.get("header_tar_member_scans_count", 0) == 0
+    assert bucket.get("header_file_opens_count", 0) == len(sources)
+
+
 def test_date_tar_offset_index_matches_unindexed_metadata(tmp_path: Path):
     unindexed_root = _build_date_tar(tmp_path / "unindexed", amp_names=["LL", "LU"], ifuslot="074")
     indexed_root = _build_date_tar(tmp_path / "indexed", amp_names=["LL", "LU"], ifuslot="075")
@@ -442,6 +523,18 @@ def test_date_tar_offset_index_matches_unindexed_metadata(tmp_path: Path):
         assert unindexed_id.zipcode.specid == indexed_id.zipcode.specid
         assert unindexed_id.zipcode.controller == indexed_id.zipcode.controller
         assert unindexed_id.zipcode.amp == indexed_id.zipcode.amp
+
+    unindexed_metadata = db.get_exposure_metadata(
+        "20260501T010000.0", db_path=str(unindexed_db),
+    )
+    indexed_metadata = db.get_exposure_metadata(
+        "20260501T010000.0", db_path=str(indexed_db),
+    )
+    assert {
+        key: value for key, value in unindexed_metadata.items() if key != "tar_path"
+    } == {
+        key: value for key, value in indexed_metadata.items() if key != "tar_path"
+    }
 
     with db.connect(str(indexed_db)) as conn:
         rows = conn.execute(

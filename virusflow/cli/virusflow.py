@@ -96,6 +96,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
         )
         print(
             f"  header tar opens={int(bucket.get('header_tar_opens_count', 0))}; "
+            f"member-list scans={int(bucket.get('header_tar_member_scans_count', 0))}; "
             f"header file opens={int(bucket.get('header_file_opens_count', 0))}; "
             f"seeks={int(bucket.get('header_seeks_count', 0))}; "
             f"header bytes read={int(bucket.get('header_bytes_read', 0))}; "
