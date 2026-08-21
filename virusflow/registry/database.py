@@ -1005,6 +1005,12 @@ def _extract_observation_number(path: str) -> Optional[int]:
     return None
 
 
+def is_test_observation_path(path: str) -> bool:
+    """Return whether ``path`` is in VIRUSFlow's established test-frame set."""
+    obs_num = _extract_observation_number(path)
+    return obs_num is not None and obs_num >= 999
+
+
 def upsert_amplifier(conn: sqlite3.Connection, z: ZipCode) -> None:
     conn.execute(
         """
@@ -1033,8 +1039,7 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
     if conn is None:
         init_raw_db(db_path)
     # Check observation number in the path context (use tar filename if provided)
-    obs_num = _extract_observation_number(path)
-    if obs_num is not None and obs_num >= 999:
+    if is_test_observation_path(path):
         # Ignore test frames
         return None
 

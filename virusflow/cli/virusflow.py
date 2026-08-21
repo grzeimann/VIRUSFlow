@@ -53,6 +53,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
     active_tar = None
     active_tar_label = None
     active_tar_started = 0.0
+    active_tar_last_completed = 0.0
     active_tar_sources = 0
     active_tar_registered = 0
 
@@ -104,10 +105,14 @@ def cmd_scan(args: argparse.Namespace) -> None:
 
     def finish_tar() -> None:
         nonlocal active_tar, active_tar_label, active_tar_sources
-        nonlocal active_tar_registered
+        nonlocal active_tar_registered, active_tar_last_completed
         if active_tar is None:
             return
-        elapsed = time.perf_counter() - active_tar_started
+        # The next() call that notices a new tar has already performed its
+        # discovery.  Stop the displayed timer at the previous registration so
+        # that generator look-ahead is attributed to the next tar.
+        finished_at = active_tar_last_completed or time.perf_counter()
+        elapsed = finished_at - active_tar_started
         rate = active_tar_sources / elapsed if elapsed else 0.0
         print(
             f"Finished tar {active_tar_label}: {active_tar_sources} raw sources, "
@@ -122,6 +127,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
         active_tar_label = None
         active_tar_sources = 0
         active_tar_registered = 0
+        active_tar_last_completed = 0.0
 
     # Unified iteration over both filesystem FITS and FITS inside tar archives.
     source_iter = iter(storage.iter_raw_sources(
@@ -144,6 +150,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
                         active_tar = source_tar
                         active_tar_label = source_tar_label
                         active_tar_started = discovery_started
+                        active_tar_last_completed = 0.0
                         print(f"Ingesting tar {active_tar_label}", flush=True)
                 if bucket is not None:
                     bucket["source_count"] += 1
@@ -206,6 +213,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
                         bucket["registered"] += 1
                     if rid.zipcode is not None:
                         zipcode_keys.add(rid.zipcode.key())
+                active_tar_last_completed = time.perf_counter()
             finish_tar()
     if profile is not None:
         commit_seconds = profile.get("global", {}).get("sqlite_commit_seconds", 0.0)

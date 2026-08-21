@@ -95,6 +95,14 @@ class FileSystemStorage:
             and parts[-1].lower().endswith(".tar")
         )
 
+    @staticmethod
+    def _is_test_archive(path: Path | str) -> bool:
+        # Keep source discovery tied to the same established invariant used by
+        # register_raw_file(), without duplicating its filename rule here.
+        from ..registry.database import is_test_observation_path
+
+        return is_test_observation_path(str(path))
+
     def _night_containers(
         self, first_night: str, last_night: str, subdir: Optional[str] = None,
     ) -> Optional[tuple[str, list[tuple[str, Path]]]]:
@@ -138,6 +146,7 @@ class FileSystemStorage:
     @staticmethod
     def _fits_in_tar(
         tar_path: Path, members: List[tarfile.TarInfo], *, virus_only: bool = False,
+        skip_test_archives: bool = False,
     ) -> Iterator[RawSource]:
         fits_members = [
             member for member in members
@@ -152,6 +161,7 @@ class FileSystemStorage:
             if member.isfile()
             and member.name.lower().endswith(".tar")
             and (not virus_only or FileSystemStorage._is_virus_archive(member.name))
+            and (not skip_test_archives or not FileSystemStorage._is_test_archive(member.name))
         ]
         if not nested:
             return
@@ -186,12 +196,14 @@ class FileSystemStorage:
                     source_count += 1
                     yield RawSource(path=path)
                 for tar_path in sorted(p for p in virus_root.rglob("virus*.tar") if p.is_file()):
+                    if self._is_test_archive(tar_path):
+                        continue
                     try:
                         with tarfile.open(tar_path, "r") as tf:
                             members = tf.getmembers()
                     except (tarfile.TarError, OSError):
                         continue
-                    for source in self._fits_in_tar(tar_path, members):
+                    for source in self._fits_in_tar(tar_path, members, skip_test_archives=True):
                         source_count += 1
                         yield source
             finally:
@@ -207,7 +219,9 @@ class FileSystemStorage:
                         members = outer.getmembers()
                 except (tarfile.TarError, OSError):
                     continue
-                for source in self._fits_in_tar(archive, members, virus_only=True):
+                for source in self._fits_in_tar(
+                    archive, members, virus_only=True, skip_test_archives=True,
+                ):
                     source_count += 1
                     yield source
             finally:

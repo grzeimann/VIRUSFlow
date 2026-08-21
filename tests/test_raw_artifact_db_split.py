@@ -125,7 +125,11 @@ def test_bounded_scan_prunes_corral_date_tars_and_nonvirus_nested_archives(
     _write_raw(source)
     for date in ("20260501", "20260502", "20260503"):
         with tarfile.open(root / f"{date}.tar", mode="w") as outer:
-            for instrument, archive_name in (("virus", "virus0000001.tar"), ("acm", "acm0000001.tar")):
+            for instrument, archive_name in (
+                ("virus", "virus0000001.tar"),
+                ("virus", "virus0008100.tar"),
+                ("acm", "acm0000001.tar"),
+            ):
                 inner_bytes = io.BytesIO()
                 with tarfile.open(fileobj=inner_bytes, mode="w") as inner:
                     inner.add(source, arcname=f"{date}T010000.0_074LL_sci.fits")
@@ -134,11 +138,14 @@ def test_bounded_scan_prunes_corral_date_tars_and_nonvirus_nested_archives(
                 outer.addfile(info, io.BytesIO(inner_bytes.getvalue()))
 
     opened = []
+    inner_opens = []
     original_open = tarfile.open
 
     def recording_open(name=None, *args, **kwargs):
         if isinstance(name, (str, Path)):
             opened.append(Path(name).name)
+        if kwargs.get("fileobj") is not None:
+            inner_opens.append(name)
         return original_open(name, *args, **kwargs)
 
     monkeypatch.setattr("virusflow.storage.filesystem.tarfile.open", recording_open)
@@ -150,6 +157,44 @@ def test_bounded_scan_prunes_corral_date_tars_and_nonvirus_nested_archives(
     assert {source.outer_tar_member for source in sources} == {"virus/virus0000001.tar"}
     assert "20260503.tar" not in opened
     assert "acm0000001.tar" not in opened
+    assert len(inner_opens) == 2
+
+
+def test_bounded_work_scan_skips_known_test_archives_before_opening(
+    tmp_path: Path, monkeypatch,
+):
+    root = tmp_path / "maverick"
+    source = tmp_path / "source.fits"
+    _write_raw(source)
+    virus_root = root / "20260601" / "virus"
+    virus_root.mkdir(parents=True)
+    for archive_name, exposure_date in (
+        ("virus0000001.tar", "20260602"),
+        ("virus0008100.tar", "20260602"),
+    ):
+        with tarfile.open(virus_root / archive_name, mode="w") as tf:
+            tf.add(source, arcname=f"{exposure_date}T010000.0_074LL_sci.fits")
+
+    opened = []
+    original_open = tarfile.open
+
+    def recording_open(name=None, *args, **kwargs):
+        if isinstance(name, (str, Path)):
+            opened.append(Path(name).name)
+        return original_open(name, *args, **kwargs)
+
+    monkeypatch.setattr("virusflow.storage.filesystem.tarfile.open", recording_open)
+    raw_db = tmp_path / "raw.sqlite3"
+    args = build_parser().parse_args([
+        "scan", "--raw-db", str(raw_db), "--first-night", "20260601",
+        "--last-night", "20260601", str(root),
+    ])
+    args.func(args)
+
+    rows = db.list_raw_files(db_path=str(raw_db))
+    assert [row.exposure_id for row in rows] == ["20260602T010000.0"]
+    assert "virus0000001.tar" in opened
+    assert "virus0008100.tar" not in opened
 
 
 def test_bounded_work_scan_never_walks_unrelated_night_subtrees(tmp_path: Path):
