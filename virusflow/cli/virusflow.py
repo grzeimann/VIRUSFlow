@@ -51,7 +51,9 @@ def cmd_scan(args: argparse.Namespace) -> None:
     reported_dates = set()
     # Unified iteration over both filesystem FITS and FITS inside tar archives
     with db.connect(args.raw_db) as conn:
-        for src in storage.iter_raw_sources():
+        for src in storage.iter_raw_sources(
+            start_date=start_date, end_date=end_date,
+        ):
             if start_date or end_date:
                 exposure_id, _, _ = db._parse_filename_meta(str(src.tar_member or src.path))
                 source_date = exposure_id[:8]

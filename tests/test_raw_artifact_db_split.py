@@ -110,6 +110,39 @@ def test_scan_date_window_filters_before_raw_registration(tmp_path: Path, capsys
     assert "skipped 2 source(s) outside the inclusive bounds" in output
 
 
+def test_scan_date_window_prunes_homogeneous_date_tar_root(tmp_path: Path, monkeypatch):
+    """A TACC date-tar interval must not open archives outside its bounds."""
+    root = tmp_path / "date_tars"
+    root.mkdir()
+    source = tmp_path / "source.fits"
+    _write_raw(source)
+    for date in ("20260430", "20260501", "20260502", "20260503"):
+        inner_bytes = io.BytesIO()
+        with tarfile.open(fileobj=inner_bytes, mode="w") as inner:
+            inner.add(source, arcname=f"{date}T010000.0_074LL_sci.fits")
+        info = tarfile.TarInfo(name="virus/virus0000001.tar")
+        info.size = len(inner_bytes.getvalue())
+        with tarfile.open(root / f"{date}.tar", mode="w") as outer:
+            outer.addfile(info, io.BytesIO(inner_bytes.getvalue()))
+
+    opened = []
+    original_open = tarfile.open
+
+    def recording_open(name=None, *args, **kwargs):
+        if isinstance(name, (str, Path)):
+            opened.append(Path(name).name)
+        return original_open(name, *args, **kwargs)
+
+    monkeypatch.setattr("virusflow.storage.filesystem.tarfile.open", recording_open)
+    sources = list(FileSystemStorage(root).iter_raw_sources(
+        start_date="20260501", end_date="20260502",
+    ))
+
+    assert {source.path.name for source in sources} == {"20260501.tar", "20260502.tar"}
+    assert "20260430.tar" not in opened
+    assert "20260503.tar" not in opened
+
+
 def test_artifact_publication_writes_only_to_the_artifact_database(tmp_path: Path):
     raw_db = tmp_path / "raw.sqlite3"
     artifact_db = tmp_path / "artifact.sqlite3"

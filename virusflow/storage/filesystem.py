@@ -54,13 +54,95 @@ class FileSystemStorage:
     def exists(self, relative: str | os.PathLike[str]) -> bool:
         return (self.root / relative).exists()
 
-    def list_fits(self, subdir: Optional[str] = None) -> Iterator[Path]:
+    def list_fits(
+        self,
+        subdir: Optional[str] = None,
+        *,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Iterator[Path]:
         base = self.root if subdir is None else (self.root / subdir)
         if not base.exists():
             return iter(())
+        date_roots = self._bounded_date_roots(
+            subdir=subdir, start_date=start_date, end_date=end_date,
+        )
+        if date_roots is not None:
+            for root in date_roots:
+                if root.is_dir():
+                    yield from (p for p in root.rglob("*.fits") if p.is_file())
+            return
         for p in base.rglob("*.fits"):
             if p.is_file():
                 yield p
+
+    @staticmethod
+    def _date_token(value: str) -> Optional[str]:
+        """Return a YYYYMMDD token when *value* is a date archive/directory name."""
+        name = Path(value).name
+        if name.lower().endswith(".tar"):
+            name = name[:-4]
+        if len(name) == 8 and name.isdigit():
+            return name
+        return None
+
+    def _bounded_date_roots(
+        self, *, subdir: Optional[str], start_date: Optional[str], end_date: Optional[str],
+    ) -> Optional[List[Path]]:
+        """Return selected date roots for a homogeneous TACC date-archive root.
+
+        A Corral raw root commonly contains only ``YYYYMMDD.tar`` files (or
+        date-named directories).  In that layout, scanning a bounded interval
+        must not recursively walk and open every archive in a multi-year tree.
+        We deliberately require the root to be homogeneous before using this
+        optimization; mixed or unfamiliar layouts retain the historical full
+        traversal so no in-window source can be silently omitted.
+        """
+        if not (start_date or end_date):
+            return None
+        base = self.root if subdir is None else (self.root / subdir)
+        try:
+            entries = list(base.iterdir())
+        except OSError:
+            return None
+        visible = [entry for entry in entries if not entry.name.startswith(".")]
+        if not visible:
+            return None
+        dated = [entry for entry in visible if self._date_token(entry.name) is not None]
+        if len(dated) != len(visible):
+            return None
+        selected = []
+        for entry in dated:
+            date = self._date_token(entry.name)
+            assert date is not None
+            if ((start_date and date < start_date)
+                    or (end_date and date > end_date)):
+                continue
+            selected.append(entry)
+        return sorted(selected)
+
+    def _iter_top_level_tar_paths(
+        self,
+        subdir: Optional[str] = None,
+        *,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Iterator[Path]:
+        """Yield tar paths, pruning a homogeneous date-archive root when bounded."""
+        date_roots = self._bounded_date_roots(
+            subdir=subdir, start_date=start_date, end_date=end_date,
+        )
+        if date_roots is not None:
+            for root in date_roots:
+                if root.is_file() and root.name.lower().endswith(".tar"):
+                    yield root
+                elif root.is_dir():
+                    yield from root.rglob("*.tar")
+            return
+        base = self.root if subdir is None else (self.root / subdir)
+        if not base.exists():
+            return
+        yield from base.rglob("*.tar")
 
     def list_tar_fits(self, subdir: Optional[str] = None) -> Iterator[Tuple[Path, str]]:
         """Yield (tar_path, member_name) for FITS files stored directly inside .tar archives.
@@ -107,12 +189,18 @@ class FileSystemStorage:
                 continue
 
     def _iter_top_level_tars(
-        self, subdir: Optional[str] = None
+        self,
+        subdir: Optional[str] = None,
+        *,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> Iterator[Tuple[Path, List[tarfile.TarInfo]]]:
         base = self.root if subdir is None else (self.root / subdir)
         if not base.exists():
             return iter(())
-        for tar_path in base.rglob("*.tar"):
+        for tar_path in self._iter_top_level_tar_paths(
+            subdir=subdir, start_date=start_date, end_date=end_date,
+        ):
             if not tar_path.is_file():
                 continue
             try:
@@ -123,13 +211,23 @@ class FileSystemStorage:
                 continue
             yield tar_path, members
 
-    def iter_raw_sources(self, subdir: Optional[str] = None) -> Iterator[RawSource]:
+    def iter_raw_sources(
+        self,
+        subdir: Optional[str] = None,
+        *,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+    ) -> Iterator[RawSource]:
         # filesystem files
-        for p in self.list_fits(subdir=subdir):
+        for p in self.list_fits(
+            subdir=subdir, start_date=start_date, end_date=end_date,
+        ):
             yield RawSource(path=p, tar_member=None, backend="filesystem")
         # tar members (direct FITS members) and date-tar members (nested tars) are
         # mutually exclusive per top-level tar, detected by inspecting its contents once.
-        for tar_path, members in self._iter_top_level_tars(subdir=subdir):
+        for tar_path, members in self._iter_top_level_tars(
+            subdir=subdir, start_date=start_date, end_date=end_date,
+        ):
             fits_members = [m for m in members if m.isfile() and m.name.endswith(".fits")]
             if fits_members:
                 for member in fits_members:
