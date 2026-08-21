@@ -82,6 +82,34 @@ def test_scan_populates_only_the_raw_database(tmp_path: Path):
     assert not artifact_db.exists() or "raw_files" not in _tables(artifact_db)
 
 
+def test_scan_date_window_filters_before_raw_registration(tmp_path: Path, capsys):
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    for exposure_id in (
+        "20260430T235959.0",
+        "20260501T010000.0",
+        "20260502T010000.0",
+        "20260503T000000.0",
+    ):
+        _write_raw(data_root / f"{exposure_id}_074LL_sci.fits")
+
+    raw_db = tmp_path / "raw.sqlite3"
+    parser = build_parser()
+    args = parser.parse_args([
+        "scan", "--raw-db", str(raw_db),
+        "--start-date", "20260501", "--end-date", "20260502", str(data_root),
+    ])
+    args.func(args)
+
+    assert [row.exposure_id for row in db.list_raw_files(db_path=str(raw_db))] == [
+        "20260501T010000.0", "20260502T010000.0",
+    ]
+    output = capsys.readouterr().out
+    assert "Ingesting exposure date 20260501" in output
+    assert "Ingesting exposure date 20260502" in output
+    assert "skipped 2 source(s) outside the inclusive bounds" in output
+
+
 def test_artifact_publication_writes_only_to_the_artifact_database(tmp_path: Path):
     raw_db = tmp_path / "raw.sqlite3"
     artifact_db = tmp_path / "artifact.sqlite3"

@@ -26,13 +26,45 @@ def cmd_init(args: argparse.Namespace) -> None:
 def cmd_scan(args: argparse.Namespace) -> None:
     storage = FileSystemStorage(args.root)
     db.init_raw_db(args.raw_db)
+    start_date = getattr(args, "start_date", None)
+    end_date = getattr(args, "end_date", None)
+    for name, value in (("--start-date", start_date), ("--end-date", end_date)):
+        if value:
+            try:
+                value = str(value).replace("-", "")
+                if len(value) != 8 or not value.isdigit():
+                    raise ValueError
+            except ValueError:
+                raise SystemExit(f"Invalid {name} value '{value}'. Use YYYYMMDD.")
+            if name == "--start-date":
+                start_date = value
+            else:
+                end_date = value
+    if start_date and end_date and start_date > end_date:
+        raise SystemExit("--start-date must be on or before --end-date.")
     count = 0
+    skipped_outside_window = 0
+    skipped_unparseable_date = 0
     zipcode_keys = set()
     indexed_tars = set()
     indexed_date_tars = set()
+    reported_dates = set()
     # Unified iteration over both filesystem FITS and FITS inside tar archives
     with db.connect(args.raw_db) as conn:
         for src in storage.iter_raw_sources():
+            if start_date or end_date:
+                exposure_id, _, _ = db._parse_filename_meta(str(src.tar_member or src.path))
+                source_date = exposure_id[:8]
+                if len(source_date) != 8 or not source_date.isdigit():
+                    skipped_unparseable_date += 1
+                    continue
+                if ((start_date and source_date < start_date)
+                        or (end_date and source_date > end_date)):
+                    skipped_outside_window += 1
+                    continue
+                if source_date not in reported_dates:
+                    print(f"Ingesting exposure date {source_date}")
+                    reported_dates.add(source_date)
             # For tar-backed members, ensure we have a DB tar index built once per tar
             if src.backend == "tar":
                 p = os.path.abspath(str(src.path))
@@ -73,6 +105,12 @@ def cmd_scan(args: argparse.Namespace) -> None:
         print(f"Indexed {len(indexed_tars)} tar files into registry (DB mode)")
     if indexed_date_tars:
         print(f"Indexed {len(indexed_date_tars)} nested date-tar members into registry (DB mode)")
+    if start_date or end_date:
+        print(
+            f"Scan date window {start_date or 'open'}..{end_date or 'open'}: "
+            f"skipped {skipped_outside_window} source(s) outside the inclusive bounds"
+            + (f" and {skipped_unparseable_date} without a parseable exposure date" if skipped_unparseable_date else "")
+        )
 
 
 def cmd_exposures(args: argparse.Namespace) -> None:
@@ -965,7 +1003,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("init", help="Initialize a registry")
     _add_raw_db(sp); sp.set_defaults(func=cmd_init)
     sp = sub.add_parser("scan", help="Register raw FITS inputs")
-    _add_raw_db(sp); sp.add_argument("root"); sp.set_defaults(func=cmd_scan)
+    _add_raw_db(sp)
+    sp.add_argument("--start-date", help="Inclusive UTC acquisition date (YYYYMMDD)")
+    sp.add_argument("--end-date", help="Inclusive UTC acquisition date (YYYYMMDD)")
+    sp.add_argument("root")
+    sp.set_defaults(func=cmd_scan)
     sp = sub.add_parser("exposures", help="List scanned exposures")
     _add_raw_db(sp)
     sp.add_argument("--start-date")

@@ -442,6 +442,7 @@ class LocalProfileMap:
     bin_model_weighted_rms: np.ndarray
     optimizer_status: np.ndarray
     optimizer_cost: np.ndarray
+    optimizer_nfev: np.ndarray
     parameter_at_bound: np.ndarray
     left_valley_u: np.ndarray
     right_valley_u: np.ndarray
@@ -915,24 +916,92 @@ def collect_profile_evidence(
     )
 
 
-def robust_profile_bins(u: np.ndarray, values: np.ndarray, *, support: float, bin_width: float) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return robust bin medians, counts, and scatter without fitting a curve."""
-    centers = np.arange(-support + bin_width / 2.0, support, bin_width)
-    edges = np.r_[centers - bin_width / 2.0, centers[-1] + bin_width / 2.0]
-    median = np.full(centers.shape, np.nan)
-    scatter = np.full(centers.shape, np.nan)
-    count = np.zeros(centers.shape, dtype=np.int32)
-    indices = np.digitize(u, edges) - 1
-    for index in range(centers.size):
-        selected = values[(indices == index) & np.isfinite(values)]
-        if selected.size:
-            location = float(np.median(selected))
-            scale = float(1.4826 * np.median(np.abs(selected - location)))
-            if np.isfinite(scale) and scale > 0.0:
-                selected = selected[np.abs(selected - location) <= 5.0 * scale]
-            count[index] = selected.size
-            median[index] = np.median(selected)
-            scatter[index] = 1.4826 * np.median(np.abs(selected - median[index]))
+@dataclass(frozen=True)
+class RobustBinGeometry:
+    """The u-dependent portion of one unchanged robust-bin calculation."""
+
+    u: np.ndarray
+    centers: np.ndarray
+    indices: np.ndarray
+
+
+class RobustBinGeometryCache:
+    """Reuse membership only when an identical ordered u vector recurs."""
+
+    def __init__(self, mode: str):
+        if mode not in ("legacy", "cached"):
+            raise ValueError(f"unknown robust-bin geometry mode: {mode}")
+        self.mode = mode
+        self.by_cell: dict[int, list[RobustBinGeometry]] = {}
+
+    def resolve(
+        self,
+        cell: int | None,
+        u: np.ndarray,
+        *,
+        support: float,
+        bin_width: float,
+        runtime_profile: RuntimeProfile | None,
+    ) -> RobustBinGeometry:
+        if self.mode == "cached" and cell is not None:
+            with timed(runtime_profile, "robust-bin cached membership lookup [NumPy]"):
+                for geometry in self.by_cell.get(cell, ()):
+                    if np.array_equal(u, geometry.u):
+                        if runtime_profile is not None:
+                            runtime_profile.count("robust_bin_geometry_cache_hits")
+                        return geometry
+        with timed(runtime_profile, "robust-bin index/membership construction [NumPy]"):
+            centers = np.arange(-support + bin_width / 2.0, support, bin_width)
+            edges = np.r_[centers - bin_width / 2.0, centers[-1] + bin_width / 2.0]
+            indices = np.digitize(u, edges) - 1
+            geometry = RobustBinGeometry(np.asarray(u).copy(), centers, indices)
+        if runtime_profile is not None:
+            runtime_profile.count("robust_bin_geometry_cache_misses")
+        if self.mode == "cached" and cell is not None:
+            self.by_cell.setdefault(cell, []).append(geometry)
+        return geometry
+
+
+def robust_profile_bins(
+    u: np.ndarray,
+    values: np.ndarray,
+    *,
+    support: float,
+    bin_width: float,
+    geometry_cache: RobustBinGeometryCache | None = None,
+    cell: int | None = None,
+    runtime_profile: RuntimeProfile | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return the existing robust statistic, optionally reusing only u geometry."""
+    if geometry_cache is None:
+        geometry_cache = RobustBinGeometryCache("legacy")
+    geometry = geometry_cache.resolve(
+        cell, u, support=support, bin_width=bin_width, runtime_profile=runtime_profile,
+    )
+    centers, indices = geometry.centers, geometry.indices
+    with timed(runtime_profile, "robust-bin output allocation [NumPy]"):
+        median = np.full(centers.shape, np.nan)
+        scatter = np.full(centers.shape, np.nan)
+        count = np.zeros(centers.shape, dtype=np.int32)
+    with timed(runtime_profile, "robust-bin finite-value selection [NumPy]"):
+        finite_values = np.isfinite(values)
+    with timed(runtime_profile, "robust-bin Python loop over bins"):
+        for index in range(centers.size):
+            with timed(runtime_profile, "robust-bin value gathering [NumPy]"):
+                selected = values[(indices == index) & finite_values]
+            if selected.size:
+                with timed(runtime_profile, "robust-bin median [NumPy]"):
+                    location = float(np.median(selected))
+                with timed(runtime_profile, "robust-bin MAD/scatter [NumPy]"):
+                    scale = float(1.4826 * np.median(np.abs(selected - location)))
+                if np.isfinite(scale) and scale > 0.0:
+                    with timed(runtime_profile, "robust-bin rejection mask/allocation [NumPy]"):
+                        selected = selected[np.abs(selected - location) <= 5.0 * scale]
+                count[index] = selected.size
+                with timed(runtime_profile, "robust-bin median [NumPy]"):
+                    median[index] = np.median(selected)
+                with timed(runtime_profile, "robust-bin MAD/scatter [NumPy]"):
+                    scatter[index] = 1.4826 * np.median(np.abs(selected - median[index]))
     return centers, median, scatter, count
 
 
@@ -942,6 +1011,9 @@ def fit_constrained_profile(
     *,
     support: float,
     bin_width: float,
+    initial_radius_sigma: tuple[float, float] | None = None,
+    robust_bin_geometry_cache: RobustBinGeometryCache | None = None,
+    cell: int | None = None,
     runtime_profile: RuntimeProfile | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict[str, float | int | bool]]:
     """Regularize robust bins with a circular source and GH optical blur.
@@ -953,7 +1025,11 @@ def fit_constrained_profile(
     h3 and h4 perturbations are fixed at zero for this fit.
     """
     with timed(runtime_profile, "robust-bin construction [NumPy/Python bins]"):
-        centers, median, scatter, count = robust_profile_bins(u, values, support=support, bin_width=bin_width)
+        centers, median, scatter, count = robust_profile_bins(
+            u, values, support=support, bin_width=bin_width,
+            geometry_cache=robust_bin_geometry_cache, cell=cell,
+            runtime_profile=runtime_profile,
+        )
     finite = np.isfinite(median) & np.isfinite(scatter) & (count >= 8)
     if finite.sum() < 8:
         raise ValueError("insufficient robust local-profile bins")
@@ -1040,7 +1116,14 @@ def fit_constrained_profile(
 
     # Fit height, R, sigma, and du only.  The circular source is fixed at
     # q=0 and the optional h3/h4 optical-blur terms are fixed at zero.
-    initial = np.r_[np.log([max(peak, noise), 3.2, 0.8]), 0.0]
+    start_radius, start_sigma = initial_radius_sigma if initial_radius_sigma is not None else (3.2, 0.8)
+    if not (np.isfinite(start_radius) and np.isfinite(start_sigma)):
+        start_radius, start_sigma = 3.2, 0.8
+    # A warm start changes only the feasible optimizer seed.  The existing
+    # height/du seeds, direct evaluator, bounds, and all fit inputs remain as-is.
+    start_radius = float(np.clip(start_radius, np.nextafter(2.5, np.inf), np.nextafter(4.0, -np.inf)))
+    start_sigma = float(np.clip(start_sigma, np.nextafter(0.3, np.inf), np.nextafter(2.0, -np.inf)))
+    initial = np.r_[np.log([max(peak, noise), start_radius, start_sigma]), 0.0]
     lower = np.r_[np.log([max(peak * 0.25, noise), 2.5, 0.3]), -0.5]
     upper = np.r_[np.log([max(peak * 4.0, noise * 4.0), 4.0, 2.0]), 0.5]
 
@@ -1096,6 +1179,7 @@ def fit_constrained_profile(
         "bin_model_weighted_rms": bin_model_weighted_rms,
         "optimizer_status": int(result.status),
         "optimizer_cost": float(result.cost),
+        "optimizer_nfev": int(result.nfev),
         "parameter_at_bound": parameter_at_bound,
         "left_valley_u": left_valley_u,
         "right_valley_u": right_valley_u,
@@ -1250,6 +1334,9 @@ def measure_local_profiles(
     grid: ProfileGrid,
     iterations: int,
     valley_weight: int,
+    optimizer_initial_radius: np.ndarray | None = None,
+    optimizer_initial_sigma: np.ndarray | None = None,
+    robust_bin_geometry_mode: str = "legacy",
     runtime_profile: RuntimeProfile | None = None,
 ) -> tuple[LocalProfileMap, LocalProfileMap, np.ndarray, int, bool, float, float, list[dict[str, float | int]]]:
     """Fit local maps from fixed evidence, updating only its interpretation."""
@@ -1272,6 +1359,7 @@ def measure_local_profiles(
     bin_model_weighted_rms = np.full_like(peak_u, np.nan)
     optimizer_status = np.zeros(peak_u.shape, dtype=np.int16)
     optimizer_cost = np.full_like(peak_u, np.nan)
+    optimizer_nfev = np.zeros(peak_u.shape, dtype=np.int16)
     parameter_at_bound = np.zeros(peak_u.shape, dtype=bool)
     left_valley_u = np.full_like(peak_u, np.nan)
     right_valley_u = np.full_like(peak_u, np.nan)
@@ -1287,6 +1375,7 @@ def measure_local_profiles(
     if runtime_profile is not None:
         runtime_profile.add("adaptive_cells", grid.cell_columns.shape[0])
     geometry = _profile_cell_geometry(evidence, grid.cell_columns.shape[0], runtime_profile)
+    bin_geometry_cache = RobustBinGeometryCache(robust_bin_geometry_mode)
     for iteration in range(max(1, int(iterations) + 1)):
         completed_iterations = iteration + 1
         updated = np.full_like(profiles, np.nan)
@@ -1303,6 +1392,10 @@ def measure_local_profiles(
             try:
                 fitted_u, fitted, counts, scatter, used, topology = fit_constrained_profile(
                     sample_u, values, support=support, bin_width=bin_width,
+                    initial_radius_sigma=(
+                        float(optimizer_initial_radius[cell]), float(optimizer_initial_sigma[cell]),
+                    ) if optimizer_initial_radius is not None and optimizer_initial_sigma is not None else None,
+                    robust_bin_geometry_cache=bin_geometry_cache, cell=cell,
                     runtime_profile=runtime_profile,
                 )
                 integral = topology["profile_integral"]
@@ -1324,6 +1417,7 @@ def measure_local_profiles(
                 bin_model_weighted_rms[cell] = topology["bin_model_weighted_rms"]
                 optimizer_status[cell] = topology["optimizer_status"]
                 optimizer_cost[cell] = topology["optimizer_cost"]
+                optimizer_nfev[cell] = topology["optimizer_nfev"]
                 parameter_at_bound[cell] = topology["parameter_at_bound"]
                 left_valley_u[cell] = topology["left_valley_u"]
                 right_valley_u[cell] = topology["right_valley_u"]
@@ -1332,8 +1426,8 @@ def measure_local_profiles(
             except ValueError:
                 if previous is not None:
                     updated[cell] = previous.density[cell]
-        profiles, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, height, radius, sigma, profile_integral, h3, h4, bin_model_rms, bin_model_weighted_rms, optimizer_status, optimizer_cost, parameter_at_bound, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u = _fill_missing_local_profiles(
-            updated, grid.cell_columns, grid.cell_fibers, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, height, radius, sigma, profile_integral, h3, h4, bin_model_rms, bin_model_weighted_rms, optimizer_status, optimizer_cost, parameter_at_bound, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u,
+        profiles, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, height, radius, sigma, profile_integral, h3, h4, bin_model_rms, bin_model_weighted_rms, optimizer_status, optimizer_cost, optimizer_nfev, parameter_at_bound, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u = _fill_missing_local_profiles(
+            updated, grid.cell_columns, grid.cell_fibers, bin_count, bin_scatter, bin_used, peak_u, centroid_offset, height, radius, sigma, profile_integral, h3, h4, bin_model_rms, bin_model_weighted_rms, optimizer_status, optimizer_cost, optimizer_nfev, parameter_at_bound, left_valley_u, right_valley_u, left_inflection_u, right_inflection_u,
         )
         current = LocalProfileMap(
             u_grid=u_grid, density=profiles,
@@ -1346,6 +1440,7 @@ def measure_local_profiles(
             bin_model_rms=bin_model_rms,
             bin_model_weighted_rms=bin_model_weighted_rms,
             optimizer_status=optimizer_status, optimizer_cost=optimizer_cost,
+            optimizer_nfev=optimizer_nfev,
             parameter_at_bound=parameter_at_bound,
             left_valley_u=left_valley_u, right_valley_u=right_valley_u,
             left_inflection_u=left_inflection_u, right_inflection_u=right_inflection_u,
@@ -1404,6 +1499,7 @@ def measure_local_profiles(
     closure_bin_model_weighted_rms = current.bin_model_weighted_rms.copy()
     closure_optimizer_status = current.optimizer_status.copy()
     closure_optimizer_cost = current.optimizer_cost.copy()
+    closure_optimizer_nfev = current.optimizer_nfev.copy()
     closure_parameter_at_bound = current.parameter_at_bound.copy()
     closure_left_valley_u = current.left_valley_u.copy()
     closure_right_valley_u = current.right_valley_u.copy()
@@ -1422,6 +1518,10 @@ def measure_local_profiles(
         try:
             fitted_u, fitted, counts, scatter, used, topology = fit_constrained_profile(
                 fit_u, fit_values, support=support, bin_width=bin_width,
+                initial_radius_sigma=(
+                    float(optimizer_initial_radius[cell]), float(optimizer_initial_sigma[cell]),
+                ) if optimizer_initial_radius is not None and optimizer_initial_sigma is not None else None,
+                robust_bin_geometry_cache=bin_geometry_cache, cell=cell,
                 runtime_profile=runtime_profile,
             )
         except ValueError:
@@ -1429,6 +1529,7 @@ def measure_local_profiles(
             # the corresponding diagnostic panel as an unavailable fit.
             closure_optimizer_status[cell] = -99
             closure_optimizer_cost[cell] = np.nan
+            closure_optimizer_nfev[cell] = 0
             closure_bin_model_rms[cell] = np.nan
             closure_bin_model_weighted_rms[cell] = np.nan
             closure_parameter_at_bound[cell] = False
@@ -1452,6 +1553,7 @@ def measure_local_profiles(
         closure_bin_model_weighted_rms[cell] = topology["bin_model_weighted_rms"]
         closure_optimizer_status[cell] = topology["optimizer_status"]
         closure_optimizer_cost[cell] = topology["optimizer_cost"]
+        closure_optimizer_nfev[cell] = topology["optimizer_nfev"]
         closure_parameter_at_bound[cell] = topology["parameter_at_bound"]
         closure_left_valley_u[cell] = topology["left_valley_u"]
         closure_right_valley_u[cell] = topology["right_valley_u"]
@@ -1471,6 +1573,7 @@ def measure_local_profiles(
         bin_model_weighted_rms=closure_bin_model_weighted_rms,
         optimizer_status=closure_optimizer_status,
         optimizer_cost=closure_optimizer_cost,
+        optimizer_nfev=closure_optimizer_nfev,
         parameter_at_bound=closure_parameter_at_bound,
         left_valley_u=closure_left_valley_u,
         right_valley_u=closure_right_valley_u,
@@ -1685,12 +1788,16 @@ def plot_profile_diagnostics(
     plt.close(fig)
 
 
-def profile_map_coordinates(trace: np.ndarray, profiles: LocalProfileMap) -> tuple[np.ndarray, np.ndarray]:
-    """Return physical detector coordinates for each local-profile cell."""
-    coordinates_x = np.mean(profiles.cell_columns, axis=1, dtype=float)
-    coordinates_y = np.full(profiles.cell_columns.shape[0], np.nan, dtype=float)
+def profile_grid_coordinates(
+    trace: np.ndarray,
+    cell_columns: np.ndarray,
+    cell_fibers: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return physical detector coordinates for a trace-only local-profile grid."""
+    coordinates_x = np.mean(cell_columns, axis=1, dtype=float)
+    coordinates_y = np.full(cell_columns.shape[0], np.nan, dtype=float)
     trace_columns = np.arange(trace.shape[1], dtype=float)
-    for cell, ((first_fiber, last_fiber), x) in enumerate(zip(profiles.cell_fibers, coordinates_x)):
+    for cell, ((first_fiber, last_fiber), x) in enumerate(zip(cell_fibers, coordinates_x)):
         group_trace = np.asarray(trace[int(first_fiber):int(last_fiber) + 1], dtype=float)
         positions: list[float] = []
         for fiber_trace in group_trace:
@@ -1700,6 +1807,11 @@ def profile_map_coordinates(trace: np.ndarray, profiles: LocalProfileMap) -> tup
         if positions:
             coordinates_y[cell] = float(np.median(positions))
     return coordinates_x, coordinates_y
+
+
+def profile_map_coordinates(trace: np.ndarray, profiles: LocalProfileMap) -> tuple[np.ndarray, np.ndarray]:
+    """Return physical detector coordinates for each local-profile cell."""
+    return profile_grid_coordinates(trace, profiles.cell_columns, profiles.cell_fibers)
 
 
 def measure_profiles_on_trace(
@@ -1716,6 +1828,9 @@ def measure_profiles_on_trace(
     valley_weight: int,
     retain_capture: bool,
     raw_evidence: RawProfileEvidence | None = None,
+    optimizer_initial_radius: np.ndarray | None = None,
+    optimizer_initial_sigma: np.ndarray | None = None,
+    robust_bin_geometry_mode: str = "legacy",
     checkpoint: Callable[[str], None] | None = None,
     runtime_profile: RuntimeProfile | None = None,
 ) -> ProfileMeasurement:
@@ -1739,6 +1854,9 @@ def measure_profiles_on_trace(
         evidence, trace, preliminary, detector_rows=image.shape[0], aperture_width=aperture_width,
         support=support, bin_width=bin_width, grid=grid,
         iterations=deblend_iterations, valley_weight=valley_weight,
+        optimizer_initial_radius=optimizer_initial_radius,
+        optimizer_initial_sigma=optimizer_initial_sigma,
+        robust_bin_geometry_mode=robust_bin_geometry_mode,
         runtime_profile=runtime_profile,
     )
     if checkpoint is not None:
@@ -2651,18 +2769,41 @@ def robust_linear_profile_fit(
         raise ValueError("too few pixels for overlapping-fiber centroid solve")
     weights = np.ones(data.size, dtype=float)
     coefficient = np.zeros(design.shape[1], dtype=float)
-    for _ in range(4):
+    if runtime_profile is not None:
+        runtime_profile.add("robust_centroid_fit_rows", design.shape[0])
+        runtime_profile.add("robust_centroid_fit_columns", design.shape[1])
+        runtime_profile.add("robust_centroid_iterations", 4)
+    for iteration in range(4):
         with timed(runtime_profile, "weighted linear solve [NumPy linear algebra]"):
-            normal = design.T @ (weights[:, None] * design)
-            diagonal = max(float(np.trace(normal)) / normal.shape[0], 1.0) * 1e-10
-            coefficient = np.linalg.solve(normal + diagonal * np.eye(normal.shape[0]), design.T @ (weights * data))
+            with timed(runtime_profile, "robust centroid weighted-array construction [NumPy]"):
+                normal = design.T @ (weights[:, None] * design)
+                diagonal = max(float(np.trace(normal)) / normal.shape[0], 1.0) * 1e-10
+            with timed(runtime_profile, "robust centroid actual linear solve [NumPy]"):
+                coefficient = np.linalg.solve(normal + diagonal * np.eye(normal.shape[0]), design.T @ (weights * data))
         with timed(runtime_profile, "robust rejection and quality [NumPy]"):
-            residual = data - design @ coefficient
-            scale = max(robust_mad(residual), np.finfo(float).eps)
-            weights = np.minimum(1.0, 1.5 * scale / np.maximum(np.abs(residual), np.finfo(float).eps))
+            with timed(runtime_profile, "robust centroid residual calculation [NumPy]"):
+                residual = data - design @ coefficient
+            with timed(runtime_profile, "robust centroid MAD/scale estimation [NumPy]"):
+                scale = max(robust_mad(residual), np.finfo(float).eps)
+            with timed(runtime_profile, "robust centroid weight/rejection update [NumPy]"):
+                next_weights = np.minimum(1.0, 1.5 * scale / np.maximum(np.abs(residual), np.finfo(float).eps))
+            if runtime_profile is not None:
+                previous_membership = weights == 1.0
+                membership_changed = not np.array_equal(previous_membership, next_weights == 1.0)
+                weights_changed = not np.array_equal(weights, next_weights)
+                runtime_profile.add("robust_centroid_membership_changed", int(membership_changed))
+                runtime_profile.add("robust_centroid_weights_changed", int(weights_changed))
+                if not weights_changed:
+                    # A subsequent weighted solve would receive precisely the
+                    # same matrix and RHS.  This is shadow-only in 4B.
+                    runtime_profile.add("robust_centroid_shadow_redundant_solves", 3 - iteration)
+                    runtime_profile.add("robust_centroid_exact_convergence_iteration", iteration + 1)
+            weights = next_weights
     with timed(runtime_profile, "robust rejection and quality [NumPy]"):
-        residual = data - design @ coefficient
-        scale = max(robust_mad(residual), np.finfo(float).eps)
+        with timed(runtime_profile, "robust centroid residual calculation [NumPy]"):
+            residual = data - design @ coefficient
+        with timed(runtime_profile, "robust centroid MAD/scale estimation [NumPy]"):
+            scale = max(robust_mad(residual), np.finfo(float).eps)
     with timed(runtime_profile, "weighted linear solve [NumPy linear algebra]"):
         normal = design.T @ (weights[:, None] * design)
         covariance = scale ** 2 * np.linalg.pinv(normal)
@@ -3749,12 +3890,36 @@ def run_stage_replay(
                 "evidence_neighbor_fiber": "neighbor_fiber", "evidence_neighbor_u": "neighbor_u",
                 "evidence_neighbor_overlaps": "neighbor_overlaps",
             }
+        optimizer_initial_radius = optimizer_initial_sigma = None
+        if args.profile_optimizer_initialization == "initial-field":
+            if stage != "refined-profile":
+                raise ValueError("initial-field profile warm start is defined only for refined-profile replay")
+            width_fields, fraction_fields = _load_saved_smooth_fields(replay_dir / "02_ldls_smooth_profile_field.npz")
+            map_x, map_y = profile_grid_coordinates(stage_trace, grid.cell_columns, grid.cell_fibers)
+            _width, _fraction, optimizer_initial_radius, optimizer_initial_sigma = evaluate_smooth_profile_fields(
+                width_fields, fraction_fields, map_x, map_y,
+                amplifier_y_boundary=amplifier_y_boundary,
+            )
         measurement = measure_profiles_on_trace(
             image, mask, stage_trace, grid, aperture_width=args.aperture_width,
             support=args.profile_support, bin_width=args.profile_bin_width,
             smoothing_window=args.ldls_smoothing_window, deblend_iterations=args.profile_deblend_iterations,
             valley_weight=args.profile_valley_weight, retain_capture=False, raw_evidence=raw_evidence,
+            optimizer_initial_radius=optimizer_initial_radius,
+            optimizer_initial_sigma=optimizer_initial_sigma,
+            robust_bin_geometry_mode=args.robust_bin_geometry_mode,
             runtime_profile=runtime,
+        )
+        variance = measurement.profiles.radius ** 2 / 4.0 + measurement.profiles.sigma ** 2
+        np.savez_compressed(
+            output / f"profile_replay_state_{stage}.npz",
+            R=measurement.profiles.radius, sigma=measurement.profiles.sigma,
+            du=measurement.profiles.centroid_offset, W=np.sqrt(variance + 1.0 / 12.0),
+            f_sigma=np.divide(measurement.profiles.sigma ** 2, variance, out=np.full(variance.shape, np.nan), where=variance > 0.0),
+            integral=measurement.profiles.profile_integral, compact_total=measurement.compact_total,
+            status=measurement.profiles.optimizer_status, cost=measurement.profiles.optimizer_cost,
+            nfev=measurement.profiles.optimizer_nfev, bin_count=measurement.profiles.bin_count,
+            bin_scatter=measurement.profiles.bin_scatter, bin_used=measurement.profiles.bin_used,
         )
         with np.load(expected_path) as expected:
             for expected_key, actual_name in expected_keys.items():
@@ -3986,6 +4151,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--centroid-bookkeeping-mode", choices=("batched", "legacy"), default="batched",
         help="Development replay timing only: run optimized bookkeeping (default) or the pre-4A baseline",
+    )
+    parser.add_argument(
+        "--profile-optimizer-initialization", choices=("authoritative", "initial-field"), default="authoritative",
+        help="Replay-only profile optimizer seed: established seed or initial smooth-field R/sigma",
+    )
+    parser.add_argument(
+        "--robust-bin-geometry-mode", choices=("legacy", "cached"), default="legacy",
+        help="Replay-only robust-bin membership bookkeeping: rebuild or exact-u cached",
     )
     parser.add_argument("--ldls-smoothing-window", type=int, default=101)
     parser.add_argument("--arc-smoothing-window", type=int, default=51)
