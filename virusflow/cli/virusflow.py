@@ -14,7 +14,7 @@ import os as _os_mplcfg
 _os_mplcfg.environ.setdefault("MPLBACKEND", "Agg")
 
 from ..registry import database as db
-from ..storage.filesystem import FileSystemStorage
+from ..storage.filesystem import FileSystemStorage, validate_night_range
 from ..core.identity import parse_zipcode_key
 from .formatting import format_artifacts_table, format_exposures_table
 
@@ -27,29 +27,16 @@ def cmd_init(args: argparse.Namespace) -> None:
 def cmd_scan(args: argparse.Namespace) -> None:
     storage = FileSystemStorage(args.root)
     db.init_raw_db(args.raw_db)
-    start_date = getattr(args, "start_date", None)
-    end_date = getattr(args, "end_date", None)
-    for name, value in (("--start-date", start_date), ("--end-date", end_date)):
-        if value:
-            try:
-                value = str(value).replace("-", "")
-                if len(value) != 8 or not value.isdigit():
-                    raise ValueError
-            except ValueError:
-                raise SystemExit(f"Invalid {name} value '{value}'. Use YYYYMMDD.")
-            if name == "--start-date":
-                start_date = value
-            else:
-                end_date = value
-    if start_date and end_date and start_date > end_date:
-        raise SystemExit("--start-date must be on or before --end-date.")
+    try:
+        first_night, last_night = validate_night_range(
+            getattr(args, "first_night", None), getattr(args, "last_night", None),
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     count = 0
-    skipped_outside_window = 0
-    skipped_unparseable_date = 0
     zipcode_keys = set()
     indexed_tars = set()
     indexed_date_tars = set()
-    reported_dates = set()
 
     def tar_identity(source):
         if source.backend == "tar":
@@ -66,18 +53,17 @@ def cmd_scan(args: argparse.Namespace) -> None:
     active_tar_started = 0.0
     active_tar_sources = 0
     active_tar_registered = 0
-    active_tar_excluded = 0
 
     def finish_tar() -> None:
         nonlocal active_tar, active_tar_label, active_tar_sources
-        nonlocal active_tar_registered, active_tar_excluded
+        nonlocal active_tar_registered
         if active_tar is None:
             return
         elapsed = time.perf_counter() - active_tar_started
         rate = active_tar_sources / elapsed if elapsed else 0.0
         print(
             f"Finished tar {active_tar_label}: {active_tar_sources} raw sources, "
-            f"{active_tar_registered} registered, {active_tar_excluded} excluded "
+            f"{active_tar_registered} registered "
             f"in {elapsed:.1f} s ({rate:.1f} sources/s)",
             flush=True,
         )
@@ -85,12 +71,11 @@ def cmd_scan(args: argparse.Namespace) -> None:
         active_tar_label = None
         active_tar_sources = 0
         active_tar_registered = 0
-        active_tar_excluded = 0
 
     # Unified iteration over both filesystem FITS and FITS inside tar archives
     with db.connect(args.raw_db) as conn:
         for src in storage.iter_raw_sources(
-            start_date=start_date, end_date=end_date,
+            first_night=first_night, last_night=last_night,
         ):
             source_tar, source_tar_label = tar_identity(src)
             if source_tar != active_tar:
@@ -102,23 +87,6 @@ def cmd_scan(args: argparse.Namespace) -> None:
                     print(f"Ingesting tar {active_tar_label}", flush=True)
             if source_tar is not None:
                 active_tar_sources += 1
-            if start_date or end_date:
-                exposure_id, _, _ = db._parse_filename_meta(str(src.tar_member or src.path))
-                source_date = exposure_id[:8]
-                if len(source_date) != 8 or not source_date.isdigit():
-                    skipped_unparseable_date += 1
-                    if source_tar is not None:
-                        active_tar_excluded += 1
-                    continue
-                if ((start_date and source_date < start_date)
-                        or (end_date and source_date > end_date)):
-                    skipped_outside_window += 1
-                    if source_tar is not None:
-                        active_tar_excluded += 1
-                    continue
-                if source_date not in reported_dates:
-                    print(f"Ingesting exposure date {source_date}")
-                    reported_dates.add(source_date)
             # For tar-backed members, ensure we have a DB tar index built once per tar
             if src.backend == "tar":
                 p = os.path.abspath(str(src.path))
@@ -162,12 +130,6 @@ def cmd_scan(args: argparse.Namespace) -> None:
         print(f"Indexed {len(indexed_tars)} tar files into registry (DB mode)")
     if indexed_date_tars:
         print(f"Indexed {len(indexed_date_tars)} nested date-tar members into registry (DB mode)")
-    if start_date or end_date:
-        print(
-            f"Scan date window {start_date or 'open'}..{end_date or 'open'}: "
-            f"skipped {skipped_outside_window} source(s) outside the inclusive bounds"
-            + (f" and {skipped_unparseable_date} without a parseable exposure date" if skipped_unparseable_date else "")
-        )
 
 
 def cmd_exposures(args: argparse.Namespace) -> None:
@@ -487,8 +449,20 @@ def _run_planned(args: argparse.Namespace) -> None:
     from ..planning import validate_graph
     validate_graph(nodes, edges)
     G = ReductionGraph(nodes, edges)
-    # Determine scopes: list zipcodes that have any raw files in optional date window
-    zcs = _db.list_zipcodes(db_path=args.raw_db, frame_type=None, start_date=getattr(args, "plan_start_date", None), end_date=getattr(args, "plan_end_date", None))
+    try:
+        first_night, last_night = validate_night_range(
+            getattr(args, "first_night", None), getattr(args, "last_night", None),
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    # Determine scopes from the selected observing-night dataset.  Any optional
+    # start/end dates below remain actual UTC planning-window bounds.
+    zcs = _db.list_zipcodes(
+        db_path=args.raw_db, frame_type=None,
+        start_date=getattr(args, "plan_start_date", None),
+        end_date=getattr(args, "plan_end_date", None),
+        first_night=first_night, last_night=last_night,
+    )
     # Optional developer filter: only specified zipcode keys
     only_keys = getattr(args, "only_zipcodes", None)
     if only_keys:
@@ -517,6 +491,7 @@ def _run_planned(args: argparse.Namespace) -> None:
     planned, report = G.plan(
         db_path=args.db, raw_db_path=args.raw_db, scopes=scopes, when=when_win,
         force_replan=bool(getattr(args, "force_replan", False)),
+        first_night=first_night, last_night=last_night,
     )
     # Persist a compact JSON report.  Large calibration plans serialize much
     # faster and occupy less space than the former human-oriented YAML dump.
@@ -1061,8 +1036,8 @@ def build_parser() -> argparse.ArgumentParser:
     _add_raw_db(sp); sp.set_defaults(func=cmd_init)
     sp = sub.add_parser("scan", help="Register raw FITS inputs")
     _add_raw_db(sp)
-    sp.add_argument("--start-date", help="Inclusive UTC acquisition date (YYYYMMDD)")
-    sp.add_argument("--end-date", help="Inclusive UTC acquisition date (YYYYMMDD)")
+    sp.add_argument("--first-night", help="First inclusive HET observing-night container (YYYYMMDD)")
+    sp.add_argument("--last-night", help="Last inclusive HET observing-night container (YYYYMMDD)")
     sp.add_argument("root")
     sp.set_defaults(func=cmd_scan)
     sp = sub.add_parser("exposures", help="List scanned exposures")
@@ -1082,7 +1057,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--planning-yaml",
         help="Canonical calibration node/edge overrides and execution defaults",
     ); cal.add_argument("--plan-only", action="store_true")
-    cal.add_argument("--start-date", dest="plan_start_date"); cal.add_argument("--end-date", dest="plan_end_date")
+    cal.add_argument("--start-date", dest="plan_start_date", help="Actual UTC planning-window start (YYYYMMDD)")
+    cal.add_argument("--end-date", dest="plan_end_date", help="Actual UTC planning-window end (YYYYMMDD)")
+    cal.add_argument("--first-night", help="First inclusive HET observing-night container (YYYYMMDD)")
+    cal.add_argument("--last-night", help="Last inclusive HET observing-night container (YYYYMMDD)")
     cal.add_argument("--only-zipcodes"); cal.add_argument("--force-replan", action="store_true")
     cal.add_argument("--qa-yaml"); cal.add_argument("--debug-timing", action="store_true"); cal.add_argument("--debug-inputs", action="store_true")
     cal.add_argument(

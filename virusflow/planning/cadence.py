@@ -387,7 +387,7 @@ def pair_lamp_groups(
     return pairs, unresolved
 
 
-def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_days: int, min_n_inputs: int = 1, start_date: str | None = None, end_date: str | None = None) -> List[TemporalWindow]:
+def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_days: int, min_n_inputs: int = 1, start_date: str | None = None, end_date: str | None = None, first_night: str | None = None, last_night: str | None = None) -> List[TemporalWindow]:
     """Enumerate periodic windows for a zipcode.
 
     Refined minimal behavior:
@@ -403,7 +403,10 @@ def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_d
     SD = start_date or "19000101"
     ED = end_date or "21000101"
     try:
-        rows = db.list_raw_files_scoped(frame_type=frame_type, start_date=SD, end_date=ED, zipcode=z, db_path=db_path)
+        rows = db.list_raw_files_scoped(
+            frame_type=frame_type, start_date=SD, end_date=ED, zipcode=z,
+            db_path=db_path, first_night=first_night, last_night=last_night,
+        )
     except Exception:
         # Fallback: attempt unscoped listing and filter client-side when older APIs are present
         raw = db.list_raw_files(exposure_id=None, db_path=db_path)
@@ -440,7 +443,7 @@ def time_cadence_windows(*, db_path: str, scope: Scope, frame_type: str, every_d
     return [TemporalWindow(start=start_t, end=end_t)]
 
 
-def exposure_count_windows(*, db_path: str, scope: Scope, frame_type: str, min_n: int, max_span_days: int, start_date: str | None = None, end_date: str | None = None) -> List[TemporalWindow]:
+def exposure_count_windows(*, db_path: str, scope: Scope, frame_type: str, min_n: int, max_span_days: int, start_date: str | None = None, end_date: str | None = None, first_night: str | None = None, last_night: str | None = None) -> List[TemporalWindow]:
     """Enumerate windows by rolling exposure counts.
 
     Implementation notes:
@@ -461,7 +464,10 @@ def exposure_count_windows(*, db_path: str, scope: Scope, frame_type: str, min_n
     SD = start_date or "19000101"
     ED = end_date or "21000101"
     try:
-        rows = db.list_raw_files_scoped(frame_type=frame_type, start_date=SD, end_date=ED, zipcode=z, db_path=db_path)
+        rows = db.list_raw_files_scoped(
+            frame_type=frame_type, start_date=SD, end_date=ED, zipcode=z,
+            db_path=db_path, first_night=first_night, last_night=last_night,
+        )
     except TypeError:
         # Fallback path: list_raw_files (no zipcode scoping available); filter client-side
         raw = db.list_raw_files(exposure_id=None, db_path=db_path)

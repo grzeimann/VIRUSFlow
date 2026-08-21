@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Tuple, Literal
-import tarfile
 from dataclasses import dataclass
+from datetime import datetime
+import os
+from pathlib import Path, PurePosixPath
+from typing import Iterator, List, Literal, Optional, Tuple
+import tarfile
 
 
 @dataclass
@@ -45,8 +46,39 @@ def read_member_bytes(source: RawSource) -> bytes:
     raise ValueError(f"Unknown storage backend: {source.backend!r}")
 
 
+def _night_token(value: str) -> Optional[str]:
+    """Return a YYYYMMDD token from a night directory or date-tar name."""
+    name = Path(value).name
+    if name.lower().endswith(".tar"):
+        name = name[:-4]
+    return name if len(name) == 8 and name.isdigit() else None
+
+
+def validate_night_range(
+    first_night: Optional[str], last_night: Optional[str],
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate and normalize inclusive HET observing-night labels."""
+    normalized = []
+    for option, value in (("--first-night", first_night), ("--last-night", last_night)):
+        if value is None:
+            normalized.append(None)
+            continue
+        try:
+            text = str(value)
+            if len(text) != 8 or not text.isdigit():
+                raise ValueError
+            parsed = datetime.strptime(text, "%Y%m%d")
+        except ValueError as exc:
+            raise ValueError(f"{option} must use YYYYMMDD") from exc
+        normalized.append(parsed.strftime("%Y%m%d"))
+    first, last = normalized
+    if first and last and first > last:
+        raise ValueError("--first-night must be on or before --last-night")
+    return first, last
+
+
 class FileSystemStorage:
-    """Simple filesystem storage listing raw frames by extension or inside tar archives."""
+    """Discover filesystem and tar-backed VIRUS raw inputs."""
 
     def __init__(self, root: str | os.PathLike[str]):
         self.root = Path(root)
@@ -54,210 +86,197 @@ class FileSystemStorage:
     def exists(self, relative: str | os.PathLike[str]) -> bool:
         return (self.root / relative).exists()
 
-    def list_fits(
-        self,
-        subdir: Optional[str] = None,
-        *,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-    ) -> Iterator[Path]:
-        base = self.root if subdir is None else (self.root / subdir)
-        if not base.exists():
-            return iter(())
-        date_roots = self._bounded_date_roots(
-            subdir=subdir, start_date=start_date, end_date=end_date,
-        )
-        if date_roots is not None:
-            for root in date_roots:
-                if root.is_dir():
-                    yield from (p for p in root.rglob("*.fits") if p.is_file())
-            return
-        for p in base.rglob("*.fits"):
-            if p.is_file():
-                yield p
-
     @staticmethod
-    def _date_token(value: str) -> Optional[str]:
-        """Return a YYYYMMDD token when *value* is a date archive/directory name."""
-        name = Path(value).name
-        if name.lower().endswith(".tar"):
-            name = name[:-4]
-        if len(name) == 8 and name.isdigit():
-            return name
-        return None
+    def _is_virus_archive(name: str) -> bool:
+        parts = PurePosixPath(name).parts
+        return (
+            any(part.lower() == "virus" for part in parts[:-1])
+            and parts[-1].lower().startswith("virus")
+            and parts[-1].lower().endswith(".tar")
+        )
 
-    def _bounded_date_roots(
-        self, *, subdir: Optional[str], start_date: Optional[str], end_date: Optional[str],
-    ) -> Optional[List[Path]]:
-        """Return selected immediate date roots for the supported raw layouts.
+    def _night_containers(
+        self, first_night: str, last_night: str, subdir: Optional[str] = None,
+    ) -> Optional[tuple[str, list[tuple[str, Path]]]]:
+        """Recognize HET roots and select their inclusive night containers.
 
-        VIRUS raw data are stored either as ``YYYYMMDD/virus/virus*.tar``
-        under a Maverick root or as Corral ``YYYYMMDD.tar`` date-tars.  Both
-        roots may contain unrelated configuration and other-instrument
-        siblings.  A bounded VIRUS scan must select only the date containers,
-        rather than recursively walking those siblings first.  Roots without
-        immediate date containers retain the historical generic traversal.
+        ``None`` means the root is unfamiliar and should use the historical
+        recursive fallback.  An empty list means a recognized root with no
+        containers in the requested range.
         """
-        if not (start_date or end_date):
-            return None
-        base = self.root if subdir is None else (self.root / subdir)
+        base = self.root if subdir is None else self.root / subdir
         try:
             entries = list(base.iterdir())
         except OSError:
             return None
-        dated = [
-            entry for entry in entries
-            if self._date_token(entry.name) is not None
-            and (entry.is_dir() or (entry.is_file() and entry.name.lower().endswith(".tar")))
-        ]
-        if not dated:
-            return None
-        selected = []
-        for entry in dated:
-            date = self._date_token(entry.name)
-            assert date is not None
-            if ((start_date and date < start_date)
-                    or (end_date and date > end_date)):
-                continue
-            selected.append(entry)
-        return sorted(selected)
 
-    def _iter_top_level_tar_paths(
-        self,
-        subdir: Optional[str] = None,
-        *,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-    ) -> Iterator[Path]:
-        """Yield tar paths, pruning supported date-container roots when bounded."""
-        date_roots = self._bounded_date_roots(
-            subdir=subdir, start_date=start_date, end_date=end_date,
-        )
-        if date_roots is not None:
-            for root in date_roots:
-                date = self._date_token(root.name)
-                assert date is not None
-                label = "archive" if root.is_file() else "source"
-                print(f"Scanning date {label} {date}: {root}", flush=True)
-                if root.is_file() and root.name.lower().endswith(".tar"):
-                    yield root
-                elif root.is_dir():
-                    yield from root.rglob("*.tar")
+        work = [
+            (night, entry) for entry in entries
+            if entry.is_dir()
+            and (night := _night_token(entry.name)) is not None
+            and (entry / "virus").is_dir()
+        ]
+        if work:
+            return "work", sorted(
+                (night, entry) for night, entry in work
+                if first_night <= night <= last_night
+            )
+
+        corral = [
+            (night, entry) for entry in entries
+            if entry.is_file()
+            and (night := _night_token(entry.name)) is not None
+            and entry.name.lower().endswith(".tar")
+        ]
+        if corral:
+            return "corral", sorted(
+                (night, entry) for night, entry in corral
+                if first_night <= night <= last_night
+            )
+        return None
+
+    @staticmethod
+    def _fits_in_tar(
+        tar_path: Path, members: List[tarfile.TarInfo], *, virus_only: bool = False,
+    ) -> Iterator[RawSource]:
+        fits_members = [
+            member for member in members
+            if member.isfile() and member.name.endswith(".fits")
+        ]
+        if fits_members:
+            for member in fits_members:
+                yield RawSource(path=tar_path, tar_member=member.name, backend="tar")
             return
-        base = self.root if subdir is None else (self.root / subdir)
+        nested = [
+            member for member in members
+            if member.isfile()
+            and member.name.lower().endswith(".tar")
+            and (not virus_only or FileSystemStorage._is_virus_archive(member.name))
+        ]
+        if not nested:
+            return
+        try:
+            with tarfile.open(tar_path, "r") as outer:
+                for nested_tar in nested:
+                    stream = outer.extractfile(nested_tar)
+                    if stream is None:
+                        continue
+                    try:
+                        with tarfile.open(fileobj=stream, mode="r") as inner:
+                            for member in inner:
+                                if member.isfile() and member.name.endswith(".fits"):
+                                    yield RawSource(
+                                        path=tar_path,
+                                        tar_member=member.name,
+                                        backend="date_tar",
+                                        outer_tar_member=nested_tar.name,
+                                    )
+                    except (tarfile.TarError, OSError):
+                        continue
+        except (tarfile.TarError, OSError):
+            return
+
+    def _iter_selected_work(self, nights: list[tuple[str, Path]]) -> Iterator[RawSource]:
+        for night, container in nights:
+            virus_root = container / "virus"
+            print(f"Scanning night {night}: {virus_root}", flush=True)
+            source_count = 0
+            try:
+                for path in sorted(p for p in virus_root.rglob("*.fits") if p.is_file()):
+                    source_count += 1
+                    yield RawSource(path=path)
+                for tar_path in sorted(p for p in virus_root.rglob("virus*.tar") if p.is_file()):
+                    try:
+                        with tarfile.open(tar_path, "r") as tf:
+                            members = tf.getmembers()
+                    except (tarfile.TarError, OSError):
+                        continue
+                    for source in self._fits_in_tar(tar_path, members):
+                        source_count += 1
+                        yield source
+            finally:
+                print(f"Finished night {night}: {source_count} raw sources", flush=True)
+
+    def _iter_selected_corral(self, nights: list[tuple[str, Path]]) -> Iterator[RawSource]:
+        for night, archive in nights:
+            print(f"Scanning night archive {night}: {archive}", flush=True)
+            source_count = 0
+            try:
+                try:
+                    with tarfile.open(archive, "r") as outer:
+                        members = outer.getmembers()
+                except (tarfile.TarError, OSError):
+                    continue
+                for source in self._fits_in_tar(archive, members, virus_only=True):
+                    source_count += 1
+                    yield source
+            finally:
+                print(f"Finished night {night}: {source_count} raw sources", flush=True)
+
+    def list_fits(self, subdir: Optional[str] = None) -> Iterator[Path]:
+        base = self.root if subdir is None else self.root / subdir
         if not base.exists():
             return
-        yield from base.rglob("*.tar")
+        for path in base.rglob("*.fits"):
+            if path.is_file():
+                yield path
+
+    def _iter_top_level_tar_paths(self, subdir: Optional[str] = None) -> Iterator[Path]:
+        base = self.root if subdir is None else self.root / subdir
+        if not base.exists():
+            return
+        yield from (path for path in base.rglob("*.tar") if path.is_file())
+
+    def _iter_top_level_tars(
+        self, subdir: Optional[str] = None,
+    ) -> Iterator[Tuple[Path, List[tarfile.TarInfo]]]:
+        for tar_path in self._iter_top_level_tar_paths(subdir=subdir):
+            try:
+                with tarfile.open(tar_path, "r") as tf:
+                    yield tar_path, tf.getmembers()
+            except (tarfile.TarError, OSError):
+                continue
 
     def list_tar_fits(self, subdir: Optional[str] = None) -> Iterator[Tuple[Path, str]]:
-        """Yield (tar_path, member_name) for FITS files stored directly inside .tar archives.
-
-        Note: member_name is the path within the tar archive. Tars whose members are
-        themselves nested tars (Corral date-tar layout) are handled by
-        list_date_tar_fits() instead.
-        """
+        """Yield direct FITS members from ordinary tar archives."""
         for tar_path, members in self._iter_top_level_tars(subdir=subdir):
-            fits_members = [m for m in members if m.isfile() and m.name.endswith(".fits")]
-            if fits_members:
-                for member in fits_members:
+            for member in members:
+                if member.isfile() and member.name.endswith(".fits"):
                     yield tar_path, member.name
 
     def list_date_tar_fits(
-        self, subdir: Optional[str] = None
+        self, subdir: Optional[str] = None,
     ) -> Iterator[Tuple[Path, str, str]]:
-        """Yield (date_tar_path, nested_tar_member, fits_member) for Corral date-tars.
-
-        A date-tar (e.g. 20260501.tar) contains nested VIRUS tars (e.g. virus/virus...tar),
-        each of which contains FITS files as usual.
-        """
+        """Yield FITS members from nested date-tar archives."""
         for tar_path, members in self._iter_top_level_tars(subdir=subdir):
-            fits_members = [m for m in members if m.isfile() and m.name.endswith(".fits")]
-            if fits_members:
+            if any(member.isfile() and member.name.endswith(".fits") for member in members):
                 continue
-            nested_tar_members = [m for m in members if m.isfile() and m.name.endswith(".tar")]
-            if not nested_tar_members:
-                continue
-            try:
-                with tarfile.open(tar_path, "r") as outer:
-                    for nested in nested_tar_members:
-                        stream = outer.extractfile(nested)
-                        if stream is None:
-                            continue
-                        try:
-                            with tarfile.open(fileobj=stream, mode="r") as inner:
-                                for inner_member in inner:
-                                    if inner_member.isfile() and inner_member.name.endswith(".fits"):
-                                        yield tar_path, nested.name, inner_member.name
-                        except (tarfile.TarError, OSError):
-                            continue
-            except (tarfile.TarError, OSError):
-                continue
-
-    def _iter_top_level_tars(
-        self,
-        subdir: Optional[str] = None,
-        *,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
-    ) -> Iterator[Tuple[Path, List[tarfile.TarInfo]]]:
-        base = self.root if subdir is None else (self.root / subdir)
-        if not base.exists():
-            return iter(())
-        for tar_path in self._iter_top_level_tar_paths(
-            subdir=subdir, start_date=start_date, end_date=end_date,
-        ):
-            if not tar_path.is_file():
-                continue
-            try:
-                with tarfile.open(tar_path, "r") as tf:
-                    members = list(tf.getmembers())
-            except (tarfile.TarError, OSError):
-                # Skip unreadable/corrupt tar files silently for now
-                continue
-            yield tar_path, members
+            yield from (
+                (source.path, source.outer_tar_member, source.tar_member)
+                for source in self._fits_in_tar(tar_path, members)
+            )
 
     def iter_raw_sources(
         self,
         subdir: Optional[str] = None,
         *,
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
+        first_night: Optional[str] = None,
+        last_night: Optional[str] = None,
     ) -> Iterator[RawSource]:
-        # filesystem files
-        for p in self.list_fits(
-            subdir=subdir, start_date=start_date, end_date=end_date,
-        ):
-            yield RawSource(path=p, tar_member=None, backend="filesystem")
-        # tar members (direct FITS members) and date-tar members (nested tars) are
-        # mutually exclusive per top-level tar, detected by inspecting its contents once.
-        for tar_path, members in self._iter_top_level_tars(
-            subdir=subdir, start_date=start_date, end_date=end_date,
-        ):
-            fits_members = [m for m in members if m.isfile() and m.name.endswith(".fits")]
-            if fits_members:
-                for member in fits_members:
-                    yield RawSource(path=tar_path, tar_member=member.name, backend="tar")
-                continue
-            nested_tar_members = [m for m in members if m.isfile() and m.name.endswith(".tar")]
-            if not nested_tar_members:
-                continue
-            try:
-                with tarfile.open(tar_path, "r") as outer:
-                    for nested in nested_tar_members:
-                        stream = outer.extractfile(nested)
-                        if stream is None:
-                            continue
-                        try:
-                            with tarfile.open(fileobj=stream, mode="r") as inner:
-                                for inner_member in inner:
-                                    if inner_member.isfile() and inner_member.name.endswith(".fits"):
-                                        yield RawSource(
-                                            path=tar_path,
-                                            tar_member=inner_member.name,
-                                            backend="date_tar",
-                                            outer_tar_member=nested.name,
-                                        )
-                        except (tarfile.TarError, OSError):
-                            continue
-            except (tarfile.TarError, OSError):
-                continue
+        first_night, last_night = validate_night_range(first_night, last_night)
+        if first_night or last_night:
+            first = first_night or "00000000"
+            last = last_night or "99999999"
+            recognized = self._night_containers(first, last, subdir=subdir)
+            if recognized is not None:
+                kind, nights = recognized
+                if kind == "work":
+                    yield from self._iter_selected_work(nights)
+                else:
+                    yield from self._iter_selected_corral(nights)
+                return
+
+        for path in self.list_fits(subdir=subdir):
+            yield RawSource(path=path)
+        for tar_path, members in self._iter_top_level_tars(subdir=subdir):
+            yield from self._fits_in_tar(tar_path, members)

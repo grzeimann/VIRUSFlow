@@ -139,6 +139,8 @@ class ReductionGraph:
         service_factory: Optional[callable] = None,
         force_replan: bool = False,
         raw_db_path: Optional[str] = None,
+        first_night: Optional[str] = None,
+        last_night: Optional[str] = None,
     ) -> Tuple[List[Target], PlanningReport]:
         """Emit a set of Targets to execute in topological order.
 
@@ -346,6 +348,7 @@ class ReductionGraph:
                for node in self.nodes):
             for row in db.list_calibration_grouping_rows_bulk(
                 db_path=raw_db_path, start_date=start_date, end_date=end_date,
+                first_night=first_night, last_night=last_night,
             ):
                 amp_key = str(row.get("amp_key") or "")
                 if amp_key in requested_scopes:
@@ -701,12 +704,14 @@ class ReductionGraph:
                                 every_days=node.cadence.every_days,
                                 min_n_inputs=node.cadence.min_n_inputs,
                                 start_date=start_date, end_date=end_date,
+                                first_night=first_night, last_night=last_night,
                             )
                         elif isinstance(node.cadence, ExposureCountCadence):
                             windows = exposure_count_windows(
                                 db_path=raw_db_path, scope=scope, frame_type=frame_type,
                                 min_n=node.cadence.min_n, max_span_days=node.cadence.max_span_days,
                                 start_date=start_date, end_date=end_date,
+                                first_night=first_night, last_night=last_night,
                             )
                         else:
                             windows = []
@@ -717,6 +722,7 @@ class ReductionGraph:
                             end_date=window.end.strftime("%Y%m%d") if window.end else "21000101",
                             zipcode=scope.zipcode, db_path=raw_db_path,
                             start_time=window.start, end_time=window.end,
+                            first_night=first_night, last_night=last_night,
                         )
                         raw_ids = tuple(sorted(int(row_id) for row_id, _ in rows))
                         effective = (node.kind, scope_key(scope), raw_ids)

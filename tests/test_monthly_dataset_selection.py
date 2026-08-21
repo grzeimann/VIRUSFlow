@@ -8,9 +8,9 @@ from virusflow.core.identity import ZipCode
 from virusflow.registry import database as db
 
 
-def _seed_raw(conn, zipcode: ZipCode, exposure_id: str) -> None:
+def _seed_raw(conn, zipcode: ZipCode, exposure_id: str, *, night: str | None = None) -> None:
     conn.execute(
-        "INSERT INTO amplifiers(key,ifuslot,ifuid,specid,amp,controller) VALUES(?,?,?,?,?,?)",
+        "INSERT OR IGNORE INTO amplifiers(key,ifuslot,ifuid,specid,amp,controller) VALUES(?,?,?,?,?,?)",
         (zipcode.key(), *zipcode.as_tuple()),
     )
     conn.execute(
@@ -19,7 +19,12 @@ def _seed_raw(conn, zipcode: ZipCode, exposure_id: str) -> None:
     )
     conn.execute(
         "INSERT INTO raw_files(exposure_id,frame_type,path,storage_backend,amp_key) VALUES(?,?,?,?,?)",
-        (exposure_id, "zro", f"/raw/{exposure_id}_{zipcode.amp}.fits", "filesystem", zipcode.key()),
+        (
+            exposure_id, "zro",
+            f"/work/03946/hetdex/maverick/{night}/virus/virus0001.tar"
+            if night else f"/raw/{exposure_id}_{zipcode.amp}.fits",
+            "tar" if night else "filesystem", zipcode.key(),
+        ),
     )
 
 
@@ -72,3 +77,27 @@ def test_calibration_cli_month_and_zipcode_selection_are_optional_and_composable
     )
     assert combined["summary"]["n_scopes"] == 2
     assert {item["zipcode"]["amp"] for item in combined["planned"]} == {"LL", "LU"}
+
+
+def test_calibration_observing_night_scope_filters_candidates_not_timestamps(tmp_path: Path):
+    raw_db = tmp_path / "raw.sqlite3"
+    artifact_db = tmp_path / "artifacts.sqlite3"
+    db.init_raw_db(str(raw_db))
+    db.init_db(str(artifact_db))
+    zipcode = ZipCode("001", "002", "003", "LL", "A")
+    with db.connect(str(raw_db)) as conn:
+        _seed_raw(conn, zipcode, "20260602T010000.0", night="20260601")
+        _seed_raw(conn, zipcode, "20260603T010000.0", night="20260602")
+
+    rows = db.list_calibration_grouping_rows_bulk(
+        db_path=str(raw_db), first_night="20260601", last_night="20260601",
+    )
+    assert [row["exposure_id"] for row in rows] == ["20260602T010000.0"]
+    assert rows[0]["when_utc"] == "20260602"
+
+    report = _plan(
+        tmp_path, raw_db, artifact_db,
+        "--first-night", "20260601", "--last-night", "20260601",
+        "--only-zipcodes", zipcode.key(),
+    )
+    assert report["summary"]["n_scopes"] == 1

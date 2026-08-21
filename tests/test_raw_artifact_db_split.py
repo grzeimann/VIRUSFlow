@@ -5,7 +5,6 @@ import tarfile
 from pathlib import Path
 
 import numpy as np
-import pytest
 from astropy.io import fits
 
 from virusflow.artifacts import ArtifactService
@@ -14,12 +13,11 @@ from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
 from virusflow.cli.virusflow import build_parser
 from virusflow.core.identity import ZipCode
 from virusflow.io.raw import RawFrameLoader
-from virusflow.ontology.scopes import PhysicalScope
 from virusflow.persistence.policy import DefaultPersistencePolicy
 from virusflow.publication.context import PublicationContext
 from virusflow.publication.service import DefaultPublicationService
 from virusflow.registry import database as db
-from virusflow.storage.filesystem import FileSystemStorage, RawSource, read_member_bytes
+from virusflow.storage.filesystem import FileSystemStorage, read_member_bytes
 from virusflow.tasks.base import TaskContext
 
 
@@ -82,36 +80,42 @@ def test_scan_populates_only_the_raw_database(tmp_path: Path):
     assert not artifact_db.exists() or "raw_files" not in _tables(artifact_db)
 
 
-def test_scan_date_window_filters_before_raw_registration(tmp_path: Path, capsys):
-    data_root = tmp_path / "data"
-    data_root.mkdir()
-    for exposure_id in (
-        "20260430T235959.0",
-        "20260501T010000.0",
-        "20260502T010000.0",
-        "20260503T000000.0",
-    ):
-        _write_raw(data_root / f"{exposure_id}_074LL_sci.fits")
+def test_bounded_scan_uses_work_night_and_keeps_actual_exposure_date(
+    tmp_path: Path, capsys,
+):
+    """Night-container membership is independent of the FITS exposure date."""
+    root = tmp_path / "maverick"
+    source = tmp_path / "source.fits"
+    _write_raw(source)
+    for night, exposure_date in (("20260601", "20260602"), ("20260602", "20260603")):
+        archive = root / night / "virus" / "virus0000001.tar"
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive, mode="w") as tf:
+            tf.add(source, arcname=f"{exposure_date}T010000.0_074LL_sci.fits")
+        acm = root / night / "acm" / "acm0000001.tar"
+        acm.parent.mkdir(parents=True)
+        with tarfile.open(acm, mode="w") as tf:
+            tf.add(source, arcname=f"{exposure_date}T010000.0_074LL_sci.fits")
 
     raw_db = tmp_path / "raw.sqlite3"
-    parser = build_parser()
-    args = parser.parse_args([
-        "scan", "--raw-db", str(raw_db),
-        "--start-date", "20260501", "--end-date", "20260502", str(data_root),
+    args = build_parser().parse_args([
+        "scan", "--raw-db", str(raw_db), "--first-night", "20260601",
+        "--last-night", "20260601", str(root),
     ])
     args.func(args)
 
-    assert [row.exposure_id for row in db.list_raw_files(db_path=str(raw_db))] == [
-        "20260501T010000.0", "20260502T010000.0",
-    ]
+    rows = db.list_raw_files(db_path=str(raw_db))
+    assert [row.exposure_id for row in rows] == ["20260602T010000.0"]
+    assert "/20260601/virus/" in rows[0].path
     output = capsys.readouterr().out
-    assert "Ingesting exposure date 20260501" in output
-    assert "Ingesting exposure date 20260502" in output
-    assert "skipped 2 source(s) outside the inclusive bounds" in output
+    assert "Scanning night 20260601" in output
+    assert "/acm/" not in output
 
 
-def test_scan_date_window_prunes_date_tar_root_with_unrelated_siblings(tmp_path: Path, monkeypatch):
-    """A bounded TACC scan must ignore configuration and other date archives."""
+def test_bounded_scan_prunes_corral_date_tars_and_nonvirus_nested_archives(
+    tmp_path: Path, monkeypatch,
+):
+    """Only selected Corral outer nights and nested VIRUS archives are opened."""
     root = tmp_path / "date_tars"
     root.mkdir()
     config_fits = root / "virus_config" / "labflats" / "pixelflat_cam004_LL.fits"
@@ -119,14 +123,15 @@ def test_scan_date_window_prunes_date_tar_root_with_unrelated_siblings(tmp_path:
     _write_raw(config_fits)
     source = tmp_path / "source.fits"
     _write_raw(source)
-    for date in ("20260430", "20260501", "20260502", "20260503"):
-        inner_bytes = io.BytesIO()
-        with tarfile.open(fileobj=inner_bytes, mode="w") as inner:
-            inner.add(source, arcname=f"{date}T010000.0_074LL_sci.fits")
-        info = tarfile.TarInfo(name="virus/virus0000001.tar")
-        info.size = len(inner_bytes.getvalue())
+    for date in ("20260501", "20260502", "20260503"):
         with tarfile.open(root / f"{date}.tar", mode="w") as outer:
-            outer.addfile(info, io.BytesIO(inner_bytes.getvalue()))
+            for instrument, archive_name in (("virus", "virus0000001.tar"), ("acm", "acm0000001.tar")):
+                inner_bytes = io.BytesIO()
+                with tarfile.open(fileobj=inner_bytes, mode="w") as inner:
+                    inner.add(source, arcname=f"{date}T010000.0_074LL_sci.fits")
+                info = tarfile.TarInfo(name=f"{instrument}/{archive_name}")
+                info.size = len(inner_bytes.getvalue())
+                outer.addfile(info, io.BytesIO(inner_bytes.getvalue()))
 
     opened = []
     original_open = tarfile.open
@@ -138,15 +143,16 @@ def test_scan_date_window_prunes_date_tar_root_with_unrelated_siblings(tmp_path:
 
     monkeypatch.setattr("virusflow.storage.filesystem.tarfile.open", recording_open)
     sources = list(FileSystemStorage(root).iter_raw_sources(
-        start_date="20260501", end_date="20260502",
+        first_night="20260501", last_night="20260502",
     ))
 
     assert {source.path.name for source in sources} == {"20260501.tar", "20260502.tar"}
-    assert "20260430.tar" not in opened
+    assert {source.outer_tar_member for source in sources} == {"virus/virus0000001.tar"}
     assert "20260503.tar" not in opened
+    assert "acm0000001.tar" not in opened
 
 
-def test_scan_date_window_prunes_maverick_date_directories(tmp_path: Path):
+def test_bounded_work_scan_never_walks_unrelated_night_subtrees(tmp_path: Path):
     root = tmp_path / "maverick"
     root.mkdir()
     config_fits = root / "virus_config" / "labflats" / "pixelflat_cam004_LL.fits"
@@ -154,17 +160,36 @@ def test_scan_date_window_prunes_maverick_date_directories(tmp_path: Path):
     _write_raw(config_fits)
     source = tmp_path / "source.fits"
     _write_raw(source)
-    for date in ("20260430", "20260501", "20260502", "20260503"):
+    for date in ("20260429", "20260430", "20260501", "20260502", "20260503", "20260504"):
         archive = root / date / "virus" / "virus0000001.tar"
         archive.parent.mkdir(parents=True)
         with tarfile.open(archive, mode="w") as tf:
             tf.add(source, arcname=f"{date}T010000.0_074LL_sci.fits")
+        acm_archive = root / date / "acm" / "acm0000001.tar"
+        acm_archive.parent.mkdir(parents=True)
+        with tarfile.open(acm_archive, mode="w") as tf:
+            tf.add(source, arcname=f"{date}T010000.0_074LL_sci.fits")
 
     sources = list(FileSystemStorage(root).iter_raw_sources(
-        start_date="20260501", end_date="20260502",
+        first_night="20260501", last_night="20260502",
     ))
 
-    assert {source.path.parent.parent.name for source in sources} == {"20260501", "20260502"}
+    assert {source.path.parent.parent.name for source in sources} == {
+        "20260501", "20260502",
+    }
+
+
+def test_bounded_scan_keeps_generic_fallback_for_unfamiliar_roots(tmp_path: Path):
+    root = tmp_path / "unfamiliar"
+    root.mkdir()
+    raw_path = root / "frame_074LL_sci.fits"
+    _write_raw(raw_path)
+
+    sources = list(FileSystemStorage(root).iter_raw_sources(
+        first_night="20260501", last_night="20260501",
+    ))
+
+    assert [source.path for source in sources] == [raw_path]
 
 
 def test_artifact_publication_writes_only_to_the_artifact_database(tmp_path: Path):
@@ -252,7 +277,7 @@ def test_filesystem_and_tar_backends_still_enumerate_correctly(tmp_path: Path, c
     args.func(args)
     output = capsys.readouterr().out
     assert f"Ingesting tar {tar_path.resolve()}" in output
-    assert f"Finished tar {tar_path.resolve()}: 1 raw sources, 1 registered, 0 excluded" in output
+    assert f"Finished tar {tar_path.resolve()}: 1 raw sources, 1 registered" in output
 
 
 def test_date_tar_backend_reads_nested_virus_tar(tmp_path: Path):
@@ -380,8 +405,6 @@ def test_date_tar_offset_index_matches_unindexed_metadata(tmp_path: Path):
 
 def test_date_tar_index_powers_raw_frame_loader_fast_path(tmp_path: Path):
     root = _build_date_tar(tmp_path, amp_names=["LL", "LU"], ifuslot="074")
-    date_tar_path = root / "20260501.tar"
-
     raw_db = tmp_path / "raw.sqlite3"
     db.init_raw_db(str(raw_db))
     with db.connect(str(raw_db)) as conn:

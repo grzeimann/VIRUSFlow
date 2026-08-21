@@ -1275,6 +1275,45 @@ def list_raw_file_rows(exposure_id: str, db_path: str = DEFAULT_RAW_DB_PATH) -> 
     return out
 
 
+def observing_night_from_provenance(
+    path: str, *, tar_member: Optional[str] = None,
+    outer_tar_member: Optional[str] = None,
+) -> Optional[str]:
+    """Derive an HET observing-night label from existing raw provenance."""
+    outer_name = Path(str(path)).name
+    if outer_tar_member and (night := _date_token(outer_name)) is not None:
+        return night
+    parts = Path(str(path)).parts
+    for index, part in enumerate(parts):
+        if part.lower() == "virus" and index:
+            if (night := _date_token(parts[index - 1])) is not None:
+                return night
+    if outer_tar_member:
+        return _date_token(outer_name)
+    return None
+
+
+def _date_token(value: str) -> Optional[str]:
+    name = Path(str(value)).name
+    if name.lower().endswith(".tar"):
+        name = name[:-4]
+    return name if len(name) == 8 and name.isdigit() else None
+
+
+def _night_in_range(
+    path: str, tar_member: Optional[str], outer_tar_member: Optional[str],
+    first_night: Optional[str], last_night: Optional[str],
+) -> bool:
+    night = observing_night_from_provenance(
+        path, tar_member=tar_member, outer_tar_member=outer_tar_member,
+    )
+    return (
+        night is not None
+        and (first_night is None or night >= first_night)
+        and (last_night is None or night <= last_night)
+    )
+
+
 def list_raw_scientific_metadata(
     raw_ids: Iterable[int], *, db_path: str = DEFAULT_RAW_DB_PATH
 ) -> List[Dict[str, Any]]:
@@ -1303,6 +1342,8 @@ def list_raw_files_scoped(
     db_path: str = DEFAULT_RAW_DB_PATH,
     start_time: Optional[datetime] = None,
     end_time: Optional[datetime] = None,
+    first_night: Optional[str] = None,
+    last_night: Optional[str] = None,
 ) -> List[Tuple[int, RawFileId]]:
     """List raw files filtered by frame_type and exposure date window, optionally by zipcode.
 
@@ -1327,6 +1368,13 @@ def list_raw_files_scoped(
             base += " AND rf.amp_key=?"
             params.append(zipcode.key())
         rows = conn.execute(base, tuple(params)).fetchall()
+        if first_night or last_night:
+            rows = [
+                row for row in rows
+                if _night_in_range(
+                    row[3], row[4], row[14], first_night, last_night,
+                )
+            ]
         if start_time is not None or end_time is not None:
             def _instant(value: str) -> Optional[datetime]:
                 try:
@@ -1404,6 +1452,7 @@ def list_raw_files_by_ids(
 def list_calibration_grouping_rows(
     *, db_path: str, zipcode: ZipCode, frame_types: Iterable[str],
     start_date: Optional[str] = None, end_date: Optional[str] = None,
+    first_night: Optional[str] = None, last_night: Optional[str] = None,
 ) -> List[dict]:
     """Return raw identities plus exposure metadata used only for grouping/reporting."""
 
@@ -1414,7 +1463,8 @@ def list_calibration_grouping_rows(
     sql = (
         "SELECT rf.id AS raw_id, rf.exposure_id, lower(rf.frame_type) AS frame_type, "
         "e.when_utc, d.exptime, d.pexptime, d.ambient_temperature, d.object_name, "
-        "d.qobject, d.lamp, d.observing_block, d.qprog "
+        "d.qobject, d.lamp, d.observing_block, d.qprog, "
+        "rf.path, rf.tar_member, rf.outer_tar_member "
         "FROM raw_files rf JOIN exposures e ON e.id=rf.exposure_id "
         "LEFT JOIN exposure_details d ON d.exposure_id=rf.exposure_id "
         f"WHERE rf.amp_key=? AND lower(rf.frame_type) IN ({placeholders})"
@@ -1428,19 +1478,30 @@ def list_calibration_grouping_rows(
         params.append(_date8(end_date))
     sql += " ORDER BY rf.exposure_id, rf.id"
     with connect(db_path) as conn:
-        return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+        rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+    if first_night or last_night:
+        rows = [
+            row for row in rows
+            if _night_in_range(
+                row["path"], row["tar_member"], row["outer_tar_member"],
+                first_night, last_night,
+            )
+        ]
+    return rows
 
 
 def list_calibration_grouping_rows_bulk(
     *, db_path: str, start_date: Optional[str] = None,
-    end_date: Optional[str] = None,
+    end_date: Optional[str] = None, first_night: Optional[str] = None,
+    last_night: Optional[str] = None,
 ) -> List[dict]:
     """Load all raw grouping evidence for one planning window in one query."""
 
     sql = (
         "SELECT rf.id AS raw_id, rf.exposure_id, lower(rf.frame_type) AS frame_type, "
         "rf.amp_key, e.when_utc, d.exptime, d.pexptime, d.ambient_temperature, "
-        "d.object_name, d.qobject, d.lamp, d.observing_block, d.qprog "
+        "d.object_name, d.qobject, d.lamp, d.observing_block, d.qprog, "
+        "rf.path, rf.tar_member, rf.outer_tar_member "
         "FROM raw_files rf JOIN exposures e ON e.id=rf.exposure_id "
         "LEFT JOIN exposure_details d ON d.exposure_id=rf.exposure_id "
         "WHERE rf.amp_key IS NOT NULL"
@@ -1454,7 +1515,16 @@ def list_calibration_grouping_rows_bulk(
         params.append(_date8(end_date))
     sql += " ORDER BY rf.amp_key, rf.exposure_id, rf.id"
     with connect(db_path) as conn:
-        return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+        rows = [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+    if first_night or last_night:
+        rows = [
+            row for row in rows
+            if _night_in_range(
+                row["path"], row["tar_member"], row["outer_tar_member"],
+                first_night, last_night,
+            )
+        ]
+    return rows
 
 
 def save_artifact(artifact, prov, db_path: str = DEFAULT_DB_PATH) -> int:
@@ -2803,9 +2873,11 @@ def list_zipcodes(
     frame_type: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
+    first_night: str | None = None,
+    last_night: str | None = None,
     limit: int | None = None,
 ) -> List[ZipCode]:
-    """Discover unique ZipCodes that have raw files in an optional date window.
+    """Discover unique ZipCodes in an optional UTC or observing-night scope.
 
     Discovery uses raw_files.amp_key joined to amplifiers.key, which is populated
     during scanning/registration by parsing filenames (including tar member names).
@@ -2821,7 +2893,8 @@ def list_zipcodes(
     ed = _d(end_date)
     with connect(db_path) as conn:
         base = (
-            "SELECT DISTINCT a.ifuslot, a.ifuid, a.specid, a.amp, a.controller "
+            "SELECT a.ifuslot, a.ifuid, a.specid, a.amp, a.controller, "
+            "rf.path, rf.tar_member, rf.outer_tar_member "
             "FROM raw_files rf JOIN exposures e ON rf.exposure_id = e.id "
             "JOIN amplifiers a ON rf.amp_key = a.key "
             "WHERE 1=1 "
@@ -2835,7 +2908,23 @@ def list_zipcodes(
             params.extend([sd, ed])
         sql = base + "ORDER BY a.ifuslot, a.ifuid, a.specid, a.amp, a.controller"
         rows = conn.execute(sql, tuple(params)).fetchall()
-        out: List[ZipCode] = [ZipCode(ifuslot=r[0], ifuid=r[1], specid=r[2], amp=r[3], controller=r[4]) for r in rows]
+        if first_night or last_night:
+            rows = [
+                row for row in rows
+                if _night_in_range(
+                    row[5], row[6], row[7], first_night, last_night,
+                )
+            ]
+        seen = set()
+        out: List[ZipCode] = []
+        for row in rows:
+            key = tuple(row[:5])
+            if key not in seen:
+                seen.add(key)
+                out.append(ZipCode(
+                    ifuslot=row[0], ifuid=row[1], specid=row[2],
+                    amp=row[3], controller=row[4],
+                ))
         if limit and limit > 0:
             out = out[: int(limit)]
         return out
