@@ -374,8 +374,10 @@ def _print_stats(stats: IOStats) -> None:
     print(f"      FITS header bytes read:   {stats.header_bytes:,} ({_human_bytes(stats.header_bytes)})")
 
 
-def _print_header_samples(result: RunResult) -> None:
-    print("    Header comparison sample (first 3 members; missing cards are None):")
+def _print_header_samples(
+    result: RunResult, title: str = "Header comparison sample (first 3 members; missing cards are None):",
+) -> None:
+    print(f"    {title}")
     for record, header in zip(result.records[:3], result.headers[:3]):
         values = ", ".join(
             f"{card}={_format_value(header[card])}"
@@ -445,15 +447,61 @@ def _print_aggregate(results: list[tuple[RunResult, RunResult]]) -> None:
     print(f"  time reduction:   {reduction:.3f}%")
 
 
+def _print_single_report(path: Path, result: RunResult) -> None:
+    size = path.stat().st_size
+    print("=" * 70)
+    print(f"Tar: {path}")
+    print(f"Size: {size:,} bytes ({_human_bytes(size)})")
+    print(f"Relevant FITS members: {len(result.records)}")
+    print()
+    if result.strategy == "A":
+        print("Strategy A: two-phase")
+        print("  discovery:")
+        print(f"      wall time:       {result.discovery_seconds:.6f} s")
+        print("  header phase:")
+        print(f"      wall time:       {result.header_seconds:.6f} s")
+    else:
+        print("Strategy B: ordered acquisition")
+        print("  traversal + headers:")
+        print(f"      wall time:       {result.total_seconds:.6f} s")
+    print("  total:")
+    print(f"      wall time:       {result.total_seconds:.6f} s")
+    _print_stats(result.stats)
+    print()
+    print("Validation:")
+    print("  selected-strategy member/header work: PASS")
+    print(f"  primary headers parsed:               {len(result.headers)}")
+    print("  A/B equivalence comparison:           NOT RUN (single-strategy mode)")
+    _print_header_samples(result, "Primary-header sample (first 3 members; missing cards are None):")
+    print("=" * 70)
+
+
+def _print_single_aggregate(results: list[RunResult]) -> None:
+    strategy = results[0].strategy
+    total = sum(result.total_seconds for result in results)
+    members = sum(len(result.records) for result in results)
+    print()
+    print("Aggregate")
+    print(f"  tar count:     {len(results)}")
+    print(f"  members:       {members}")
+    print()
+    print(f"  Strategy {strategy} total: {total:.6f} s")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Compare two physical primary-FITS-header access patterns in ordinary VIRUS tars."
     )
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--order",
         choices=("A-B", "B-A"),
-        default="A-B",
         help="strategy execution order for each tar (default: A-B)",
+    )
+    mode.add_argument(
+        "--strategy",
+        choices=("A", "B"),
+        help="run only the selected strategy for each tar",
     )
     parser.add_argument("tar_paths", nargs="+", type=Path, metavar="TAR")
     return parser
@@ -474,8 +522,12 @@ def main(argv: Optional[list[str]] = None) -> int:
             )
             return 2
 
+    execution_order = args.order or "A-B"
     print("VIRUSFlow tar primary-header access benchmark")
-    print(f"Execution order for each tar: {args.order}")
+    if args.strategy is not None:
+        print(f"Execution mode: Strategy {args.strategy} only")
+    else:
+        print(f"Execution order for each tar: {execution_order}")
     print("Filesystem cache flushing: none")
     print("Tar mode: r: (ordinary uncompressed tar only)")
     print("Physical access notes:")
@@ -489,9 +541,20 @@ def main(argv: Optional[list[str]] = None) -> int:
     print()
 
     results: list[tuple[RunResult, RunResult]] = []
+    single_results: list[RunResult] = []
     for path in paths:
         try:
-            if args.order == "A-B":
+            if args.strategy == "A":
+                selected = _strategy_a(path)
+                _print_single_report(path, selected)
+                single_results.append(selected)
+                continue
+            elif args.strategy == "B":
+                selected = _strategy_b(path)
+                _print_single_report(path, selected)
+                single_results.append(selected)
+                continue
+            elif execution_order == "A-B":
                 a = _strategy_a(path)
                 b = _strategy_b(path)
             else:
@@ -504,7 +567,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"ERROR while benchmarking {path}: {exc}", file=sys.stderr)
             return 1
 
-    if len(results) > 1:
+    if args.strategy is not None:
+        if len(single_results) > 1:
+            _print_single_aggregate(single_results)
+    elif len(results) > 1:
         _print_aggregate(results)
     return 0
 
