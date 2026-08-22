@@ -209,6 +209,35 @@ class StreamHeaderFile:
         return getattr(self._stream, name)
 
 
+class CountingInnerView:
+    """Count logical operations on Corral's seekable ExFileObject view."""
+
+    def __init__(self, raw: Any, stats: IOStats):
+        self._raw = raw
+        self._stats = stats
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._raw.read(size)
+        self._stats.archive_bytes_read += len(data)
+        return data
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        before = self._raw.tell()
+        result = self._raw.seek(offset, whence)
+        self._stats.seek_calls += 1
+        if result < before:
+            self._stats.backward_seek_calls += 1
+        elif result > before:
+            self._stats.forward_seek_calls += 1
+        return result
+
+    def tell(self) -> int:
+        return self._raw.tell()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw, name)
+
+
 @dataclass
 class RunResult:
     strategy: str
@@ -219,6 +248,31 @@ class RunResult:
     headers: list[dict[str, Any]]
     stats: IOStats
     logical_stream_bytes: Optional[int] = None
+
+
+@dataclass
+class CorralRunResult:
+    outer_path: Path
+    inner_name: str
+    outer_size: int
+    inner_size: int
+    outer_location_seconds: float
+    inner_setup_seconds: float
+    inner_traversal_seconds: float
+    total_seconds: float
+    outer_members_examined: int
+    records: list[MemberRecord]
+    headers: list[dict[str, Any]]
+    outer_stats: IOStats
+    inner_stats: IOStats
+    outer_location_seek_calls: int
+    outer_location_forward_seeks: int
+    outer_location_backward_seeks: int
+    outer_location_bytes_read: int
+    outer_inner_seek_calls: int
+    outer_inner_forward_seeks: int
+    outer_inner_backward_seeks: int
+    outer_inner_bytes_read: int
 
 
 def _human_bytes(value: int) -> str:
@@ -484,6 +538,133 @@ def _strategy_c(path: Path) -> RunResult:
     )
 
 
+def _is_production_inner_tar_name(name: str) -> bool:
+    path = Path(name)
+    return (
+        path.name.lower().startswith("virus")
+        and path.name.lower().endswith(".tar")
+        and any(part.lower() == "virus" for part in path.parts[:-1])
+    )
+
+
+def _strategy_b_corral(outer_path: Path, inner_name: str) -> CorralRunResult:
+    """Benchmark B-style access through one selected Corral nested-tar view."""
+    if not _is_production_inner_tar_name(inner_name):
+        raise BenchmarkError(
+            "--corral-inner must name a nested production virus*.tar under a virus directory"
+        )
+    test_number = _test_observation_number(Path(inner_name))
+    if test_number is not None and test_number >= 999:
+        raise BenchmarkError(
+            f"refusing test observation inner archive {inner_name} (observation {test_number} >= 999)"
+        )
+
+    total_started = time.perf_counter()
+    outer_stats = IOStats()
+    outer_open_started = time.perf_counter()
+    raw = open(outer_path, "rb", buffering=0)
+    counted_outer = CountingFile(raw, outer_stats)
+    try:
+        outer = tarfile.open(fileobj=counted_outer, mode="r:")
+        outer_stats.archive_opens += 1
+    except Exception:
+        raw.close()
+        raise
+
+    nested_info: Optional[tarfile.TarInfo] = None
+    try:
+        outer_stats.member_list_scan_passes += 1
+        for member in outer:
+            outer_stats.member_scans += 1
+            if member.name == inner_name:
+                if not member.isfile() or not _is_production_inner_tar_name(member.name):
+                    raise BenchmarkError(f"requested member is not a regular production inner tar: {inner_name}")
+                nested_info = member
+                break
+        if nested_info is None:
+            raise BenchmarkError(f"nested tar member not found in outer archive: {inner_name}")
+        outer_location_seconds = time.perf_counter() - outer_open_started
+
+        outer_location_seek_calls = outer_stats.seek_calls
+        outer_location_forward_seeks = outer_stats.forward_seek_calls
+        outer_location_backward_seeks = outer_stats.backward_seek_calls
+        outer_location_bytes_read = outer_stats.archive_bytes_read
+
+        inner_setup_started = time.perf_counter()
+        inner_stream = outer.extractfile(nested_info)
+        if inner_stream is None:
+            raise BenchmarkError(f"could not open nested tar member: {inner_name}")
+        inner_stats = IOStats()
+        counted_inner = CountingInnerView(inner_stream, inner_stats)
+        try:
+            inner = tarfile.open(fileobj=counted_inner, mode="r:")
+            inner_stats.archive_opens += 1
+        except Exception:
+            inner_stream.close()
+            raise
+        inner_setup_seconds = time.perf_counter() - inner_setup_started
+
+        records: list[MemberRecord] = []
+        headers: list[dict[str, Any]] = []
+        inner_traversal_started = time.perf_counter()
+        try:
+            inner_stats.member_list_scan_passes += 1
+            for member in inner:
+                inner_stats.member_scans += 1
+                if not _is_relevant_member(member):
+                    continue
+                record = _record(member)
+                current = counted_inner.tell()
+                if current != record.offset_data:
+                    raise BenchmarkError(
+                        "Corral inner Strategy B did not encounter the member payload at "
+                        f"the expected offset for {record.name}: current={current}, "
+                        f"offset_data={record.offset_data}"
+                    )
+                header_file = StreamHeaderFile(counted_inner, inner_stats)
+                snapshot, header_bytes = _read_primary_header(header_file, record)
+                _discard_stream_member_payload(
+                    counted_inner, record, header_bytes, inner_stats,
+                )
+                records.append(record)
+                headers.append(snapshot)
+        finally:
+            inner.close()
+            inner_stream.close()
+        inner_traversal_seconds = time.perf_counter() - inner_traversal_started
+
+        outer_inner_seek_calls = outer_stats.seek_calls - outer_location_seek_calls
+        outer_inner_forward_seeks = outer_stats.forward_seek_calls - outer_location_forward_seeks
+        outer_inner_backward_seeks = outer_stats.backward_seek_calls - outer_location_backward_seeks
+        outer_inner_bytes_read = outer_stats.archive_bytes_read - outer_location_bytes_read
+        return CorralRunResult(
+            outer_path=outer_path,
+            inner_name=inner_name,
+            outer_size=outer_path.stat().st_size,
+            inner_size=int(nested_info.size),
+            outer_location_seconds=outer_location_seconds,
+            inner_setup_seconds=inner_setup_seconds,
+            inner_traversal_seconds=inner_traversal_seconds,
+            total_seconds=time.perf_counter() - total_started,
+            outer_members_examined=outer_stats.member_scans,
+            records=records,
+            headers=headers,
+            outer_stats=outer_stats,
+            inner_stats=inner_stats,
+            outer_location_seek_calls=outer_location_seek_calls,
+            outer_location_forward_seeks=outer_location_forward_seeks,
+            outer_location_backward_seeks=outer_location_backward_seeks,
+            outer_location_bytes_read=outer_location_bytes_read,
+            outer_inner_seek_calls=outer_inner_seek_calls,
+            outer_inner_forward_seeks=outer_inner_forward_seeks,
+            outer_inner_backward_seeks=outer_inner_backward_seeks,
+            outer_inner_bytes_read=outer_inner_bytes_read,
+        )
+    finally:
+        outer.close()
+        raw.close()
+
+
 def _compare_results(a: RunResult, b: RunResult) -> None:
     if a.records != b.records:
         for index, (a_record, b_record) in enumerate(zip(a.records, b.records)):
@@ -576,6 +757,69 @@ def _print_strategy_c_stats(path: Path, result: RunResult) -> None:
     print(
         "      tarfile logical forward seeks (implemented by reads): "
         f"{result.stats.stream_forward_seek_calls}"
+    )
+
+
+def _print_corral_report(result: CorralRunResult) -> None:
+    inner = result.inner_stats
+    outer = result.outer_stats
+    print("VIRUSFlow Corral nested-tar Strategy B benchmark")
+    print("Execution mode: selected inner Strategy B only")
+    print(f"Outer date tar: {result.outer_path}")
+    print(f"Nested member: {result.inner_name}")
+    print()
+    print("Outer tar")
+    print(f"  size:                         {result.outer_size:,} bytes ({_human_bytes(result.outer_size)})")
+    print(f"  open + member-location time:  {result.outer_location_seconds:.6f} s")
+    print(f"  source opens:                 {outer.archive_opens}")
+    print(f"  tar members examined:         {result.outer_members_examined}")
+    print(f"  bytes read during location:   {result.outer_location_bytes_read:,}")
+    print(f"  location seek calls:          {result.outer_location_seek_calls}")
+    print(f"    forward seeks:              {result.outer_location_forward_seeks}")
+    print(f"    backward seeks:             {result.outer_location_backward_seeks}")
+    print()
+    print("Inner VIRUS tar")
+    print(f"  logical size:                 {result.inner_size:,} bytes ({_human_bytes(result.inner_size)})")
+    print(f"  setup + open time:            {result.inner_setup_seconds:.6f} s")
+    print(f"  traversal + headers time:     {result.inner_traversal_seconds:.6f} s")
+    print(f"  logical tar opens:            {inner.archive_opens}")
+    print(f"  relevant FITS members:        {len(result.records)}")
+    print(f"  FITS headers parsed:           {inner.header_reads}")
+    print(f"  FITS header bytes parsed:      {inner.header_bytes:,}")
+    print(f"  logical inner bytes read:      {inner.archive_bytes_read:,}")
+    print(f"  payload bytes discarded:       {inner.payload_bytes_discarded:,}")
+    print(f"  inner seek calls:              {inner.seek_calls}")
+    print(f"    forward seeks:               {inner.forward_seek_calls}")
+    print(f"    backward seeks:              {inner.backward_seek_calls}")
+    print("    direct header seeks:         0")
+    print()
+    print("Outer physical access while reading inner tar")
+    print(f"  bytes read:                    {result.outer_inner_bytes_read:,}")
+    print(f"  seek calls:                    {result.outer_inner_seek_calls}")
+    print(f"    forward seeks:               {result.outer_inner_forward_seeks}")
+    print(f"    backward seeks:              {result.outer_inner_backward_seeks}")
+    print("  inner seek mechanism:          outer-file seeks through ExFileObject/_FileInFile")
+    print()
+    print("Validation")
+    print("  requested inner member:        PASS")
+    print("  production FITS members:       PASS")
+    print("  primary-header parsing:        PASS")
+    print("  FITS image arrays loaded:      NO")
+    print("  unrelated inner tars opened:   0")
+    print()
+    print(f"Total time: {result.total_seconds:.6f} s")
+    print("Header sample (first 3 members; missing cards are None):")
+    _print_header_samples(
+        RunResult(
+            strategy="B",
+            total_seconds=result.inner_traversal_seconds,
+            discovery_seconds=None,
+            header_seconds=None,
+            records=result.records,
+            headers=result.headers,
+            stats=inner,
+        ),
+        "  Primary-header sample (first 3 members; missing cards are None):",
     )
 
 
@@ -700,6 +944,11 @@ def _parser() -> argparse.ArgumentParser:
         choices=("A", "B", "C"),
         help="run only the selected strategy for each tar",
     )
+    mode.add_argument(
+        "--corral-inner",
+        metavar="MEMBER",
+        help="benchmark B-style access for one nested Corral virus*.tar member",
+    )
     parser.add_argument("tar_paths", nargs="+", type=Path, metavar="TAR")
     return parser
 
@@ -707,6 +956,23 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parser().parse_args(argv)
     paths = [path.expanduser() for path in args.tar_paths]
+
+    if args.corral_inner is not None:
+        if len(paths) != 1:
+            print("ERROR: --corral-inner requires exactly one outer date tar path", file=sys.stderr)
+            return 2
+        outer_path = paths[0]
+        if not outer_path.is_file():
+            print(f"ERROR: outer date tar is not a regular file: {outer_path}", file=sys.stderr)
+            return 2
+        try:
+            result = _strategy_b_corral(outer_path, args.corral_inner)
+            _print_corral_report(result)
+        except (BenchmarkError, OSError, tarfile.TarError, fits.VerifyError) as exc:
+            print(f"ERROR while benchmarking Corral inner tar {args.corral_inner}: {exc}", file=sys.stderr)
+            return 1
+        return 0
+
     for path in paths:
         if not path.is_file():
             print(f"ERROR: tar path is not a regular file: {path}", file=sys.stderr)

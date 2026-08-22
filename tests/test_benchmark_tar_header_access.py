@@ -94,6 +94,23 @@ def _build_small_fits_tar(tmp_path: Path) -> tuple[Path, bytes]:
     return tar_path, fits_bytes.getvalue()
 
 
+def _build_small_corral_tar(tmp_path: Path) -> tuple[Path, Path, str]:
+    inner_path, _ = _build_small_fits_tar(tmp_path)
+    outer_path = tmp_path / "20260604.tar"
+    inner_name = "virus/virus0000001.tar"
+    unrelated_name = "virus/virus0000002.tar"
+    inner_bytes = inner_path.read_bytes()
+    with tarfile.open(outer_path, "w") as outer:
+        unrelated = tarfile.TarInfo(unrelated_name)
+        unrelated_bytes = b"not an inner tar"
+        unrelated.size = len(unrelated_bytes)
+        outer.addfile(unrelated, io.BytesIO(unrelated_bytes))
+        selected = tarfile.TarInfo(inner_name)
+        selected.size = len(inner_bytes)
+        outer.addfile(selected, io.BytesIO(inner_bytes))
+    return outer_path, inner_path, inner_name
+
+
 def test_strategy_a_runs_a_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
     calls = _patch_strategies(monkeypatch)
 
@@ -164,6 +181,48 @@ def test_strategy_c_does_not_open_fits_image_data(monkeypatch: pytest.MonkeyPatc
 
     assert result.stats.header_reads == 1
     assert result.stats.payload_bytes_discarded > 0
+
+
+def test_corral_inner_strategy_b_matches_standalone_inner_tar(tmp_path: Path):
+    outer_path, inner_path, inner_name = _build_small_corral_tar(tmp_path)
+
+    nested = benchmark._strategy_b_corral(outer_path, inner_name)
+    standalone = benchmark._strategy_a(inner_path)
+
+    assert nested.records == standalone.records
+    assert nested.headers == standalone.headers
+    assert nested.outer_stats.archive_opens == 1
+    assert nested.outer_members_examined == 2
+    assert nested.inner_size == inner_path.stat().st_size
+    assert nested.inner_stats.archive_opens == 1
+    assert nested.inner_stats.header_reads == len(nested.records) == 1
+    assert nested.inner_stats.payload_bytes_discarded > 0
+    assert nested.outer_inner_seek_calls > 0
+    assert nested.outer_inner_backward_seeks == 0
+    assert nested.inner_stats.backward_seek_calls == 0
+
+
+def test_corral_inner_mode_is_exclusive_with_strategy(tmp_path: Path):
+    with pytest.raises(SystemExit):
+        benchmark._parser().parse_args([
+            "--strategy", "B", "--corral-inner", "virus/virus0000001.tar",
+            str(tmp_path / "20260604.tar"),
+        ])
+
+
+def test_corral_inner_cli_report_is_self_contained(tmp_path: Path, capsys):
+    outer_path, _, inner_name = _build_small_corral_tar(tmp_path)
+
+    assert benchmark.main(["--corral-inner", inner_name, str(outer_path)]) == 0
+
+    output = capsys.readouterr().out
+    assert "Execution mode: selected inner Strategy B only" in output
+    assert "open + member-location time:" in output
+    assert "setup + open time:" in output
+    assert "traversal + headers time:" in output
+    assert "outer-file seeks through ExFileObject/_FileInFile" in output
+    assert "Total time:" in output
+    assert "speedup" not in output
 
 
 def test_strategy_and_order_are_mutually_exclusive(tmp_path: Path):
