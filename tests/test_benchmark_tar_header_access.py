@@ -196,10 +196,14 @@ def test_corral_inner_strategy_b_matches_standalone_inner_tar(tmp_path: Path):
     assert nested.inner_size == inner_path.stat().st_size
     assert nested.inner_stats.archive_opens == 1
     assert nested.inner_stats.header_reads == len(nested.records) == 1
-    assert nested.inner_stats.payload_bytes_discarded > 0
+    assert nested.inner_stats.payload_bytes_discarded == 0
+    assert nested.inner_stats.payload_skip_seek_calls >= 1
     assert nested.outer_inner_seek_calls > 0
+    assert nested.outer_stats.corral_outer_next_seek_calls >= 1
+    assert nested.outer_stats.corral_outer_fits_next_seek_calls >= 1
     assert nested.outer_inner_backward_seeks == 0
     assert nested.inner_stats.backward_seek_calls == 0
+    assert nested.outer_inner_payload_bytes_read < nested.records[0].size
 
 
 def test_corral_inner_mode_is_exclusive_with_strategy(tmp_path: Path):
@@ -221,6 +225,8 @@ def test_corral_inner_cli_report_is_self_contained(tmp_path: Path, capsys):
     assert "setup + open time:" in output
     assert "traversal + headers time:" in output
     assert "outer-file seeks through ExFileObject/_FileInFile" in output
+    assert "FITS image/payload bytes physically read from outer:" in output
+    assert "FITS payload remainder read/discarded by benchmark: NO" in output
     assert "Total time:" in output
     assert "speedup" not in output
 

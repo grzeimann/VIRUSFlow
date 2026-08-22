@@ -23,11 +23,14 @@ member in bounded chunks, and continues to EOF.  In stream mode tarfile's
 forward ``seek()`` operation is implemented by reads, so it does not issue
 filesystem seeks.
 
-The benchmark deliberately does not use ``TarFile.extractfile()``.  That API
-uses a _FileInFile wrapper whose reads seek to the member offset, which would
-add an explicit seek for every header and obscure the physical comparison.
-The benchmark also does not call ``getmembers()`` or ``getmember()`` after the
-initial traversal, so there are no hidden member-list scans.
+For ordinary Strategies A/B/C, the benchmark deliberately does not use
+``TarFile.extractfile()``.  That API uses a _FileInFile wrapper whose reads
+seek to the member offset, which would add an explicit seek for every header
+and obscure the ordinary-tar comparison.  The separate Corral nested-tar
+mode intentionally uses ``outer.extractfile()`` because that is the physical
+seekable inner view being tested.  No mode calls ``getmembers()`` or
+``getmember()`` after its initial traversal, so there are no hidden
+member-list scans.
 """
 
 from __future__ import annotations
@@ -90,10 +93,14 @@ class IOStats:
     backward_seek_calls: int = 0
     forward_seek_calls: int = 0
     stream_forward_seek_calls: int = 0
+    payload_skip_seek_calls: int = 0
+    corral_outer_next_seek_calls: int = 0
+    corral_outer_fits_next_seek_calls: int = 0
     header_reads: int = 0
     header_bytes: int = 0
     archive_bytes_read: int = 0
     payload_bytes_discarded: int = 0
+    corral_read_ranges: list[tuple[int, int]] = field(default_factory=list, repr=False)
     _phase: str = field(default="other", repr=False)
     _header_bytes_current: int = field(default=0, repr=False)
 
@@ -137,8 +144,11 @@ class CountingFile:
                     "primary FITS header read exceeded the 1 MiB safety limit; "
                     "refusing to risk reading an image payload"
                 )
+        start = self._raw.tell()
         data = self._raw.read(size)
         self._stats.archive_bytes_read += len(data)
+        if self._stats._phase.startswith("corral-inner") and data:
+            self._stats.corral_read_ranges.append((start, start + len(data)))
         if self._stats._phase in {"a-header", "b-header"}:
             self._stats._header_bytes_current += len(data)
         return data
@@ -155,6 +165,11 @@ class CountingFile:
             self._stats.traversal_seek_calls += 1
         elif self._stats._phase in {"a-header", "b-header"}:
             self._stats.header_seek_calls += 1
+        elif self._stats._phase == "corral-inner-next":
+            self._stats.corral_outer_next_seek_calls += 1
+        elif self._stats._phase == "corral-inner-fits-next":
+            self._stats.corral_outer_next_seek_calls += 1
+            self._stats.corral_outer_fits_next_seek_calls += 1
         return result
 
     def tell(self) -> int:
@@ -273,6 +288,9 @@ class CorralRunResult:
     outer_inner_forward_seeks: int
     outer_inner_backward_seeks: int
     outer_inner_bytes_read: int
+    header_bytes_per_member: list[int]
+    outer_inner_header_bytes_read: int
+    outer_inner_payload_bytes_read: int
 
 
 def _human_bytes(value: int) -> str:
@@ -547,6 +565,24 @@ def _is_production_inner_tar_name(name: str) -> bool:
     )
 
 
+def _sum_read_overlap(
+    read_ranges: list[tuple[int, int]],
+    intervals: list[tuple[int, int]],
+) -> int:
+    """Count physically read bytes overlapping logical member intervals.
+
+    Read ranges are intentionally not coalesced: repeated reads represent
+    repeated physical bytes delivered by the outer file object.  This is the
+    closest direct byte accounting available through tarfile's nested
+    _FileInFile/ExFileObject stack.
+    """
+    total = 0
+    for read_start, read_end in read_ranges:
+        for interval_start, interval_end in intervals:
+            total += max(0, min(read_end, interval_end) - max(read_start, interval_start))
+    return total
+
+
 def _strategy_b_corral(outer_path: Path, inner_name: str) -> CorralRunResult:
     """Benchmark B-style access through one selected Corral nested-tar view."""
     if not _is_production_inner_tar_name(inner_name):
@@ -597,8 +633,9 @@ def _strategy_b_corral(outer_path: Path, inner_name: str) -> CorralRunResult:
         inner_stats = IOStats()
         counted_inner = CountingInnerView(inner_stream, inner_stats)
         try:
-            inner = tarfile.open(fileobj=counted_inner, mode="r:")
-            inner_stats.archive_opens += 1
+            with counted_outer.phase("corral-inner"):
+                inner = tarfile.open(fileobj=counted_inner, mode="r:")
+                inner_stats.archive_opens += 1
         except Exception:
             inner_stream.close()
             raise
@@ -609,7 +646,32 @@ def _strategy_b_corral(outer_path: Path, inner_name: str) -> CorralRunResult:
         inner_traversal_started = time.perf_counter()
         try:
             inner_stats.member_list_scan_passes += 1
-            for member in inner:
+            header_bytes_per_member: list[int] = []
+            pending_fits_payload_skip = False
+            while True:
+                # In seekable tarfile mode, TarFile.next() seeks from the
+                # current header position to the next member header.  Since
+                # the current FITS payload remains unread, this is the
+                # physical payload skip required by nested Strategy B.
+                logical_payload_skip = (
+                    pending_fits_payload_skip and inner.offset != counted_inner.tell()
+                )
+                phase = (
+                    "corral-inner-fits-next"
+                    if pending_fits_payload_skip
+                    else "corral-inner-next"
+                )
+                inner_stats._phase = phase
+                try:
+                    with counted_outer.phase(phase):
+                        member = inner.next()
+                finally:
+                    inner_stats._phase = "other"
+                if logical_payload_skip:
+                    inner_stats.payload_skip_seek_calls += 1
+                pending_fits_payload_skip = False
+                if member is None:
+                    break
                 inner_stats.member_scans += 1
                 if not _is_relevant_member(member):
                     continue
@@ -621,13 +683,17 @@ def _strategy_b_corral(outer_path: Path, inner_name: str) -> CorralRunResult:
                         f"the expected offset for {record.name}: current={current}, "
                         f"offset_data={record.offset_data}"
                     )
-                header_file = StreamHeaderFile(counted_inner, inner_stats)
-                snapshot, header_bytes = _read_primary_header(header_file, record)
-                _discard_stream_member_payload(
-                    counted_inner, record, header_bytes, inner_stats,
-                )
+                inner_stats._phase = "corral-inner-header"
+                try:
+                    with counted_outer.phase("corral-inner"):
+                        header_file = StreamHeaderFile(counted_inner, inner_stats)
+                        snapshot, header_bytes = _read_primary_header(header_file, record)
+                finally:
+                    inner_stats._phase = "other"
                 records.append(record)
                 headers.append(snapshot)
+                header_bytes_per_member.append(header_bytes)
+                pending_fits_payload_skip = True
         finally:
             inner.close()
             inner_stream.close()
@@ -637,6 +703,18 @@ def _strategy_b_corral(outer_path: Path, inner_name: str) -> CorralRunResult:
         outer_inner_forward_seeks = outer_stats.forward_seek_calls - outer_location_forward_seeks
         outer_inner_backward_seeks = outer_stats.backward_seek_calls - outer_location_backward_seeks
         outer_inner_bytes_read = outer_stats.archive_bytes_read - outer_location_bytes_read
+        inner_base = int(nested_info.offset_data)
+        header_intervals = [
+            (inner_base + record.offset_data, inner_base + record.offset_data + header_bytes)
+            for record, header_bytes in zip(records, header_bytes_per_member)
+        ]
+        payload_intervals = [
+            (
+                inner_base + record.offset_data + header_bytes,
+                inner_base + record.offset_data + record.size,
+            )
+            for record, header_bytes in zip(records, header_bytes_per_member)
+        ]
         return CorralRunResult(
             outer_path=outer_path,
             inner_name=inner_name,
@@ -659,6 +737,13 @@ def _strategy_b_corral(outer_path: Path, inner_name: str) -> CorralRunResult:
             outer_inner_forward_seeks=outer_inner_forward_seeks,
             outer_inner_backward_seeks=outer_inner_backward_seeks,
             outer_inner_bytes_read=outer_inner_bytes_read,
+            header_bytes_per_member=header_bytes_per_member,
+            outer_inner_header_bytes_read=_sum_read_overlap(
+                outer_stats.corral_read_ranges, header_intervals,
+            ),
+            outer_inner_payload_bytes_read=_sum_read_overlap(
+                outer_stats.corral_read_ranges, payload_intervals,
+            ),
         )
     finally:
         outer.close()
@@ -786,9 +871,14 @@ def _print_corral_report(result: CorralRunResult) -> None:
     print(f"  relevant FITS members:        {len(result.records)}")
     print(f"  FITS headers parsed:           {inner.header_reads}")
     print(f"  FITS header bytes parsed:      {inner.header_bytes:,}")
+    print(f"  FITS header bytes physically read from outer: "
+          f"{result.outer_inner_header_bytes_read:,}")
+    print(f"  FITS image/payload bytes physically read from outer: "
+          f"{result.outer_inner_payload_bytes_read:,}")
     print(f"  logical inner bytes read:      {inner.archive_bytes_read:,}")
-    print(f"  payload bytes discarded:       {inner.payload_bytes_discarded:,}")
+    print(f"  payload bytes read/discarded by benchmark: {inner.payload_bytes_discarded:,}")
     print(f"  inner seek calls:              {inner.seek_calls}")
+    print(f"    inner payload-skip seeks:    {inner.payload_skip_seek_calls}")
     print(f"    forward seeks:               {inner.forward_seek_calls}")
     print(f"    backward seeks:              {inner.backward_seek_calls}")
     print("    direct header seeks:         0")
@@ -796,6 +886,10 @@ def _print_corral_report(result: CorralRunResult) -> None:
     print("Outer physical access while reading inner tar")
     print(f"  bytes read:                    {result.outer_inner_bytes_read:,}")
     print(f"  seek calls:                    {result.outer_inner_seek_calls}")
+    print("  physical seeks during inner.next (payload skip + next metadata): "
+          f"{outer.corral_outer_next_seek_calls}")
+    print("  physical seeks during FITS payload-skip inner.next: "
+          f"{outer.corral_outer_fits_next_seek_calls}")
     print(f"    forward seeks:               {result.outer_inner_forward_seeks}")
     print(f"    backward seeks:              {result.outer_inner_backward_seeks}")
     print("  inner seek mechanism:          outer-file seeks through ExFileObject/_FileInFile")
@@ -805,6 +899,7 @@ def _print_corral_report(result: CorralRunResult) -> None:
     print("  production FITS members:       PASS")
     print("  primary-header parsing:        PASS")
     print("  FITS image arrays loaded:      NO")
+    print("  FITS payload remainder read/discarded by benchmark: NO")
     print("  unrelated inner tars opened:   0")
     print()
     print(f"Total time: {result.total_seconds:.6f} s")
