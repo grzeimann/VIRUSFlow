@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
+import tarfile
 
+import numpy as np
 import pytest
+from astropy.io import fits
 
 import scripts.benchmark_tar_header_access as benchmark
 
@@ -17,6 +21,8 @@ def _result(strategy: str, total: float) -> benchmark.RunResult:
         member_list_scan_passes=1,
         header_reads=1,
         header_bytes=2880,
+        archive_bytes_read=4096 if strategy == "C" else 0,
+        payload_bytes_discarded=1024 if strategy == "C" else 0,
     )
     return benchmark.RunResult(
         strategy=strategy,
@@ -26,6 +32,7 @@ def _result(strategy: str, total: float) -> benchmark.RunResult:
         records=[record],
         headers=headers,
         stats=stats,
+        logical_stream_bytes=4096 if strategy == "C" else None,
     )
 
 
@@ -40,8 +47,13 @@ def _patch_strategies(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         calls.append("B")
         return _result("B", 4.0)
 
+    def run_c(path: Path) -> benchmark.RunResult:
+        calls.append("C")
+        return _result("C", 5.0)
+
     monkeypatch.setattr(benchmark, "_strategy_a", run_a)
     monkeypatch.setattr(benchmark, "_strategy_b", run_b)
+    monkeypatch.setattr(benchmark, "_strategy_c", run_c)
     return calls
 
 
@@ -49,6 +61,37 @@ def _tar_path(tmp_path: Path, name: str = "virus0000001.tar") -> Path:
     path = tmp_path / name
     path.write_bytes(b"test")
     return path
+
+
+def _build_small_fits_tar(tmp_path: Path) -> tuple[Path, bytes]:
+    hdu = fits.PrimaryHDU(data=np.arange(16, dtype=np.int16).reshape(4, 4))
+    hdu.header["DATE"] = "2026-08-21T00:00:00"
+    hdu.header["EXPTIME"] = 12.5
+    hdu.header["PEXPTIME"] = 13.5
+    hdu.header["QPROG"] = "fixture-program"
+    hdu.header["OBJECT"] = "fixture-object"
+    hdu.header["QOBJECT"] = "fixture-qobject"
+    hdu.header["IFUSLOT"] = 13
+    hdu.header["IFUID"] = "043"
+    hdu.header["SPECID"] = 412
+    hdu.header["CONTID"] = "S/N 0021"
+    hdu.header["AMPNAME"] = "LR"
+    hdu.header["CCDPOS"] = "L"
+    hdu.header["CCDHALF"] = "R"
+    fits_bytes = io.BytesIO()
+    hdu.writeto(fits_bytes)
+
+    tar_path = tmp_path / "virus0000001.tar"
+    member_name = "nested/" + ("long-name-" * 12) + ".fits"
+    info = tarfile.TarInfo(member_name)
+    info.size = len(fits_bytes.getvalue())
+    with tarfile.open(tar_path, "w", format=tarfile.PAX_FORMAT) as archive:
+        note = tarfile.TarInfo("notes.txt")
+        note_bytes = b"non-FITS member\n"
+        note.size = len(note_bytes)
+        archive.addfile(note, io.BytesIO(note_bytes))
+        archive.addfile(info, io.BytesIO(fits_bytes.getvalue()))
+    return tar_path, fits_bytes.getvalue()
 
 
 def test_strategy_a_runs_a_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
@@ -75,6 +118,52 @@ def test_strategy_b_runs_b_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     assert "Strategy B: ordered acquisition" in output
     assert "B/A ratio" not in output
     assert "speedup" not in output
+
+
+def test_strategy_c_runs_c_only(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys):
+    calls = _patch_strategies(monkeypatch)
+
+    assert benchmark.main(["--strategy", "C", str(_tar_path(tmp_path))]) == 0
+
+    output = capsys.readouterr().out
+    assert calls == ["C"]
+    assert "Execution mode: Strategy C only" in output
+    assert "Strategy C: sequential stream" in output
+    assert "speedup" not in output
+    assert "B/A ratio" not in output
+    assert "C/B ratio" not in output
+
+
+def test_strategy_c_matches_a_on_small_pax_tar_and_discards_payload(tmp_path: Path):
+    tar_path, fits_bytes = _build_small_fits_tar(tmp_path)
+
+    c = benchmark._strategy_c(tar_path)
+    a = benchmark._strategy_a(tar_path)
+
+    assert c.records == a.records
+    assert c.headers == a.headers
+    assert len(c.records) == 1
+    assert c.stats.header_reads == 1
+    assert c.stats.header_bytes < len(fits_bytes)
+    assert c.stats.payload_bytes_discarded == len(fits_bytes) - c.stats.header_bytes
+    assert c.stats.archive_opens == 1
+    assert c.stats.seek_calls == 0
+    assert c.stats.backward_seek_calls == 0
+    assert c.stats.stream_forward_seek_calls >= 1
+    assert c.stats.archive_bytes_read == tar_path.stat().st_size
+
+
+def test_strategy_c_does_not_open_fits_image_data(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    tar_path, _ = _build_small_fits_tar(tmp_path)
+
+    def fail_if_image_api_is_used(*args, **kwargs):
+        raise AssertionError("Strategy C must not open FITS image HDUs")
+
+    monkeypatch.setattr(benchmark.fits, "open", fail_if_image_api_is_used)
+    result = benchmark._strategy_c(tar_path)
+
+    assert result.stats.header_reads == 1
+    assert result.stats.payload_bytes_discarded > 0
 
 
 def test_strategy_and_order_are_mutually_exclusive(tmp_path: Path):
@@ -110,18 +199,23 @@ def test_default_two_strategy_order_remains_a_b(monkeypatch, tmp_path, capsys):
     assert "Execution order for each tar: A-B" in output
 
 
+@pytest.mark.parametrize("strategy", ["A", "C"])
 def test_single_strategy_aggregate_has_no_comparison_fields(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys,
+    strategy: str,
 ):
     calls = _patch_strategies(monkeypatch)
     paths = [_tar_path(tmp_path, "virus0000001.tar"), _tar_path(tmp_path, "virus0000002.tar")]
 
-    assert benchmark.main(["--strategy", "A", *(str(path) for path in paths)]) == 0
+    assert benchmark.main([
+        "--strategy", strategy, *(str(path) for path in paths)
+    ]) == 0
 
     output = capsys.readouterr().out
-    assert calls == ["A", "A"]
+    assert calls == [strategy, strategy]
     assert "Aggregate" in output
-    assert "Strategy A total:" in output
+    assert f"Strategy {strategy} total:" in output
+    assert "Strategy A total:" not in output or strategy == "A"
     assert "Strategy B total:" not in output
     assert "B/A ratio" not in output
     assert "speedup" not in output

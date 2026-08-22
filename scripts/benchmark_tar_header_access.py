@@ -17,6 +17,12 @@ file object positioned at that member's ``offset_data``.  The benchmark reads
 the primary FITS header directly from that existing file object, then lets the
 next ``TarFile.next()`` call skip the unconsumed FITS payload.
 
+Strategy C opens an ordinary tar with ``mode="r|"``.  It reads the primary
+header from the current stream position, consumes the rest of each FITS
+member in bounded chunks, and continues to EOF.  In stream mode tarfile's
+forward ``seek()`` operation is implemented by reads, so it does not issue
+filesystem seeks.
+
 The benchmark deliberately does not use ``TarFile.extractfile()``.  That API
 uses a _FileInFile wrapper whose reads seek to the member offset, which would
 add an explicit seek for every header and obscure the physical comparison.
@@ -82,8 +88,12 @@ class IOStats:
     traversal_seek_calls: int = 0
     header_seek_calls: int = 0
     backward_seek_calls: int = 0
+    forward_seek_calls: int = 0
+    stream_forward_seek_calls: int = 0
     header_reads: int = 0
     header_bytes: int = 0
+    archive_bytes_read: int = 0
+    payload_bytes_discarded: int = 0
     _phase: str = field(default="other", repr=False)
     _header_bytes_current: int = field(default=0, repr=False)
 
@@ -128,6 +138,7 @@ class CountingFile:
                     "refusing to risk reading an image payload"
                 )
         data = self._raw.read(size)
+        self._stats.archive_bytes_read += len(data)
         if self._stats._phase in {"a-header", "b-header"}:
             self._stats._header_bytes_current += len(data)
         return data
@@ -138,6 +149,8 @@ class CountingFile:
         result = self._raw.seek(offset, whence)
         if result < before:
             self._stats.backward_seek_calls += 1
+        elif result > before:
+            self._stats.forward_seek_calls += 1
         if self._stats._phase in {"a-discovery", "b-traversal"}:
             self._stats.traversal_seek_calls += 1
         elif self._stats._phase in {"a-header", "b-header"}:
@@ -151,6 +164,51 @@ class CountingFile:
         return getattr(self._raw, name)
 
 
+class StreamHeaderFile:
+    """Header-only view over tarfile's current non-seekable stream position."""
+
+    binary = True
+
+    def __init__(self, stream: Any, stats: IOStats):
+        self._stream = stream
+        self._stats = stats
+
+    def begin_header(self) -> None:
+        self._stats._header_bytes_current = 0
+
+    def end_header(self, start: int, end: int) -> int:
+        consumed = end - start
+        if consumed <= 0:
+            raise BenchmarkError("primary FITS header read consumed no bytes")
+        if consumed > MAX_PRIMARY_HEADER_BYTES:
+            raise BenchmarkError(
+                "primary FITS header read exceeded the 1 MiB safety limit; "
+                "refusing to risk reading an image payload"
+            )
+        self._stats.header_bytes += consumed
+        self._stats.header_reads += 1
+        return consumed
+
+    def read(self, size: int = -1) -> bytes:
+        if size >= 0 and self._stats._header_bytes_current + size > MAX_PRIMARY_HEADER_BYTES:
+            raise BenchmarkError(
+                "primary FITS header read exceeded the 1 MiB safety limit; "
+                "refusing to risk reading an image payload"
+            )
+        data = self._stream.read(size)
+        self._stats._header_bytes_current += len(data)
+        return data
+
+    def seek(self, *args: Any, **kwargs: Any) -> int:
+        raise BenchmarkError("FITS header parsing attempted a seek in Strategy C")
+
+    def tell(self) -> int:
+        return self._stream.tell()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stream, name)
+
+
 @dataclass
 class RunResult:
     strategy: str
@@ -160,6 +218,7 @@ class RunResult:
     records: list[MemberRecord]
     headers: list[dict[str, Any]]
     stats: IOStats
+    logical_stream_bytes: Optional[int] = None
 
 
 def _human_bytes(value: int) -> str:
@@ -213,7 +272,7 @@ def _header_snapshot(header: fits.Header) -> dict[str, Any]:
     }
 
 
-def _read_primary_header(fileobj: CountingFile, member: MemberRecord) -> tuple[dict[str, Any], int]:
+def _read_primary_header(fileobj: Any, member: MemberRecord) -> tuple[dict[str, Any], int]:
     start = fileobj.tell()
     fileobj.begin_header()
     header = fits.Header.fromfile(
@@ -329,6 +388,102 @@ def _strategy_b(path: Path) -> RunResult:
     )
 
 
+def _instrument_stream_seek(stream: Any, stats: IOStats) -> None:
+    """Count tarfile's logical forward seeks; _Stream implements them as reads."""
+    original_seek = stream.seek
+
+    def counted_seek(position: int = 0) -> int:
+        before = stream.tell()
+        result = original_seek(position)
+        after = stream.tell()
+        if after < before:
+            raise BenchmarkError("Strategy C performed a backwards stream seek")
+        if after > before:
+            stats.stream_forward_seek_calls += 1
+        return result
+
+    stream.seek = counted_seek
+
+
+def _discard_stream_member_payload(stream: Any, member: MemberRecord, header_bytes: int, stats: IOStats) -> None:
+    remaining = member.size - header_bytes
+    if remaining < 0:
+        raise BenchmarkError(
+            f"primary header exceeds FITS member size for {member.name}: "
+            f"header={header_bytes}, member={member.size}"
+        )
+    while remaining:
+        chunk = stream.read(min(1024 * 1024, remaining))
+        if not chunk:
+            raise BenchmarkError(
+                f"unexpected EOF while consuming FITS member payload: {member.name}"
+            )
+        remaining -= len(chunk)
+        stats.payload_bytes_discarded += len(chunk)
+
+
+def _strategy_c(path: Path) -> RunResult:
+    """Read an ordinary tar as a true sequential byte stream."""
+    stats = IOStats()
+    started = time.perf_counter()
+    raw = open(path, "rb", buffering=0)
+    counted = CountingFile(raw, stats)
+    try:
+        archive = tarfile.open(
+            fileobj=counted,
+            mode="r|",
+            bufsize=tarfile.RECORDSIZE,
+        )
+        stats.archive_opens += 1
+    except Exception:
+        raw.close()
+        raise
+
+    records: list[MemberRecord] = []
+    headers: list[dict[str, Any]] = []
+    logical_stream_bytes: Optional[int] = None
+    try:
+        _instrument_stream_seek(archive.fileobj, stats)
+        stats.member_list_scan_passes += 1
+        while True:
+            member = archive.next()
+            if member is None:
+                break
+            stats.member_scans += 1
+            if not _is_relevant_member(member):
+                continue
+            record = _record(member)
+            current = archive.fileobj.tell()
+            if current != record.offset_data:
+                raise BenchmarkError(
+                    "Strategy C did not encounter the member payload at the "
+                    f"expected stream offset for {record.name}: current={current}, "
+                    f"offset_data={record.offset_data}"
+                )
+            header_file = StreamHeaderFile(archive.fileobj, stats)
+            snapshot, header_bytes = _read_primary_header(header_file, record)
+            _discard_stream_member_payload(
+                archive.fileobj, record, header_bytes, stats,
+            )
+            records.append(record)
+            headers.append(snapshot)
+        logical_stream_bytes = archive.fileobj.tell()
+    finally:
+        archive.close()
+        raw.close()
+
+    return RunResult(
+        strategy="C",
+        total_seconds=time.perf_counter() - started,
+        discovery_seconds=None,
+        header_seconds=None,
+        records=records,
+        headers=headers,
+        stats=stats,
+        logical_stream_bytes=logical_stream_bytes,
+    )
+
+
 def _compare_results(a: RunResult, b: RunResult) -> None:
     if a.records != b.records:
         for index, (a_record, b_record) in enumerate(zip(a.records, b.records)):
@@ -385,6 +540,43 @@ def _print_header_samples(
             if header[card] is not None
         )
         print(f"      {record.name}: {values or '(no representative cards present)'}")
+
+
+def _print_strategy_c_stats(path: Path, result: RunResult) -> None:
+    size = path.stat().st_size
+    bytes_read = result.stats.archive_bytes_read
+    fraction = bytes_read / size if size else float("nan")
+    throughput = (
+        bytes_read / (1024 * 1024) / result.total_seconds
+        if result.total_seconds
+        else float("nan")
+    )
+    print("Strategy C: sequential stream")
+    print("  total:")
+    print(f"      wall time:       {result.total_seconds:.6f} s")
+    print(f"      archive opens:             {result.stats.archive_opens}")
+    print("      header file opens:         0")
+    print(f"      total underlying opens:    {result.stats.archive_opens}")
+    print(f"      member-list scan passes:   {result.stats.member_list_scan_passes}")
+    print(f"      members examined:          {result.stats.member_scans}")
+    print("      hidden getmember scans:    0")
+    print(f"      relevant FITS members:     {len(result.records)}")
+    print(f"      FITS headers parsed:        {result.stats.header_reads}")
+    print(f"      FITS header bytes parsed:   {result.stats.header_bytes:,}")
+    print(f"      payload bytes discarded:   {result.stats.payload_bytes_discarded:,}")
+    print(f"      total archive bytes read:   {bytes_read:,}")
+    print(f"      logical stream bytes:       {result.logical_stream_bytes}")
+    print(f"      archive size:               {size:,}")
+    print(f"      fraction physically read:  {fraction:.6f}")
+    print(f"      effective throughput:       {throughput:.3f} MiB/s")
+    print(f"      filesystem seek calls:      {result.stats.seek_calls}")
+    print(f"        forward seeks:            {result.stats.forward_seek_calls}")
+    print(f"        backward seeks:           {result.stats.backward_seek_calls}")
+    print("        direct header seeks:      0")
+    print(
+        "      tarfile logical forward seeks (implemented by reads): "
+        f"{result.stats.stream_forward_seek_calls}"
+    )
 
 
 def _print_report(path: Path, a: RunResult, b: RunResult) -> None:
@@ -460,13 +652,18 @@ def _print_single_report(path: Path, result: RunResult) -> None:
         print(f"      wall time:       {result.discovery_seconds:.6f} s")
         print("  header phase:")
         print(f"      wall time:       {result.header_seconds:.6f} s")
-    else:
+        print("  total:")
+        print(f"      wall time:       {result.total_seconds:.6f} s")
+        _print_stats(result.stats)
+    elif result.strategy == "B":
         print("Strategy B: ordered acquisition")
         print("  traversal + headers:")
         print(f"      wall time:       {result.total_seconds:.6f} s")
-    print("  total:")
-    print(f"      wall time:       {result.total_seconds:.6f} s")
-    _print_stats(result.stats)
+        print("  total:")
+        print(f"      wall time:       {result.total_seconds:.6f} s")
+        _print_stats(result.stats)
+    else:
+        _print_strategy_c_stats(path, result)
     print()
     print("Validation:")
     print("  selected-strategy member/header work: PASS")
@@ -500,7 +697,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     mode.add_argument(
         "--strategy",
-        choices=("A", "B"),
+        choices=("A", "B", "C"),
         help="run only the selected strategy for each tar",
     )
     parser.add_argument("tar_paths", nargs="+", type=Path, metavar="TAR")
@@ -538,6 +735,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     print("  B uses neither extractfile() nor getmember(), and does not read image payloads.")
     print("  B therefore removes the later independent header seeks, but traversal")
     print("  can still issue seeks to skip each unconsumed member payload.")
+    print("  Strategy C uses tarfile r|, reads headers at the current stream position,")
+    print("  and consumes/discards each remaining FITS member payload sequentially.")
+    print("  C uses one unbuffered archive source and does not issue filesystem seeks.")
     print()
 
     results: list[tuple[RunResult, RunResult]] = []
@@ -551,6 +751,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 continue
             elif args.strategy == "B":
                 selected = _strategy_b(path)
+                _print_single_report(path, selected)
+                single_results.append(selected)
+                continue
+            elif args.strategy == "C":
+                selected = _strategy_c(path)
                 _print_single_report(path, selected)
                 single_results.append(selected)
                 continue
