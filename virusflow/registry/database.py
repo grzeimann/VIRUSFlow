@@ -1029,7 +1029,7 @@ def upsert_amplifier(conn: sqlite3.Connection, z: ZipCode) -> None:
     )
 
 
-def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str = DEFAULT_RAW_DB_PATH, tar_member: Optional[str] = None, outer_tar_member: Optional[str] = None, conn: Optional[sqlite3.Connection] = None) -> Optional[RawFileId]:
+def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str = DEFAULT_RAW_DB_PATH, tar_member: Optional[str] = None, outer_tar_member: Optional[str] = None, conn: Optional[sqlite3.Connection] = None, primary_header: Optional[fits.Header] = None) -> Optional[RawFileId]:
     """Register a raw FITS file in the DB unless it belongs to a test observation.
 
     Supports files inside tar archives by passing tar_member (member path inside the tar).
@@ -1050,6 +1050,8 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
     exposure_id, ft, amp_token = _parse_filename_meta(parse_target)
     frame_type = frame_type or ft
 
+    # A recognized production tar traversal may already have acquired the primary
+    # header.  Otherwise retain the existing indexed/direct/fallback readers.
     # For plain (non-nested) tar members, reuse the byte offset already indexed by
     # ensure_tar_index() to read the header directly in one seek, instead of the O(n)
     # tarfile.getmember() scan (repeated once per file, this made scanning an exposure's
@@ -1057,14 +1059,14 @@ def register_raw_file(path: str, frame_type: Optional[str] = None, db_path: str 
     # The same applies to the Corral date-tar backend (a tar of nested VIRUS tars):
     # ensure_date_tar_index() pre-computes each nested tar's member offsets as absolute
     # positions within the date-tar file, so the same offset-based header reader works.
-    shared_header = None
-    if tar_member and not outer_tar_member:
+    shared_header = primary_header
+    if shared_header is None and tar_member and not outer_tar_member:
         tar_path_abs = os.path.abspath(path)
         tar_offset = _lookup_tar_member_offset(tar_path_abs, tar_member, conn=conn, db_path=db_path)
         if tar_offset is not None:
             with _scan_profile_phase("fits_metadata_seconds"):
                 shared_header = _read_header_via_tar_offset(path, tar_offset)
-    elif tar_member and outer_tar_member:
+    elif shared_header is None and tar_member and outer_tar_member:
         date_tar_path_abs = os.path.abspath(path)
         date_tar_offset = _lookup_date_tar_member_offset(
             date_tar_path_abs, outer_tar_member, tar_member, conn=conn, db_path=db_path

@@ -77,6 +77,7 @@ def _scan(data_root: Path, raw_database: Path) -> int:
             raw_id = db.register_raw_file(
                 str(source.path), db_path=str(raw_database), tar_member=source.tar_member,
                 outer_tar_member=source.outer_tar_member, conn=connection,
+                primary_header=source.primary_header,
             )
             count += int(raw_id is not None)
     return count

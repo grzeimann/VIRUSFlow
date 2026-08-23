@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import shutil
 import tarfile
 from pathlib import Path
 
@@ -139,7 +140,9 @@ def test_bounded_scan_prunes_corral_date_tars_and_nonvirus_nested_archives(
 
     opened = []
     inner_opens = []
+    extracted = []
     original_open = tarfile.open
+    original_extractfile = tarfile.TarFile.extractfile
 
     def recording_open(name=None, *args, **kwargs):
         if isinstance(name, (str, Path)):
@@ -148,7 +151,12 @@ def test_bounded_scan_prunes_corral_date_tars_and_nonvirus_nested_archives(
             inner_opens.append(name)
         return original_open(name, *args, **kwargs)
 
+    def recording_extractfile(self, member, *args, **kwargs):
+        extracted.append(member.name)
+        return original_extractfile(self, member, *args, **kwargs)
+
     monkeypatch.setattr("virusflow.storage.filesystem.tarfile.open", recording_open)
+    monkeypatch.setattr("virusflow.storage.filesystem.tarfile.TarFile.extractfile", recording_extractfile)
     sources = list(FileSystemStorage(root).iter_raw_sources(
         first_night="20260501", last_night="20260502",
     ))
@@ -157,6 +165,7 @@ def test_bounded_scan_prunes_corral_date_tars_and_nonvirus_nested_archives(
     assert {source.outer_tar_member for source in sources} == {"virus/virus0000001.tar"}
     assert "20260503.tar" not in opened
     assert "acm0000001.tar" not in opened
+    assert all("virus0008100.tar" not in name for name in extracted)
     assert len(inner_opens) == 2
 
 
@@ -459,6 +468,31 @@ def _register_production_tar(tar_path: Path, raw_db: Path, *, indexed: bool, pro
     return sources
 
 
+def _source_identity_signature(source):
+    return (source.path.name, source.tar_member, source.backend, source.outer_tar_member)
+
+
+def _raw_identity_signature(raw_id):
+    zipcode = raw_id.zipcode.as_tuple() if raw_id.zipcode is not None else None
+    return (
+        raw_id.exposure_id, raw_id.frame_type, raw_id.tar_member,
+        raw_id.storage_backend, raw_id.outer_tar_member, zipcode,
+    )
+
+
+def _register_sources(sources, raw_db: Path, *, carry_headers: bool):
+    db.init_raw_db(str(raw_db))
+    db._IFUSLOT_META_CACHE.clear()
+    db._POPULATED_EXPOSURE_DETAILS.clear()
+    with db.connect(str(raw_db)) as conn:
+        for source in sources:
+            db.register_raw_file(
+                str(source.path), db_path=str(raw_db), tar_member=source.tar_member,
+                outer_tar_member=source.outer_tar_member, conn=conn,
+                primary_header=source.primary_header if carry_headers else None,
+            )
+
+
 def test_indexed_tar_header_metadata_matches_fallback_without_member_scans(tmp_path: Path):
     tar_path = _build_production_tar(tmp_path)
     unindexed_db = tmp_path / "unindexed.sqlite3"
@@ -483,6 +517,125 @@ def test_indexed_tar_header_metadata_matches_fallback_without_member_scans(tmp_p
     assert bucket.get("header_tar_opens_count", 0) == 0
     assert bucket.get("header_tar_member_scans_count", 0) == 0
     assert bucket.get("header_file_opens_count", 0) == len(sources)
+
+
+def test_recognized_work_tar_strategy_b_matches_fallback_registration(
+    tmp_path: Path, monkeypatch, capsys,
+):
+    fixture_root = tmp_path / "fixture"
+    fixture_root.mkdir()
+    fallback_tar = _build_production_tar(fixture_root)
+    work_root = tmp_path / "work"
+    optimized_tar = work_root / "20260501" / "virus" / "virus0000001.tar"
+    optimized_tar.parent.mkdir(parents=True)
+    shutil.copyfile(fallback_tar, optimized_tar)
+
+    fallback_sources = list(FileSystemStorage(fallback_tar.parent).iter_raw_sources())
+    optimized_sources = list(FileSystemStorage(work_root).iter_raw_sources(
+        first_night="20260501", last_night="20260501",
+    ))
+    assert [
+        _source_identity_signature(source) for source in optimized_sources
+    ] == [
+        _source_identity_signature(source) for source in fallback_sources
+    ]
+    assert all(source.primary_header is not None for source in optimized_sources)
+
+    def fail_image_open(*args, **kwargs):
+        raise AssertionError("optimized traversal must not open FITS image arrays")
+
+    profile = {"active": {}}
+    optimized_db = tmp_path / "optimized.sqlite3"
+    with monkeypatch.context() as patch:
+        patch.setattr("virusflow.storage.filesystem.fits.open", fail_image_open)
+        with db.scan_profile(profile):
+            _register_sources(optimized_sources, optimized_db, carry_headers=True)
+    optimized_bucket = profile["active"]
+    assert optimized_bucket.get("header_file_opens_count", 0) == 0
+    assert optimized_bucket.get("header_seeks_count", 0) == 0
+    assert optimized_bucket.get("header_tar_opens_count", 0) == 0
+
+    fallback_db = tmp_path / "fallback.sqlite3"
+    _register_sources(fallback_sources, fallback_db, carry_headers=False)
+    assert [
+        _raw_identity_signature(raw_id)
+        for raw_id in db.list_raw_files(db_path=str(optimized_db))
+    ] == [
+        _raw_identity_signature(raw_id)
+        for raw_id in db.list_raw_files(db_path=str(fallback_db))
+    ]
+    optimized_metadata = db.get_exposure_metadata(
+        "20260501T010000.0", db_path=str(optimized_db),
+    )
+    fallback_metadata = db.get_exposure_metadata(
+        "20260501T010000.0", db_path=str(fallback_db),
+    )
+    assert optimized_metadata is not None and fallback_metadata is not None
+    assert {k: v for k, v in optimized_metadata.items() if k != "tar_path"} == {
+        k: v for k, v in fallback_metadata.items() if k != "tar_path"
+    }
+
+    cli_db = tmp_path / "cli.sqlite3"
+    args = build_parser().parse_args([
+        "scan", "--raw-db", str(cli_db), "--profile-tars", str(work_root),
+        "--first-night", "20260501", "--last-night", "20260501",
+    ])
+    args.func(args)
+    output = capsys.readouterr().out
+    assert "ordered FITS header acquisition for 2 sources" in output
+    assert "header file opens=0; seeks=0" in output
+
+
+def test_recognized_corral_strategy_b_matches_fallback_registration(
+    tmp_path: Path, monkeypatch,
+):
+    optimized_root = _build_date_tar(tmp_path / "corral", amp_names=["LL", "LU"], ifuslot="074")
+    def fail_image_open(*args, **kwargs):
+        raise AssertionError("optimized traversal must not open FITS image arrays")
+
+    with monkeypatch.context() as patch:
+        patch.setattr("virusflow.storage.filesystem.fits.open", fail_image_open)
+        optimized_sources = list(FileSystemStorage(optimized_root).iter_raw_sources(
+            first_night="20260501", last_night="20260501",
+        ))
+    date_tar = optimized_root / "20260501.tar"
+    with tarfile.open(date_tar, mode="r") as outer:
+        fallback_sources = list(FileSystemStorage._fits_in_tar(
+            date_tar, outer.getmembers(), virus_only=True, skip_test_archives=True,
+        ))
+    assert [
+        _source_identity_signature(source) for source in optimized_sources
+    ] == [
+        _source_identity_signature(source) for source in fallback_sources
+    ]
+    assert all(source.primary_header is not None for source in optimized_sources)
+
+    optimized_db = tmp_path / "corral_optimized.sqlite3"
+    fallback_db = tmp_path / "corral_fallback.sqlite3"
+    profile = {"active": {}}
+    with db.scan_profile(profile):
+        _register_sources(optimized_sources, optimized_db, carry_headers=True)
+    assert profile["active"].get("header_file_opens_count", 0) == 0
+    assert profile["active"].get("header_seeks_count", 0) == 0
+    assert profile["active"].get("header_tar_opens_count", 0) == 0
+    _register_sources(fallback_sources, fallback_db, carry_headers=False)
+    assert [
+        _raw_identity_signature(raw_id)
+        for raw_id in db.list_raw_files(db_path=str(optimized_db))
+    ] == [
+        _raw_identity_signature(raw_id)
+        for raw_id in db.list_raw_files(db_path=str(fallback_db))
+    ]
+    optimized_metadata = db.get_exposure_metadata(
+        "20260501T010000.0", db_path=str(optimized_db),
+    )
+    fallback_metadata = db.get_exposure_metadata(
+        "20260501T010000.0", db_path=str(fallback_db),
+    )
+    assert optimized_metadata is not None and fallback_metadata is not None
+    assert {k: v for k, v in optimized_metadata.items() if k != "tar_path"} == {
+        k: v for k, v in fallback_metadata.items() if k != "tar_path"
+    }
 
 
 def test_date_tar_offset_index_matches_unindexed_metadata(tmp_path: Path):

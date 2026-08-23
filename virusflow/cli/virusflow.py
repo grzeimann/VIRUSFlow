@@ -66,6 +66,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
             "source_count": 0,
             "registered": 0,
             "discovery_seconds": 0.0,
+            "ordered_header_sources": 0,
             "index_seconds": 0.0,
             "register_seconds": 0.0,
         })
@@ -87,7 +88,9 @@ def cmd_scan(args: argparse.Namespace) -> None:
             flush=True,
         )
         print(
-            f"  discovery/opening={discovery:.3f} s; "
+            f"  discovery/opening={discovery:.3f} s "
+            f"(includes ordered FITS header acquisition for "
+            f"{int(bucket.get('ordered_header_sources', 0))} sources); "
             f"tar-index={indexing:.3f} s "
             f"(SQLite index SQL={bucket.get('sqlite_index_seconds', 0.0):.3f} s); "
             f"FITS/header/metadata={fits_seconds:.3f} s; "
@@ -156,6 +159,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
                 if bucket is not None:
                     bucket["source_count"] += 1
                     bucket["discovery_seconds"] += discovery_seconds
+                    if src.primary_header is not None:
+                        bucket["ordered_header_sources"] += 1
                     profile["active"] = bucket
                 if source_tar is not None:
                     active_tar_sources += 1
@@ -200,6 +205,7 @@ def cmd_scan(args: argparse.Namespace) -> None:
                     rid = db.register_raw_file(
                         str(src.path), db_path=args.raw_db, tar_member=src.tar_member,
                         outer_tar_member=src.outer_tar_member, conn=conn,
+                        primary_header=src.primary_header,
                     )
                 finally:
                     if profile is not None:
