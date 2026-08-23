@@ -19,6 +19,18 @@ class RawSource:
     # Ephemeral evidence acquired while a recognized production tar is being
     # traversed.  Storage owns acquisition; registration owns interpretation.
     primary_header: Optional[fits.Header] = field(default=None, repr=False, compare=False)
+    tar_index_evidence: Optional["TarIndexEvidence"] = field(
+        default=None, repr=False, compare=False,
+    )
+
+
+@dataclass(frozen=True)
+class TarIndexEvidence:
+    """Primitive member-position evidence observed during Strategy-B traversal."""
+
+    member: str
+    offset: int
+    size: int
 
 
 def read_member_bytes(source: RawSource) -> bytes:
@@ -87,6 +99,11 @@ def _iter_strategy_b_tar_sources(tar_path: Path) -> Iterator[RawSource]:
                 tar_member=member.name,
                 backend="tar",
                 primary_header=header,
+                tar_index_evidence=TarIndexEvidence(
+                    member=member.name,
+                    offset=int(member.offset_data),
+                    size=int(member.size),
+                ),
             )
 
 
@@ -104,26 +121,33 @@ def _iter_strategy_b_date_tar_sources(
             if stream is None:
                 continue
             try:
-                try:
-                    with tarfile.open(fileobj=stream, mode="r") as inner:
-                        while True:
-                            member = inner.next()
-                            if member is None:
-                                break
-                            if not member.isfile() or not member.name.endswith(".fits"):
-                                continue
-                            header = _read_primary_header_at_current_position(inner.fileobj)
-                            if header is None:
-                                _skip_failed_header_member(inner, member)
-                            yield RawSource(
-                                path=tar_path,
-                                tar_member=member.name,
-                                backend="date_tar",
-                                outer_tar_member=nested_tar.name,
-                                primary_header=header,
-                            )
-                except (tarfile.TarError, OSError):
-                    continue
+                with tarfile.open(fileobj=stream, mode="r") as inner:
+                    while True:
+                        member = inner.next()
+                        if member is None:
+                            break
+                        if not member.isfile() or not member.name.endswith(".fits"):
+                            continue
+                        header = _read_primary_header_at_current_position(inner.fileobj)
+                        if header is None:
+                            _skip_failed_header_member(inner, member)
+                        yield RawSource(
+                            path=tar_path,
+                            tar_member=member.name,
+                            backend="date_tar",
+                            outer_tar_member=nested_tar.name,
+                            primary_header=header,
+                            tar_index_evidence=TarIndexEvidence(
+                                member=member.name,
+                                # The old date-tar builder seeks the raw
+                                # outer file to nested_tar.offset_data before
+                                # opening the inner tar.  The inner offset is
+                                # relative to that starting position, so the
+                                # stored date-tar coordinate is their sum.
+                                offset=int(nested_tar.offset_data) + int(member.offset_data),
+                                size=int(member.size),
+                            ),
+                        )
             finally:
                 stream.close()
 
@@ -280,12 +304,9 @@ class FileSystemStorage:
                 for tar_path in sorted(p for p in virus_root.rglob("virus*.tar") if p.is_file()):
                     if self._is_test_archive(tar_path):
                         continue
-                    try:
-                        for source in _iter_strategy_b_tar_sources(tar_path):
-                            source_count += 1
-                            yield source
-                    except (tarfile.TarError, OSError):
-                        continue
+                    for source in _iter_strategy_b_tar_sources(tar_path):
+                        source_count += 1
+                        yield source
             finally:
                 print(f"Finished night {night}: {source_count} raw sources", flush=True)
 
@@ -294,13 +315,10 @@ class FileSystemStorage:
             print(f"Scanning night archive {night}: {archive}", flush=True)
             source_count = 0
             try:
-                try:
-                    sources = _iter_strategy_b_date_tar_sources(archive)
-                    for source in sources:
-                        source_count += 1
-                        yield source
-                except (tarfile.TarError, OSError):
-                    continue
+                sources = _iter_strategy_b_date_tar_sources(archive)
+                for source in sources:
+                    source_count += 1
+                    yield source
             finally:
                 print(f"Finished night {night}: {source_count} raw sources", flush=True)
 

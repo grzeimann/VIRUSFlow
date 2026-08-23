@@ -56,6 +56,8 @@ def cmd_scan(args: argparse.Namespace) -> None:
     active_tar_last_completed = 0.0
     active_tar_sources = 0
     active_tar_registered = 0
+    active_index_rows = []
+    active_index_fallback = False
 
     def profile_bucket(source_tar, source_tar_label, source):
         if profile is None or source_tar is None:
@@ -67,6 +69,9 @@ def cmd_scan(args: argparse.Namespace) -> None:
             "registered": 0,
             "discovery_seconds": 0.0,
             "ordered_header_sources": 0,
+            "observed_index_rows": 0,
+            "index_fallback_scans": 0,
+            "index_persistence_failures": 0,
             "index_seconds": 0.0,
             "register_seconds": 0.0,
         })
@@ -92,7 +97,9 @@ def cmd_scan(args: argparse.Namespace) -> None:
             f"(includes ordered FITS header acquisition for "
             f"{int(bucket.get('ordered_header_sources', 0))} sources); "
             f"tar-index={indexing:.3f} s "
-            f"(SQLite index SQL={bucket.get('sqlite_index_seconds', 0.0):.3f} s); "
+            f"(persistence of observed rows={int(bucket.get('observed_index_rows', 0))}; "
+            f"fallback filesystem builds={int(bucket.get('index_fallback_scans', 0))}; "
+            f"SQLite index SQL={bucket.get('sqlite_index_seconds', 0.0):.3f} s); "
             f"FITS/header/metadata={fits_seconds:.3f} s; "
             f"SQLite lookup/write={sqlite_seconds:.3f} s; remaining={remaining:.3f} s",
             flush=True,
@@ -110,8 +117,41 @@ def cmd_scan(args: argparse.Namespace) -> None:
     def finish_tar() -> None:
         nonlocal active_tar, active_tar_label, active_tar_sources
         nonlocal active_tar_registered, active_tar_last_completed
+        nonlocal active_index_rows, active_index_fallback
         if active_tar is None:
             return
+        if active_index_rows and not active_index_fallback:
+            started = time.perf_counter()
+            bucket = profile.get("active") if profile is not None else None
+            if profile is not None:
+                profile["stage"] = "index"
+            try:
+                path = active_tar[1]
+                rows = [
+                    (member, int(offset), int(size))
+                    for member, offset, size in active_index_rows
+                ]
+                if active_tar[0] == "tar":
+                    db.persist_tar_index_from_evidence(path, rows, conn=conn)
+                else:
+                    db.persist_date_tar_index_from_evidence(
+                        path, active_tar[2], rows, conn=conn,
+                    )
+            except Exception as exc:
+                if bucket is not None:
+                    bucket["index_persistence_failures"] += 1
+                print(
+                    f"WARNING: observed tar index was not persisted for "
+                    f"{active_tar_label}: {exc}",
+                    flush=True,
+                )
+            finally:
+                if profile is not None:
+                    profile["stage"] = None
+                if bucket is not None:
+                    bucket["index_seconds"] += time.perf_counter() - started
+        active_index_rows = []
+        active_index_fallback = False
         # The next() call that notices a new tar has already performed its
         # discovery.  Stop the displayed timer at the previous registration so
         # that generator look-ahead is attributed to the next tar.
@@ -164,40 +204,62 @@ def cmd_scan(args: argparse.Namespace) -> None:
                     profile["active"] = bucket
                 if source_tar is not None:
                     active_tar_sources += 1
-                # For tar-backed members, ensure we have a DB tar index built once per tar.
+                # Optimized recognized-layout sources carry the exact index row
+                # evidence observed during their still-open Strategy-B traversal.
+                # Generic sources retain the existing filesystem-scanning fallback.
                 if src.backend == "tar":
                     p = os.path.abspath(str(src.path))
-                    if p not in indexed_tars:
-                        started = time.perf_counter()
-                        if profile is not None:
-                            profile["stage"] = "index"
-                        try:
-                            db.ensure_tar_index(p, conn=conn)
-                        except Exception:
-                            pass
-                        finally:
-                            if profile is not None:
-                                profile["stage"] = None
+                    evidence = src.tar_index_evidence
+                    if evidence is not None:
+                        active_index_rows.append(
+                            (evidence.member, evidence.offset, evidence.size)
+                        )
                         if bucket is not None:
-                            bucket["index_seconds"] += time.perf_counter() - started
-                        indexed_tars.add(p)
+                            bucket["observed_index_rows"] += 1
+                    else:
+                        active_index_fallback = True
+                        if p not in indexed_tars:
+                            started = time.perf_counter()
+                            if profile is not None:
+                                profile["stage"] = "index"
+                            try:
+                                db.ensure_tar_index(p, conn=conn)
+                            except Exception:
+                                pass
+                            finally:
+                                if profile is not None:
+                                    profile["stage"] = None
+                            if bucket is not None:
+                                bucket["index_seconds"] += time.perf_counter() - started
+                                bucket["index_fallback_scans"] += 1
+                            indexed_tars.add(p)
                 elif src.backend == "date_tar":
                     p = os.path.abspath(str(src.path))
                     key = (p, src.outer_tar_member)
-                    if key not in indexed_date_tars:
-                        started = time.perf_counter()
-                        if profile is not None:
-                            profile["stage"] = "index"
-                        try:
-                            db.ensure_date_tar_index(p, src.outer_tar_member, conn=conn)
-                        except Exception:
-                            pass
-                        finally:
-                            if profile is not None:
-                                profile["stage"] = None
+                    evidence = src.tar_index_evidence
+                    if evidence is not None:
+                        active_index_rows.append(
+                            (evidence.member, evidence.offset, evidence.size)
+                        )
                         if bucket is not None:
-                            bucket["index_seconds"] += time.perf_counter() - started
-                        indexed_date_tars.add(key)
+                            bucket["observed_index_rows"] += 1
+                    else:
+                        active_index_fallback = True
+                        if key not in indexed_date_tars:
+                            started = time.perf_counter()
+                            if profile is not None:
+                                profile["stage"] = "index"
+                            try:
+                                db.ensure_date_tar_index(p, src.outer_tar_member, conn=conn)
+                            except Exception:
+                                pass
+                            finally:
+                                if profile is not None:
+                                    profile["stage"] = None
+                            if bucket is not None:
+                                bucket["index_seconds"] += time.perf_counter() - started
+                                bucket["index_fallback_scans"] += 1
+                            indexed_date_tars.add(key)
                 started = time.perf_counter()
                 if profile is not None:
                     profile["stage"] = "register"

@@ -3073,6 +3073,135 @@ def get_exposure_metadata(exposure_id: str, db_path: str = DEFAULT_RAW_DB_PATH) 
     return dict(row) if row is not None else None
 
 
+def _replace_tar_index_rows(
+    conn: sqlite3.Connection, tar_path: str, meta: tuple[float, int],
+    rows: list[tuple[str, str, int, int]],
+) -> None:
+    """Atomically replace one ordinary-tar index, marking it complete last."""
+    conn.execute("SAVEPOINT virusflow_tar_index_replace")
+    try:
+        conn.execute("DELETE FROM tar_members WHERE tar_path=?", (tar_path,))
+        if rows:
+            conn.executemany(
+                "INSERT INTO tar_members(tar_path, member, offset, size) VALUES(?, ?, ?, ?)",
+                rows,
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO tar_files(path, mtime, size, n_members) VALUES(?, ?, ?, ?)",
+            (tar_path, float(meta[0]), int(meta[1]), len(rows)),
+        )
+        conn.execute("RELEASE SAVEPOINT virusflow_tar_index_replace")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT virusflow_tar_index_replace")
+        conn.execute("RELEASE SAVEPOINT virusflow_tar_index_replace")
+        raise
+
+
+def _replace_date_tar_index_rows(
+    conn: sqlite3.Connection, date_tar_path: str, outer_member: str,
+    meta: tuple[float, int], rows: list[tuple[str, str, str, int, int]],
+) -> None:
+    """Atomically replace one nested-tar index, marking it complete last."""
+    conn.execute("SAVEPOINT virusflow_date_tar_index_replace")
+    try:
+        conn.execute(
+            "DELETE FROM date_tar_members WHERE date_tar_path=? AND outer_member=?",
+            (date_tar_path, outer_member),
+        )
+        if rows:
+            conn.executemany(
+                "INSERT INTO date_tar_members(date_tar_path, outer_member, member, offset, size) "
+                "VALUES(?, ?, ?, ?, ?)",
+                rows,
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO date_tar_files(date_tar_path, outer_member, mtime, size, n_members) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (date_tar_path, outer_member, float(meta[0]), int(meta[1]), len(rows)),
+        )
+        conn.execute("RELEASE SAVEPOINT virusflow_date_tar_index_replace")
+    except Exception:
+        conn.execute("ROLLBACK TO SAVEPOINT virusflow_date_tar_index_replace")
+        conn.execute("RELEASE SAVEPOINT virusflow_date_tar_index_replace")
+        raise
+
+
+def persist_tar_index_from_evidence(
+    tar_path: str, rows: Iterable[tuple[str, int, int]],
+    db_path: str = DEFAULT_RAW_DB_PATH, conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """Persist a complete ordinary-tar index from Strategy-B evidence."""
+    import os as _os
+
+    try:
+        st = _os.stat(tar_path)
+    except OSError:
+        return False
+    meta = (st.st_mtime, st.st_size)
+    materialized = [
+        (tar_path, str(member), int(offset), int(size))
+        for member, offset, size in rows
+    ]
+
+    def _persist(c: sqlite3.Connection) -> bool:
+        existing = c.execute(
+            "SELECT mtime, size, n_members FROM tar_files WHERE path=?", (tar_path,)
+        ).fetchone()
+        if existing is not None and float(existing[0]) == float(meta[0]) and int(existing[1]) == int(meta[1]):
+            count = c.execute(
+                "SELECT count(*) FROM tar_members WHERE tar_path=?", (tar_path,)
+            ).fetchone()[0]
+            if int(count) == int(existing[2]):
+                return False
+        _replace_tar_index_rows(c, tar_path, meta, materialized)
+        return True
+
+    if conn is None:
+        with connect(db_path) as c:
+            return _persist(c)
+    return _persist(conn)
+
+
+def persist_date_tar_index_from_evidence(
+    date_tar_path: str, outer_member: str, rows: Iterable[tuple[str, int, int]],
+    db_path: str = DEFAULT_RAW_DB_PATH, conn: Optional[sqlite3.Connection] = None,
+) -> bool:
+    """Persist a complete nested-tar index from Strategy-B outer/inner evidence."""
+    import os as _os
+
+    try:
+        st = _os.stat(date_tar_path)
+    except OSError:
+        return False
+    meta = (st.st_mtime, st.st_size)
+    materialized = [
+        (date_tar_path, outer_member, str(member), int(offset), int(size))
+        for member, offset, size in rows
+    ]
+
+    def _persist(c: sqlite3.Connection) -> bool:
+        existing = c.execute(
+            "SELECT mtime, size, n_members FROM date_tar_files WHERE date_tar_path=? AND outer_member=?",
+            (date_tar_path, outer_member),
+        ).fetchone()
+        if existing is not None and float(existing[0]) == float(meta[0]) and int(existing[1]) == int(meta[1]):
+            count = c.execute(
+                "SELECT count(*) FROM date_tar_members WHERE date_tar_path=? AND outer_member=?",
+                (date_tar_path, outer_member),
+            ).fetchone()[0]
+            if int(count) == int(existing[2]):
+                return False
+        _replace_date_tar_index_rows(
+            c, date_tar_path, outer_member, meta, materialized,
+        )
+        return True
+
+    if conn is None:
+        with connect(db_path) as c:
+            return _persist(c)
+    return _persist(conn)
+
+
 def ensure_tar_index(tar_path: str, db_path: str = DEFAULT_RAW_DB_PATH, conn: Optional[sqlite3.Connection] = None) -> None:
     """Ensure a DB-backed index of a tar member offsets/sizes exists for an uncompressed .tar.
 
@@ -3089,11 +3218,16 @@ def ensure_tar_index(tar_path: str, db_path: str = DEFAULT_RAW_DB_PATH, conn: Op
     meta = (st.st_mtime, st.st_size)
 
     def _needs_reindex(c: sqlite3.Connection) -> bool:
-        row = c.execute("SELECT mtime, size FROM tar_files WHERE path=?", (tar_path,)).fetchone()
+        row = c.execute("SELECT mtime, size, n_members FROM tar_files WHERE path=?", (tar_path,)).fetchone()
         if row is None:
             return True
         try:
-            return (float(row[0]) != float(meta[0])) or (int(row[1]) != int(meta[1]))
+            if (float(row[0]) != float(meta[0])) or (int(row[1]) != int(meta[1])):
+                return True
+            count = c.execute(
+                "SELECT count(*) FROM tar_members WHERE tar_path=?", (tar_path,)
+            ).fetchone()[0]
+            return int(count) != int(row[2])
         except Exception:
             return True
 
@@ -3107,11 +3241,7 @@ def ensure_tar_index(tar_path: str, db_path: str = DEFAULT_RAW_DB_PATH, conn: Op
                     if m.offset_data is None or m.size is None:
                         continue
                     rows.append((tar_path, m.name, int(m.offset_data), int(m.size)))
-                c.execute("INSERT OR REPLACE INTO tar_files(path, mtime, size, n_members) VALUES(?, ?, ?, ?)", (tar_path, float(meta[0]), int(meta[1]), len(rows)))
-                # Replace members for this tar
-                c.execute("DELETE FROM tar_members WHERE tar_path=?", (tar_path,))
-                if rows:
-                    c.executemany("INSERT INTO tar_members(tar_path, member, offset, size) VALUES(?, ?, ?, ?)", rows)
+                _replace_tar_index_rows(c, tar_path, meta, rows)
         except Exception:
             # On any error (e.g., compressed tar), do not index
             return
@@ -3154,13 +3284,19 @@ def ensure_date_tar_index(
 
     def _needs_reindex(c: sqlite3.Connection) -> bool:
         row = c.execute(
-            "SELECT mtime, size FROM date_tar_files WHERE date_tar_path=? AND outer_member=?",
+            "SELECT mtime, size, n_members FROM date_tar_files WHERE date_tar_path=? AND outer_member=?",
             (date_tar_path, outer_member),
         ).fetchone()
         if row is None:
             return True
         try:
-            return (float(row[0]) != float(meta[0])) or (int(row[1]) != int(meta[1]))
+            if (float(row[0]) != float(meta[0])) or (int(row[1]) != int(meta[1])):
+                return True
+            count = c.execute(
+                "SELECT count(*) FROM date_tar_members WHERE date_tar_path=? AND outer_member=?",
+                (date_tar_path, outer_member),
+            ).fetchone()[0]
+            return int(count) != int(row[2])
         except Exception:
             return True
 
@@ -3182,19 +3318,9 @@ def ensure_date_tar_index(
                         if m.offset_data is None or m.size is None:
                             continue
                         rows.append((date_tar_path, outer_member, m.name, int(m.offset_data), int(m.size)))
-            c.execute(
-                "INSERT OR REPLACE INTO date_tar_files(date_tar_path, outer_member, mtime, size, n_members) VALUES(?, ?, ?, ?, ?)",
-                (date_tar_path, outer_member, float(meta[0]), int(meta[1]), len(rows)),
+            _replace_date_tar_index_rows(
+                c, date_tar_path, outer_member, meta, rows,
             )
-            c.execute(
-                "DELETE FROM date_tar_members WHERE date_tar_path=? AND outer_member=?",
-                (date_tar_path, outer_member),
-            )
-            if rows:
-                c.executemany(
-                    "INSERT INTO date_tar_members(date_tar_path, outer_member, member, offset, size) VALUES(?, ?, ?, ?, ?)",
-                    rows,
-                )
         except Exception:
             # On any error (e.g., compressed tar, missing member), do not index
             return

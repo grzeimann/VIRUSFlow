@@ -6,6 +6,7 @@ import tarfile
 from pathlib import Path
 
 import numpy as np
+import pytest
 from astropy.io import fits
 
 from virusflow.artifacts import ArtifactService
@@ -493,6 +494,23 @@ def _register_sources(sources, raw_db: Path, *, carry_headers: bool):
             )
 
 
+def _ordinary_index_rows(raw_db: Path, tar_path: Path):
+    with db.connect(str(raw_db)) as conn:
+        return conn.execute(
+            "SELECT member, offset, size FROM tar_members WHERE tar_path=? ORDER BY member",
+            (str(tar_path.resolve()),),
+        ).fetchall()
+
+
+def _date_index_rows(raw_db: Path, date_tar: Path, outer_member: str):
+    with db.connect(str(raw_db)) as conn:
+        return conn.execute(
+            "SELECT member, offset, size FROM date_tar_members "
+            "WHERE date_tar_path=? AND outer_member=? ORDER BY member",
+            (str(date_tar.resolve()), outer_member),
+        ).fetchall()
+
+
 def test_indexed_tar_header_metadata_matches_fallback_without_member_scans(tmp_path: Path):
     tar_path = _build_production_tar(tmp_path)
     unindexed_db = tmp_path / "unindexed.sqlite3"
@@ -580,14 +598,35 @@ def test_recognized_work_tar_strategy_b_matches_fallback_registration(
         "scan", "--raw-db", str(cli_db), "--profile-tars", str(work_root),
         "--first-night", "20260501", "--last-night", "20260501",
     ])
-    args.func(args)
+    def fail_fallback_index(*args, **kwargs):
+        raise AssertionError("optimized scan must not invoke ensure_tar_index")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(db, "ensure_tar_index", fail_fallback_index)
+        args.func(args)
     output = capsys.readouterr().out
     assert "ordered FITS header acquisition for 2 sources" in output
     assert "header file opens=0; seeks=0" in output
+    assert "persistence of observed rows=2" in output
+    assert "fallback filesystem builds=0" in output
+
+    old_index_db = tmp_path / "old_index.sqlite3"
+    db.init_raw_db(str(old_index_db))
+    with db.connect(str(old_index_db)) as conn:
+        db.ensure_tar_index(str(fallback_tar.resolve()), conn=conn)
+    assert _ordinary_index_rows(old_index_db, fallback_tar) == _ordinary_index_rows(
+        cli_db, optimized_tar,
+    )
+    fallback_by_member = {source.tar_member: source for source in fallback_sources}
+    for member, offset, size in _ordinary_index_rows(cli_db, optimized_tar):
+        with open(optimized_tar, "rb") as handle:
+            handle.seek(offset)
+            indexed_bytes = handle.read(size)
+        assert indexed_bytes == read_member_bytes(fallback_by_member[member])
 
 
 def test_recognized_corral_strategy_b_matches_fallback_registration(
-    tmp_path: Path, monkeypatch,
+    tmp_path: Path, monkeypatch, capsys,
 ):
     optimized_root = _build_date_tar(tmp_path / "corral", amp_names=["LL", "LU"], ifuslot="074")
     def fail_image_open(*args, **kwargs):
@@ -609,6 +648,21 @@ def test_recognized_corral_strategy_b_matches_fallback_registration(
         _source_identity_signature(source) for source in fallback_sources
     ]
     assert all(source.primary_header is not None for source in optimized_sources)
+
+    cli_db = tmp_path / "corral_cli.sqlite3"
+    args = build_parser().parse_args([
+        "scan", "--raw-db", str(cli_db), "--profile-tars", str(optimized_root),
+        "--first-night", "20260501", "--last-night", "20260501",
+    ])
+    def fail_fallback_index(*args, **kwargs):
+        raise AssertionError("optimized scan must not invoke ensure_date_tar_index")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(db, "ensure_date_tar_index", fail_fallback_index)
+        args.func(args)
+    output = capsys.readouterr().out
+    assert "persistence of observed rows=2" in output
+    assert "fallback filesystem builds=0" in output
 
     optimized_db = tmp_path / "corral_optimized.sqlite3"
     fallback_db = tmp_path / "corral_fallback.sqlite3"
@@ -636,6 +690,80 @@ def test_recognized_corral_strategy_b_matches_fallback_registration(
     assert {k: v for k, v in optimized_metadata.items() if k != "tar_path"} == {
         k: v for k, v in fallback_metadata.items() if k != "tar_path"
     }
+
+    old_index_db = tmp_path / "corral_old_index.sqlite3"
+    observed_index_db = tmp_path / "corral_observed_index.sqlite3"
+    db.init_raw_db(str(old_index_db))
+    db.init_raw_db(str(observed_index_db))
+    with db.connect(str(old_index_db)) as conn:
+        db.ensure_date_tar_index(
+            str(date_tar.resolve()), "virus/virus0000001.tar", conn=conn,
+        )
+    with db.connect(str(observed_index_db)) as conn:
+        db.persist_date_tar_index_from_evidence(
+            str(date_tar.resolve()), "virus/virus0000001.tar",
+            [
+                (source.tar_index_evidence.member, source.tar_index_evidence.offset,
+                 source.tar_index_evidence.size)
+                for source in optimized_sources
+            ],
+            conn=conn,
+        )
+    assert _date_index_rows(old_index_db, date_tar, "virus/virus0000001.tar") == (
+        _date_index_rows(observed_index_db, date_tar, "virus/virus0000001.tar")
+    )
+    fallback_by_member = {source.tar_member: source for source in fallback_sources}
+    for member, offset, size in _date_index_rows(
+        observed_index_db, date_tar, "virus/virus0000001.tar",
+    ):
+        with open(date_tar, "rb") as handle:
+            handle.seek(offset)
+            indexed_bytes = handle.read(size)
+        assert indexed_bytes == read_member_bytes(fallback_by_member[member])
+
+
+def test_interrupted_strategy_b_traversal_does_not_persist_partial_index(
+    tmp_path: Path, monkeypatch,
+):
+    fixture_root = tmp_path / "fixture"
+    fixture_root.mkdir()
+    fixture_tar = _build_production_tar(fixture_root)
+    work_root = tmp_path / "work"
+    optimized_tar = work_root / "20260501" / "virus" / "virus0000001.tar"
+    optimized_tar.parent.mkdir(parents=True)
+    shutil.copyfile(fixture_tar, optimized_tar)
+    observed_sources = list(FileSystemStorage(work_root).iter_raw_sources(
+        first_night="20260501", last_night="20260501",
+    ))
+
+    def interrupted(_tar_path):
+        yield observed_sources[0]
+        raise OSError("synthetic interrupted tar traversal")
+
+    monkeypatch.setattr(
+        "virusflow.storage.filesystem._iter_strategy_b_tar_sources", interrupted,
+    )
+    raw_db = tmp_path / "interrupted.sqlite3"
+    args = build_parser().parse_args([
+        "scan", "--raw-db", str(raw_db), "--first-night", "20260501",
+        "--last-night", "20260501", str(work_root),
+    ])
+    with pytest.raises(OSError, match="synthetic interrupted"):
+        args.func(args)
+    with db.connect(str(raw_db)) as conn:
+        assert conn.execute("SELECT count(*) FROM tar_files").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM tar_members").fetchone()[0] == 0
+    with db.connect(str(raw_db)) as conn:
+        db.ensure_tar_index(str(optimized_tar.resolve()), conn=conn)
+    assert len(_ordinary_index_rows(raw_db, optimized_tar)) == len(observed_sources)
+    with db.connect(str(raw_db)) as conn:
+        conn.execute(
+            "DELETE FROM tar_members WHERE tar_path=? AND member=?",
+            (str(optimized_tar.resolve()), observed_sources[0].tar_member),
+        )
+    with db.connect(str(raw_db)) as conn:
+        db.ensure_tar_index(str(optimized_tar.resolve()), conn=conn)
+    assert len(_ordinary_index_rows(raw_db, optimized_tar)) == len(observed_sources)
 
 
 def test_date_tar_offset_index_matches_unindexed_metadata(tmp_path: Path):

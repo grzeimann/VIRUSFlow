@@ -61,25 +61,70 @@ def _scan(data_root: Path, raw_database: Path) -> int:
     count = 0
     indexed = set()
     indexed_date_tars = set()
+    active_index_key = None
+    active_index_rows = []
+    active_index_fallback = False
+
+    def finish_index() -> None:
+        nonlocal active_index_key, active_index_rows, active_index_fallback
+        if active_index_key is not None and active_index_rows and not active_index_fallback:
+            if active_index_key[0] == "tar":
+                db.persist_tar_index_from_evidence(
+                    active_index_key[1], active_index_rows, conn=connection,
+                )
+            else:
+                db.persist_date_tar_index_from_evidence(
+                    active_index_key[1], active_index_key[2], active_index_rows,
+                    conn=connection,
+                )
+        active_index_key = None
+        active_index_rows = []
+        active_index_fallback = False
+
     with db.connect(str(raw_database)) as connection:
         for source in FileSystemStorage(data_root).iter_raw_sources():
+            source_key = None
             if source.backend == "tar":
                 tar_path = os.path.abspath(str(source.path))
-                if tar_path not in indexed:
-                    db.ensure_tar_index(tar_path, conn=connection)
-                    indexed.add(tar_path)
+                source_key = ("tar", tar_path, None)
+            elif source.backend == "date_tar":
+                date_tar_path = os.path.abspath(str(source.path))
+                source_key = ("date_tar", date_tar_path, source.outer_tar_member)
+            if source_key != active_index_key:
+                finish_index()
+                active_index_key = source_key
+            if source.backend == "tar":
+                tar_path = os.path.abspath(str(source.path))
+                if source.tar_index_evidence is not None:
+                    evidence = source.tar_index_evidence
+                    active_index_rows.append(
+                        (evidence.member, evidence.offset, evidence.size)
+                    )
+                else:
+                    active_index_fallback = True
+                    if tar_path not in indexed:
+                        db.ensure_tar_index(tar_path, conn=connection)
+                        indexed.add(tar_path)
             elif source.backend == "date_tar":
                 date_tar_path = os.path.abspath(str(source.path))
                 key = (date_tar_path, source.outer_tar_member)
-                if key not in indexed_date_tars:
-                    db.ensure_date_tar_index(date_tar_path, source.outer_tar_member, conn=connection)
-                    indexed_date_tars.add(key)
+                if source.tar_index_evidence is not None:
+                    evidence = source.tar_index_evidence
+                    active_index_rows.append(
+                        (evidence.member, evidence.offset, evidence.size)
+                    )
+                else:
+                    active_index_fallback = True
+                    if key not in indexed_date_tars:
+                        db.ensure_date_tar_index(date_tar_path, source.outer_tar_member, conn=connection)
+                        indexed_date_tars.add(key)
             raw_id = db.register_raw_file(
                 str(source.path), db_path=str(raw_database), tar_member=source.tar_member,
                 outer_tar_member=source.outer_tar_member, conn=connection,
                 primary_header=source.primary_header,
             )
             count += int(raw_id is not None)
+        finish_index()
     return count
 
 
