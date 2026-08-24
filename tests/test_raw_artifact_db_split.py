@@ -20,7 +20,7 @@ from virusflow.publication.context import PublicationContext
 from virusflow.publication.service import DefaultPublicationService
 from virusflow.registry import database as db
 from virusflow.storage.filesystem import FileSystemStorage, read_member_bytes
-from virusflow.tasks.base import TaskContext
+from virusflow.tasks.base import CalibrationTask, TaskContext
 
 
 def _write_raw(path: Path, **header_values) -> None:
@@ -859,3 +859,77 @@ def test_date_tar_index_powers_raw_frame_loader_fast_path(tmp_path: Path):
     # cache should hold exactly one open handle (shared across both amps).
     assert len(loader._archive_handles) == 1
     loader.close()
+
+
+def test_calibration_task_preserves_nested_offsets_and_fallback(tmp_path: Path, monkeypatch):
+    root = _build_date_tar(tmp_path, amp_names=["LL"], ifuslot="074")
+    raw_db = tmp_path / "raw.sqlite3"
+    db.init_raw_db(str(raw_db))
+    with db.connect(str(raw_db)) as conn:
+        source = next(FileSystemStorage(root).iter_raw_sources())
+        db.ensure_date_tar_index(str(source.path), source.outer_tar_member, conn=conn)
+        db.register_raw_file(
+            str(source.path), db_path=str(raw_db), tar_member=source.tar_member,
+            outer_tar_member=source.outer_tar_member, conn=conn,
+        )
+
+    resolved = db.list_raw_files_scoped(
+        "sci", "20260501", "20260501", db_path=str(raw_db),
+    )
+    assert len(resolved) == 1
+    _, raw_id = resolved[0]
+    assert raw_id.archive_offset is not None
+    assert raw_id.archive_size is not None
+
+    raw_inputs = [{
+        "path": raw_id.path,
+        "tar_member": raw_id.tar_member,
+        "archive_offset": raw_id.archive_offset,
+        "archive_size": raw_id.archive_size,
+        "outer_tar_member": raw_id.outer_tar_member,
+    }]
+    observed_loads = []
+    observed_branches = []
+    original_load = RawFrameLoader.load
+    original_read = RawFrameLoader._read_physical
+
+    def observe_load(self, path, tar_member=None, **kwargs):
+        observed_loads.append(dict(kwargs))
+        return original_load(self, path, tar_member, **kwargs)
+
+    def observe_read(self, path, tar_member, *, archive_offset, archive_size,
+                     outer_tar_member=None, timing):
+        observed_branches.append(
+            "indexed" if tar_member and archive_offset is not None and archive_size is not None
+            else "nested_fallback" if outer_tar_member else "other"
+        )
+        return original_read(
+            self, path, tar_member, archive_offset=archive_offset,
+            archive_size=archive_size, outer_tar_member=outer_tar_member,
+            timing=timing,
+        )
+
+    monkeypatch.setattr(RawFrameLoader, "load", observe_load)
+    monkeypatch.setattr(RawFrameLoader, "_read_physical", observe_read)
+    task = CalibrationTask(
+        TaskContext(str(raw_db), str(tmp_path), {}, raw_db_path=str(raw_db)),
+    )
+
+    task.load_reduced_inputs(raw_inputs)
+    assert observed_loads[0] == {
+        "archive_offset": raw_id.archive_offset,
+        "archive_size": raw_id.archive_size,
+        "outer_tar_member": raw_id.outer_tar_member,
+    }
+    assert observed_branches == ["indexed"]
+
+    fallback_input = dict(raw_inputs[0])
+    fallback_input["archive_offset"] = None
+    fallback_input["archive_size"] = None
+    task.load_reduced_inputs([fallback_input])
+    assert observed_loads[1] == {
+        "archive_offset": None,
+        "archive_size": None,
+        "outer_tar_member": raw_id.outer_tar_member,
+    }
+    assert observed_branches == ["indexed", "nested_fallback"]

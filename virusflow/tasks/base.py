@@ -170,6 +170,8 @@ class CalibrationTask(Task):
                 if item.get("outer_tar_member") is not None:
                     frame = loader.load(
                         str(item["path"]), item.get("tar_member"),
+                        archive_offset=item.get("archive_offset"),
+                        archive_size=item.get("archive_size"),
                         outer_tar_member=item.get("outer_tar_member"),
                     )
                 elif item.get("archive_offset") is None:
