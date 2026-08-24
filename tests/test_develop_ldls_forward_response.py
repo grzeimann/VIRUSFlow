@@ -7,6 +7,14 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
+
+from virusflow.artifacts import ArtifactService, Scope
+from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
+from virusflow.core.identity import ZipCode
+from virusflow.persistence.policy import DefaultPersistencePolicy
+from virusflow.publication.context import PublicationContext
+from virusflow.publication.service import DefaultPublicationService
 
 
 def _solver_module():
@@ -17,6 +25,105 @@ def _solver_module():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+EXPOSURES_A = (
+    "20250418T232722.6", "20250418T232847.8", "20250418T233011.0",
+)
+EXPOSURES_B = (
+    "20250419T232722.6", "20250419T232847.8", "20250419T233011.0",
+)
+
+
+def _publish_fixture(service, root: Path, request: ArtifactRequest):
+    publication = DefaultPublicationService(
+        svc=service, policy=DefaultPersistencePolicy(), base_dir=str(root)
+    )
+    context = PublicationContext(
+        task_name="fixture", task_version="1", algorithm_name="fixture",
+        algorithm_version="1", parameters={}, parent_ids=[], timings={},
+    )
+    return publication.publish([request], context)[0]
+
+
+def _fixture_pair(tmp_path: Path, exposures: tuple[str, ...], value: float):
+    solver = _solver_module()
+    service = ArtifactService(str(tmp_path / "artifacts.sqlite3"))
+    lower = ZipCode("106", "033", "506", "LL", "S/N 0013")
+    upper = ZipCode("106", "033", "506", "LU", "S/N 0013")
+    group = {
+        "frame_membership": [{"exposure_id": exposure} for exposure in exposures],
+        "n_exposures": len(exposures),
+        "temporal_center": exposures[1],
+    }
+    trace = np.asarray([
+        [100.0] * 24, [112.0] * 24, [400.0] * 24, [412.0] * 24,
+    ])
+    artifacts = {}
+    for index, zipcode in enumerate((lower, upper)):
+        image = np.full((1032, 24), value + index, dtype=np.float32)
+        mask = np.zeros_like(image, dtype=np.uint8)
+        master = _publish_fixture(service, tmp_path, ArtifactRequest(
+            kind="master_ldls",
+            components={
+                "master_ldls": LogicalComponent("master_ldls", "array2d", image, "electron", "oriented_amplifier"),
+                "flat_response_mask": LogicalComponent("flat_response_mask", "array2d", mask, "1", "oriented_amplifier"),
+            },
+            metadata={"calibration_group_id": f"master_ldls:{exposures[0]}:{zipcode.amp}", "calibration_group": group},
+            scope=Scope(zipcode=zipcode),
+        ))
+        trace_components = {
+            "fiber_trace_map": LogicalComponent("fiber_trace_map", "array2d", trace, "pixel", "fiber_by_dispersion_pixel"),
+            "trace_sample_columns": LogicalComponent("trace_sample_columns", "array1d", np.asarray([0.0, 23.0]), "pixel", "dispersion_pixel"),
+            "sampled_trace_positions": LogicalComponent("sampled_trace_positions", "array2d", trace[:, [0, -1]], "pixel", "fiber_by_sample"),
+            "per_fiber_trace_residual_rms": LogicalComponent("per_fiber_trace_residual_rms", "array1d", np.zeros(4), "pixel", "fiber"),
+            "trace_sample_valid_mask": LogicalComponent("trace_sample_valid_mask", "array2d", np.ones((4, 2), dtype=np.uint8), "1", "fiber_by_sample"),
+            "trace_fit_residuals": LogicalComponent("trace_fit_residuals", "array2d", np.zeros((4, 2)), "pixel", "fiber_by_sample"),
+            "per_fiber_valid_sample_count": LogicalComponent("per_fiber_valid_sample_count", "array1d", np.full(4, 2), "1", "fiber"),
+            "trace_interpolated_fiber_mask": LogicalComponent("trace_interpolated_fiber_mask", "array1d", np.zeros(4, dtype=np.uint8), "1", "fiber"),
+        }
+        trace_artifact = _publish_fixture(service, tmp_path, ArtifactRequest(
+            kind="trace_map", components=trace_components,
+            metadata={"calibration_group_id": f"trace_map:{exposures[0]}:{zipcode.amp}", "calibration_group": group},
+            scope=Scope(zipcode=zipcode), parents=[master.id],
+        ))
+        artifacts[zipcode.amp] = {"master_ldls": master, "trace_map": trace_artifact}
+    return solver, service, lower, upper, artifacts, trace
+
+
+def test_artifact_bridge_selects_exact_group_and_is_read_only(tmp_path: Path):
+    solver, _service_a, lower, upper, artifacts_a, trace = _fixture_pair(tmp_path, EXPOSURES_A, 10.0)
+    _solver_b, service, _lower_b, _upper_b, _artifacts_b, _trace_b = _fixture_pair(tmp_path, EXPOSURES_B, 20.0)
+    before = {kind: len(service.adapter.list_all(kind=kind)) for kind in ("master_ldls", "trace_map")}
+
+    evidence, selection = solver.load_ldls_evidence_pair(
+        service, lower, upper, exposure_ids=EXPOSURES_A,
+    )
+
+    assert selection["artifact_db"] == service.db_path
+    assert selection["selected_exposure_ids"] == sorted(EXPOSURES_A)
+    assert selection["lower_master_ldls"]["id"] == artifacts_a["LL"]["master_ldls"].id
+    assert selection["upper_master_ldls"]["id"] == artifacts_a["LU"]["master_ldls"].id
+    assert selection["lower_trace_map"]["id"] == artifacts_a["LL"]["trace_map"].id
+    assert selection["upper_trace_map"]["id"] == artifacts_a["LU"]["trace_map"].id
+    assert selection["master_ldls_array_shapes"] == {"lower": [1032, 24], "upper": [1032, 24]}
+    assert selection["trace_map_shapes"] == {"lower": [4, 24], "upper": [4, 24]}
+    assert selection["assembled_physical_ccd_shape"] == [2064, 24]
+    assert selection["read_only"] is True
+    assert evidence.image.shape == (2064, 24)
+    assert evidence.base_trace.shape == (8, 24)
+    np.testing.assert_allclose(evidence.base_trace[:4], trace)
+    np.testing.assert_allclose(evidence.base_trace[4:], trace + 1032.0)
+
+    after = {kind: len(service.adapter.list_all(kind=kind)) for kind in ("master_ldls", "trace_map")}
+    assert after == before
+
+
+def test_artifact_bridge_rejects_mismatched_physical_ccd_pair(tmp_path: Path):
+    solver, service, lower, _upper, _artifacts, _trace = _fixture_pair(tmp_path, EXPOSURES_A, 10.0)
+    mismatched = ZipCode("999", lower.ifuid, lower.specid, "LU", lower.controller)
+    with pytest.raises(ValueError, match="one physical CCD"):
+        solver.load_ldls_evidence_pair(service, lower, mismatched, exposure_ids=EXPOSURES_A)
 
 
 def _synthetic_problem():

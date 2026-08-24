@@ -26,7 +26,7 @@ import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter
-from typing import Any
+from typing import Any, Iterable
 
 import matplotlib
 
@@ -1170,6 +1170,26 @@ def _load(service: ArtifactService, row: dict[str, Any], component: str) -> np.n
     return np.asarray(service.load_component(row, component)["data"])
 
 
+def _group_exposure_ids(row: dict[str, Any]) -> tuple[str, ...]:
+    """Return the persisted calibration-group exposure IDs for one artifact."""
+    metadata = row.get("metadata") or {}
+    group = metadata.get("calibration_group") or {}
+    membership = group.get("frame_membership") or []
+    values = [item.get("exposure_id") for item in membership if item.get("exposure_id")]
+    if not values:
+        values = group.get("exposure_ids") or metadata.get("exposure_ids") or []
+    return tuple(sorted(str(value) for value in values))
+
+
+def _select_one(rows: list[dict[str, Any]], *, label: str, zipcode: ZipCode) -> dict[str, Any]:
+    if len(rows) != 1:
+        ids = [int(row["id"]) for row in rows]
+        raise RuntimeError(
+            f"expected exactly one {label} for {zipcode.key()}, found {len(rows)}: {ids}"
+        )
+    return rows[0]
+
+
 def _array_checksum(array: np.ndarray) -> str:
     """Shape-, dtype-, and byte-stable input provenance checksum."""
     values = np.ascontiguousarray(array)
@@ -1180,36 +1200,130 @@ def _array_checksum(array: np.ndarray) -> str:
     return digest.hexdigest()
 
 
-def _select_ldls_trace(service: ArtifactService, zipcode: ZipCode) -> tuple[dict[str, Any], dict[str, Any]]:
-    for ldls in _active_rows(service, "master_ldls", zipcode):
-        for trace in _active_rows(service, "trace_map", zipcode):
-            if int(ldls["id"]) in _parents(service, trace):
-                return ldls, trace
-    raise RuntimeError(f"no active trace_map directly derived from an active master_ldls for {zipcode.key()}")
+def _select_ldls_trace(
+    service: ArtifactService,
+    zipcode: ZipCode,
+    *,
+    exposure_ids: Iterable[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Select one LDLS product and its directly derived trace map.
+
+    With an exposure selector, both the LDLS group and its trace child are
+    required to resolve unambiguously.  Without one, retain the historical
+    newest-active behavior for the legacy development invocation.
+    """
+    requested = None if exposure_ids is None else tuple(sorted(str(value) for value in exposure_ids))
+    ldls_rows = _active_rows(service, "master_ldls", zipcode)
+    if requested is not None:
+        ldls_rows = [row for row in ldls_rows if _group_exposure_ids(row) == requested]
+        ldls = _select_one(ldls_rows, label="master_ldls exposure group", zipcode=zipcode)
+    else:
+        ldls = ldls_rows[0] if ldls_rows else None
+        if ldls is None:
+            raise RuntimeError(f"no active master_ldls for {zipcode.key()}")
+
+    trace_rows = [
+        row for row in _active_rows(service, "trace_map", zipcode)
+        if int(ldls["id"]) in _parents(service, row)
+    ]
+    if requested is not None:
+        trace_rows = [
+            row for row in trace_rows
+            if not _group_exposure_ids(row) or _group_exposure_ids(row) == requested
+        ]
+        trace = _select_one(trace_rows, label="trace_map derived from selected master_ldls", zipcode=zipcode)
+    elif not trace_rows:
+        raise RuntimeError(
+            f"no active trace_map directly derived from an active master_ldls for {zipcode.key()}"
+        )
+    else:
+        trace = trace_rows[0]
+    return ldls, trace
 
 
-def load_ldls_evidence(service: ArtifactService, requested: ZipCode, *, aperture_width: float = 5.0) -> tuple[LDLSEvidence, dict[str, Any]]:
-    """Load the same physical-CCD LDLS/trace/mask inputs through public APIs."""
-    if requested.amp not in PAIR:
-        raise ValueError("zipcode amplifier must be LL, LU, RU, or RL")
-    side, lower_amp, upper_amp = PAIR[requested.amp]
-    lower_zip = ZipCode(requested.ifuslot, requested.ifuid, requested.specid, lower_amp, requested.controller)
-    upper_zip = ZipCode(requested.ifuslot, requested.ifuid, requested.specid, upper_amp, requested.controller)
-    lower_ldls, lower_trace = _select_ldls_trace(service, lower_zip)
-    upper_ldls, upper_trace = _select_ldls_trace(service, upper_zip)
-    lower_image, upper_image = _load(service, lower_ldls, "master_ldls").astype(float), _load(service, upper_ldls, "master_ldls").astype(float)
+def _validate_pair_zipcodes(lower: ZipCode, upper: ZipCode) -> tuple[str, str, str]:
+    if (lower.ifuslot, lower.ifuid, lower.specid, lower.controller) != (
+        upper.ifuslot, upper.ifuid, upper.specid, upper.controller
+    ):
+        raise ValueError(
+            "lower and upper ZipCodes must identify one physical CCD: "
+            f"{lower.key()} vs {upper.key()}"
+        )
+    for side, lower_amp, upper_amp in PAIR.values():
+        if (lower.amp, upper.amp) == (lower_amp, upper_amp):
+            return side, lower_amp, upper_amp
+    raise ValueError(
+        "lower and upper ZipCodes must be an ordered physical-CCD pair "
+        f"(LL/LU or RU/RL), got {lower.amp}/{upper.amp}"
+    )
+
+
+def _artifact_selection_summary(
+    service: ArtifactService, row: dict[str, Any], *, array_shape: tuple[int, ...], component: str,
+) -> dict[str, Any]:
+    description = service.describe(row)
+    metadata = description["summary"]
+    group = metadata.get("calibration_group") or {}
+    return {
+        "id": int(row["id"]),
+        "kind": description["canonical_kind"],
+        "component": component,
+        "calibration_group_id": metadata.get("calibration_group_id"),
+        "computation_identity": (
+            group.get("computation_id")
+            or metadata.get("computation_identity")
+            or description.get("revision")
+        ),
+        "artifact_revision": description.get("revision"),
+        "source_exposure_ids": list(_group_exposure_ids(row)),
+        "raw_parent_ids": list(description["provenance"]["raw_parents"]),
+        "array_shape": list(array_shape),
+    }
+
+
+def load_ldls_evidence_pair(
+    service: ArtifactService,
+    lower_zipcode: ZipCode,
+    upper_zipcode: ZipCode,
+    *,
+    exposure_ids: Iterable[str] | None = None,
+    aperture_width: float = 5.0,
+) -> tuple[LDLSEvidence, dict[str, Any]]:
+    """Load an explicit amplifier pair through read-only ArtifactService APIs."""
+    side, lower_amp, upper_amp = _validate_pair_zipcodes(lower_zipcode, upper_zipcode)
+    lower_ldls, lower_trace = _select_ldls_trace(
+        service, lower_zipcode, exposure_ids=exposure_ids
+    )
+    upper_ldls, upper_trace = _select_ldls_trace(
+        service, upper_zipcode, exposure_ids=exposure_ids
+    )
+    lower_group = _group_exposure_ids(lower_ldls)
+    upper_group = _group_exposure_ids(upper_ldls)
+    if lower_group != upper_group:
+        raise RuntimeError(
+            "selected master_ldls products do not share one calibration exposure group: "
+            f"{lower_zipcode.key()}={list(lower_group)}, {upper_zipcode.key()}={list(upper_group)}"
+        )
+    lower_image = _load(service, lower_ldls, "master_ldls").astype(float)
+    upper_image = _load(service, upper_ldls, "master_ldls").astype(float)
     lower_mask, upper_mask = ~np.isfinite(lower_image), ~np.isfinite(upper_image)
     for row, image, mask in ((lower_ldls, lower_image, lower_mask), (upper_ldls, upper_image, upper_mask)):
         try:
             mask |= _load(service, row, "flat_response_mask").astype(bool)
         except KeyError:
             pass
-    assembly = assemble_physical_ccd(lower_image, upper_image, side=side, lower_amp=lower_amp, upper_amp=upper_amp, lower_variance=np.maximum(lower_image, 1.0), upper_variance=np.maximum(upper_image, 1.0), lower_mask=lower_mask, upper_mask=upper_mask)
-    scatter = fit_gap_scattered_light(assembly, _load(service, lower_trace, "fiber_trace_map"), _load(service, upper_trace, "fiber_trace_map"))
+    assembly = assemble_physical_ccd(
+        lower_image, upper_image, side=side, lower_amp=lower_amp, upper_amp=upper_amp,
+        lower_variance=np.maximum(lower_image, 1.0), upper_variance=np.maximum(upper_image, 1.0),
+        lower_mask=lower_mask, upper_mask=upper_mask,
+    )
+    lower_trace_array = _load(service, lower_trace, "fiber_trace_map")
+    upper_trace_array = _load(service, upper_trace, "fiber_trace_map")
+    scatter = fit_gap_scattered_light(assembly, lower_trace_array, upper_trace_array)
     image = np.asarray(scatter.get_array("scatter_subtracted_image"), float)
     valid = ~np.asarray(assembly.get_array("pixel_mask"), bool) & np.isfinite(image)
     variance = np.maximum(np.abs(image), 1.0)
-    base_trace = physical_trace_map(_load(service, lower_trace, "fiber_trace_map"), _load(service, upper_trace, "fiber_trace_map")).astype(float)
+    base_trace = physical_trace_map(lower_trace_array, upper_trace_array).astype(float)
     extraction = extract_fractional_aperture(image, variance, base_trace, pixel_mask=~valid, width=aperture_width)
     rows, weights, _ = fractional_aperture_geometry(base_trace, image.shape[0], width=aperture_width)
     yy, xx = np.nonzero(valid)
@@ -1224,15 +1338,45 @@ def load_ldls_evidence(service: ArtifactService, requested: ZipCode, *, aperture
         "aperture_weights": _array_checksum(weights),
     }
     return evidence, {
-        "requested_zipcode": requested.key(),
-        "lower_ldls_id": int(lower_ldls["id"]),
-        "upper_ldls_id": int(upper_ldls["id"]),
-        "lower_trace_id": int(lower_trace["id"]),
-        "upper_trace_id": int(upper_trace["id"]),
+        "artifact_db": service.db_path,
+        "lower_zipcode": lower_zipcode.key(),
+        "upper_zipcode": upper_zipcode.key(),
+        "selected_exposure_ids": list(lower_group),
+        "lower_master_ldls": _artifact_selection_summary(service, lower_ldls, array_shape=lower_image.shape, component="master_ldls"),
+        "upper_master_ldls": _artifact_selection_summary(service, upper_ldls, array_shape=upper_image.shape, component="master_ldls"),
+        "lower_trace_map": _artifact_selection_summary(service, lower_trace, array_shape=lower_trace_array.shape, component="fiber_trace_map"),
+        "upper_trace_map": _artifact_selection_summary(service, upper_trace, array_shape=upper_trace_array.shape, component="fiber_trace_map"),
+        "master_ldls_array_shapes": {
+            "lower": list(lower_image.shape), "upper": list(upper_image.shape),
+        },
+        "trace_map_shapes": {
+            "lower": list(lower_trace_array.shape), "upper": list(upper_trace_array.shape),
+        },
+        "assembled_physical_ccd_shape": list(image.shape),
         "physical_ccd_side": side,
         "read_only": True,
         "input_checksums": input_checksums,
     }
+
+
+def load_ldls_evidence(
+    service: ArtifactService,
+    requested: ZipCode,
+    *,
+    exposure_ids: Iterable[str] | None = None,
+    aperture_width: float = 5.0,
+) -> tuple[LDLSEvidence, dict[str, Any]]:
+    """Load the same physical-CCD LDLS/trace/mask inputs through public APIs."""
+    if requested.amp not in PAIR:
+        raise ValueError("zipcode amplifier must be LL, LU, RU, or RL")
+    side, lower_amp, upper_amp = PAIR[requested.amp]
+    lower_zip = ZipCode(requested.ifuslot, requested.ifuid, requested.specid, lower_amp, requested.controller)
+    upper_zip = ZipCode(requested.ifuslot, requested.ifuid, requested.specid, upper_amp, requested.controller)
+    evidence, selection = load_ldls_evidence_pair(
+        service, lower_zip, upper_zip, exposure_ids=exposure_ids, aperture_width=aperture_width,
+    )
+    selection["requested_zipcode"] = requested.key()
+    return evidence, selection
 
 
 def _write_diagnostics(
@@ -1563,8 +1707,15 @@ def _write_state_and_provenance(
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--db", required=True)
-    parser.add_argument("--zipcode", required=True)
+    parser.add_argument("--db", help="legacy artifact database option")
+    parser.add_argument("--artifact-db", help="read-only ArtifactService database")
+    parser.add_argument("--zipcode", help="legacy paired-CCD selector")
+    parser.add_argument("--lower-zipcode", help="lower amplifier ZipCode for an explicit pair")
+    parser.add_argument("--upper-zipcode", help="upper amplifier ZipCode for an explicit pair")
+    parser.add_argument(
+        "--ldls-exposure-id", action="append", dest="ldls_exposure_ids",
+        help="exact exposure-group member; repeat once per selected LDLS input exposure",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--support", type=float, default=9.0)
     parser.add_argument("--trace-degree", type=int, default=4)
@@ -1580,10 +1731,43 @@ def main(argv: list[str] | None = None) -> int:
         help="development-only fixed radial-illumination diagnostic alpha in [-0.5, 1]; never fitted or persisted as state",
     )
     args = parser.parse_args(argv)
+    db_path = args.artifact_db or args.db
+    if not db_path:
+        parser.error("one of --artifact-db or --db is required")
+    explicit_pair = args.lower_zipcode is not None or args.upper_zipcode is not None
+    if explicit_pair and (args.lower_zipcode is None or args.upper_zipcode is None):
+        parser.error("--lower-zipcode and --upper-zipcode must be supplied together")
+    if explicit_pair and args.zipcode is not None:
+        parser.error("use either --zipcode or --lower-zipcode/--upper-zipcode")
+    if not explicit_pair and args.zipcode is None:
+        parser.error("--zipcode or --lower-zipcode/--upper-zipcode is required")
     runtime = RuntimeProfile()
     with runtime.measure("data/evidence setup"):
-        service = ArtifactService(args.db)
-        evidence, selection = load_ldls_evidence(service, parse_zipcode_key(args.zipcode))
+        service = ArtifactService(db_path)
+        if explicit_pair:
+            evidence, selection = load_ldls_evidence_pair(
+                service,
+                parse_zipcode_key(args.lower_zipcode),
+                parse_zipcode_key(args.upper_zipcode),
+                exposure_ids=args.ldls_exposure_ids,
+            )
+        else:
+            evidence, selection = load_ldls_evidence(
+                service, parse_zipcode_key(args.zipcode), exposure_ids=args.ldls_exposure_ids,
+            )
+    print(f"artifact DB path: {selection['artifact_db']}")
+    print(f"lower ZipCode: {selection['lower_zipcode']}")
+    print(f"upper ZipCode: {selection['upper_zipcode']}")
+    for label in ("lower_master_ldls", "upper_master_ldls", "lower_trace_map", "upper_trace_map"):
+        product = selection[label]
+        print(
+            f"{label} artifact ID: {product['id']}; "
+            f"calibration_group_id: {product['calibration_group_id']}; "
+            f"computation identity: {product['computation_identity']}; "
+            f"shape: {product['array_shape']}; "
+            f"source exposure IDs: {product['source_exposure_ids']}"
+        )
+    print(f"assembled physical-CCD shape: {selection['assembled_physical_ccd_shape']}")
     reference_W = np.full(evidence.base_trace.shape, args.initial_W)
     reference_f = np.full(evidence.base_trace.shape, args.initial_f_sigma)
     initial_field_checksum = None
