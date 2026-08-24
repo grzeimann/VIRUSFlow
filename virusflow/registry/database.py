@@ -2448,7 +2448,7 @@ def find_artifacts(
                 " AND (a.validity_end IS NULL OR a.validity_end >= ?)"
             )
             params.extend([at_iso, at_iso])
-        sql += " ORDER BY p.created_at DESC NULLS LAST, a.id DESC"
+        sql += " ORDER BY CASE WHEN p.created_at IS NULL THEN 1 ELSE 0 END ASC, p.created_at DESC, a.id DESC"
         if limit and int(limit) > 0:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -2493,7 +2493,7 @@ def list_artifacts(
                 " AND (a.validity_end IS NULL OR a.validity_end >= ?)"
             )
             params.extend([at_iso, at_iso])
-        sql += " ORDER BY p.created_at DESC NULLS LAST, a.id DESC"
+        sql += " ORDER BY CASE WHEN p.created_at IS NULL THEN 1 ELSE 0 END ASC, p.created_at DESC, a.id DESC"
         if limit and int(limit) > 0:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -2535,7 +2535,7 @@ def find_artifacts_by_calibration_groups(
             "AND COALESCE(r.state, 'active') = ? "
             "AND CAST(json_extract(r.metadata_json, '$.calibration_group_id') AS TEXT) "
             f"IN ({placeholders}) "
-            "ORDER BY p.created_at DESC NULLS LAST, a.id DESC",
+            "ORDER BY CASE WHEN p.created_at IS NULL THEN 1 ELSE 0 END ASC, p.created_at DESC, a.id DESC",
             (str(kind), str(state), *group_ids),
         ).fetchall()
     artifacts = _rows_to_dicts(rows)
