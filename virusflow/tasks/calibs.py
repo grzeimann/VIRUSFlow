@@ -61,6 +61,7 @@ from ..core.scientific_metadata import (
     normalize_scientific_metadata,
 )
 from ..ontology.artifact_kinds import kind_spec
+from ..planning.cadence import nominal_dark_exptime_seconds
 from ..persistence.policy import DefaultPersistencePolicy
 from ..publication.context import PublicationContext
 from ..publication.service import DefaultPublicationService
@@ -70,6 +71,7 @@ logger = logging.getLogger(__name__)
 
 
 AMP_CODE = {"LL": 0, "LU": 1, "RU": 2, "RL": 3}
+DARK_EXPTIME_TOLERANCE_SECONDS = 1.0
 
 
 def _artifact_id(row) -> int:
@@ -108,6 +110,46 @@ def _planned_parent_rows(service, target, kind: str) -> list[dict]:
 
 def _model_type(value) -> str:
     return "array1d" if np.asarray(value).ndim == 1 else "array2d"
+
+
+def _validate_dark_exposure_times(arrays) -> tuple[float, int, list[float]]:
+    """Validate one nominal dark exposure class while retaining measured times."""
+
+    exposure_times = [
+        float(item["header"].get("EXPTIME") or 0.0)
+        for item in arrays
+    ]
+    positive = [
+        value for value in exposure_times
+        if np.isfinite(value) and value > 0.0
+    ]
+    if len(positive) != len(exposure_times):
+        raise RuntimeError(
+            "master_dark inputs require a positive finite EXPTIME; "
+            f"observed EXPTIME values={exposure_times}"
+        )
+
+    nominal_classes = sorted({nominal_dark_exptime_seconds(value) for value in positive})
+    if len(nominal_classes) != 1:
+        raise RuntimeError(
+            "master_dark inputs contain incompatible nominal exposure classes; "
+            f"nominal classes={nominal_classes}, "
+            f"observed EXPTIME range=[{min(positive)}, {max(positive)}], "
+            f"offending EXPTIME values={exposure_times}"
+        )
+    nominal_class = int(nominal_classes[0])
+    outside_tolerance = [
+        value for value in positive
+        if abs(value - nominal_class) > DARK_EXPTIME_TOLERANCE_SECONDS
+    ]
+    if outside_tolerance:
+        raise RuntimeError(
+            "master_dark inputs are outside the nominal exposure tolerance; "
+            f"nominal class={nominal_class}s, tolerance={DARK_EXPTIME_TOLERANCE_SECONDS}s, "
+            f"observed EXPTIME range=[{min(positive)}, {max(positive)}], "
+            f"offending EXPTIME values={outside_tolerance}"
+        )
+    return float(np.median(positive)), nominal_class, exposure_times
 
 
 class _CanonicalTask(CalibrationTask):
@@ -285,6 +327,9 @@ class _RawCalibrationTask(_CanonicalTask):
         self._require_target()
         raw_inputs, parent_ids = self.query_inputs()
         arrays = self.load_reduced_inputs(raw_inputs)
+        dark_exposure_summary = None
+        if self.artifact_name == "master_dark":
+            dark_exposure_summary = _validate_dark_exposure_times(arrays)
         calibration_parent_ids = []
         correction_result = None
         if self.apply_response_detector_corrections:
@@ -337,18 +382,10 @@ class _RawCalibrationTask(_CanonicalTask):
                 self.algorithm(raw_inputs=arrays, params=self._params()), kind=self.result_kind
             )
         if self.artifact_name == "master_dark":
-            exposure_times = np.asarray([
-                float(item["header"].get("EXPTIME") or 0.0) for item in arrays
-            ])
-            positive = exposure_times[np.isfinite(exposure_times) & (exposure_times > 0.0)]
-            if positive.size != exposure_times.size:
-                raise RuntimeError("master_dark inputs require a positive EXPTIME")
-            reference_seconds = float(np.median(positive))
-            if not np.allclose(positive, reference_seconds, rtol=0.0, atol=1e-6):
-                raise RuntimeError(
-                    "electron-valued master_dark inputs require one common EXPTIME"
-                )
+            reference_seconds, nominal_seconds, measured_exptimes = dark_exposure_summary
             result.scalars["reference_exposure_time_seconds"] = reference_seconds
+            result.scalars["nominal_dark_exptime_seconds"] = nominal_seconds
+            result.meta["input_exptime_seconds"] = measured_exptimes
             result.scalars["bias_convention"] = DARK_BIAS_CONVENTION
         if correction_result is not None:
             result.meta.update(correction_result.meta)

@@ -8,7 +8,7 @@ from virusflow.core.identity import ZipCode
 from virusflow.planning.cadence import pair_lamp_groups, resolve_calibration_groups
 from virusflow.planning.targets import PurposeCadence
 from virusflow.io import RawFrameData
-from virusflow.planning import ReductionGraph, adapt_target, default_calibration_graph
+from virusflow.planning import ReductionGraph, TaskSpec, adapt_target, default_calibration_graph
 from virusflow.planning.config import load_planning_config_from_dict
 from virusflow.registry import database as db
 from virusflow.tasks.base import TaskContext
@@ -90,6 +90,40 @@ def test_dark_monthly_and_configurable_weekly_are_not_nightly(tmp_path):
     assert monthly.groups[0].applicability["start"] == "2026-06-01T00:00:00.000000"
     assert monthly.groups[0].applicability["end"] == "2026-07-01T00:00:00.000000"
     assert len(weekly.groups) == 3
+
+
+def test_dark_monthly_groups_by_nominal_exposure_seconds_and_preserves_measured_times(tmp_path):
+    path = _catalog(tmp_path, [
+        ("20260601T010000.0", "drk", 360.00007, 11.0, None, None),
+        ("20260602T010000.0", "drk", 360.00021, 11.0, None, None),
+        ("20260603T010000.0", "drk", 360.00046, 11.0, None, None),
+        ("20260604T010000.0", "drk", 15.00012, 11.0, None, None),
+    ])
+
+    result = _groups(path, "master_dark", "monthly", minimum_exposures=1)
+
+    assert len(result.groups) == 2
+    by_nominal = {
+        group.metadata["nominal_dark_exptime_seconds"]: group
+        for group in result.groups
+    }
+    assert set(by_nominal) == {15, 360}
+    assert by_nominal[360].metadata["frame_membership"][-1]["exposure_time_seconds"] == 360.00046
+    assert [item["exposure_time_seconds"] for item in by_nominal[360].metadata["frame_membership"]] == [
+        360.00007, 360.00021, 360.00046,
+    ]
+    assert by_nominal[15].metadata["frame_membership"][0]["exposure_time_seconds"] == 15.00012
+    assert by_nominal[15].computation_id != by_nominal[360].computation_id
+
+    planned, _report = ReductionGraph([
+        TaskSpec(
+            kind="master_dark", task_cls=object, inputs_raw=["drk"],
+            scope_mode="per_zipcode", cadence=PurposeCadence("monthly", minimum_exposures=1),
+        )
+    ], []).plan(db_path=path, scopes=[Scope(ZIP)])
+    assert len(planned) == 2
+    assert {target.group.metadata["nominal_dark_exptime_seconds"] for target in planned} == {15, 360}
+    assert len({target.group.group_id for target in planned}) == 2
 
 
 def test_twilight_week_and_ldls_isolated_temperature_metadata(tmp_path):

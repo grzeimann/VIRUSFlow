@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 import hashlib
 import json
+import math
 import statistics
 from typing import Any, Iterable, List
 
@@ -64,6 +65,17 @@ def _stats(values: Iterable[float]) -> dict[str, float | int | None]:
         "median": statistics.median(data), "minimum": min(data),
         "maximum": max(data), "spread": max(data) - min(data),
     }
+
+
+def nominal_dark_exptime_seconds(value: Any) -> int | None:
+    """Return the integer-second dark exposure class for measured EXPTIME."""
+
+    if value is None:
+        return None
+    measured = float(value)
+    if not (math.isfinite(measured) and measured > 0.0):
+        return None
+    return int(round(measured))
 
 
 def _lamp_kind(row: dict[str, Any]) -> str | None:
@@ -145,8 +157,17 @@ def _make_group(
             applicability_end = applicability_start.replace(month=applicability_start.month + 1)
     exposure_times = [row.get("exposure_time") for row in rows]
     temperatures = [row.get("ambient_temperature") for row in rows]
+    nominal_dark_exptimes = {
+        row.get("nominal_dark_exptime_seconds")
+        for row in rows
+    } if kind == "master_dark" else set()
+    nominal_dark_exptime = (
+        next(iter(nominal_dark_exptimes))
+        if len(nominal_dark_exptimes) == 1 else None
+    )
     identity_payload = {
         "kind": kind, "zipcode": zipcode, "raw_ids": raw_ids,
+        "nominal_dark_exptime_seconds": nominal_dark_exptime,
         "algorithm_version": options.get("algorithm_version", _ALGORITHM_IDENTITIES.get(kind)),
         "algorithm_parameters": options.get("algorithm_parameters", {}),
         "configuration_references": options.get("configuration_references", ()),
@@ -171,6 +192,7 @@ def _make_group(
         ],
         "n_exposures": len(rows),
         "exposure_time_seconds": _stats(exposure_times),
+        "nominal_dark_exptime_seconds": nominal_dark_exptime,
         "total_exposure_seconds": sum(float(value) for value in exposure_times if value is not None),
         "ambient_temperature": _stats(temperatures),
         "missing_temperature": any(value is None for value in temperatures),
@@ -236,10 +258,17 @@ def resolve_calibration_groups(
                                "decision": "excluded", "reason": "unparseable_timestamp"})
             continue
         row["timestamp"] = at
-        value = row.get("exptime") if row.get("exptime") is not None else row.get("pexptime")
+        # Dark classification follows measured EXPTIME.  PEXPTIME is retained
+        # as a fallback for the existing non-dark grouping policies, but is not
+        # a requested dark-duration discriminator.
+        if kind == "master_dark":
+            value = row.get("exptime")
+        else:
+            value = row.get("exptime") if row.get("exptime") is not None else row.get("pexptime")
         row["exposure_time"] = float(value) if value is not None else None
-        row["exposure_time_source"] = "EXPTIME" if row.get("exptime") is not None else (
-            "PEXPTIME" if row.get("pexptime") is not None else None
+        row["exposure_time_source"] = (
+            "EXPTIME" if row.get("exptime") is not None else
+            "PEXPTIME" if kind != "master_dark" and row.get("pexptime") is not None else None
         )
         row["lamp_kind"] = _lamp_kind(row)
         if kind in {"master_hg", "master_cd"} and row["lamp_kind"] != kind.removeprefix("master_"):
@@ -287,6 +316,20 @@ def resolve_calibration_groups(
             key = key if key is not None else _calendar_key(row["timestamp"], policy, row, options)
             keyed.setdefault(key, []).append(row)
         buckets = list(keyed.values())
+
+    if kind == "master_dark":
+        # Keep cadence boundaries unchanged, but make nominal exposure class a
+        # master_dark-specific discriminator within each cadence bucket.
+        split_buckets: list[list[dict[str, Any]]] = []
+        for bucket in buckets:
+            by_nominal: dict[int | None, list[dict[str, Any]]] = {}
+            for row in bucket:
+                row["nominal_dark_exptime_seconds"] = nominal_dark_exptime_seconds(
+                    row.get("exposure_time")
+                )
+                by_nominal.setdefault(row["nominal_dark_exptime_seconds"], []).append(row)
+            split_buckets.extend(by_nominal.values())
+        buckets = split_buckets
 
     groups: list[CalibrationGroup] = []
     minimum = int(options.get("minimum_exposures", 1))
