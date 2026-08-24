@@ -157,21 +157,23 @@ def _make_group(
             applicability_end = applicability_start.replace(month=applicability_start.month + 1)
     exposure_times = [row.get("exposure_time") for row in rows]
     temperatures = [row.get("ambient_temperature") for row in rows]
-    nominal_dark_exptimes = {
-        row.get("nominal_dark_exptime_seconds")
-        for row in rows
-    } if kind == "master_dark" else set()
-    nominal_dark_exptime = (
-        next(iter(nominal_dark_exptimes))
-        if len(nominal_dark_exptimes) == 1 else None
-    )
     identity_payload = {
         "kind": kind, "zipcode": zipcode, "raw_ids": raw_ids,
-        "nominal_dark_exptime_seconds": nominal_dark_exptime,
         "algorithm_version": options.get("algorithm_version", _ALGORITHM_IDENTITIES.get(kind)),
         "algorithm_parameters": options.get("algorithm_parameters", {}),
         "configuration_references": options.get("configuration_references", ()),
     }
+    nominal_dark_exptime = None
+    if kind == "master_dark":
+        nominal_dark_exptimes = {
+            row.get("nominal_dark_exptime_seconds")
+            for row in rows
+        }
+        nominal_dark_exptime = (
+            next(iter(nominal_dark_exptimes))
+            if len(nominal_dark_exptimes) == 1 else None
+        )
+        identity_payload["nominal_dark_exptime_seconds"] = nominal_dark_exptime
     computation_id = hashlib.sha256(
         json.dumps(identity_payload, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()[:24]
@@ -192,7 +194,6 @@ def _make_group(
         ],
         "n_exposures": len(rows),
         "exposure_time_seconds": _stats(exposure_times),
-        "nominal_dark_exptime_seconds": nominal_dark_exptime,
         "total_exposure_seconds": sum(float(value) for value in exposure_times if value is not None),
         "ambient_temperature": _stats(temperatures),
         "missing_temperature": any(value is None for value in temperatures),
@@ -200,6 +201,8 @@ def _make_group(
         "temporal_span_seconds": (times[-1] - times[0]).total_seconds(),
         "sufficiency": dict(sufficiency or {}),
     }
+    if kind == "master_dark":
+        metadata["nominal_dark_exptime_seconds"] = nominal_dark_exptime
     return CalibrationGroup(
         group_id=group_id, computation_id=computation_id, policy=policy,
         raw_ids=raw_ids, exposure_ids=exposure_ids, timestamps=times,

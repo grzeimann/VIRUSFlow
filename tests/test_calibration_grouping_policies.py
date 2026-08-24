@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import hashlib
+import json
 
 from virusflow.artifacts import Scope
 from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
@@ -124,6 +126,27 @@ def test_dark_monthly_groups_by_nominal_exposure_seconds_and_preserves_measured_
     assert len(planned) == 2
     assert {target.group.metadata["nominal_dark_exptime_seconds"] for target in planned} == {15, 360}
     assert len({target.group.group_id for target in planned}) == 2
+
+
+def test_dark_identity_discriminator_is_not_leaked_to_other_calibration_kinds(tmp_path):
+    path = _catalog(tmp_path, [
+        ("20260601T010000.0", "zro", 0.0, None, None, None),
+        ("20260602T010000.0", "drk", 15.00012, None, None, None),
+        ("20260603T010000.0", "drk", 360.00012, None, None, None),
+    ])
+
+    bias = _groups(path, "master_bias", "nightly", minimum_exposures=1).groups[0]
+    expected_bias_identity = hashlib.sha256(json.dumps({
+        "kind": "master_bias", "zipcode": ZIP.key(), "raw_ids": bias.raw_ids,
+        "algorithm_version": "bias-1.1", "algorithm_parameters": {},
+        "configuration_references": (),
+    }, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:24]
+    assert bias.computation_id == expected_bias_identity
+    assert "nominal_dark_exptime_seconds" not in bias.metadata
+
+    dark = _groups(path, "master_dark", "monthly", minimum_exposures=1)
+    assert {group.metadata["nominal_dark_exptime_seconds"] for group in dark.groups} == {15, 360}
+    assert len({group.computation_id for group in dark.groups}) == 2
 
 
 def test_twilight_week_and_ldls_isolated_temperature_metadata(tmp_path):

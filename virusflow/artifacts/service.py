@@ -219,6 +219,7 @@ class ArtifactService:
             kind, scope, normalized_components, stable_parents, context,
             request.configuration_refs, request.scientific_metadata,
             tuple((row["input_name"], row["measurement_group_id"]) for row in group_inputs),
+            calibration_group_id=(request.metadata or {}).get("calibration_group_id"),
         )
         from ..performance import current_task_timing, phase
         with phase("artifact_lookup"):
@@ -753,7 +754,7 @@ class ArtifactService:
     @staticmethod
     def _logical_revision(
         kind, scope, components, parents, context, configuration_refs=(),
-        scientific_metadata=None, measurement_group_inputs=(),
+        scientific_metadata=None, measurement_group_inputs=(), calibration_group_id=None,
     ) -> str:
         digest = hashlib.sha256()
         identity = {
@@ -772,6 +773,8 @@ class ArtifactService:
             ),
             "measurement_group_inputs": sorted(measurement_group_inputs),
         }
+        if calibration_group_id is not None:
+            identity["calibration_group_id"] = str(calibration_group_id)
         digest.update(json.dumps(identity, sort_keys=True, default=str).encode("utf-8"))
         for name, component in sorted(components.items()):
             value = component.value
