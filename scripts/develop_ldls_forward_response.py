@@ -1205,6 +1205,7 @@ def _select_ldls_trace(
     zipcode: ZipCode,
     *,
     exposure_ids: Iterable[str] | None = None,
+    ldls_artifact_id: int | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Select one LDLS product and its directly derived trace map.
 
@@ -1213,14 +1214,36 @@ def _select_ldls_trace(
     newest-active behavior for the legacy development invocation.
     """
     requested = None if exposure_ids is None else tuple(sorted(str(value) for value in exposure_ids))
-    ldls_rows = _active_rows(service, "master_ldls", zipcode)
-    if requested is not None:
-        ldls_rows = [row for row in ldls_rows if _group_exposure_ids(row) == requested]
-        ldls = _select_one(ldls_rows, label="master_ldls exposure group", zipcode=zipcode)
-    else:
-        ldls = ldls_rows[0] if ldls_rows else None
+    if ldls_artifact_id is not None:
+        ldls = service.adapter.get_row(int(ldls_artifact_id))
         if ldls is None:
-            raise RuntimeError(f"no active master_ldls for {zipcode.key()}")
+            raise RuntimeError(f"master_ldls artifact {ldls_artifact_id} was not found")
+        if str(ldls.get("state") or "active") != "active":
+            raise RuntimeError(f"master_ldls artifact {ldls_artifact_id} is not active")
+        if str(ldls.get("canonical_kind") or ldls.get("kind")) != "master_ldls":
+            raise RuntimeError(
+                f"artifact {ldls_artifact_id} is not a master_ldls: "
+                f"{ldls.get('canonical_kind') or ldls.get('kind')}"
+            )
+        if str(ldls.get("amp_key") or "") != zipcode.key():
+            raise RuntimeError(
+                f"master_ldls artifact {ldls_artifact_id} belongs to "
+                f"{ldls.get('amp_key')}, expected {zipcode.key()}"
+            )
+        if requested is not None and _group_exposure_ids(ldls) != requested:
+            raise RuntimeError(
+                f"master_ldls artifact {ldls_artifact_id} exposure group is "
+                f"{list(_group_exposure_ids(ldls))}, expected {list(requested)}"
+            )
+    else:
+        ldls_rows = _active_rows(service, "master_ldls", zipcode)
+        if requested is not None:
+            ldls_rows = [row for row in ldls_rows if _group_exposure_ids(row) == requested]
+            ldls = _select_one(ldls_rows, label="master_ldls exposure group", zipcode=zipcode)
+        else:
+            ldls = ldls_rows[0] if ldls_rows else None
+            if ldls is None:
+                raise RuntimeError(f"no active master_ldls for {zipcode.key()}")
 
     trace_rows = [
         row for row in _active_rows(service, "trace_map", zipcode)
@@ -1287,15 +1310,19 @@ def load_ldls_evidence_pair(
     upper_zipcode: ZipCode,
     *,
     exposure_ids: Iterable[str] | None = None,
+    lower_ldls_artifact_id: int | None = None,
+    upper_ldls_artifact_id: int | None = None,
     aperture_width: float = 5.0,
 ) -> tuple[LDLSEvidence, dict[str, Any]]:
     """Load an explicit amplifier pair through read-only ArtifactService APIs."""
     side, lower_amp, upper_amp = _validate_pair_zipcodes(lower_zipcode, upper_zipcode)
     lower_ldls, lower_trace = _select_ldls_trace(
-        service, lower_zipcode, exposure_ids=exposure_ids
+        service, lower_zipcode, exposure_ids=exposure_ids,
+        ldls_artifact_id=lower_ldls_artifact_id,
     )
     upper_ldls, upper_trace = _select_ldls_trace(
-        service, upper_zipcode, exposure_ids=exposure_ids
+        service, upper_zipcode, exposure_ids=exposure_ids,
+        ldls_artifact_id=upper_ldls_artifact_id,
     )
     lower_group = _group_exposure_ids(lower_ldls)
     upper_group = _group_exposure_ids(upper_ldls)
@@ -1364,6 +1391,8 @@ def load_ldls_evidence(
     requested: ZipCode,
     *,
     exposure_ids: Iterable[str] | None = None,
+    lower_ldls_artifact_id: int | None = None,
+    upper_ldls_artifact_id: int | None = None,
     aperture_width: float = 5.0,
 ) -> tuple[LDLSEvidence, dict[str, Any]]:
     """Load the same physical-CCD LDLS/trace/mask inputs through public APIs."""
@@ -1373,7 +1402,10 @@ def load_ldls_evidence(
     lower_zip = ZipCode(requested.ifuslot, requested.ifuid, requested.specid, lower_amp, requested.controller)
     upper_zip = ZipCode(requested.ifuslot, requested.ifuid, requested.specid, upper_amp, requested.controller)
     evidence, selection = load_ldls_evidence_pair(
-        service, lower_zip, upper_zip, exposure_ids=exposure_ids, aperture_width=aperture_width,
+        service, lower_zip, upper_zip, exposure_ids=exposure_ids,
+        lower_ldls_artifact_id=lower_ldls_artifact_id,
+        upper_ldls_artifact_id=upper_ldls_artifact_id,
+        aperture_width=aperture_width,
     )
     selection["requested_zipcode"] = requested.key()
     return evidence, selection
@@ -1716,6 +1748,8 @@ def main(argv: list[str] | None = None) -> int:
         "--ldls-exposure-id", action="append", dest="ldls_exposure_ids",
         help="exact exposure-group member; repeat once per selected LDLS input exposure",
     )
+    parser.add_argument("--lower-master-ldls-id", type=int, help="explicit lower master_ldls artifact ID")
+    parser.add_argument("--upper-master-ldls-id", type=int, help="explicit upper master_ldls artifact ID")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--support", type=float, default=9.0)
     parser.add_argument("--trace-degree", type=int, default=4)
@@ -1741,6 +1775,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("use either --zipcode or --lower-zipcode/--upper-zipcode")
     if not explicit_pair and args.zipcode is None:
         parser.error("--zipcode or --lower-zipcode/--upper-zipcode is required")
+    if (args.lower_master_ldls_id is None) != (args.upper_master_ldls_id is None):
+        parser.error("--lower-master-ldls-id and --upper-master-ldls-id must be supplied together")
     runtime = RuntimeProfile()
     with runtime.measure("data/evidence setup"):
         service = ArtifactService(db_path)
@@ -1750,10 +1786,14 @@ def main(argv: list[str] | None = None) -> int:
                 parse_zipcode_key(args.lower_zipcode),
                 parse_zipcode_key(args.upper_zipcode),
                 exposure_ids=args.ldls_exposure_ids,
+                lower_ldls_artifact_id=args.lower_master_ldls_id,
+                upper_ldls_artifact_id=args.upper_master_ldls_id,
             )
         else:
             evidence, selection = load_ldls_evidence(
                 service, parse_zipcode_key(args.zipcode), exposure_ids=args.ldls_exposure_ids,
+                lower_ldls_artifact_id=args.lower_master_ldls_id,
+                upper_ldls_artifact_id=args.upper_master_ldls_id,
             )
     print(f"artifact DB path: {selection['artifact_db']}")
     print(f"lower ZipCode: {selection['lower_zipcode']}")

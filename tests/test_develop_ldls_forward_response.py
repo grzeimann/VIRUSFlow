@@ -126,6 +126,21 @@ def test_artifact_bridge_rejects_mismatched_physical_ccd_pair(tmp_path: Path):
         solver.load_ldls_evidence_pair(service, lower, mismatched, exposure_ids=EXPOSURES_A)
 
 
+def test_artifact_bridge_can_pin_one_duplicate_group_by_master_ldls_id(tmp_path: Path):
+    solver, _service_a, lower, upper, artifacts_a, _trace = _fixture_pair(tmp_path, EXPOSURES_A, 10.0)
+    _solver_b, service, _lower_b, _upper_b, _artifacts_b, _trace_b = _fixture_pair(tmp_path, EXPOSURES_A, 20.0)
+
+    evidence, selection = solver.load_ldls_evidence_pair(
+        service, lower, upper, exposure_ids=EXPOSURES_A,
+        lower_ldls_artifact_id=artifacts_a["LL"]["master_ldls"].id,
+        upper_ldls_artifact_id=artifacts_a["LU"]["master_ldls"].id,
+    )
+
+    assert evidence.image.shape == (2064, 24)
+    assert selection["lower_master_ldls"]["id"] == artifacts_a["LL"]["master_ldls"].id
+    assert selection["upper_master_ldls"]["id"] == artifacts_a["LU"]["master_ldls"].id
+
+
 def _synthetic_problem():
     solver = _solver_module()
     fiber_count, columns, rows = 3, 24, 48
