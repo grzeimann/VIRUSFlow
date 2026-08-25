@@ -366,6 +366,58 @@ class ProfileCache:
         return value.reshape(u.shape), derivative.reshape(u.shape)
 
 
+def model_fwhm_from_radius_sigma(radius: float, sigma: float) -> float:
+    """Return the exact-model FWHM from one unit-pixel compact profile."""
+    profile = fourier_compact_profile(radius, sigma, alpha=0.0)
+    coordinate = profile.coordinate
+    density = profile.density
+    center = int(np.argmin(np.abs(coordinate)))
+    peak = float(density[center])
+    if not np.isfinite(peak) or peak <= 0.0:
+        raise ValueError("compact profile has no finite positive central maximum")
+    half_max = 0.5 * peak
+    positive_coordinate = coordinate[center:]
+    positive_density = density[center:]
+    crossing = np.flatnonzero(
+        (positive_density[:-1] >= half_max) & (positive_density[1:] <= half_max)
+    )
+    if crossing.size == 0:
+        raise ValueError("compact profile has no positive half-maximum crossing")
+    index = int(crossing[0])
+    x0, x1 = positive_coordinate[index:index + 2]
+    y0, y1 = positive_density[index:index + 2]
+    if y1 == y0:
+        half_width = float(x0)
+    else:
+        half_width = float(x0 + (half_max - y0) * (x1 - x0) / (y1 - y0))
+    if not np.isfinite(half_width) or half_width <= 0.0:
+        raise ValueError("compact profile half-maximum crossing is invalid")
+    return 2.0 * half_width
+
+
+def model_fwhm_field(
+    radius: np.ndarray, sigma: np.ndarray, *, quantization: float = 2e-3,
+) -> np.ndarray:
+    """Compute a quantized exact-profile FWHM field without one FFT per pixel."""
+    radius, sigma = np.broadcast_arrays(np.asarray(radius, float), np.asarray(sigma, float))
+    if not np.isfinite(quantization) or quantization <= 0.0:
+        raise ValueError("FWHM quantization must be positive and finite")
+    if np.any(~np.isfinite(radius)) or np.any(~np.isfinite(sigma)):
+        raise ValueError("FWHM field requires finite R and sigma")
+    quantized_radius = np.rint(radius / quantization).astype(np.int32)
+    quantized_sigma = np.rint(sigma / quantization).astype(np.int32)
+    pairs, inverse = np.unique(
+        np.column_stack((quantized_radius.ravel(), quantized_sigma.ravel())),
+        axis=0, return_inverse=True,
+    )
+    values = np.empty(pairs.shape[0], float)
+    for index, (radius_key, sigma_key) in enumerate(pairs):
+        values[index] = model_fwhm_from_radius_sigma(
+            float(radius_key) * quantization, float(sigma_key) * quantization,
+        )
+    return values[inverse].reshape(radius.shape)
+
+
 def _normalised_coordinate(value: np.ndarray, low: float, high: float) -> np.ndarray:
     return (np.asarray(value, float) - 0.5 * (low + high)) / max(0.5 * (high - low), 1.0)
 
@@ -1313,7 +1365,7 @@ def load_ldls_evidence_pair(
     lower_ldls_artifact_id: int | None = None,
     upper_ldls_artifact_id: int | None = None,
     aperture_width: float = 5.0,
-) -> tuple[LDLSEvidence, dict[str, Any]]:
+) -> tuple[LDLSEvidence, dict[str, Any], np.ndarray]:
     """Load an explicit amplifier pair through read-only ArtifactService APIs."""
     side, lower_amp, upper_amp = _validate_pair_zipcodes(lower_zipcode, upper_zipcode)
     lower_ldls, lower_trace = _select_ldls_trace(
@@ -1344,6 +1396,7 @@ def load_ldls_evidence_pair(
         lower_variance=np.maximum(lower_image, 1.0), upper_variance=np.maximum(upper_image, 1.0),
         lower_mask=lower_mask, upper_mask=upper_mask,
     )
+    assembly_image = assembly.get_array("image")
     lower_trace_array = _load(service, lower_trace, "fiber_trace_map")
     upper_trace_array = _load(service, upper_trace, "fiber_trace_map")
     scatter = fit_gap_scattered_light(assembly, lower_trace_array, upper_trace_array)
@@ -1383,7 +1436,7 @@ def load_ldls_evidence_pair(
         "physical_ccd_side": side,
         "read_only": True,
         "input_checksums": input_checksums,
-    }
+    }, assembly_image
 
 
 def load_ldls_evidence(
@@ -1394,21 +1447,37 @@ def load_ldls_evidence(
     lower_ldls_artifact_id: int | None = None,
     upper_ldls_artifact_id: int | None = None,
     aperture_width: float = 5.0,
-) -> tuple[LDLSEvidence, dict[str, Any]]:
+) -> tuple[LDLSEvidence, dict[str, Any], np.ndarray]:
     """Load the same physical-CCD LDLS/trace/mask inputs through public APIs."""
     if requested.amp not in PAIR:
         raise ValueError("zipcode amplifier must be LL, LU, RU, or RL")
     side, lower_amp, upper_amp = PAIR[requested.amp]
     lower_zip = ZipCode(requested.ifuslot, requested.ifuid, requested.specid, lower_amp, requested.controller)
     upper_zip = ZipCode(requested.ifuslot, requested.ifuid, requested.specid, upper_amp, requested.controller)
-    evidence, selection = load_ldls_evidence_pair(
+    evidence, selection, assembly_image = load_ldls_evidence_pair(
         service, lower_zip, upper_zip, exposure_ids=exposure_ids,
         lower_ldls_artifact_id=lower_ldls_artifact_id,
         upper_ldls_artifact_id=upper_ldls_artifact_id,
         aperture_width=aperture_width,
     )
     selection["requested_zipcode"] = requested.key()
-    return evidence, selection
+    return evidence, selection, assembly_image
+
+
+def _write_assembled_master_ldls_diagnostic(
+    output: Path, assembly_image: np.ndarray, selection: dict[str, Any],
+) -> None:
+    """Write the pre-scatter physical-CCD image for development inspection only."""
+    from astropy.io import fits
+
+    output.mkdir(parents=True, exist_ok=True)
+    header = fits.Header()
+    header["CCD_SIDE"] = selection["physical_ccd_side"]
+    header["LOWERZC"] = selection["lower_zipcode"]
+    header["UPPERZC"] = selection["upper_zipcode"]
+    fits.PrimaryHDU(assembly_image, header=header).writeto(
+        output / "assembled_master_ldls_physical_ccd.fits", overwrite=True,
+    )
 
 
 def _write_diagnostics(
@@ -1419,8 +1488,12 @@ def _write_diagnostics(
     closure: ForwardEvaluation,
     trace_convergence: TraceStep,
     displacement: DetectorDisplacementExperiment | None = None,
+    profile_cache_quantization: float = 2e-3,
 ) -> None:
     output.mkdir(parents=True, exist_ok=True)
+    model_fwhm = model_fwhm_field(
+        closure.R, closure.sigma, quantization=profile_cache_quantization,
+    )
     proposal_delta = np.einsum(
         "fxt,ft->fx", geometry.trace_basis, trace_convergence.incremental_trace_coeff,
     )
@@ -1428,6 +1501,7 @@ def _write_diagnostics(
         "trace": closure.trace, "W": closure.W, "f_sigma": closure.f_sigma,
         "aperture_illumination_alpha": np.asarray(0.0),
         "R": closure.R, "sigma": closure.sigma, "C5": closure.C5,
+        "model_fwhm": model_fwhm,
         "amplitude": closure.total_amplitude,
         "aperture_flux_closure": closure.total_amplitude * closure.C5 - evidence.five_pixel_flux,
         "model_samples": closure.model_samples, "residuals": closure.residuals,
@@ -1515,6 +1589,51 @@ def _write_diagnostics(
             title="detector-coordinate correction dy(x, y)", xlabel="detector x", ylabel="detector y",
         )
     fig.savefig(output / "forward_ldls_diagnostics.png", dpi=160)
+    plt.close(fig)
+    _write_profile_shape_diagnostics(
+        output, closure.W, closure.f_sigma, closure.R, closure.sigma, model_fwhm,
+    )
+
+
+def _write_profile_shape_diagnostics(
+    output: Path,
+    W: np.ndarray,
+    f_sigma: np.ndarray,
+    radius: np.ndarray,
+    sigma: np.ndarray,
+    model_fwhm: np.ndarray,
+) -> None:
+    """Write development-only maps and per-fiber summaries of profile shape."""
+    fields = (
+        (W, "W", "W (pixels)"),
+        (f_sigma, "f_sigma", "f_sigma"),
+        (model_fwhm, "model FWHM", "pixels"),
+        (radius, "R", "pixels"),
+        (sigma, "sigma", "pixels"),
+        (np.divide(model_fwhm, W, out=np.full_like(model_fwhm, np.nan), where=W != 0.0), "model FWHM / W", "ratio"),
+    )
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
+    for axis, (field, title, colorbar_label) in zip(axes.flat, fields):
+        image = axis.imshow(field, aspect="auto", origin="lower")
+        fig.colorbar(image, ax=axis, label=colorbar_label)
+        axis.set(title=title, xlabel="detector x", ylabel="fiber")
+    fig.savefig(output / "forward_ldls_profile_shape_diagnostics.png", dpi=160)
+    plt.close(fig)
+
+    fibers = np.arange(W.shape[0])
+    summaries = (
+        (W, "W", "pixels"),
+        (radius, "R", "pixels"),
+        (sigma, "sigma", "pixels"),
+        (model_fwhm, "model FWHM", "pixels"),
+    )
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7), sharex=True, constrained_layout=True)
+    for axis, (field, title, unit) in zip(axes.flat, summaries):
+        axis.plot(fibers, np.nanmedian(field, axis=1), color="black", linewidth=1.2)
+        axis.axvline(112 - 0.5, color="tab:red", linewidth=0.8, alpha=0.8)
+        axis.set(title=f"median {title} by fiber", ylabel=unit, xlabel="fiber")
+        axis.grid(alpha=0.2)
+    fig.savefig(output / "forward_ldls_profile_shape_by_fiber.png", dpi=160)
     plt.close(fig)
 
 
@@ -1781,7 +1900,7 @@ def main(argv: list[str] | None = None) -> int:
     with runtime.measure("data/evidence setup"):
         service = ArtifactService(db_path)
         if explicit_pair:
-            evidence, selection = load_ldls_evidence_pair(
+            evidence, selection, assembly_image = load_ldls_evidence_pair(
                 service,
                 parse_zipcode_key(args.lower_zipcode),
                 parse_zipcode_key(args.upper_zipcode),
@@ -1790,11 +1909,12 @@ def main(argv: list[str] | None = None) -> int:
                 upper_ldls_artifact_id=args.upper_master_ldls_id,
             )
         else:
-            evidence, selection = load_ldls_evidence(
+            evidence, selection, assembly_image = load_ldls_evidence(
                 service, parse_zipcode_key(args.zipcode), exposure_ids=args.ldls_exposure_ids,
                 lower_ldls_artifact_id=args.lower_master_ldls_id,
                 upper_ldls_artifact_id=args.upper_master_ldls_id,
             )
+    _write_assembled_master_ldls_diagnostic(args.output_dir, assembly_image, selection)
     print(f"artifact DB path: {selection['artifact_db']}")
     print(f"lower ZipCode: {selection['lower_zipcode']}")
     print(f"upper ZipCode: {selection['upper_zipcode']}")
@@ -1892,6 +2012,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         _write_diagnostics(
             args.output_dir, evidence, geometry, sampling, closure, trace_convergence, displacement,
+            profile_cache_quantization=args.profile_cache_quantization,
         )
         _write_state_and_provenance(
             args.output_dir, state, geometry, closure, trace_convergence,

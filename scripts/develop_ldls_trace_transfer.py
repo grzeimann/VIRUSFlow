@@ -681,7 +681,7 @@ def main(argv: list[str] | None = None) -> int:
     upper_zip = ZipCode(requested.ifuslot, requested.ifuid, requested.specid, upper_amp, requested.controller)
     arrays, calibration_provenance, calibration_selection = _load_frozen_calibration(args.calibration_dir)
     service = ArtifactService(args.db)
-    current_evidence, current_selection = forward.load_ldls_evidence(service, requested)
+    current_evidence, current_selection, _assembly_image = forward.load_ldls_evidence(service, requested)
     for key in ("lower_ldls_id", "upper_ldls_id", "lower_trace_id", "upper_trace_id"):
         if int(current_selection[key]) != int(calibration_selection[key]):
             raise RuntimeError(f"frozen calibration {key}={calibration_selection[key]} does not match active selected evidence {current_selection[key]}")

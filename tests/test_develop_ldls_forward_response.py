@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from astropy.io import fits
 
 from virusflow.artifacts import ArtifactService, Scope
 from virusflow.artifacts.requests import ArtifactRequest, LogicalComponent
@@ -96,7 +97,7 @@ def test_artifact_bridge_selects_exact_group_and_is_read_only(tmp_path: Path):
     _solver_b, service, _lower_b, _upper_b, _artifacts_b, _trace_b = _fixture_pair(tmp_path, EXPOSURES_B, 20.0)
     before = {kind: len(service.adapter.list_all(kind=kind)) for kind in ("master_ldls", "trace_map")}
 
-    evidence, selection = solver.load_ldls_evidence_pair(
+    evidence, selection, assembly_image = solver.load_ldls_evidence_pair(
         service, lower, upper, exposure_ids=EXPOSURES_A,
     )
 
@@ -110,6 +111,9 @@ def test_artifact_bridge_selects_exact_group_and_is_read_only(tmp_path: Path):
     assert selection["trace_map_shapes"] == {"lower": [4, 24], "upper": [4, 24]}
     assert selection["assembled_physical_ccd_shape"] == [2064, 24]
     assert selection["read_only"] is True
+    np.testing.assert_array_equal(assembly_image, np.vstack((
+        np.full((1032, 24), 10.0), np.full((1032, 24), 11.0),
+    )))
     assert evidence.image.shape == (2064, 24)
     assert evidence.base_trace.shape == (8, 24)
     np.testing.assert_allclose(evidence.base_trace[:4], trace)
@@ -130,7 +134,7 @@ def test_artifact_bridge_can_pin_one_duplicate_group_by_master_ldls_id(tmp_path:
     solver, _service_a, lower, upper, artifacts_a, _trace = _fixture_pair(tmp_path, EXPOSURES_A, 10.0)
     _solver_b, service, _lower_b, _upper_b, _artifacts_b, _trace_b = _fixture_pair(tmp_path, EXPOSURES_A, 20.0)
 
-    evidence, selection = solver.load_ldls_evidence_pair(
+    evidence, selection, assembly_image = solver.load_ldls_evidence_pair(
         service, lower, upper, exposure_ids=EXPOSURES_A,
         lower_ldls_artifact_id=artifacts_a["LL"]["master_ldls"].id,
         upper_ldls_artifact_id=artifacts_a["LU"]["master_ldls"].id,
@@ -139,6 +143,84 @@ def test_artifact_bridge_can_pin_one_duplicate_group_by_master_ldls_id(tmp_path:
     assert evidence.image.shape == (2064, 24)
     assert selection["lower_master_ldls"]["id"] == artifacts_a["LL"]["master_ldls"].id
     assert selection["upper_master_ldls"]["id"] == artifacts_a["LU"]["master_ldls"].id
+
+
+def test_assembled_master_ldls_diagnostic_writes_exact_assembly_image(tmp_path: Path):
+    solver, service, lower, upper, _artifacts, _trace = _fixture_pair(tmp_path, EXPOSURES_A, 10.0)
+    _evidence, selection, assembly_image = solver.load_ldls_evidence_pair(
+        service, lower, upper, exposure_ids=EXPOSURES_A,
+    )
+
+    solver._write_assembled_master_ldls_diagnostic(tmp_path, assembly_image, selection)
+    diagnostic = tmp_path / "assembled_master_ldls_physical_ccd.fits"
+    with fits.open(diagnostic) as hdul:
+        np.testing.assert_array_equal(hdul[0].data, assembly_image)
+        assert hdul[0].header["CCD_SIDE"] == "left"
+        assert hdul[0].header["LOWERZC"] == lower.key()
+        assert hdul[0].header["UPPERZC"] == upper.key()
+
+
+def test_model_fwhm_uses_direct_symmetric_half_maximum_crossing():
+    solver = _solver_module()
+    radius, sigma = 1.7, 0.38
+    profile = solver.fourier_compact_profile(radius, sigma, alpha=0.0)
+    center = int(np.argmin(np.abs(profile.coordinate)))
+    half_max = 0.5 * profile.density[center]
+    coordinate = profile.coordinate[center:]
+    density = profile.density[center:]
+    crossing = np.flatnonzero((density[:-1] >= half_max) & (density[1:] <= half_max))[0]
+    x0, x1 = coordinate[crossing:crossing + 2]
+    y0, y1 = density[crossing:crossing + 2]
+    direct_half_width = x0 + (half_max - y0) * (x1 - x0) / (y1 - y0)
+
+    fwhm = solver.model_fwhm_from_radius_sigma(radius, sigma)
+    assert np.isfinite(fwhm) and fwhm > 0.0
+    np.testing.assert_allclose(fwhm, 2.0 * direct_half_width, rtol=0.0, atol=1e-12)
+
+
+def test_model_fwhm_field_is_quantized_and_matches_response_field_shape():
+    solver = _solver_module()
+    radius = np.asarray([[1.4, 1.4004], [1.7, 1.9]])
+    sigma = np.asarray([[0.25, 0.2504], [0.38, 0.45]])
+    field = solver.model_fwhm_field(radius, sigma, quantization=0.002)
+    assert field.shape == radius.shape
+    assert np.all(np.isfinite(field))
+    assert np.all(field > 0.0)
+    assert field[0, 0] == field[0, 1]
+
+
+def test_profile_shape_diagnostics_preserve_state_and_existing_arrays(tmp_path: Path):
+    solver, evidence, geometry, sampling, _truth, cache = _synthetic_problem()
+    state = solver.initial_profile_trace_state(geometry)
+    state_before = {
+        "trace_coeff": state.trace_coeff.copy(),
+        "W_coeff": state.W_coeff.copy(),
+        "f_sigma_coeff": state.f_sigma_coeff.copy(),
+    }
+    closure = solver.evaluate_state(
+        evidence, geometry, sampling, state, cache=cache,
+        derivatives=True, debug_contributions=True,
+    )
+    trace_step = solver.build_trace_step(evidence, geometry, sampling, state, closure)
+    existing = {
+        "W": closure.W.copy(), "f_sigma": closure.f_sigma.copy(),
+        "R": closure.R.copy(), "sigma": closure.sigma.copy(),
+    }
+
+    solver._write_diagnostics(
+        tmp_path, evidence, geometry, sampling, closure, trace_step,
+    )
+
+    with np.load(tmp_path / "forward_ldls_diagnostics.npz") as diagnostics:
+        for name, values in existing.items():
+            np.testing.assert_array_equal(diagnostics[name], values)
+        assert diagnostics["model_fwhm"].shape == closure.W.shape
+        assert np.all(np.isfinite(diagnostics["model_fwhm"]))
+    np.testing.assert_array_equal(state.trace_coeff, state_before["trace_coeff"])
+    np.testing.assert_array_equal(state.W_coeff, state_before["W_coeff"])
+    np.testing.assert_array_equal(state.f_sigma_coeff, state_before["f_sigma_coeff"])
+    assert (tmp_path / "forward_ldls_profile_shape_diagnostics.png").exists()
+    assert (tmp_path / "forward_ldls_profile_shape_by_fiber.png").exists()
 
 
 def _synthetic_problem():
