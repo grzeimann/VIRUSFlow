@@ -37,6 +37,7 @@ from scipy import sparse
 from scipy.interpolate import BSpline
 from scipy.sparse.linalg import lsqr, spsolve
 from scipy.special import j1, jv
+from scipy.stats import spearmanr
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -940,6 +941,116 @@ def _summary(values: np.ndarray) -> dict[str, float | int]:
     }
 
 
+ORDINARY_TRACE_PITCH_MIN_PIXELS = 5.0
+ORDINARY_TRACE_PITCH_MAX_PIXELS = 12.0
+
+
+def _summary_or_empty(values: np.ndarray) -> dict[str, float | int]:
+    values = np.asarray(values, float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {
+            "count": 0, "median": float("nan"), "MAD": float("nan"),
+            "p05": float("nan"), "p95": float("nan"),
+            "min": float("nan"), "max": float("nan"),
+        }
+    return _summary(values)
+
+
+def _robust_linear_fit(x: np.ndarray, y: np.ndarray) -> dict[str, float]:
+    """Small deterministic MAD-clipped linear fit for diagnostic reporting."""
+    x, y = np.broadcast_arrays(np.asarray(x, float), np.asarray(y, float))
+    valid = np.isfinite(x) & np.isfinite(y)
+    x, y = x[valid], y[valid]
+    if x.size < 2 or np.unique(x).size < 2:
+        return {"slope": float("nan"), "intercept": float("nan"), "count": int(x.size)}
+    keep = np.ones(x.size, dtype=bool)
+    for _ in range(5):
+        design = np.column_stack((x[keep], np.ones(int(np.sum(keep)))))
+        slope, intercept = np.linalg.lstsq(design, y[keep], rcond=None)[0]
+        residual = y - (slope * x + intercept)
+        center = float(np.median(residual[keep]))
+        mad = float(np.median(np.abs(residual[keep] - center)))
+        if not np.isfinite(mad) or mad == 0.0:
+            break
+        candidate = np.abs(residual - center) <= 4.0 * 1.4826 * mad
+        if int(np.sum(candidate)) < 2:
+            break
+        keep = candidate
+    return {"slope": float(slope), "intercept": float(intercept), "count": int(np.sum(keep))}
+
+
+def _R_trace_pitch_diagnostics(
+    trace: np.ndarray,
+    radius: np.ndarray,
+    *,
+    amplifier_boundary: float,
+    minimum_spacing: float = ORDINARY_TRACE_PITCH_MIN_PIXELS,
+    maximum_spacing: float = ORDINARY_TRACE_PITCH_MAX_PIXELS,
+) -> dict[str, Any]:
+    """Build ordinary same-amplifier adjacent-pair pitch/R diagnostics."""
+    trace, radius = np.broadcast_arrays(np.asarray(trace, float), np.asarray(radius, float))
+    if trace.ndim != 2 or trace.shape[0] < 2:
+        raise ValueError("trace and radius must be two-dimensional with at least two fibers")
+    spacing = trace[1:] - trace[:-1]
+    same_amplifier = (
+        (trace[:-1] < amplifier_boundary) == (trace[1:] < amplifier_boundary)
+    )
+    ordinary = (
+        same_amplifier
+        & np.isfinite(spacing)
+        & (spacing > float(minimum_spacing))
+        & (spacing < float(maximum_spacing))
+        & np.isfinite(radius[:-1])
+        & np.isfinite(radius[1:])
+    )
+    spacing_pair = np.where(ordinary, spacing, np.nan)
+    radius_pair = np.where(ordinary, 0.5 * (radius[:-1] + radius[1:]), np.nan)
+    radius_to_pitch = np.divide(
+        radius_pair, spacing_pair,
+        out=np.full_like(radius_pair, np.nan), where=np.isfinite(spacing_pair),
+    )
+    lower = ordinary & (trace[:-1] < amplifier_boundary)
+    upper = ordinary & (trace[:-1] >= amplifier_boundary)
+    masks = {"all": ordinary, "lower": lower, "upper": upper}
+
+    relation = {}
+    for name, mask in masks.items():
+        x, y = spacing_pair[mask], radius_pair[mask]
+        if x.size < 2 or np.unique(x).size < 2 or np.unique(y).size < 2:
+            pearson = float("nan")
+            spearman = float("nan")
+        else:
+            pearson = float(np.corrcoef(x, y)[0, 1])
+            spearman_value = spearmanr(x, y).statistic
+            spearman = float(spearman_value)
+        relation[name] = {
+            "count": int(x.size),
+            "pearson": pearson,
+            "spearman": spearman,
+            "robust_linear_fit": _robust_linear_fit(x, y),
+        }
+    ratio_summary = {
+        name: _summary_or_empty(radius_to_pitch[mask])
+        for name, mask in masks.items()
+    }
+    return {
+        "spacing_pair": spacing_pair,
+        "radius_pair": radius_pair,
+        "radius_to_pitch": radius_to_pitch,
+        "ordinary_mask": ordinary,
+        "lower_mask": lower,
+        "upper_mask": upper,
+        "relation": relation,
+        "radius_to_pitch_summary": ratio_summary,
+        "ordinary_spacing_criterion": {
+            "minimum_exclusive_pixels": float(minimum_spacing),
+            "maximum_exclusive_pixels": float(maximum_spacing),
+            "same_amplifier_only": True,
+        },
+    }
+
+
 def _local_residual_mode_projection(
     evidence: LDLSEvidence, geometry: LDLSGeometry, sampling: LDLSSampling, current: ForwardEvaluation,
 ) -> dict[str, Any]:
@@ -1593,6 +1704,9 @@ def _write_diagnostics(
     _write_profile_shape_diagnostics(
         output, closure.W, closure.f_sigma, closure.R, closure.sigma, model_fwhm,
     )
+    _write_R_trace_pitch_diagnostics(
+        output, closure.trace, closure.R, amplifier_boundary=geometry.amplifier_boundary,
+    )
 
 
 def _write_profile_shape_diagnostics(
@@ -1635,6 +1749,110 @@ def _write_profile_shape_diagnostics(
         axis.grid(alpha=0.2)
     fig.savefig(output / "forward_ldls_profile_shape_by_fiber.png", dpi=160)
     plt.close(fig)
+
+
+def _write_R_trace_pitch_diagnostics(
+    output: Path, trace: np.ndarray, radius: np.ndarray, *, amplifier_boundary: float,
+) -> None:
+    """Write read-only diagnostics comparing fitted R with ordinary trace pitch."""
+    diagnostics = _R_trace_pitch_diagnostics(
+        trace, radius, amplifier_boundary=amplifier_boundary,
+    )
+    spacing_pair = diagnostics["spacing_pair"]
+    radius_pair = diagnostics["radius_pair"]
+    radius_to_pitch = diagnostics["radius_to_pitch"]
+    relation = diagnostics["relation"]
+
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
+    for axis, name, title in zip(
+        axes[0], ("all", "lower", "upper"),
+        ("all ordinary pairs", "lower physical half", "upper physical half"),
+    ):
+        mask = diagnostics["ordinary_mask"] if name == "all" else diagnostics[f"{name}_mask"]
+        image = axis.hexbin(
+            spacing_pair[mask], radius_pair[mask], gridsize=70, mincnt=1,
+            cmap="viridis",
+        )
+        fit = relation[name]["robust_linear_fit"]
+        if np.isfinite(fit["slope"]):
+            xline = np.asarray([np.nanmin(spacing_pair[mask]), np.nanmax(spacing_pair[mask])])
+            axis.plot(xline, fit["slope"] * xline + fit["intercept"], color="white", linewidth=1.2)
+        axis.set(
+            title=f"{title}\nr={relation[name]['pearson']:.3g}, "
+            f"rho={relation[name]['spearman']:.3g}",
+            xlabel="ordinary neighboring-trace spacing (pixels)",
+            ylabel="pair-mean R (pixels)",
+        )
+        fig.colorbar(image, ax=axis, label="count")
+
+    for axis, name, title in zip(
+        axes[1], ("all", "lower", "upper"),
+        ("all", "lower physical half", "upper physical half"),
+    ):
+        mask = diagnostics["ordinary_mask"] if name == "all" else diagnostics[f"{name}_mask"]
+        x = spacing_pair[mask]
+        y = radius_pair[mask]
+        x_fractional = x / np.median(x) - 1.0
+        y_fractional = y / np.median(y) - 1.0
+        image = axis.hexbin(
+            x_fractional, y_fractional, gridsize=70, mincnt=1,
+            cmap="coolwarm",
+        )
+        axis.axhline(0.0, color="black", linewidth=0.7)
+        axis.axvline(0.0, color="black", linewidth=0.7)
+        axis.set(
+            title=f"fractional deviations: {title}",
+            xlabel="pitch / median(pitch) − 1",
+            ylabel="R / median(R) − 1",
+        )
+        fig.colorbar(image, ax=axis, label="count")
+    fig.savefig(output / "forward_ldls_R_vs_trace_pitch.png", dpi=170)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5), constrained_layout=True)
+    for axis, field, title, label in (
+        (axes[0], spacing_pair, "ordinary neighboring-trace spacing", "pixels"),
+        (axes[1], radius_pair, "pair-mean R", "pixels"),
+        (axes[2], radius_to_pitch, "R / neighboring pitch", "ratio"),
+    ):
+        image = axis.imshow(field, aspect="auto", origin="lower")
+        fig.colorbar(image, ax=axis, label=label)
+        axis.set(title=title, xlabel="detector x", ylabel="adjacent fiber pair")
+    fig.savefig(output / "forward_ldls_R_pitch_field.png", dpi=170)
+    plt.close(fig)
+
+    pair_index = np.arange(spacing_pair.shape[0])
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), constrained_layout=True)
+    pair_medians = np.asarray([
+        np.nanmedian(row) if np.any(np.isfinite(row)) else np.nan
+        for row in spacing_pair
+    ])
+    radius_medians = np.asarray([
+        np.nanmedian(row) if np.any(np.isfinite(row)) else np.nan
+        for row in radius_pair
+    ])
+    ratio_medians = np.asarray([
+        np.nanmedian(row) if np.any(np.isfinite(row)) else np.nan
+        for row in radius_to_pitch
+    ])
+    for axis, field, title, label in (
+        (axes[0], pair_medians, "median neighboring pitch", "pixels"),
+        (axes[1], radius_medians, "median pair-mean R", "pixels"),
+        (axes[2], ratio_medians, "median R / pitch", "ratio"),
+    ):
+        axis.plot(pair_index, field, color="black", linewidth=1.1)
+        axis.axvline(0.5 * trace.shape[0] - 0.5, color="tab:red", linewidth=0.8, alpha=0.8)
+        axis.set(title=title, xlabel="adjacent fiber pair", ylabel=label)
+        axis.grid(alpha=0.2)
+    fig.savefig(output / "forward_ldls_R_pitch_by_fiber.png", dpi=170)
+    plt.close(fig)
+
+    (output / "forward_ldls_R_vs_trace_pitch.json").write_text(
+        json.dumps(diagnostics["relation"] | {
+            "radius_to_pitch_summary": diagnostics["radius_to_pitch_summary"],
+            "ordinary_spacing_criterion": diagnostics["ordinary_spacing_criterion"],
+        }, indent=2) + "\n"
+    )
 
 
 def _write_aperture_illumination_comparison(

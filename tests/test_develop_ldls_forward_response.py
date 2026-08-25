@@ -221,6 +221,44 @@ def test_profile_shape_diagnostics_preserve_state_and_existing_arrays(tmp_path: 
     np.testing.assert_array_equal(state.f_sigma_coeff, state_before["f_sigma_coeff"])
     assert (tmp_path / "forward_ldls_profile_shape_diagnostics.png").exists()
     assert (tmp_path / "forward_ldls_profile_shape_by_fiber.png").exists()
+    assert (tmp_path / "forward_ldls_R_vs_trace_pitch.png").exists()
+    assert (tmp_path / "forward_ldls_R_pitch_field.png").exists()
+    assert (tmp_path / "forward_ldls_R_pitch_by_fiber.png").exists()
+    assert (tmp_path / "forward_ldls_R_vs_trace_pitch.json").exists()
+
+
+def test_R_trace_pitch_diagnostic_keeps_only_ordinary_same_amplifier_pairs():
+    solver = _solver_module()
+    trace = np.asarray([
+        [100.0, 101.0], [108.0, 109.0], [119.0, 120.0],
+        [1040.0, 1041.0], [1048.0, 1049.0], [1059.0, 1060.0],
+    ])
+    radius = np.asarray([
+        [2.0, 2.0], [4.0, 4.0], [5.5, 5.5],
+        [8.0, 8.0], [10.0, 10.0], [11.5, 11.5],
+    ])
+    diagnostics = solver._R_trace_pitch_diagnostics(
+        trace, radius, amplifier_boundary=1032.0,
+    )
+
+    spacing = diagnostics["spacing_pair"]
+    pair_radius = diagnostics["radius_pair"]
+    assert spacing.shape == (5, 2)
+    np.testing.assert_array_equal(np.isfinite(spacing).sum(axis=1), [2, 2, 0, 2, 2])
+    np.testing.assert_allclose(pair_radius[0], [3.0, 3.0])
+    np.testing.assert_allclose(pair_radius[1], [4.75, 4.75])
+    np.testing.assert_allclose(pair_radius[3], [9.0, 9.0])
+    np.testing.assert_allclose(pair_radius[4], [10.75, 10.75])
+    assert np.isnan(spacing[2]).all()
+    assert diagnostics["relation"]["all"]["count"] == 8
+    assert diagnostics["relation"]["lower"]["count"] == 4
+    assert diagnostics["relation"]["upper"]["count"] == 4
+    assert diagnostics["relation"]["lower"]["pearson"] == pytest.approx(1.0)
+    assert diagnostics["relation"]["lower"]["spearman"] == pytest.approx(1.0)
+    assert diagnostics["relation"]["upper"]["pearson"] == pytest.approx(1.0)
+    assert diagnostics["relation"]["upper"]["spearman"] == pytest.approx(1.0)
+    assert diagnostics["radius_to_pitch_summary"]["all"]["count"] == 8
+    assert diagnostics["ordinary_spacing_criterion"]["same_amplifier_only"] is True
 
 
 def _synthetic_problem():
